@@ -1,0 +1,809 @@
+import assert from 'node:assert/strict'
+
+import { ensureExperimentalFeaturesEnabled } from '../modules/preferences-automation-flows.mjs'
+import { createBoardReplyModelRegression } from '../modules/board-reply-model.mjs'
+import { createProjectOnlyNavigationRegression } from '../modules/project-only-navigation.mjs'
+import { createProjectSpacePickerRegression } from '../modules/project-space-picker.mjs'
+import { verifyIssueConversationDrawers } from '../modules/issue-conversation-drawers.mjs'
+import { verifyCollaborationIssueHome } from '../modules/collaboration-issue-home.mjs'
+import { verifyCollaborationMemberSettings } from '../modules/collaboration-member-settings.mjs'
+import {
+  verifyIssueDetailPropertyUi,
+  verifyNewDiscussionComposerUi,
+  verifyReplyComposerUi,
+} from '../modules/collaboration-issue-detail-ui.mjs'
+import {
+  verifyIssueActivityTimeline,
+  verifyCommentExecutionStatus,
+} from '../modules/issue-activity-timeline.mjs'
+import { verifyCollaborationLocalProjectImport } from '../modules/collaboration-local-project-import.mjs'
+import { REMOTE_DOCKER_DEVICE_ID } from '../modules/shared.mjs'
+import {
+  openDirectProjectCreation,
+  configureFirstProjectExecutionEnvironment,
+  selectCollaborationDomain,
+} from '../modules/workspace-flows.mjs'
+const ACTIVE_WORKBENCH_SELECTOR = '[data-workspace-tab-content][aria-hidden="false"]'
+const WORKSPACE_NAME = '协作共享核心空间'
+const PROJECT_NAME = '协作共享核心验收'
+const ISSUE_TITLE = '验证共享协作主流程'
+const COMMENT_BODY = 'Wework 真实桌面 E2E 评论'
+const HUMAN_ASSIGNMENT_COMMENT = '请处理需求确认'
+const HUMAN_WORKFLOW_STEP = '需求确认'
+const AGENT_ASSIGNMENT_COMMENT = '请处理实现步骤'
+const AGENT_WORKFLOW_STEP = '实现'
+const AGENT_NAME = '协作核心 Codex'
+const TERMINAL_STATUS_ISSUE_TITLE = '验证终态任务不再显示执行中'
+
+async function requestJson(baseUrl, token, pathname, options = {}) {
+  const response = await fetch(`${baseUrl}${pathname}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...options.headers,
+    },
+  })
+  const text = await response.text()
+  const body = text ? JSON.parse(text) : null
+  assert.equal(
+    response.ok,
+    true,
+    `${options.method ?? 'GET'} ${pathname} failed with HTTP ${response.status}: ${text}`
+  )
+  return body
+}
+
+function scoped(selector) {
+  return `${ACTIVE_WORKBENCH_SELECTOR} ${selector}`
+}
+
+async function snapshot(control) {
+  return JSON.parse(await control.command('snapshot', ACTIVE_WORKBENCH_SELECTOR))
+}
+
+async function waitForApiValue(load, predicate, message, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  let latest = null
+  while (Date.now() < deadline) {
+    latest = await load()
+    if (predicate(latest)) return latest
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  assert.fail(`${message}: ${JSON.stringify(latest)}`)
+}
+
+function terminalExecution(execution) {
+  return ['completed', 'failed', 'cancelled'].includes(execution.status)
+}
+
+export function createDesktopScenario({
+  captureScreenshot,
+  uiTimeoutMs,
+  workbenchReadyTimeoutMs,
+  executorHome,
+}) {
+  const boardReplyModel = createBoardReplyModelRegression({ executorHome, uiTimeoutMs })
+  const projectOnlyNavigation = createProjectOnlyNavigationRegression({ uiTimeoutMs })
+  let backendUrl = ''
+  let authToken = ''
+  let owner = null
+  let workspace = null
+  let project = null
+  let issue = null
+  let agent = null
+  let cloudEnvironment = null
+  let fixtureArchived = false
+
+  const request = (pathname, options) => requestJson(backendUrl, authToken, pathname, options)
+  const projectSpacePicker = createProjectSpacePickerRegression({
+    request,
+    uiTimeoutMs,
+    workbenchReadyTimeoutMs,
+  })
+  const capture = (control, name) => captureScreenshot(control, name, ACTIVE_WORKBENCH_SELECTOR)
+
+  async function archiveFixture() {
+    if (fixtureArchived) return
+    try {
+      if (project) {
+        const executions = await request(
+          `/api/v1/cloud-projects/${project.id}/executions?include_terminal=true`
+        )
+        for (const execution of executions.items.filter(
+          candidate => !terminalExecution(candidate)
+        )) {
+          await request(`/api/v1/cloud-projects/${project.id}/executions/${execution.id}/stop`, {
+            method: 'POST',
+          })
+        }
+        await waitForApiValue(
+          () => request(`/api/v1/cloud-projects/${project.id}/executions?include_terminal=true`),
+          response => response.items.every(terminalExecution),
+          'Project executions remained active during fixture cleanup',
+          Math.max(uiTimeoutMs, 30_000)
+        )
+        const latestProject = await request(`/api/v1/cloud-projects/${project.id}`)
+        if (latestProject.status !== 'archived') {
+          await request(`/api/v1/cloud-projects/${project.id}?version=${latestProject.version}`, {
+            method: 'DELETE',
+          })
+        }
+      }
+      if (workspace) {
+        const latestWorkspace = await request(`/api/v1/workspaces/${workspace.id}`)
+        if (latestWorkspace.status !== 'archived') {
+          await request(`/api/v1/workspaces/${workspace.id}?version=${latestWorkspace.version}`, {
+            method: 'DELETE',
+          })
+        }
+      }
+    } finally {
+      fixtureArchived = true
+    }
+  }
+
+  return {
+    requiresCloudEnvironment: true,
+    handleHttp: boardReplyModel.handleHttp,
+
+    async prepareCloud(cloud) {
+      backendUrl = cloud.backendUrl
+      authToken = cloud.authToken
+      owner = await request('/api/users/me')
+      await request('/api/admin/setup-complete', { method: 'POST' })
+      await projectOnlyNavigation.prepare(cloud, owner)
+      await projectSpacePicker.prepare()
+    },
+
+    setCloudEnvironment(environment) {
+      cloudEnvironment = environment
+    },
+
+    async verify(control) {
+      assert.ok(owner?.id, 'The collaboration owner fixture is missing')
+      assert.ok(cloudEnvironment, 'The real cloud environment was not attached to the scenario')
+      const remoteDevice = await cloudEnvironment.waitForDeviceType(
+        REMOTE_DOCKER_DEVICE_ID,
+        'remote'
+      )
+      assert.ok(remoteDevice?.id, 'The real remote Docker Executor device is unavailable')
+
+      try {
+        await ensureExperimentalFeaturesEnabled(control)
+        await control.command('waitFor', '[data-testid="workspace-tab-select-fixed-board"]', {
+          timeoutMs: workbenchReadyTimeoutMs,
+        })
+        await control.command('click', '[data-testid="workspace-tab-select-fixed-board"]')
+        await control.command('waitFor', scoped('[data-testid="wework-collaboration-platform"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        await selectCollaborationDomain(control, ACTIVE_WORKBENCH_SELECTOR, 'cloud')
+        assert.equal(
+          await control.command(
+            'getAttribute',
+            '[data-testid="workspace-tab-select-fixed-board"]',
+            { value: 'aria-selected' }
+          ),
+          'true',
+          'Opening Collaboration did not activate the fixed Collaboration tab'
+        )
+
+        const platformSnapshot = await snapshot(control)
+        assert.ok(
+          platformSnapshot.testIds.includes('wework-collaboration-platform') &&
+            platformSnapshot.testIds.includes('collaboration-platform-root'),
+          'The fixed Collaboration tab did not render the shared native Collaboration module'
+        )
+        await control.command('waitFor', scoped('[data-testid="collaboration-workspace-create"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        await capture(control, 'collaboration-shared-core-01-all-workspaces.png')
+        await projectOnlyNavigation.verify(control, scoped)
+        await capture(control, 'collaboration-shared-core-project-only-navigation.png')
+
+        await control.command('click', scoped('[data-testid="collaboration-primary-devices"]'))
+        const deviceRow = scoped(`[data-testid="collaboration-devices-row-${remoteDevice.id}"]`)
+        await control.command('waitFor', deviceRow, { visible: true, timeoutMs: uiTimeoutMs })
+        const currentDeviceRows = scoped(
+          '[data-testid^="collaboration-devices-row-"][data-source="local"]'
+        )
+        await control.command('waitFor', currentDeviceRows, {
+          visible: true,
+          timeoutMs: uiTimeoutMs,
+        })
+        assert.equal(
+          Number(await control.command('getElementCount', currentDeviceRows)),
+          1,
+          'Only the active local runtime may be labelled as the current device'
+        )
+        await control.command('click', scoped('[data-testid="collaboration-primary-home"]'))
+        await control.command(
+          'clickThenMacrotask',
+          scoped('[data-testid="collaboration-primary-devices"]'),
+          {
+            target: scoped('[data-testid="collaboration-devices-scope-all"]'),
+          }
+        )
+        assert.equal(
+          Number(await control.command('getElementCount', deviceRow)),
+          1,
+          'Reopening the device catalog discarded the loaded cloud runner'
+        )
+        assert.doesNotMatch(
+          await control.command('getText', scoped('[data-testid="collaboration-devices-page"]')),
+          /尚未添加设备|当前没有云端设备/,
+          'A cached device catalog rendered a false empty state'
+        )
+        await control.command('click', scoped('[data-testid="collaboration-primary-home"]'))
+
+        const workspaceName = `${WORKSPACE_NAME}-${process.pid}`
+        await control.command('click', scoped('[data-testid="collaboration-workspace-create"]'))
+        await control.command(
+          'waitFor',
+          scoped('[data-testid="collaboration-workspace-name-input"]'),
+          { timeoutMs: uiTimeoutMs }
+        )
+        await control.command(
+          'fill',
+          scoped('[data-testid="collaboration-workspace-name-input"]'),
+          {
+            value: workspaceName,
+          }
+        )
+        await control.command(
+          'fill',
+          scoped('[data-testid="collaboration-workspace-description-input"]'),
+          { value: 'Created through the real native Wework Collaboration UI.' }
+        )
+        await control.command(
+          'click',
+          scoped('[data-testid="collaboration-workspace-create-confirm"]')
+        )
+        workspace = await waitForApiValue(
+          async () => {
+            const response = await request('/api/v1/workspaces')
+            return response.items?.find(candidate => candidate.name === workspaceName) ?? null
+          },
+          value => Boolean(value),
+          'Creating a Workspace through the native Collaboration UI did not persist',
+          uiTimeoutMs
+        )
+        assert.equal(workspace.name, workspaceName)
+        await control.command(
+          'waitFor',
+          scoped('[data-testid="collaboration-workspace-project-create"]'),
+          { timeoutMs: uiTimeoutMs }
+        )
+        await capture(control, 'collaboration-shared-core-02-workspace-created.png')
+
+        const projectName = `${PROJECT_NAME}-${process.pid}`
+        await openDirectProjectCreation(control, ACTIVE_WORKBENCH_SELECTOR)
+        await control.command(
+          'waitFor',
+          scoped('[data-testid="collaboration-project-name-input"]'),
+          { timeoutMs: uiTimeoutMs }
+        )
+        await control.command('fill', scoped('[data-testid="collaboration-project-name-input"]'), {
+          value: projectName,
+        })
+        await control.command(
+          'click',
+          scoped('[data-testid="collaboration-project-create-advanced"]')
+        )
+        await control.command(
+          'fill',
+          scoped('[data-testid="collaboration-project-description-input"]'),
+          { value: 'Created through Workspace → Project in the native Wework module.' }
+        )
+        await control.command('click', scoped('[data-testid="cloud-project-visibility-public"]'))
+        await control.command('click', scoped('[data-testid="cloud-project-public-access-viewer"]'))
+        await control.command(
+          'click',
+          scoped('[data-testid="cloud-project-default-issue-security-related"]')
+        )
+        await control.command(
+          'click',
+          scoped('[data-testid="collaboration-project-create-confirm"]')
+        )
+        project = await waitForApiValue(
+          async () => {
+            const response = await request(`/api/v1/workspaces/${workspace.id}/projects`)
+            return response.items?.find(candidate => candidate.name === projectName) ?? null
+          },
+          value => Boolean(value),
+          'Creating a Project through the native Collaboration UI did not persist',
+          uiTimeoutMs
+        )
+        assert.equal(project.name, projectName)
+        assert.equal(project.visibility, 'public')
+        assert.equal(project.public_access?.role, 'Viewer')
+        assert.equal(project.default_issue_security, 'related')
+        const persistedWorkspace = await request(`/api/v1/workspaces/${workspace.id}`)
+        assert.equal(persistedWorkspace.project_count, 1)
+        const persistedProjects = await request(`/api/v1/workspaces/${workspace.id}/projects`)
+        assert.ok(persistedProjects.items.some(candidate => candidate.id === project.id))
+        await control.command('waitFor', scoped('[data-testid="collaboration-root"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command('waitFor', scoped('[data-testid="collaboration-empty-project"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        await capture(control, 'collaboration-shared-core-03-project-created.png')
+        await verifyCollaborationMemberSettings(control, { scoped, owner, request, project })
+
+        // Creation authorizes the current runner; this recovery case needs an unassigned project.
+        const initialEnvironments = await request(
+          `/api/v1/cloud-projects/${project.id}/execution-environments`
+        )
+        for (const environment of initialEnvironments.items) {
+          await request(
+            `/api/v1/cloud-projects/${project.id}/execution-environments/${environment.device_id}`,
+            { method: 'DELETE' }
+          )
+        }
+        const unassignedEnvironments = await request(
+          `/api/v1/cloud-projects/${project.id}/execution-environments`
+        )
+        assert.equal(unassignedEnvironments.items.length, 0)
+
+        agent = await request(`/api/v1/cloud-projects/${project.id}/chat-agents`, {
+          method: 'POST',
+          body: JSON.stringify({
+            name: AGENT_NAME,
+            runtime: 'codex',
+            systemPrompt: 'Complete the assigned project work.',
+            capabilityDescription: 'Desktop E2E project implementation agent',
+            visibility: 'creator_admin',
+            executionEnvironment: 'local',
+            executionMode: 'manual_approval',
+            workspaceBinding: { type: 'standalone' },
+            maxConcurrentExecutions: 1,
+            workspacePolicy: 'project',
+            plugins: [],
+          }),
+        })
+        await control.command('click', scoped('[data-testid="collaboration-primary-home"]'))
+        await control.command('waitFor', scoped('[data-testid="collaboration-issue-workspace"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command(
+          'waitFor',
+          scoped(
+            '[data-testid="collaboration-issue-home"][data-execution-environment-readiness="unassigned"]'
+          )
+        )
+        assert.equal(
+          Number(
+            await control.command(
+              'getElementCount',
+              scoped('[data-testid="issue-execution-environment-notice"]')
+            )
+          ),
+          0,
+          'A project without execution environments must not show an environment notice'
+        )
+        await control.command(
+          'click',
+          scoped(`[data-testid="collaboration-workspace-project-${project.id}"]`)
+        )
+        await configureFirstProjectExecutionEnvironment(
+          control,
+          ACTIVE_WORKBENCH_SELECTOR,
+          uiTimeoutMs,
+          remoteDevice.id
+        )
+        await control.command('click', scoped('[data-testid="collaboration-primary-home"]'))
+        await control.command('waitFor', scoped('[data-testid="collaboration-issue-workspace"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        assert.equal(
+          Number(
+            await control.command(
+              'getElementCount',
+              scoped('[data-testid="issue-execution-environment-notice"]')
+            )
+          ),
+          0,
+          'The execution environment warning remained after authorizing an online runner'
+        )
+        const terminalStatusIssue = await request(
+          `/api/v1/cloud-projects/${project.id}/loop-items`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              title: TERMINAL_STATUS_ISSUE_TITLE,
+              status: 'in_progress',
+              assignee_agent_id: agent.id,
+            }),
+          }
+        )
+        assert.equal(terminalStatusIssue.execution_state, 'waiting_approval')
+        const rejectedTerminalStatusIssue = await request(
+          `/api/v1/cloud-projects/${project.id}/loop-items/${terminalStatusIssue.id}/reject`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              version: terminalStatusIssue.version,
+              reason: 'Desktop E2E terminal status mapping fixture',
+            }),
+          }
+        )
+        assert.equal(rejectedTerminalStatusIssue.status, 'in_progress')
+        assert.equal(rejectedTerminalStatusIssue.execution_state, 'cancelled')
+        await control.command(
+          'click',
+          scoped(
+            `[data-testid="collaboration-workspace-tree-${workspace.id}"] .collaboration-workspace-identity`
+          )
+        )
+        await control.command('waitFor', scoped('[data-testid="collaboration-workspace-home"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command(
+          'waitFor',
+          scoped('[data-testid="collaboration-workspace-metric-running"]'),
+          { text: '0', timeoutMs: uiTimeoutMs }
+        )
+        await control.command(
+          'waitFor',
+          scoped('[data-testid="collaboration-workspace-metric-pending"]'),
+          { text: '1', timeoutMs: uiTimeoutMs }
+        )
+        await control.command(
+          'clickWhenEnabled',
+          scoped(`[data-testid="collaboration-workspace-project-${project.id}"]`),
+          { timeoutMs: uiTimeoutMs }
+        )
+        await control.command('waitFor', scoped('[data-testid="cloud-project-header-title"]'), {
+          text: project.name,
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command('click', scoped('[data-testid="collaboration-tab-board"]'))
+        await control.command('waitFor', scoped('[data-testid="collaboration-issue-create"]'), {
+          visible: true,
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command('click', scoped('[data-testid="collaboration-issue-create"]'))
+        await control.command('waitFor', scoped('[data-testid="cloud-todo-title"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command('fill', scoped('[data-testid="cloud-todo-title"]'), {
+          value: ISSUE_TITLE,
+        })
+        await control.command('fill', scoped('[data-testid="cloud-todo-detail-description"]'), {
+          value: '验证共享界面、评论、分配与 Wework 本地 Task 创建桥。',
+        })
+        await control.command('click', scoped('[data-testid="cloud-todo-create-confirm"]'))
+        issue = await waitForApiValue(
+          async () => {
+            const response = await request(`/api/v1/cloud-projects/${project.id}/loop-items`)
+            return response.items?.find(candidate => candidate.title === ISSUE_TITLE) ?? null
+          },
+          value => Boolean(value),
+          'Creating an Issue through the native Collaboration UI did not persist',
+          uiTimeoutMs
+        )
+        assert.equal(issue.title, ISSUE_TITLE)
+        await control.command('waitFor', scoped('[data-testid="collaboration-issue-detail"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        await capture(control, 'collaboration-shared-core-04-issue-created.png')
+
+        await control.command('waitFor', scoped('[data-testid="cloud-todo-detail"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        await verifyCollaborationIssueHome(control, {
+          request,
+          project,
+          issue,
+          owner,
+          agent,
+          scoped,
+        })
+        await capture(control, 'collaboration-shared-core-05-shared-issue-detail.png')
+        const activitySelector = scoped(`[data-testid="cloud-task-activity-${issue.id}"]`)
+        const activityListSelector = scoped('[data-testid="cloud-task-activity-list"]')
+        const activityComposerSelector = scoped('[data-testid="cloud-task-activity-composer"]')
+        await control.command('waitFor', activitySelector, { timeoutMs: uiTimeoutMs })
+        await verifyIssueDetailPropertyUi(control, scoped, uiTimeoutMs)
+        await verifyNewDiscussionComposerUi(control, scoped, uiTimeoutMs)
+        assert.equal(
+          await control.command('getValue', scoped('[data-testid="cloud-todo-detail-title"]')),
+          ISSUE_TITLE,
+          'The shared Wework Issue detail did not load the selected real backend Issue'
+        )
+
+        await control.command('fill', activityComposerSelector, {
+          value: COMMENT_BODY,
+        })
+        await control.command('press', activityComposerSelector, { key: 'Enter' })
+        await control.command('waitFor', activityListSelector, {
+          text: COMMENT_BODY,
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command('click', scoped('[data-testid^="cloud-task-activity-reply-toggle-"]'))
+        const replyComposerSelector = scoped(
+          '[data-testid="issue-reply-composer"] [data-testid="cloud-task-activity-composer"]'
+        )
+        await control.command('waitFor', replyComposerSelector, { timeoutMs: uiTimeoutMs })
+        await verifyReplyComposerUi(control, scoped, uiTimeoutMs)
+        await control.command('fill', replyComposerSelector, {
+          value: '在动态卡片内回复',
+        })
+        await control.command('press', replyComposerSelector, { key: 'Enter' })
+        await control.command('waitFor', scoped('[data-testid^="cloud-task-activity-replies-"]'), {
+          text: '在动态卡片内回复',
+          timeoutMs: uiTimeoutMs,
+        })
+        await verifyIssueActivityTimeline(control, scoped, uiTimeoutMs)
+
+        await request(`/api/v1/loop-items/${issue.id}/assignments`, {
+          method: 'POST',
+          body: JSON.stringify({
+            target_type: 'human',
+            target_id: String(owner.id),
+            workflow_step: HUMAN_WORKFLOW_STEP,
+            comment_body: HUMAN_ASSIGNMENT_COMMENT,
+            notify_target: false,
+          }),
+        })
+        await request(`/api/v1/loop-items/${issue.id}/assignments`, {
+          method: 'POST',
+          body: JSON.stringify({
+            target_type: 'agent',
+            target_id: agent.id,
+            workflow_step: AGENT_WORKFLOW_STEP,
+            comment_body: AGENT_ASSIGNMENT_COMMENT,
+            notify_target: false,
+          }),
+        })
+        const assignments = await request(`/api/v1/loop-items/${issue.id}/assignments`)
+        assert.ok(
+          assignments.items.some(
+            assignment =>
+              assignment.target_type === 'human' &&
+              assignment.target_id === String(owner.id) &&
+              assignment.workflow_step === HUMAN_WORKFLOW_STEP
+          ),
+          'The real backend did not persist the human workflow-step assignment'
+        )
+        assert.ok(
+          assignments.items.some(
+            assignment =>
+              assignment.target_type === 'agent' &&
+              assignment.target_id === agent.id &&
+              assignment.workflow_step === AGENT_WORKFLOW_STEP
+          ),
+          'The real backend did not persist the Agent workflow-step assignment'
+        )
+        await capture(control, 'collaboration-shared-core-06-issue-activity.png')
+        await control.command('click', scoped('[data-testid="cloud-todo-detail-close"]'))
+        await control.command('waitFor', scoped('[data-testid="collaboration-issue-detail"]'), {
+          visible: false,
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command(
+          'clickWhenEnabled',
+          scoped(`[data-testid="cloud-todo-card-${issue.id}"]`),
+          { timeoutMs: uiTimeoutMs }
+        )
+        await control.command('waitFor', activitySelector, { timeoutMs: uiTimeoutMs })
+        await boardReplyModel.verify(control, issue, scoped, {
+          backendUrl,
+          authToken,
+          projectId: project.id,
+          agentId: agent.id,
+        })
+        await verifyCommentExecutionStatus(control, scoped, uiTimeoutMs)
+        await verifyIssueConversationDrawers(control, scoped, uiTimeoutMs)
+        await capture(control, 'collaboration-shared-core-06-cloud-model-reply.png')
+        const personalAssignment = await request(`/api/v1/loop-items/${issue.id}/assignments`, {
+          method: 'POST',
+          body: JSON.stringify({
+            target_type: 'human',
+            target_id: String(owner.id),
+            workflow_step: '本机处理',
+            comment_body: '请在自己的电脑上创建任务并处理',
+            notify_target: false,
+          }),
+        })
+        assert.equal(
+          personalAssignment.issue.assignee_user_id,
+          owner.id,
+          'The real backend did not make the current user the Issue assignee'
+        )
+        assert.equal(
+          personalAssignment.issue.assignee_agent_id,
+          null,
+          'The real backend retained the previous Agent as the Issue assignee'
+        )
+        await control.command('click', scoped('[data-testid="cloud-todo-detail-close"]'))
+        await control.command('waitFor', scoped('[data-testid="collaboration-issue-detail"]'), {
+          visible: false,
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command(
+          'clickWhenEnabled',
+          scoped(`[data-testid="cloud-todo-card-${issue.id}"]`),
+          { timeoutMs: uiTimeoutMs }
+        )
+        await control.command('waitFor', scoped('[data-testid="cloud-todo-tasks"]'), {
+          text: '关联任务',
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command('waitFor', scoped('[data-testid="cloud-todo-create-task"]'), {
+          text: '新建任务',
+          timeoutMs: uiTimeoutMs,
+        })
+        const personalTaskSnapshot = await snapshot(control)
+        assert.ok(
+          personalTaskSnapshot.testIds.includes('cloud-task-activity-composer'),
+          'The public Issue comment composer disappeared when linked Tasks were shown'
+        )
+        const previousBindings = await request(`/api/v1/loop-items/${issue.id}/tasks`)
+        const durationSelector = scoped('[data-testid="cloud-todo-execution-duration"]')
+        await control.command('waitFor', durationSelector, {
+          visible: true,
+          timeoutMs: uiTimeoutMs,
+        })
+        // Compare actual execution start/end instants, not the binding creation time.
+        const executionState = (await request(`/api/v1/loop-items/${issue.id}`)).ai_state
+        assert.ok(executionState?.started_at, 'The real execution must have a start time')
+        const utcInstant = timestamp =>
+          Date.parse(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(timestamp) ? timestamp : `${timestamp}Z`)
+        const startedAt = utcInstant(executionState.started_at)
+        const endedAt = executionState.completed_at
+          ? utcInstant(executionState.completed_at)
+          : Date.now()
+        assert.ok(Number.isFinite(startedAt) && Number.isFinite(endedAt))
+        const elapsedMinutes = Math.max(1, Math.floor((endedAt - startedAt) / 60_000))
+        assert.ok(elapsedMinutes < 60, 'The fresh Issue fixture must be less than an hour old')
+        const durationText = await control.command('getText', durationSelector)
+        assert.match(
+          durationText,
+          /^\d+\s*分钟$/,
+          'A fresh execution must not include a timezone-sized offset'
+        )
+        assert.ok(
+          Math.abs(Number.parseInt(durationText, 10) - elapsedMinutes) <= 1,
+          `Execution duration ${durationText} must match the actual execution ${elapsedMinutes} minutes`
+        )
+        const previousTaskIds = new Set(
+          previousBindings.map(binding => binding.taskId ?? binding.task_id)
+        )
+
+        await control.command('click', scoped('[data-testid="cloud-todo-create-task"]'))
+        await control.command('waitFor', scoped('[data-testid="ai-chat-modal"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command('waitFor', scoped('[data-testid="work-item-new-task-chat-panel"]'), {
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command(
+          'waitFor',
+          scoped(
+            '[data-testid="work-item-new-task-chat-panel"] [data-composer-reference-kind="issue"]'
+          ),
+          {
+            text: ISSUE_TITLE,
+            timeoutMs: uiTimeoutMs,
+          }
+        )
+        await control.command(
+          'waitFor',
+          scoped(
+            '[data-testid="work-item-new-task-chat-panel"] [data-testid="chat-message-input"]'
+          ),
+          {
+            timeoutMs: uiTimeoutMs,
+          }
+        )
+        const bridgeSnapshot = await snapshot(control)
+        assert.ok(
+          bridgeSnapshot.text.includes(project.name) &&
+            bridgeSnapshot.text.includes(issue.id) &&
+            bridgeSnapshot.text.includes(ISSUE_TITLE),
+          'The Wework local Task bridge did not retain the Project and Issue context'
+        )
+        await capture(control, 'collaboration-shared-core-07-local-task-bridge.png')
+
+        const taskComposer = scoped(
+          '[data-testid="work-item-new-task-chat-panel"] [data-testid="chat-message-input"]'
+        )
+        await control.command('press', taskComposer, { key: 'Enter' })
+        await control.command(
+          'waitFor',
+          scoped(
+            '[data-testid="work-item-new-task-chat-panel"] [data-testid^="sent-issue-token-"]'
+          ),
+          {
+            text: ISSUE_TITLE,
+            timeoutMs: uiTimeoutMs,
+          }
+        )
+        const taskBindings = await waitForApiValue(
+          async () =>
+            (await request(`/api/v1/loop-items/${issue.id}/tasks`)).filter(
+              binding => !previousTaskIds.has(binding.taskId ?? binding.task_id)
+            ),
+          value => Array.isArray(value) && value.length > 0,
+          'Starting work did not bind the new Wework local Task to the Issue',
+          uiTimeoutMs
+        )
+        const binding = taskBindings[0]
+        const bindingDeviceId = binding.deviceId ?? binding.device_id
+        assert.ok(bindingDeviceId, 'The Task binding has no device identity')
+        assert.notEqual(
+          String(bindingDeviceId),
+          String(remoteDevice.id),
+          'The personal Task incorrectly reused the Project shared execution device'
+        )
+        assert.ok(
+          binding.taskId ?? binding.task_id,
+          'The Task binding has no runtime task identity'
+        )
+        const issueAfterPersonalTask = await waitForApiValue(
+          () => request(`/api/v1/loop-items/${issue.id}`),
+          value => value?.status === 'in_progress',
+          'Starting the private local Task did not mark the shared Issue in progress',
+          uiTimeoutMs
+        )
+        assert.equal(
+          issueAfterPersonalTask.status,
+          'in_progress',
+          'Starting the private local Task did not preserve the shared Issue running state'
+        )
+        assert.equal(
+          issueAfterPersonalTask.assignee_user_id,
+          owner.id,
+          'The private personal Task unexpectedly changed the shared Issue assignee'
+        )
+        await capture(control, 'collaboration-shared-core-08-local-task-bound.png')
+        await verifyCollaborationLocalProjectImport(control, {
+          cloudProjectId: project.id,
+          cloudWorkspaceId: workspace.id,
+          executorHome,
+          scoped,
+          workbenchReadyTimeoutMs,
+        })
+        await projectSpacePicker.verify(control, {
+          deviceId: binding.deviceId ?? binding.device_id,
+          taskId: binding.taskId ?? binding.task_id,
+        })
+      } finally {
+        try {
+          await archiveFixture()
+        } finally {
+          try {
+            await projectOnlyNavigation.cleanup()
+          } finally {
+            await projectSpacePicker.cleanup()
+          }
+        }
+      }
+    },
+
+    async cleanup() {
+      try {
+        await archiveFixture()
+      } finally {
+        try {
+          await projectOnlyNavigation.cleanup()
+        } finally {
+          await projectSpacePicker.cleanup()
+        }
+      }
+    },
+
+    diagnostics() {
+      return {
+        agentId: agent?.id ?? null,
+        fixtureArchived,
+        issueId: issue?.id ?? null,
+        projectId: project?.id ?? null,
+        workspaceId: workspace?.id ?? null,
+      }
+    },
+  }
+}

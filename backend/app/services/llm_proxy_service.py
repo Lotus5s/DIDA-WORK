@@ -1,0 +1,521 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Authenticated LLM proxy gateway for Wework cloud models."""
+
+import json
+import logging
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import getproxies
+
+import httpx
+from fastapi import HTTPException, Request, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+
+from app.models.kind import Kind
+from app.models.user import User
+from app.services import model_credential_service
+from app.services.chat.config.model_resolver import extract_and_process_model_config
+from app.services.group_permission import get_user_groups
+from app.services.wework_model_config import wework_model_config_options
+from shared.utils.crypto import CryptoConfigurationError
+
+logger = logging.getLogger(__name__)
+
+MODEL_TYPE_HEADER = "x-wegent-model-type"
+MODEL_NAMESPACE_HEADER = "x-wegent-model-namespace"
+MODEL_USER_ID_HEADER = "x-wegent-model-user-id"
+UPSTREAM_HEADER_PREFIX = "x-wegent-upstream-header-"
+SUPPORTED_MODEL_TYPES = {"public", "user", "group"}
+PROTECTED_UPSTREAM_HEADERS = {
+    "accept",
+    "authorization",
+    "connection",
+    "content-length",
+    "content-type",
+    "cookie",
+    "host",
+    "proxy-authorization",
+    "set-cookie",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    MODEL_TYPE_HEADER,
+    MODEL_NAMESPACE_HEADER,
+    MODEL_USER_ID_HEADER,
+}
+PROTECTED_UPSTREAM_HEADER_MARKERS = (
+    "api-key",
+    "apikey",
+    "credential",
+    "secret",
+    "token",
+)
+LLM_PROXY_STREAM_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+RUNTIME_METADATA_HEADERS = {
+    "openai-beta",
+    "originator",
+    "session-id",
+    "thread-id",
+    "user-agent",
+    "x-client-request-id",
+    "x-codex-beta-features",
+    "x-codex-installation-id",
+    "x-codex-parent-thread-id",
+    "x-codex-turn-metadata",
+    "x-codex-turn-state",
+    "x-codex-window-id",
+    "x-openai-internal-codex-responses-lite",
+    "x-openai-memgen-request",
+    "x-openai-subagent",
+    "x-responsesapi-include-timing-metrics",
+}
+
+
+def resolve_llm_proxy_protocol(
+    model_name: str,
+    model_config: dict[str, Any],
+) -> str:
+    """Resolve the shared wire protocol for Runtime conversion and forwarding.
+
+    Supports OpenAI Responses, OpenAI Chat Completions, and Anthropic Messages.
+    The model's DB configuration is the single source of truth; if it cannot be
+    mapped to a known upstream API, an explicit error is returned so operators
+    can fix the Model CRD instead of silently falling back to /responses.
+    """
+    api_format = str(model_config.get("api_format") or "").strip().lower()
+    protocol = str(model_config.get("protocol") or "").strip().lower()
+    wire_api = str(model_config.get("wire_api") or "").strip().lower()
+
+    is_anthropic = protocol in {"claude", "anthropic-messages"}
+    is_chat_completions = (
+        api_format == "chat/completions"
+        or protocol in {"openai", "openai-chat-completions"}
+        or wire_api == "chat/completions"
+    )
+    is_responses = (
+        api_format == "responses"
+        or protocol == "openai-responses"
+        or wire_api == "responses"
+    )
+
+    if protocol == "openai-responses" and api_format == "chat/completions":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Model '{model_name}' has conflicting protocol/apiFormat: "
+                f"protocol={protocol!r}, api_format={api_format!r}. "
+                "Use protocol 'openai-responses' with apiFormat 'responses'."
+            ),
+        )
+    if protocol in {"claude", "anthropic-messages"} and api_format == "responses":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Model '{model_name}' has conflicting protocol/apiFormat: "
+                f"protocol={protocol!r}, api_format={api_format!r}. "
+                "Anthropic Messages does not support apiFormat 'responses'."
+            ),
+        )
+
+    if is_anthropic:
+        return "anthropic-messages"
+
+    if is_responses:
+        return "openai-responses"
+
+    if is_chat_completions:
+        return "openai-chat-completions"
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            f"Model '{model_name}' has an unsupported or ambiguous protocol/apiFormat "
+            f"configuration: protocol={protocol!r}, api_format={api_format!r}, "
+            f"wire_api={wire_api!r}. "
+            "Please update the Model CRD: use protocol 'openai-responses' with "
+            "apiFormat 'responses' for OpenAI Responses, protocol 'openai' with "
+            "apiFormat 'chat/completions' for OpenAI Chat Completions, or protocol "
+            "'claude'/'anthropic-messages' for Anthropic Messages."
+        ),
+    )
+
+
+def _resolve_upstream_target(
+    model_name: str,
+    model_config: dict[str, Any],
+) -> tuple[str, dict[str, str]]:
+    """Choose the provider endpoint and authentication for the resolved protocol."""
+    protocol = resolve_llm_proxy_protocol(model_name, model_config)
+    provider_api_key = str(model_config.get("api_key") or "").strip()
+    if protocol == "anthropic-messages":
+        auth_headers: dict[str, str] = {"anthropic-version": "2023-06-01"}
+        if provider_api_key:
+            auth_headers["x-api-key"] = provider_api_key
+        return "/v1/messages", auth_headers
+
+    auth_headers = {}
+    if provider_api_key:
+        auth_headers["Authorization"] = f"Bearer {provider_api_key}"
+    endpoint = "/responses" if protocol == "openai-responses" else "/chat/completions"
+    return endpoint, auth_headers
+
+
+def _join_upstream_url(base_url: str, endpoint_path: str) -> str:
+    """Append an endpoint path without duplicating existing path segments."""
+    parsed = urlsplit(base_url.strip())
+    base_segments = [segment for segment in parsed.path.split("/") if segment]
+    endpoint_segments = [
+        segment for segment in endpoint_path.strip().split("/") if segment
+    ]
+
+    max_overlap = min(len(base_segments), len(endpoint_segments))
+    overlap = next(
+        (
+            size
+            for size in range(max_overlap, 0, -1)
+            if base_segments[-size:] == endpoint_segments[:size]
+        ),
+        0,
+    )
+    path_segments = [*base_segments, *endpoint_segments[overlap:]]
+    path = f"/{'/'.join(path_segments)}" if path_segments else ""
+    return urlunsplit(parsed._replace(path=path))
+
+
+def _safe_proxy_config() -> dict[str, str]:
+    """Return proxy routing without exposing credentials."""
+    safe_proxies: dict[str, str] = {}
+    for scheme, proxy_url in getproxies().items():
+        parsed = urlsplit(str(proxy_url))
+        hostname = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        safe_proxies[str(scheme)] = urlunsplit(
+            (parsed.scheme, f"{hostname}{port}", parsed.path, "", "")
+        )
+    return safe_proxies
+
+
+def _is_protected_upstream_header(name: str) -> bool:
+    normalized = name.strip().lower().replace("_", "-")
+    parts = normalized.split("-")
+    return (
+        normalized in PROTECTED_UPSTREAM_HEADERS
+        or "auth" in parts
+        or "authentication" in parts
+        or any(marker in normalized for marker in PROTECTED_UPSTREAM_HEADER_MARKERS)
+    )
+
+
+def _extract_custom_upstream_headers(request: Request) -> dict[str, str]:
+    custom_headers: dict[str, str] = {}
+    for header_name, value in request.headers.items():
+        if not header_name.lower().startswith(UPSTREAM_HEADER_PREFIX):
+            continue
+        target_name = header_name[len(UPSTREAM_HEADER_PREFIX) :].strip()
+        if not target_name or target_name.startswith("-"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid custom upstream header name",
+            )
+        if _is_protected_upstream_header(target_name):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Custom upstream header is protected: {target_name}",
+            )
+        custom_headers[target_name] = value
+    return custom_headers
+
+
+def _extract_runtime_metadata_headers(request: Request) -> dict[str, str]:
+    """Preserve non-secret Runtime request identity across the cloud gateway."""
+    return {
+        name: value
+        for name, value in request.headers.items()
+        if name.lower() in RUNTIME_METADATA_HEADERS
+    }
+
+
+def _merge_headers_case_insensitive(
+    *header_sources: dict[str, str],
+) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    names_by_lowercase: dict[str, str] = {}
+    for headers in header_sources:
+        for name, value in headers.items():
+            normalized = name.lower()
+            previous_name = names_by_lowercase.get(normalized)
+            if previous_name is not None:
+                merged.pop(previous_name, None)
+            merged[name] = value
+            names_by_lowercase[normalized] = name
+    return merged
+
+
+def _required_header(request: Request, name: str) -> str:
+    value = (request.headers.get(name) or "").strip()
+    if not value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Missing {name} header",
+        )
+    return value
+
+
+def _resource_user_id(request: Request) -> int:
+    raw_value = _required_header(request, MODEL_USER_ID_HEADER)
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid {MODEL_USER_ID_HEADER} header",
+        ) from exc
+    if value < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid {MODEL_USER_ID_HEADER} header",
+        )
+    return value
+
+
+def _validate_model_access(
+    db: Session,
+    current_user: User,
+    model_type: str,
+    namespace: str,
+    resource_user_id: int,
+) -> None:
+    if model_type == "user":
+        allowed = namespace == "default" and resource_user_id == current_user.id
+    elif model_type == "public":
+        allowed = namespace == "default" and resource_user_id == 0
+    elif model_type == "group":
+        allowed = namespace != "default" and namespace in get_user_groups(
+            db, current_user.id
+        )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported cloud model type: {model_type}",
+        )
+
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cloud model access denied",
+        )
+
+
+def resolve_llm_proxy_model_config(
+    db: Session,
+    current_user: User,
+    *,
+    model_name: str,
+    model_type: str,
+    namespace: str,
+    resource_user_id: int,
+) -> dict[str, Any]:
+    """Resolve and validate an authorized Model CRD by its complete identity."""
+    if model_type not in SUPPORTED_MODEL_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported cloud model type: {model_type}",
+        )
+    _validate_model_access(
+        db,
+        current_user,
+        model_type,
+        namespace,
+        resource_user_id,
+    )
+
+    kind = (
+        db.query(Kind)
+        .filter(
+            Kind.user_id == resource_user_id,
+            Kind.kind == "Model",
+            Kind.namespace == namespace,
+            Kind.name == model_name,
+            Kind.is_active == True,
+        )
+        .first()
+    )
+    if not kind or not kind.json:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Cloud model not found",
+        )
+    model_spec = kind.json.get("spec", {})
+    try:
+        config = extract_and_process_model_config(
+            model_spec=model_spec,
+            user_id=current_user.id,
+            user_name=current_user.user_name or "",
+        )
+    except CryptoConfigurationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cloud model credentials are unavailable; check the encryption configuration",
+        ) from error
+    model_config = model_spec.get("modelConfig")
+    upstream_api_format = None
+    if (
+        isinstance(model_config, dict)
+        and model_config.get("codex_request_mode") == "passthrough"
+    ):
+        upstream_api_format = resolve_llm_proxy_protocol(model_name, config)
+    try:
+        wework_model_config_options(
+            model_config, upstream_api_format=upstream_api_format
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return model_credential_service.with_model_api_key_template(config, model_spec)
+
+
+def _parse_request_body(body_bytes: bytes) -> tuple[dict[str, Any], str]:
+    try:
+        body = json.loads(body_bytes)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="LLM proxy request body must be valid JSON",
+        ) from exc
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="LLM proxy request body must be an object",
+        )
+    model_name = body.get("model")
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="LLM proxy request model is required",
+        )
+    return body, model_name.strip()
+
+
+async def proxy_llm_responses(
+    request: Request,
+    db: Session,
+    current_user: User,
+) -> StreamingResponse:
+    """Resolve a cloud model for the authenticated user and stream its response."""
+    body_json, model_name = _parse_request_body(await request.body())
+    model_type = _required_header(request, MODEL_TYPE_HEADER)
+    namespace = _required_header(request, MODEL_NAMESPACE_HEADER)
+    resource_user_id = _resource_user_id(request)
+    model_config = resolve_llm_proxy_model_config(
+        db,
+        current_user,
+        model_name=model_name,
+        model_type=model_type,
+        namespace=namespace,
+        resource_user_id=resource_user_id,
+    )
+
+    provider_base_url = str(model_config.get("base_url") or "").strip()
+    provider_model_id = str(model_config.get("model_id") or "").strip()
+    default_headers = model_config.get("default_headers") or {}
+    if not provider_base_url or not provider_model_id:
+        logger.error(
+            "LLM proxy model configuration incomplete for user %s model %s",
+            current_user.id,
+            model_name,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model configuration incomplete",
+        )
+
+    body_json["model"] = provider_model_id
+    body_bytes = json.dumps(body_json).encode("utf-8")
+    # Validate the endpoint before invoking a deployment credential service.
+    resolve_llm_proxy_protocol(model_name, model_config)
+    try:
+        api_key = await model_credential_service.resolve_model_provider_api_key(
+            model_config, current_user
+        )
+    except model_credential_service.ModelCredentialError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model credentials unavailable",
+        ) from None
+    model_config = {**model_config, "api_key": api_key}
+    upstream_path, auth_headers = _resolve_upstream_target(model_name, model_config)
+    upstream_url = _join_upstream_url(provider_base_url, upstream_path)
+
+    configured_headers = (
+        {str(key): str(value) for key, value in default_headers.items()}
+        if isinstance(default_headers, dict)
+        else {}
+    )
+    custom_headers = _extract_custom_upstream_headers(request)
+    runtime_headers = _extract_runtime_metadata_headers(request)
+    provider_headers = _merge_headers_case_insensitive(
+        configured_headers,
+        custom_headers,
+        runtime_headers,
+    )
+    protocol_headers: dict[str, str] = dict(auth_headers)
+    content_type = request.headers.get("content-type")
+    if content_type:
+        protocol_headers["Content-Type"] = content_type
+    accept = request.headers.get("accept")
+    if accept:
+        protocol_headers["Accept"] = accept
+    provider_headers = _merge_headers_case_insensitive(
+        provider_headers,
+        protocol_headers,
+    )
+
+    proxy_config = _safe_proxy_config()
+    logger.info(
+        "LLM proxy transport configured user=%s upstream=%s proxies=%s",
+        current_user.id,
+        urlunsplit(urlsplit(upstream_url)._replace(query="", fragment="")),
+        proxy_config,
+    )
+    client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))
+    try:
+        upstream_request = httpx.Request(
+            "POST", upstream_url, headers=provider_headers, content=body_bytes
+        )
+        upstream_response = await client.send(upstream_request, stream=True)
+    except httpx.RequestError as exc:
+        await client.aclose()
+        logger.error(
+            "LLM proxy upstream request failed for user %s: %s",
+            current_user.id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Upstream request failed: {exc}",
+        ) from exc
+
+    async def response_stream():
+        try:
+            async for chunk in upstream_response.aiter_raw():
+                yield chunk
+        finally:
+            await client.aclose()
+
+    content_type = upstream_response.headers.get("content-type", "text/event-stream")
+    return StreamingResponse(
+        response_stream(),
+        status_code=upstream_response.status_code,
+        media_type=content_type,
+        headers=LLM_PROXY_STREAM_HEADERS,
+    )

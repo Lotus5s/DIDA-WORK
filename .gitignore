@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Python
+.idea/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+wework/electron/src/vendor/
+downloads/
+eggs/
+.eggs/
+backend/lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.iml
+
+# Environment variables
+.env
+.venv-x86_64
+
+# Logs
+logs/
+*.log
+
+# Start script runtime files
+.pids/
+executor/.pids/
+
+# Coverage reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+# Database
+*.db
+*.sqlite3
+
+# Celery Beat schedule files
+# PersistentScheduler (default, uses shelve/dumbdbm)
+celerybeat-schedule.dat
+celerybeat-schedule.dir
+celerybeat-schedule.bak
+celerybeat-schedule
+# SQLAlchemyScheduler (uses SQLite-WAL)
+celerybeat-schedule.db
+celerybeat-schedule.pag
+celerybeat-schedule-shm
+celerybeat-schedule-wal
+
+# Frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+frontend/.wecoderules
+/dummy-non-existing-folder/
+/public/
+/ui-demo/
+
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# pyenv
+.python-version
+*.tsbuildinfo
+coverage/
+
+# claude
+.claude/
+!.claude/settings.json
+.gstack/
+.history
+.omo/
+.playwright-mcp/
+.superpowers/
+.wegent/
+.wegentrc
+.worktrees/
+.codex-commit-scope-*/
+.pnpm-store/
+
+# PyInstaller
+*.spec
+executor/build/
+executor/dist/
+executor/target/
+wework/src-tauri/
+wework/resources/binaries/
+backend/init_data/plugins/wegent-sites/
+backend/init_data/plugins/wegent-mini-program/
+docs/superpowers/
+# Local architecture records must never be published.
+.live-architecture/
+docs/en/architecture/
+docs/zh/architecture/
+local-artifacts/
+.worktrees/
+wework/resources/bundled-harness-runtime/
+!wework/resources/bundled-harness-runtime/
+wework/resources/bundled-harness-runtime/*
+!wework/resources/bundled-harness-runtime/.resource-placeholder
+wework/resources/bin/
+wework/resources/codex/
+wework/resources/components.json
+wework/resources/harness-runtime/
+wework/resources/wework-core-plugins/
+
+# Local build scratch and downloaded artifacts
+tmp/

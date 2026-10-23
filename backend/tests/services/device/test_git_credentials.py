@@ -1,0 +1,841 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for explicit device Git credential synchronization."""
+
+import json
+import os
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from app.services.device import git_credentials
+from app.services.device.git_credential_paths import managed_git_cli_command
+from app.services.device.git_credentials_command import (
+    GIT_CREDENTIALS_SECRET_ENV,
+    SYNC_GIT_CREDENTIALS_COMMAND,
+)
+
+
+def _user(*accounts):
+    return SimpleNamespace(id=7, user_name="alice", git_info=list(accounts))
+
+
+def _account(domain, token, *, account_id, provider="gitea"):
+    return {
+        "id": account_id,
+        "git_domain": domain,
+        "git_token": token,
+        "type": provider,
+        "git_login": "alice",
+        "git_email": "alice@example.com",
+    }
+
+
+def _command_environment(home: Path) -> dict[str, str]:
+    return {
+        "HOME": str(home),
+        "PATH": os.pathsep.join([str(Path(sys.executable).parent), os.defpath]),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+    }
+
+
+def _run_sync_command(
+    home: Path,
+    accounts: list[dict],
+    *,
+    command_path: str | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    environment = _command_environment(home)
+    environment.update(extra_env or {})
+    if command_path is not None:
+        environment["PATH"] = command_path
+    environment[GIT_CREDENTIALS_SECRET_ENV] = json.dumps(
+        {"version": 1, "accounts": accounts}
+    )
+    return subprocess.run(
+        ["sh", "-c", SYNC_GIT_CREDENTIALS_COMMAND],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
+def _isolated_command_path(
+    tmp_path: Path,
+    *,
+    tool: str | None,
+    tool_exit_code: int = 0,
+) -> str:
+    bin_path = tmp_path / "bin"
+    bin_path.mkdir()
+    for command in ("git", "python3", "sh"):
+        executable = shutil.which(command)
+        assert executable is not None
+        (bin_path / command).symlink_to(executable)
+    if tool:
+        executable = bin_path / tool
+        executable.write_text(
+            "#!/bin/sh\nread -r credential\n"
+            '[ -n "$credential" ] || exit 97\n'
+            f"exit {tool_exit_code}\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+    return str(bin_path)
+
+
+def test_summary_preserves_order_and_hides_duplicate_tokens():
+    user = _user(
+        _account("https://Git.Example.com/", "first-secret", account_id="first"),
+        _account("git.example.com", "duplicate-secret", account_id="second"),
+        _account("git.other.example", "other-secret", account_id="third"),
+    )
+
+    summary = git_credentials.build_git_account_sync_summary(user)
+
+    assert summary == {
+        "accounts": [
+            {
+                "id": "first",
+                "domain": "git.example.com",
+                "provider": "gitea",
+                "login": "alice",
+                "email": "alice@example.com",
+                "effective": True,
+                "duplicate_of": None,
+            },
+            {
+                "id": "second",
+                "domain": "git.example.com",
+                "provider": "gitea",
+                "login": "alice",
+                "email": "alice@example.com",
+                "effective": False,
+                "duplicate_of": "first",
+            },
+            {
+                "id": "third",
+                "domain": "git.other.example",
+                "provider": "gitea",
+                "login": "alice",
+                "email": "alice@example.com",
+                "effective": True,
+                "duplicate_of": None,
+            },
+        ],
+        "effective_count": 2,
+        "duplicate_count": 1,
+    }
+    assert "secret" not in json.dumps(summary)
+
+
+@pytest.mark.asyncio
+async def test_sync_resolves_all_accounts_before_dispatch(monkeypatch):
+    require_device = AsyncMock()
+    dispatch = AsyncMock(
+        return_value={
+            "success": True,
+            "stdout": {
+                "synced_domains": ["git.example.com"],
+                "removed_domains": [],
+                "identity_warning_domains": [],
+                "cli": [],
+                "warnings": [],
+            },
+        }
+    )
+
+    @asynccontextmanager
+    async def acquired(*_args, **_kwargs):
+        yield True
+
+    monkeypatch.setattr(git_credentials, "_require_eligible_device", require_device)
+    monkeypatch.setattr(git_credentials, "execute_configured_device_command", dispatch)
+    monkeypatch.setattr(
+        git_credentials.distributed_lock,
+        "acquire_watchdog_context_async",
+        acquired,
+    )
+    user = _user(
+        _account("git.example.com", "resolved-secret", account_id="first"),
+        _account("git.example.com", "ignored-secret", account_id="second"),
+    )
+
+    result = await git_credentials.sync_git_accounts_to_device(
+        SimpleNamespace(),
+        user=user,
+        device_id="remote-1",
+        allow_empty=False,
+    )
+
+    require_device.assert_awaited_once()
+    dispatch.assert_awaited_once()
+    payload = json.loads(dispatch.await_args.kwargs["env"][GIT_CREDENTIALS_SECRET_ENV])
+    assert len(payload["accounts"]) == 1
+    assert payload["accounts"][0]["token"] == "resolved-secret"
+    assert result["duplicate_domains"] == ["git.example.com"]
+    assert "resolved-secret" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_unresolved_effective_token_aborts_before_dispatch(monkeypatch):
+    dispatch = AsyncMock()
+    monkeypatch.setattr(git_credentials, "_require_eligible_device", AsyncMock())
+    monkeypatch.setattr(
+        git_credentials, "resolve_plaintext_git_token", lambda *_args: ""
+    )
+    monkeypatch.setattr(git_credentials, "execute_configured_device_command", dispatch)
+
+    with pytest.raises(
+        git_credentials.DeviceGitCredentialResolutionError,
+        match="unavailable",
+    ):
+        await git_credentials.sync_git_accounts_to_device(
+            SimpleNamespace(),
+            user=_user(_account("git.example.com", "***", account_id="first")),
+            device_id="remote-1",
+            allow_empty=False,
+        )
+
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("git_login", "alice\n[credential]\nhelper=store"),
+        ("git_email", "alice@example.com\n[include]\npath=/tmp/unsafe"),
+        ("git_token", "secret\npassword=injected"),
+    ],
+)
+async def test_multiline_account_values_abort_before_dispatch(
+    monkeypatch,
+    field,
+    value,
+):
+    dispatch = AsyncMock()
+    monkeypatch.setattr(git_credentials, "_require_eligible_device", AsyncMock())
+    monkeypatch.setattr(git_credentials, "execute_configured_device_command", dispatch)
+    account = _account("git.example.com", "safe-secret", account_id="first")
+    account[field] = value
+
+    with pytest.raises(
+        git_credentials.DeviceGitCredentialResolutionError,
+        match="invalid",
+    ):
+        await git_credentials.sync_git_accounts_to_device(
+            SimpleNamespace(),
+            user=_user(account),
+            device_id="remote-1",
+            allow_empty=False,
+        )
+
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("spec", "online_info", "message"),
+    [
+        ({"deviceType": "local"}, None, "cloud or remote"),
+        (
+            {"deviceType": "remote", "bindShell": "openclaw"},
+            None,
+            "ClaudeCode",
+        ),
+        (
+            {"deviceType": "remote", "bindShell": "claudecode"},
+            {"status": "busy"},
+            "online and idle",
+        ),
+        (
+            {"deviceType": "remote", "bindShell": "claudecode"},
+            {"socket_id": "missing-status"},
+            "online and idle",
+        ),
+    ],
+)
+async def test_target_must_be_online_idle_claudecode_cloud_or_remote(
+    monkeypatch,
+    spec,
+    online_info,
+    message,
+):
+    monkeypatch.setattr(
+        git_credentials.device_service,
+        "get_device_by_device_id",
+        lambda *_args: SimpleNamespace(json={"spec": spec}),
+    )
+    get_online = AsyncMock(return_value=online_info)
+    monkeypatch.setattr(
+        git_credentials.device_service,
+        "get_device_online_info_by_type",
+        get_online,
+    )
+
+    with pytest.raises(git_credentials.DeviceGitCredentialTargetError, match=message):
+        await git_credentials._require_eligible_device(
+            SimpleNamespace(), user_id=7, device_id="device-1"
+        )
+
+
+@pytest.mark.asyncio
+async def test_cloud_target_uses_runtime_device_id_for_online_check(monkeypatch):
+    monkeypatch.setattr(
+        git_credentials.device_service,
+        "get_device_by_device_id",
+        lambda *_args: SimpleNamespace(
+            json={
+                "spec": {
+                    "deviceType": "cloud",
+                    "bindShell": "claudecode",
+                    "cloudConfig": {"deviceId": "runtime-device-1"},
+                }
+            }
+        ),
+    )
+    get_online = AsyncMock(return_value={"status": "online"})
+    monkeypatch.setattr(
+        git_credentials.device_service,
+        "get_device_online_info_by_type",
+        get_online,
+    )
+
+    await git_credentials._require_eligible_device(
+        SimpleNamespace(), user_id=7, device_id="cloud-device-1"
+    )
+
+    assert get_online.await_args.args[1] == "runtime-device-1"
+
+
+def test_device_command_reconciles_credentials_and_preserves_user_config(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    global_config = home / ".gitconfig"
+    global_config.write_text(
+        "[user]\n\tsigningKey = user-owned-key\n", encoding="utf-8"
+    )
+    first_token = "first-secret-value"
+    first = {
+        "domain": "git.example.com",
+        "host": "git.example.com",
+        "provider": "gitea",
+        "token": first_token,
+        "username": "alice",
+        "identity_name": "Alice",
+        "identity_email": "alice@example.com",
+    }
+
+    applied = _run_sync_command(home, [first])
+
+    assert applied.returncode == 0, applied.stderr
+    assert first_token not in applied.stdout
+    assert json.loads(applied.stdout)["synced_domains"] == ["git.example.com"]
+    current = home / ".wegent/workbench/git-auth/current"
+    assert current.is_symlink()
+    token_file = next((current / "tokens").iterdir())
+    helper_file = current / "credential-helper"
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(helper_file.stat().st_mode) == 0o700
+
+    environment = _command_environment(home)
+    credential = subprocess.run(
+        ["git", "credential", "fill"],
+        env=environment,
+        input="protocol=https\nhost=git.example.com\n\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert credential.returncode == 0
+    assert "username=alice" in credential.stdout
+    assert f"password={first_token}" in credential.stdout
+
+    repository = home / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], env=environment, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "remote",
+            "add",
+            "origin",
+            "https://git.example.com/acme/repository.git",
+        ],
+        env=environment,
+        check=True,
+    )
+    identity = subprocess.run(
+        ["git", "-C", str(repository), "config", "--get", "user.email"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+    assert identity.stdout.strip() == "alice@example.com"
+
+    second = {
+        **first,
+        "domain": "git.other.example",
+        "host": "git.other.example",
+        "token": "second-secret-value",
+    }
+    reconciled = _run_sync_command(home, [second])
+
+    assert reconciled.returncode == 0, reconciled.stderr
+    assert json.loads(reconciled.stdout)["removed_domains"] == ["git.example.com"]
+    managed_contents = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in (home / ".wegent/workbench/git-auth").rglob("*")
+        if path.is_file()
+    )
+    assert first_token not in managed_contents
+
+    cleared = _run_sync_command(home, [])
+
+    assert cleared.returncode == 0, cleared.stderr
+    assert not (home / ".wegent/workbench/git-auth").exists()
+    assert not (home / ".wecode").exists()
+    assert "user-owned-key" in global_config.read_text(encoding="utf-8")
+    assert "git-auth/current/gitconfig" not in global_config.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("provider", "tool", "tool_exit_code", "expected_status"),
+    [
+        ("github", "gh", 0, "configured"),
+        ("gitlab", "glab", 9, "failed"),
+        ("gitlab", None, 0, "not_installed"),
+    ],
+)
+def test_device_command_reports_cli_outcome_without_affecting_git_auth(
+    tmp_path,
+    provider,
+    tool,
+    tool_exit_code,
+    expected_status,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    command_path = _isolated_command_path(
+        tmp_path,
+        tool=tool,
+        tool_exit_code=tool_exit_code,
+    )
+    token = "cli-test-secret"
+    account = {
+        "domain": f"{provider}.example.com",
+        "host": f"{provider}.example.com",
+        "provider": provider,
+        "token": token,
+        "username": "alice",
+        "identity_name": "Alice",
+        "identity_email": "alice@example.com",
+    }
+
+    applied = _run_sync_command(home, [account], command_path=command_path)
+
+    assert applied.returncode == 0, applied.stderr
+    assert token not in applied.stdout
+    result = json.loads(applied.stdout)
+    expected_cli_result = {
+        "provider": "gh" if provider == "github" else "glab",
+        "domain": f"{provider}.example.com",
+        "status": expected_status,
+        "reason_code": (
+            None
+            if expected_status == "configured"
+            else (
+                "cli_auth_failed"
+                if expected_status == "failed"
+                else "cli_not_installed"
+            )
+        ),
+    }
+    if expected_status == "failed":
+        expected_cli_result["detail"] = f"exit={tool_exit_code}"
+    assert result["cli"] == [expected_cli_result]
+
+    environment = _command_environment(home)
+    environment["PATH"] = command_path
+    credential = subprocess.run(
+        ["git", "credential", "fill"],
+        env=environment,
+        input=f"protocol=https\nhost={provider}.example.com\n\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert credential.returncode == 0
+    assert f"password={token}" in credential.stdout
+    env_file = home / ".wegent/workbench/git-auth/env.sh"
+    assert env_file.exists() is (expected_status == "configured")
+
+
+def _recording_tool_path(
+    tmp_path: Path,
+    *,
+    tool: str,
+    help_text: str,
+    reject_flag: str | None = None,
+) -> tuple[str, Path]:
+    bin_path = tmp_path / "bin"
+    bin_path.mkdir()
+    for command in ("git", "python3", "sh"):
+        executable = shutil.which(command)
+        assert executable is not None
+        (bin_path / command).symlink_to(executable)
+    args_log = tmp_path / "tool-args.log"
+    script = (
+        "#!/bin/sh\n"
+        'if [ "$1" = "auth" ] && [ "$2" = "login" ] && [ "$3" = "--help" ]; then\n'
+        f"  printf '%s\\n' {shlex.quote(help_text)}\n"
+        "  exit 0\n"
+        "fi\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(args_log))}\n"
+    )
+    if reject_flag:
+        script += f'case " $* " in *" {reject_flag} "*) exit 1;; esac\n'
+    script += "read -r credential\nexit 0\n"
+    executable = bin_path / tool
+    executable.write_text(script, encoding="utf-8")
+    executable.chmod(0o700)
+    return str(bin_path), args_log
+
+
+def _synthetic_account():
+    return {
+        "domain": "git.example.invalid",
+        "host": "git.example.invalid",
+        "provider": "gitea",
+        "token": "synthetic-device-secret",
+        "username": "alice",
+        "identity_name": "Alice",
+        "identity_email": "alice@example.invalid",
+    }
+
+
+def _legacy_store(home):
+    root = home / ".wecode/git-auth"
+    revision = root / "revisions/old"
+    revision.mkdir(parents=True)
+    (revision / "token").write_text("synthetic-old-secret")
+    (revision / "manifest.json").write_text(
+        json.dumps({"version": 1, "domains": ["old.invalid"], "credentials": {}})
+    )
+    (revision / "gitconfig").write_text("# old managed config\n")
+    (root / "current").symlink_to("revisions/old")
+    (home / ".gitconfig").write_text(
+        '[user]\n\tname = User Owned\n[include]\n\tpath = "'
+        + str(root / "current/gitconfig")
+        + '"\n'
+    )
+    (home / ".profile").write_text(
+        "# user profile\n# >>> Wegent managed Git authentication >>>\n"
+        '. "$HOME/.wecode/git-auth/env.sh"\n'
+        "# <<< Wegent managed Git authentication <<<\n"
+    )
+    return root
+
+
+def test_sync_migrates_only_managed_credentials_and_is_repeatable(tmp_path):
+    home = tmp_path / "home"
+    legacy = _legacy_store(home)
+    other = home / ".wecode/user-owned"
+    other.write_text("preserve")
+    helper = home / ".wegent/workbench/runtime/git-auth/askpass.sh"
+    helper.parent.mkdir(parents=True)
+    helper.write_text("# no secret")
+
+    applied = _run_sync_command(home, [_synthetic_account()])
+    assert applied.returncode == 0, applied.stdout
+    assert json.loads(applied.stdout)["removed_domains"] == ["old.invalid"]
+    assert not legacy.exists()
+    assert other.read_text() == "preserve"
+    assert ".wecode/git-auth" not in (home / ".gitconfig").read_text()
+    assert (home / ".profile").read_text() == "# user profile\n"
+    repeated = _run_sync_command(home, [_synthetic_account()])
+    assert repeated.returncode == 0, repeated.stdout
+    revisions = home / ".wegent/workbench/git-auth/revisions"
+    assert len(list(revisions.iterdir())) == 1
+    cleared = _run_sync_command(home, [])
+    assert cleared.returncode == 0, cleared.stdout
+    assert helper.read_text() == "# no secret"
+    assert "User Owned" in (home / ".gitconfig").read_text()
+
+
+def test_failed_publication_restores_legacy_config_and_can_resume(
+    tmp_path, monkeypatch
+):
+    import app.services.device.git_credentials_command as commands
+
+    home = tmp_path / "home"
+    legacy = _legacy_store(home)
+    before = (home / ".gitconfig").read_bytes()
+    profile = (home / ".profile").read_bytes()
+    script = commands.GIT_CREDENTIAL_SYNC_SCRIPT.replace(
+        "os.replace(next_link, current)", 'raise OSError("synthetic publish failure")'
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            sys.modules[__name__],
+            "SYNC_GIT_CREDENTIALS_COMMAND",
+            "python3 -c " + shlex.quote(script),
+        )
+        result = _run_sync_command(home, [_synthetic_account()])
+    assert result.returncode == 1
+    assert (home / ".gitconfig").read_bytes() == before
+    assert (home / ".profile").read_bytes() == profile
+    assert (legacy / "current/token").read_text() == "synthetic-old-secret"
+    result = _run_sync_command(home, [_synthetic_account()])
+    assert result.returncode == 0, result.stdout
+    assert not legacy.exists()
+
+
+@pytest.mark.parametrize("key", ["WEGENT_WORKBENCH_HOME", "WEGENT_EXECUTOR_HOME"])
+def test_custom_root_sync_and_cli_do_not_use_or_modify_production_home(tmp_path, key):
+    home = tmp_path / "home"
+    legacy = _legacy_store(home)
+    global_before = (home / ".gitconfig").read_bytes()
+    profile_before = (home / ".profile").read_bytes()
+    configured = tmp_path / "development space's root"
+    workbench = (
+        configured / "workbench" if key == "WEGENT_EXECUTOR_HOME" else configured
+    )
+    extra = {key: str(configured), "DEVICE_TYPE": "remote"}
+    result = _run_sync_command(home, [_synthetic_account()], extra_env=extra)
+    assert result.returncode == 0, result.stdout
+    assert json.loads(result.stdout)["removed_domains"] == []
+
+    environment = _command_environment(home) | extra
+    credential = subprocess.run(
+        ["sh", "-c", managed_git_cli_command("git credential fill")],
+        env=environment,
+        input="protocol=https\nhost=git.example.invalid\n\n",
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert credential.returncode == 0, credential.stderr
+    assert "password=synthetic-device-secret" in credential.stdout
+    probe = "python3 -c " + shlex.quote(
+        "import os,json; print(json.dumps([os.environ[k] for k in "
+        "['GH_CONFIG_DIR','GLAB_CONFIG_DIR','GIT_CONFIG_GLOBAL']]))"
+    )
+    for accounts in (None, []):
+        if accounts is not None:
+            cleared = _run_sync_command(home, accounts, extra_env=extra)
+            assert cleared.returncode == 0, cleared.stdout
+        read = subprocess.run(
+            ["sh", "-c", managed_git_cli_command(probe)],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert read.returncode == 0, read.stderr
+        assert all(
+            Path(path).is_relative_to(workbench) for path in json.loads(read.stdout)
+        )
+    assert (home / ".gitconfig").read_bytes() == global_before
+    assert (home / ".profile").read_bytes() == profile_before
+    assert (legacy / "current/token").read_text() == "synthetic-old-secret"
+    assert not (home / ".wegent").exists()
+
+
+@pytest.mark.parametrize("legacy_lock", [True, False])
+def test_sync_refuses_active_lock_without_changing_accounts(tmp_path, legacy_lock):
+    import fcntl
+
+    home = tmp_path / "home"
+    legacy = _legacy_store(home)
+    lock_path = home / (
+        ".wecode/git-auth-sync.lock"
+        if legacy_lock
+        else ".wegent/workbench/runtime/git-auth/sync.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        result = _run_sync_command(home, [_synthetic_account()])
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["error"] == "sync_in_progress"
+    assert (legacy / "current/token").read_text() == "synthetic-old-secret"
+    assert not (home / ".wegent/workbench/git-auth/current").exists()
+
+
+def test_sync_rejects_linked_store_without_touching_target(tmp_path):
+    home = tmp_path / "home"
+    root = home / ".wegent/workbench"
+    root.mkdir(parents=True)
+    target = tmp_path / "unmanaged"
+    target.mkdir()
+    marker = target / "keep"
+    marker.write_text("preserve")
+    (root / "git-auth").symlink_to(target, target_is_directory=True)
+    result = _run_sync_command(home, [_synthetic_account()])
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["error"] == "credential_directory_invalid"
+    assert marker.read_text() == "preserve"
+    assert list(target.iterdir()) == [marker]
+
+
+def test_sync_preserves_unmanaged_legacy_directory(tmp_path):
+    home = tmp_path / "home"
+    legacy = _legacy_store(home)
+    marker = legacy / "user-owned"
+    marker.write_text("preserve")
+    result = _run_sync_command(home, [_synthetic_account()])
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["error"] == "legacy_credentials_unmanaged"
+    assert marker.read_text() == "preserve"
+    assert (legacy / "current/token").read_text() == "synthetic-old-secret"
+
+
+@pytest.mark.parametrize("accounts", [[], [_synthetic_account()]])
+def test_sync_does_not_replace_or_clear_unmanaged_current_file(tmp_path, accounts):
+    home = tmp_path / "home"
+    root = home / ".wegent/workbench/git-auth"
+    root.mkdir(parents=True)
+    current = root / "current"
+    current.write_text("user-owned")
+    result = _run_sync_command(home, accounts)
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["error"] == "credential_directory_invalid"
+    assert current.read_text() == "user-owned"
+
+
+def test_cli_reader_preserves_desktop_native_configuration_without_device_store(
+    tmp_path,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    native = str(home / "native-cli")
+    environment = _command_environment(home) | {
+        "WEGENT_WORKBENCH_HOME": str(tmp_path / "desktop/workbench"),
+        "DEVICE_TYPE": "local",
+        "GH_CONFIG_DIR": native,
+    }
+    probe = "python3 -c " + shlex.quote("import os; print(os.environ['GH_CONFIG_DIR'])")
+    result = subprocess.run(
+        ["sh", "-c", managed_git_cli_command(probe)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == native
+
+
+def test_device_command_redacts_token_from_cli_failure_detail(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    bin_path = tmp_path / "bin"
+    bin_path.mkdir()
+    for command in ("git", "python3", "sh"):
+        executable = shutil.which(command)
+        assert executable is not None
+        (bin_path / command).symlink_to(executable)
+    token = "leaky-glab-secret"
+    glab = bin_path / "glab"
+    glab.write_text(
+        "#!/bin/sh\nread -r credential\n"
+        f'echo "login failed for token {token}" >&2\n'
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    glab.chmod(0o700)
+    account = {
+        "domain": "gitlab.example.com",
+        "host": "gitlab.example.com",
+        "provider": "gitlab",
+        "token": token,
+        "username": "alice",
+        "identity_name": "Alice",
+        "identity_email": "alice@example.com",
+    }
+
+    applied = _run_sync_command(home, [account], command_path=str(bin_path))
+
+    assert applied.returncode == 0, applied.stderr
+    cli_result = json.loads(applied.stdout)["cli"][0]
+    assert cli_result["status"] == "failed"
+    assert "login failed for token ***" in cli_result["detail"]
+    assert token not in applied.stdout
+
+
+@pytest.mark.parametrize("supports_insecure_storage", [True, False])
+@pytest.mark.parametrize("supports_git_protocol", [True, False])
+def test_device_command_only_passes_supported_login_flags(
+    tmp_path,
+    supports_insecure_storage,
+    supports_git_protocol,
+):
+    # Executor images ship different glab generations: some reject
+    # --insecure-storage, others (e.g. glab 1.2x) reject --git-protocol.
+    # Unknown flags make `auth login` exit non-zero, so the sync must probe
+    # for support and only pass the flags the installed CLI advertises.
+    home = tmp_path / "home"
+    home.mkdir()
+    help_text = "Usage: glab auth login --hostname <host> --stdin"
+    if supports_insecure_storage:
+        help_text += " --insecure-storage"
+    if supports_git_protocol:
+        help_text += " --git-protocol"
+    reject_flag = None
+    if not supports_git_protocol:
+        reject_flag = "--git-protocol"
+    elif not supports_insecure_storage:
+        reject_flag = "--insecure-storage"
+    command_path, args_log = _recording_tool_path(
+        tmp_path,
+        tool="glab",
+        help_text=help_text,
+        reject_flag=reject_flag,
+    )
+    account = {
+        "domain": "gitlab.example.com",
+        "host": "gitlab.example.com",
+        "provider": "gitlab",
+        "token": "cli-probe-secret",
+        "username": "alice",
+        "identity_name": "Alice",
+        "identity_email": "alice@example.com",
+    }
+
+    applied = _run_sync_command(home, [account], command_path=command_path)
+
+    assert applied.returncode == 0, applied.stderr
+    result = json.loads(applied.stdout)
+    assert result["cli"][0]["status"] == "configured"
+    invocations = args_log.read_text(encoding="utf-8").splitlines()
+    login_invocations = [line for line in invocations if "--hostname" in line]
+    assert len(login_invocations) == 1
+    assert ("--insecure-storage" in login_invocations[0]) is supports_insecure_storage
+    assert ("--git-protocol" in login_invocations[0]) is supports_git_protocol
+    config_set_invocations = [
+        line for line in invocations if line.startswith("config set git_protocol")
+    ]
+    assert len(config_set_invocations) == (0 if supports_git_protocol else 1)

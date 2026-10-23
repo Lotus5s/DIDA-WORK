@@ -1,0 +1,73 @@
+import type { CSSProperties, ReactNode } from 'react'
+import { cn } from '@/lib/utils'
+import { getPlatform } from '@/lib/platform'
+import { MacOSTitleBarDragRegion } from './MacOSTitleBarDragRegion'
+
+export const DESKTOP_TOP_BAR_BUTTON_CLASS =
+  'electron-titlebar-interactive-region flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border-0 bg-transparent p-0 text-text-secondary transition-colors hover:bg-text-primary/[0.06] hover:text-text-primary active:bg-text-primary/[0.10] [&_svg]:h-4 [&_svg]:w-4 [&_svg]:stroke-[2]'
+
+interface DesktopTopBarProps {
+  left?: ReactNode
+  right?: ReactNode
+  className?: string
+  leftClassName?: string
+  rightClassName?: string
+  dragRegionClassName?: string
+  testId?: string
+  style?: CSSProperties
+}
+
+export function DesktopTopBar({
+  left,
+  right,
+  className,
+  leftClassName,
+  rightClassName,
+  dragRegionClassName,
+  testId = 'desktop-topbar',
+  style,
+}: DesktopTopBarProps) {
+  const platform = getPlatform()
+  const dragRegionHidden = platform === 'win'
+
+  return (
+    <header
+      data-testid={testId}
+      className={cn('flex h-[52px] w-full shrink-0 items-center bg-background px-6', className)}
+      style={style}
+    >
+      {left && (
+        <div
+          data-testid={`${testId}-left-actions`}
+          className={cn(
+            'electron-titlebar-interactive-region flex shrink-0 items-center gap-2',
+            leftClassName
+          )}
+        >
+          {left}
+        </div>
+      )}
+      <div
+        data-testid={`${testId}-drag-region`}
+        className={cn(
+          'min-w-4 flex-1 self-stretch',
+          dragRegionHidden && 'hidden',
+          dragRegionClassName
+        )}
+      >
+        <MacOSTitleBarDragRegion className="h-full w-full" />
+      </div>
+      {right && (
+        <div
+          data-testid={`${testId}-right-actions`}
+          className={cn(
+            'electron-titlebar-interactive-region ml-auto flex shrink-0 items-center gap-1',
+            rightClassName
+          )}
+        >
+          {right}
+        </div>
+      )}
+    </header>
+  )
+}

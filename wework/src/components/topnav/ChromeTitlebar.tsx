@@ -1,0 +1,161 @@
+import { NotificationCenter } from '@/features/notifications/NotificationCenter'
+import { cn } from '@/lib/utils'
+import { isDesktopRuntime, isElectronRuntime } from '@/lib/runtime-environment'
+import { getPlatform } from '@/lib/platform'
+import {
+  TITLEBAR_ACTIONS_PORTAL_ID,
+  TITLEBAR_FEEDBACK_PORTAL_ID,
+  TITLEBAR_RIGHT_PANEL_PORTAL_ID,
+} from './TitlebarActionsPortal'
+import { TitlebarExtensionSlot } from '@extensions/titlebar'
+import { MacOSTitleBarDragRegion } from '@/components/layout/MacOSTitleBarDragRegion'
+import { WindowFrameControls } from '@/components/layout/WindowFrameControls'
+import { ApplicationMenuButton } from './ApplicationMenuButton'
+import { GlobalFeedbackButton } from '@/features/feedback/GlobalFeedbackButton'
+import type { ReactNode } from 'react'
+import { WorkspaceTabStrip } from '@/features/workspace-tabs/WorkspaceTabStrip'
+import type { WorkspaceTabKind } from '@/features/workspace-tabs/workspaceTabs'
+
+interface ChromeTitlebarProps {
+  beforeTabs?: ReactNode
+  afterTabs?: ReactNode
+  className?: string
+  showWorkspacePortals?: boolean
+  showFeedback?: boolean
+  availableWorkspaceTabKinds?: readonly WorkspaceTabKind[]
+}
+
+export function ChromeTitlebar({
+  beforeTabs,
+  afterTabs,
+  className,
+  showWorkspacePortals = true,
+  showFeedback = true,
+  availableWorkspaceTabKinds,
+}: ChromeTitlebarProps) {
+  const isElectron = isElectronRuntime()
+  const isDesktop = isDesktopRuntime()
+  const platform = getPlatform()
+  const feedbackSlotVisible = isDesktop
+  const fixedActionsWidth = showWorkspacePortals
+    ? feedbackSlotVisible
+      ? '9rem'
+      : '7.25rem'
+    : feedbackSlotVisible
+      ? '4rem'
+      : '2.25rem'
+
+  return (
+    <div
+      data-testid="chrome-titlebar"
+      className={cn(
+        'z-titlebar flex h-[38px] shrink-0 items-center bg-[rgb(var(--color-titlebar))] pr-2 select-none',
+        className
+      )}
+    >
+      {/* macOS: traffic light spacer (left) */}
+      {isDesktop && platform === 'mac' && (
+        <div className="w-[92px] shrink-0 self-stretch" data-testid="macos-traffic-light-spacer">
+          <MacOSTitleBarDragRegion />
+        </div>
+      )}
+
+      {/* Windows/Linux: the frameless window hides the OS menu bar, so the
+          application menu is exposed through a native button instead. */}
+      {isDesktop && (platform === 'win' || platform === 'linux') && <ApplicationMenuButton />}
+
+      {beforeTabs && (
+        <div
+          data-testid="chrome-titlebar-before-tabs"
+          className="electron-titlebar-interactive-region mr-1 flex shrink-0 items-center"
+        >
+          {beforeTabs}
+        </div>
+      )}
+
+      <WorkspaceTabStrip availableKinds={availableWorkspaceTabKinds} />
+      {afterTabs && (
+        <div
+          data-testid="chrome-titlebar-after-tabs"
+          className="electron-titlebar-interactive-region ml-3 flex shrink-0 items-center"
+        >
+          {afterTabs}
+        </div>
+      )}
+
+      {showWorkspacePortals && isDesktop && <TitlebarExtensionSlot />}
+      {showWorkspacePortals && (
+        <div
+          data-testid="titlebar-right-workspace-zone"
+          className="pointer-events-none absolute top-0 z-chrome flex h-full items-center"
+          style={{
+            right:
+              isDesktop && platform === 'win'
+                ? `calc(138px + ${fixedActionsWidth})`
+                : isDesktop && platform === 'linux'
+                  ? `calc(138px + ${fixedActionsWidth})`
+                  : fixedActionsWidth,
+            width: 'var(--right-workspace-titlebar-width, auto)',
+          }}
+        >
+          <div
+            id={TITLEBAR_RIGHT_PANEL_PORTAL_ID}
+            data-testid="titlebar-right-panel"
+            className="pointer-events-auto relative flex min-w-0 flex-1 self-stretch items-center"
+          >
+            {isDesktop ? (
+              <div data-testid="titlebar-right-panel-drag-region" className="absolute inset-0 z-0">
+                <MacOSTitleBarDragRegion className="h-full w-full" />
+              </div>
+            ) : null}
+          </div>
+        </div>
+      )}
+      {
+        <div
+          data-testid="titlebar-fixed-actions"
+          className="relative z-chrome flex h-full shrink-0 items-center"
+          style={{ width: fixedActionsWidth }}
+        >
+          {showWorkspacePortals && (
+            <div
+              id={TITLEBAR_ACTIONS_PORTAL_ID}
+              data-testid="titlebar-actions"
+              className="electron-titlebar-interactive-region pointer-events-auto flex h-full w-[5rem] shrink-0 items-center justify-end gap-1"
+            />
+          )}
+          <div
+            data-testid="titlebar-notifications"
+            className="electron-titlebar-interactive-region flex h-full w-9 shrink-0 items-center justify-center"
+          >
+            <NotificationCenter />
+          </div>
+          {feedbackSlotVisible && (
+            <div
+              id={TITLEBAR_FEEDBACK_PORTAL_ID}
+              data-testid="titlebar-feedback"
+              className="electron-titlebar-interactive-region pointer-events-auto flex h-full w-7 shrink-0 items-center justify-center"
+            >
+              {showFeedback && <GlobalFeedbackButton />}
+            </div>
+          )}
+        </div>
+      }
+
+      {/* Linux: right spacer for native window controls */}
+      {isDesktop && platform === 'linux' && (
+        <div className="electron-titlebar-drag-region w-[138px] shrink-0 self-stretch">
+          <MacOSTitleBarDragRegion />
+        </div>
+      )}
+
+      {/* Windows: custom window frame controls */}
+      {((isDesktop && platform === 'win') ||
+        (isElectron && (platform === 'win' || platform === 'linux'))) && (
+        <div className="electron-titlebar-interactive-region relative z-chrome w-[138px] shrink-0 self-stretch">
+          <WindowFrameControls className="h-full justify-end" />
+        </div>
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,1014 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for user-scoped MCP injection in TaskRequestBuilder."""
+
+from types import SimpleNamespace
+
+import pytest
+
+from app.services import mcp_provider_registry
+from app.services.execution.request_builder import TaskRequestBuilder
+from app.services.user_mcp_oauth import user_mcp_oauth_service
+from app.services.user_mcp_service import (
+    MCP_AUTH_MODE_OAUTH,
+    MCP_AUTH_MODE_URL,
+    user_mcp_service,
+)
+
+
+class TestUserScopedMcpInjection:
+    """Tests for DingTalk Docs MCP injection."""
+
+    def test_tool_output_guard_defaults_to_enabled(self):
+        user = SimpleNamespace(preferences="{}")
+
+        enabled = TaskRequestBuilder._is_tool_output_guard_enabled(user)
+
+        assert enabled is True
+
+    def test_tool_output_guard_ignores_true_user_preference(self):
+        user = SimpleNamespace(preferences='{"tool_output_guard_enabled": true}')
+
+        enabled = TaskRequestBuilder._is_tool_output_guard_enabled(user)
+
+        assert enabled is True
+
+    def test_tool_output_guard_ignores_false_user_preference(self):
+        user = SimpleNamespace(preferences='{"tool_output_guard_enabled": false}')
+
+        enabled = TaskRequestBuilder._is_tool_output_guard_enabled(user)
+
+        assert enabled is True
+
+    def test_tool_output_guard_invalid_preferences_fall_back_to_default(self):
+        user = SimpleNamespace(preferences="{invalid json")
+
+        enabled = TaskRequestBuilder._is_tool_output_guard_enabled(user)
+
+        assert enabled is True
+
+    def test_tool_output_guard_non_object_preferences_fall_back_to_default(self):
+        user = SimpleNamespace(preferences='["not-an-object"]')
+
+        enabled = TaskRequestBuilder._is_tool_output_guard_enabled(user)
+
+        assert enabled is True
+
+    def test_build_request_task_data_injects_decrypted_user_mcps(self):
+        preferences = user_mcp_service.dump_preferences(
+            user_mcp_service.set_provider_service_config(
+                None,
+                provider_id="dingtalk",
+                service_id="docs",
+                enabled=True,
+                url="https://example.com/mcp?token=secret",
+            )
+        )
+        user = SimpleNamespace(preferences=preferences)
+
+        task_data = TaskRequestBuilder._build_request_task_data(user)
+
+        assert task_data == {
+            "user_mcps": {
+                "dingtalk": {
+                    "services": {
+                        "docs": {
+                            "enabled": True,
+                            "credentials": {
+                                "url": "https://example.com/mcp?token=secret"
+                            },
+                        }
+                    }
+                }
+            }
+        }
+
+    def test_build_request_task_data_filters_disabled_services(self):
+        preferences = user_mcp_service.set_provider_service_config(
+            None,
+            provider_id="dingtalk",
+            service_id="docs",
+            enabled=True,
+            url="https://example.com/mcp?token=secret",
+        )
+        preferences = user_mcp_service.set_provider_service_config(
+            preferences,
+            provider_id="dingtalk",
+            service_id="ai_table",
+            enabled=False,
+            url="https://example.com/table?token=secret",
+        )
+        user = SimpleNamespace(
+            preferences=user_mcp_service.dump_preferences(preferences)
+        )
+
+        task_data = TaskRequestBuilder._build_request_task_data(user)
+
+        assert task_data == {
+            "user_mcps": {
+                "dingtalk": {
+                    "services": {
+                        "docs": {
+                            "enabled": True,
+                            "credentials": {
+                                "url": "https://example.com/mcp?token=secret"
+                            },
+                        }
+                    }
+                }
+            }
+        }
+
+    def test_get_model_config_uses_runtime_model_config_directly(self):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        runtime_model_config = {
+            "model": "openai",
+            "model_id": "codex-gpt-5.5",
+            "api_format": "responses",
+            "protocol": "openai-responses",
+        }
+
+        result = builder._get_model_config(
+            bot=SimpleNamespace(),
+            user_id=1,
+            user_name="admin",
+            override_model_name="ignored-model",
+            force_override=True,
+            task_id=33,
+            team_id=38,
+            runtime_model_config=runtime_model_config,
+        )
+
+        assert result == runtime_model_config
+        assert result is not runtime_model_config
+
+    def test_build_runtime_agent_config_wraps_model_config_as_env(self):
+        runtime_model_config = {
+            "model": "openai",
+            "model_id": "codex-gpt-5.5",
+            "api_format": "responses",
+            "protocol": "openai-responses",
+        }
+
+        result = TaskRequestBuilder._build_runtime_agent_config(runtime_model_config)
+
+        assert result == {
+            "env": runtime_model_config,
+            "protocol": "openai-responses",
+            "apiFormat": "responses",
+        }
+        assert result["env"] is not runtime_model_config
+
+    def test_injects_service_skill_when_message_mentions_provider_and_service_missing(
+        self, test_db
+    ):
+        builder = TaskRequestBuilder(test_db)
+        user = SimpleNamespace(preferences="{}")
+
+        preload_skills = builder._inject_conditional_provider_skills(
+            user=user,
+            message="看看我的钉钉文档",
+            preload_skills=[],
+        )
+
+        assert preload_skills == [
+            {
+                "name": "dingtalk-docs",
+                "namespace": "default",
+                "is_public": True,
+            }
+        ]
+
+    def test_injects_all_provider_service_skills_for_generic_dingtalk_request(
+        self, test_db
+    ):
+        builder = TaskRequestBuilder(test_db)
+        user = SimpleNamespace(preferences="{}")
+
+        preload_skills = builder._inject_conditional_provider_skills(
+            user=user,
+            message="帮我处理一下钉钉里的内容",
+            preload_skills=[],
+        )
+
+        assert preload_skills == [
+            {
+                "name": "dingtalk-docs",
+                "namespace": "default",
+                "is_public": True,
+            },
+            {
+                "name": "dingtalk-table",
+                "namespace": "default",
+                "is_public": True,
+            },
+            {
+                "name": "dingtalk-ai-table",
+                "namespace": "default",
+                "is_public": True,
+            },
+            {
+                "name": "dingtalk-wikispace",
+                "namespace": "default",
+                "is_public": True,
+            },
+        ]
+
+    def test_dingtalk_link_preserves_conditional_provider_skill_loading(self, test_db):
+        builder = TaskRequestBuilder(test_db)
+        user = SimpleNamespace(preferences="{}")
+
+        preload_skills = builder._inject_conditional_provider_skills(
+            user=user,
+            message="https://alidocs.dingtalk.com/i/nodes/abc123",
+            preload_skills=[],
+        )
+
+        assert [skill["name"] for skill in preload_skills] == ["dingtalk-docs"]
+
+    def test_injects_table_skill_when_message_mentions_dingtalk_sheet(self, test_db):
+        builder = TaskRequestBuilder(test_db)
+        user = SimpleNamespace(preferences="{}")
+
+        preload_skills = builder._inject_conditional_provider_skills(
+            user=user,
+            message="帮我看看钉钉表格里的工作表和单元格公式",
+            preload_skills=[],
+        )
+
+        assert preload_skills == [
+            {
+                "name": "dingtalk-table",
+                "namespace": "default",
+                "is_public": True,
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "帮我更新钉钉AI表格里的记录和字段",
+            "帮我更新钉钉 AI 表格里的记录和字段",
+            "Update the DingTalk AI Table records",
+        ],
+    )
+    def test_injects_only_ai_table_skill_for_ai_table_request(self, test_db, message):
+        builder = TaskRequestBuilder(test_db)
+        user = SimpleNamespace(preferences="{}")
+
+        preload_skills = builder._inject_conditional_provider_skills(
+            user=user,
+            message=message,
+            preload_skills=[],
+        )
+
+        assert preload_skills == [
+            {
+                "name": "dingtalk-ai-table",
+                "namespace": "default",
+                "is_public": True,
+            }
+        ]
+
+    def test_injects_runtime_skill_when_matching_service_is_ready(self, test_db):
+        builder = TaskRequestBuilder(test_db)
+        preferences = user_mcp_service.dump_preferences(
+            user_mcp_service.set_provider_service_config(
+                None,
+                provider_id="dingtalk",
+                service_id="docs",
+                enabled=True,
+                url="https://example.com/docs?token=secret",
+            )
+        )
+        user = SimpleNamespace(preferences=preferences)
+
+        preload_skills = builder._inject_conditional_provider_skills(
+            user=user,
+            message="帮我看一下钉钉文档",
+            preload_skills=[],
+        )
+
+        assert preload_skills == [
+            {
+                "name": "dingtalk-docs",
+                "namespace": "default",
+                "is_public": True,
+            }
+        ]
+
+    def test_does_not_inject_other_service_when_target_service_matches(self, test_db):
+        builder = TaskRequestBuilder(test_db)
+        preferences = user_mcp_service.dump_preferences(
+            user_mcp_service.set_provider_service_config(
+                None,
+                provider_id="dingtalk",
+                service_id="docs",
+                enabled=True,
+                url="https://example.com/docs?token=secret",
+            )
+        )
+        user = SimpleNamespace(preferences=preferences)
+
+        preload_skills = builder._inject_conditional_provider_skills(
+            user=user,
+            message="总结一下我的钉钉文档",
+            preload_skills=[],
+        )
+
+        assert preload_skills == [
+            {
+                "name": "dingtalk-docs",
+                "namespace": "default",
+                "is_public": True,
+            }
+        ]
+
+    def test_build_skill_data_preserves_mcp_server_placeholders_when_service_ready(
+        self, test_db
+    ):
+        builder = TaskRequestBuilder(test_db)
+        preferences = user_mcp_service.dump_preferences(
+            user_mcp_service.set_provider_service_config(
+                None,
+                provider_id="dingtalk",
+                service_id="docs",
+                enabled=True,
+                url="https://example.com/docs?token=secret",
+            )
+        )
+        user = SimpleNamespace(preferences=preferences)
+        skill = SimpleNamespace(
+            id=101,
+            user_id=0,
+            json={
+                "kind": "Skill",
+                "metadata": {"name": "dingtalk-docs", "namespace": "default"},
+                "spec": {
+                    "description": "DingTalk docs runtime skill",
+                    "bindShells": ["Chat"],
+                    "mcpServers": {
+                        "docs": {
+                            "type": "streamable-http",
+                            "url": "${{task_data.user_mcps.dingtalk.services.docs.credentials.url}}",
+                        }
+                    },
+                },
+            },
+        )
+
+        skill_data = builder._build_skill_data(skill, user=user)
+
+        assert skill_data["mcpServers"] == {
+            "docs": {
+                "type": "streamable-http",
+                "url": "${{task_data.user_mcps.dingtalk.services.docs.credentials.url}}",
+            }
+        }
+
+    def test_build_skill_data_turns_runtime_skill_into_embedded_guide_when_service_missing(
+        self, test_db
+    ):
+        builder = TaskRequestBuilder(test_db)
+        skill = SimpleNamespace(
+            id=101,
+            user_id=0,
+            json={
+                "kind": "Skill",
+                "metadata": {"name": "dingtalk-docs", "namespace": "default"},
+                "spec": {
+                    "description": "DingTalk docs runtime skill",
+                    "prompt": "Use DingTalk docs MCP.",
+                    "bindShells": ["Chat"],
+                    "mcpServers": {
+                        "docs": {
+                            "type": "streamable-http",
+                            "url": "${{task_data.user_mcps.dingtalk.services.docs.credentials.url}}",
+                        }
+                    },
+                },
+            },
+        )
+
+        skill_data = builder._build_skill_data(
+            skill, user=SimpleNamespace(preferences="{}")
+        )
+
+        assert "mcpServers" not in skill_data
+        assert skill_data["configuration_required"] is True
+        assert "Use DingTalk docs MCP." not in skill_data["prompt"]
+        assert "Configuration Required" in skill_data["prompt"]
+        assert "wegent://modal/mcp-provider-config?provider=dingtalk&service=docs" in (
+            skill_data["prompt"]
+        )
+
+    def test_build_skill_data_keeps_system_managed_mcp_without_user_config(
+        self, test_db, monkeypatch
+    ):
+        monkeypatch.setitem(
+            mcp_provider_registry.MCP_PROVIDER_REGISTRY,
+            "demo",
+            {
+                "provider_id": "demo",
+                "display_name": "示例知识",
+                "configuration_mode": "system",
+                "message_keywords": ("示例知识",),
+                "services": {
+                    "knowledge": {
+                        "service_id": "knowledge",
+                        "server_name": "demo_knowledge",
+                        "detail_url": "https://example.com/knowledge",
+                        "skill_name": "demo-knowledge",
+                        "display_name": "示例知识库",
+                        "message_keywords": ("知识库",),
+                    }
+                },
+            },
+        )
+        builder = TaskRequestBuilder(test_db)
+        skill = SimpleNamespace(
+            id=102,
+            user_id=0,
+            json={
+                "kind": "Skill",
+                "metadata": {"name": "demo-knowledge", "namespace": "default"},
+                "spec": {
+                    "description": "Demo knowledge runtime skill",
+                    "prompt": "Use the system-managed demo MCP.",
+                    "bindShells": ["Chat", "ClaudeCode"],
+                    "mcpServers": {
+                        "demo_knowledge": {
+                            "type": "streamable-http",
+                            "url": "${{backend_url}}/mcp/demo-knowledge/sse",
+                            "headers": {"Authorization": "Bearer ${{task_token}}"},
+                        }
+                    },
+                },
+            },
+        )
+
+        skill_data = builder._build_skill_data(
+            skill, user=SimpleNamespace(preferences="{}")
+        )
+
+        assert skill_data["mcpServers"] == {
+            "demo_knowledge": {
+                "type": "streamable-http",
+                "url": "${{backend_url}}/mcp/demo-knowledge/sse",
+                "headers": {"Authorization": "Bearer ${{task_token}}"},
+            }
+        }
+        assert "Configuration Required" not in skill_data["prompt"]
+
+    def test_build_skill_data_does_not_rewrite_non_public_skill_named_like_runtime_skill(
+        self, test_db
+    ):
+        builder = TaskRequestBuilder(test_db)
+        skill = SimpleNamespace(
+            id=301,
+            user_id=7,
+            json={
+                "kind": "Skill",
+                "metadata": {"name": "dingtalk-docs", "namespace": "workspace-team"},
+                "spec": {
+                    "description": "Custom skill",
+                    "prompt": "Custom prompt.",
+                    "bindShells": ["Chat"],
+                    "mcpServers": {
+                        "docs": {
+                            "type": "streamable-http",
+                            "url": "http://custom.example.com/mcp",
+                        }
+                    },
+                },
+            },
+        )
+
+        skill_data = builder._build_skill_data(
+            skill, user=SimpleNamespace(preferences="{}")
+        )
+
+        assert skill_data["prompt"] == "Custom prompt."
+        assert skill_data["mcpServers"] == {
+            "docs": {
+                "type": "streamable-http",
+                "url": "http://custom.example.com/mcp",
+            }
+        }
+
+    def test_get_bot_skills_resolves_public_user_preload_skill(self, test_db, mocker):
+        builder = TaskRequestBuilder(test_db)
+        team = SimpleNamespace(user_id=2, namespace="default")
+        bot = SimpleNamespace(
+            name="chat-bot",
+            json={
+                "kind": "Bot",
+                "metadata": {"name": "chat-bot", "namespace": "default"},
+                "spec": {
+                    "ghostRef": {"name": "chat-ghost", "namespace": "default"},
+                    "shellRef": {"name": "Chat", "namespace": "default"},
+                },
+            },
+        )
+        ghost = SimpleNamespace(
+            name="chat-ghost",
+            json={
+                "kind": "Ghost",
+                "metadata": {"name": "chat-ghost", "namespace": "default"},
+                "spec": {
+                    "systemPrompt": "You are a helpful assistant.",
+                    "skills": [],
+                    "preload_skills": [],
+                },
+            },
+        )
+        skill = SimpleNamespace(
+            id=None, name="dingtalk-docs", user_id=0, namespace="default"
+        )
+
+        mock_query = mocker.Mock()
+        mock_query.filter.return_value.first.return_value = ghost
+        mocker.patch.object(builder.db, "query", return_value=mock_query)
+        find_skill_by_ref = mocker.patch.object(
+            builder, "_find_skill_by_ref", return_value=skill
+        )
+        mocker.patch.object(
+            builder,
+            "_build_skill_data",
+            return_value={"name": "dingtalk-docs"},
+        )
+
+        (
+            skills,
+            preload_skills,
+            user_selected_skills,
+            skill_refs,
+        ) = builder._get_bot_skills(
+            bot=bot,
+            team=team,
+            user=SimpleNamespace(preferences="{}"),
+            user_id=2,
+            user_preload_skills=[
+                {
+                    "name": "dingtalk-docs",
+                    "namespace": "default",
+                    "is_public": True,
+                }
+            ],
+        )
+
+        find_skill_by_ref.assert_called_once_with(
+            "dingtalk-docs",
+            "default",
+            True,
+            2,
+            team_namespace="default",
+            skill_id=None,
+        )
+        assert skills == [{"name": "dingtalk-docs"}]
+        assert preload_skills == ["dingtalk-docs"]
+        assert user_selected_skills == ["dingtalk-docs"]
+        assert skill_refs == {
+            "dingtalk-docs": {
+                "skill_id": None,
+                "namespace": "default",
+                "is_public": True,
+                "content_hash": None,
+            }
+        }
+
+    @pytest.mark.parametrize("preloaded", [None, 55, 56])
+    def test_get_bot_skills_resolves_agent_skill_as_agent_owner(
+        self, test_db, mocker, preloaded
+    ):
+        builder = TaskRequestBuilder(test_db)
+        team = SimpleNamespace(user_id=7, namespace="default")
+        bot = SimpleNamespace(
+            name="shared-agent-bot",
+            json={
+                "kind": "Bot",
+                "metadata": {"name": "shared-agent-bot", "namespace": "default"},
+                "spec": {
+                    "ghostRef": {"name": "shared-agent-ghost", "namespace": "default"},
+                    "shellRef": {"name": "Chat", "namespace": "default"},
+                    "capability_mode": "manual",
+                },
+            },
+        )
+        ghost = SimpleNamespace(
+            name="shared-agent-ghost",
+            namespace="default",
+            json={
+                "kind": "Ghost",
+                "metadata": {
+                    "name": "shared-agent-ghost",
+                    "namespace": "default",
+                },
+                "spec": {
+                    "systemPrompt": "Use the configured private skill.",
+                    "skills": ["owner-private-skill"],
+                    "preload_skills": ["owner-private-skill"],
+                    "skill_refs": {
+                        "owner-private-skill": {
+                            "skill_id": 55,
+                            "namespace": "default",
+                            "is_public": False,
+                            "content_hash": "sha256:old-version",
+                        }
+                    },
+                },
+            },
+        )
+        skill = SimpleNamespace(
+            id=55,
+            name="owner-private-skill",
+            user_id=7,
+            namespace="default",
+            json={"status": {"fileHash": "current-version"}},
+        )
+        if preloaded:
+            ghost.json["spec"]["preload_skill_refs"] = {
+                "owner-private-skill": {
+                    "skill_id": preloaded,
+                    "namespace": "other" if preloaded == 56 else "default",
+                    "content_hash": "sha256:old-preload-version",
+                }
+            }
+        other_skill = SimpleNamespace(
+            id=56,
+            name=skill.name,
+            user_id=7,
+            namespace="other",
+            json={"status": {"fileHash": "other-version"}},
+        )
+
+        mock_query = mocker.Mock()
+        mock_query.filter.return_value.first.return_value = ghost
+        mocker.patch.object(builder.db, "query", return_value=mock_query)
+        find_attached_skill_by_ref = mocker.patch.object(
+            builder,
+            "_find_attached_skill_by_ref",
+            side_effect=lambda name, skill_id: {55: skill, 56: other_skill}[skill_id],
+        )
+        mocker.patch.object(
+            builder,
+            "_build_skill_data",
+            return_value={"name": "owner-private-skill"},
+        )
+
+        skills, preload_skills, user_selected_skills, refs = builder._get_bot_skills(
+            bot=bot,
+            team=team,
+            user=SimpleNamespace(id=99, preferences="{}"),
+            user_id=99,
+        )
+
+        find_attached_skill_by_ref.assert_any_call(
+            "owner-private-skill",
+            skill_id=55,
+        )
+        assert find_attached_skill_by_ref.call_count == (2 if preloaded == 56 else 1)
+        assert skills == [{"name": "owner-private-skill"}]
+        assert preload_skills == ["owner-private-skill"]
+        assert user_selected_skills == ["owner-private-skill"]
+        assert refs["owner-private-skill"]["content_hash"] == (
+            "sha256:other-version" if preloaded == 56 else "sha256:current-version"
+        )
+        assert refs["owner-private-skill"]["namespace"] == (
+            "other" if preloaded == 56 else "default"
+        )
+        assert (
+            ghost.json["spec"]["skill_refs"]["owner-private-skill"]["content_hash"]
+            == "sha256:old-version"
+        )
+
+    def test_get_bot_skills_excludes_ghost_skills_when_following_device(
+        self, test_db, mocker
+    ):
+        builder = TaskRequestBuilder(test_db)
+        team = SimpleNamespace(user_id=7, namespace="default")
+        bot = SimpleNamespace(
+            name="shared-agent-bot",
+            json={
+                "kind": "Bot",
+                "metadata": {"name": "shared-agent-bot", "namespace": "default"},
+                "spec": {
+                    "ghostRef": {
+                        "name": "shared-agent-ghost",
+                        "namespace": "default",
+                    },
+                    "shellRef": {"name": "Chat", "namespace": "default"},
+                    "capability_mode": "follow_device",
+                },
+            },
+        )
+        ghost = SimpleNamespace(
+            name="shared-agent-ghost",
+            namespace="default",
+            json={
+                "kind": "Ghost",
+                "metadata": {
+                    "name": "shared-agent-ghost",
+                    "namespace": "default",
+                },
+                "spec": {
+                    "systemPrompt": "Use the configured private skill.",
+                    "skills": ["owner-private-skill"],
+                    "preload_skills": ["owner-private-skill"],
+                    "skill_refs": {
+                        "owner-private-skill": {
+                            "skill_id": 55,
+                            "namespace": "default",
+                            "is_public": False,
+                        }
+                    },
+                },
+            },
+        )
+        mock_query = mocker.Mock()
+        mock_query.filter.return_value.first.return_value = ghost
+        mocker.patch.object(builder.db, "query", return_value=mock_query)
+        find_attached_skill_by_ref = mocker.patch.object(
+            builder, "_find_attached_skill_by_ref"
+        )
+
+        result = builder._get_bot_skills(
+            bot=bot,
+            team=team,
+            user=SimpleNamespace(id=99, preferences="{}"),
+            user_id=99,
+        )
+
+        find_attached_skill_by_ref.assert_not_called()
+        assert result == ([], [], [], {})
+
+    def test_member_bot_skill_refs_resolve_as_agent_owner(self, test_db, mocker):
+        builder = TaskRequestBuilder(test_db)
+        skill = SimpleNamespace(
+            id=55,
+            name="owner-private-skill",
+            user_id=7,
+            namespace="default",
+            json={},
+        )
+        find_attached_skill_by_ref = mocker.patch.object(
+            builder, "_find_attached_skill_by_ref", return_value=skill
+        )
+        mocker.patch.object(
+            builder,
+            "_build_skill_data",
+            return_value={"name": "owner-private-skill"},
+        )
+        resolved_skills = []
+        skill_refs = {}
+
+        builder._extend_resolved_skills_from_bot_configs(
+            bot_configs=[
+                {
+                    "skills": ["owner-private-skill"],
+                    "skill_refs": {
+                        "owner-private-skill": {
+                            "skill_id": 55,
+                            "namespace": "default",
+                            "is_public": False,
+                        }
+                    },
+                }
+            ],
+            resolved_skills=resolved_skills,
+            skill_refs=skill_refs,
+            team=SimpleNamespace(user_id=7, namespace="default"),
+            user=SimpleNamespace(id=99, preferences="{}"),
+        )
+
+        find_attached_skill_by_ref.assert_called_once_with(
+            "owner-private-skill",
+            skill_id=55,
+        )
+        assert resolved_skills == [{"name": "owner-private-skill"}]
+        assert skill_refs["owner-private-skill"]["skill_id"] == 55
+
+    def test_get_bot_skills_returns_four_tuple_when_ghost_not_found(
+        self, test_db, mocker
+    ):
+        builder = TaskRequestBuilder(test_db)
+        team = SimpleNamespace(user_id=2, namespace="default")
+        bot = SimpleNamespace(
+            name="chat-bot",
+            json={
+                "kind": "Bot",
+                "metadata": {"name": "chat-bot", "namespace": "default"},
+                "spec": {
+                    "ghostRef": {"name": "missing-ghost", "namespace": "default"},
+                    "shellRef": {"name": "Chat", "namespace": "default"},
+                },
+            },
+        )
+        mock_query = mocker.Mock()
+        mock_query.filter.return_value.first.return_value = None
+        mocker.patch.object(builder.db, "query", return_value=mock_query)
+
+        result = builder._get_bot_skills(
+            bot=bot,
+            team=team,
+            user=SimpleNamespace(preferences="{}"),
+            user_id=2,
+            user_preload_skills=None,
+        )
+
+        assert len(result) == 4
+        assert result == ([], [], [], {})
+
+    def test_resolve_shell_info_cache_isolated_by_shell_ref(self, test_db, mocker):
+        builder = TaskRequestBuilder(test_db)
+
+        bot_one = SimpleNamespace(
+            json={
+                "kind": "Bot",
+                "metadata": {"name": "bot-one", "namespace": "default"},
+                "spec": {
+                    "ghostRef": {"name": "ghost-a", "namespace": "default"},
+                    "shellRef": {"name": "shell-a", "namespace": "default"},
+                },
+            }
+        )
+        bot_two = SimpleNamespace(
+            json={
+                "kind": "Bot",
+                "metadata": {"name": "bot-two", "namespace": "default"},
+                "spec": {
+                    "ghostRef": {"name": "ghost-b", "namespace": "default"},
+                    "shellRef": {"name": "shell-b", "namespace": "default"},
+                },
+            }
+        )
+
+        shell_a = SimpleNamespace(
+            json={
+                "kind": "Shell",
+                "metadata": {"name": "shell-a", "namespace": "default"},
+                "spec": {"shellType": "ClaudeCode", "baseImage": "img-a"},
+            }
+        )
+        shell_b = SimpleNamespace(
+            json={
+                "kind": "Shell",
+                "metadata": {"name": "shell-b", "namespace": "default"},
+                "spec": {"shellType": "Agno", "baseImage": "img-b"},
+            }
+        )
+
+        mock_query = mocker.Mock()
+        mock_query.filter.return_value.first.side_effect = [shell_a, shell_b]
+        mocker.patch.object(builder.db, "query", return_value=mock_query)
+
+        shell_info_one = builder._resolve_shell_info(bot_one, user_id=1)
+        shell_info_two = builder._resolve_shell_info(bot_two, user_id=1)
+
+        assert shell_info_one == {"shell_type": "ClaudeCode", "base_image": "img-a"}
+        assert shell_info_two == {"shell_type": "Agno", "base_image": "img-b"}
+
+    def test_resolve_shell_info_rejects_dangling_reference(self, test_db, mocker):
+        builder = TaskRequestBuilder(test_db)
+        bot = SimpleNamespace(
+            json={
+                "kind": "Bot",
+                "metadata": {"name": "dangling-shell-bot", "namespace": "default"},
+                "spec": {
+                    "ghostRef": {"name": "ghost", "namespace": "default"},
+                    "shellRef": {"name": "missing-shell", "namespace": "default"},
+                },
+            }
+        )
+        mocker.patch(
+            "app.services.adapters.shell_utils.get_shell_by_name",
+            return_value=None,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="Shell reference 'default/missing-shell' is unavailable",
+        ):
+            builder._resolve_shell_info(bot, user_id=1)
+
+
+class TestUserMcpOAuthHeaderInjection:
+    """Tests for OAuth bearer injection into provider MCP servers."""
+
+    RESOURCE_URL = "https://mcp-gw.dingtalk.com/oauth/server/aitable"
+
+    def _skill(self, server_name: str = "dingtalk_ai_table") -> SimpleNamespace:
+        return SimpleNamespace(
+            id=201,
+            user_id=0,
+            json={
+                "kind": "Skill",
+                "metadata": {"name": "dingtalk-ai-table", "namespace": "default"},
+                "spec": {
+                    "description": "DingTalk AI table runtime skill",
+                    "prompt": "Use DingTalk AI tables.",
+                    "bindShells": ["Chat"],
+                    "mcpServers": {
+                        server_name: {
+                            "type": "streamable-http",
+                            "url": (
+                                "${{task_data.user_mcps.dingtalk.services.ai_table"
+                                ".credentials.url}}"
+                            ),
+                        }
+                    },
+                },
+            },
+        )
+
+    def _user(self, auth_mode: str) -> SimpleNamespace:
+        preferences = user_mcp_service.dump_preferences(
+            user_mcp_service.set_provider_service_config(
+                None,
+                provider_id="dingtalk",
+                service_id="ai_table",
+                enabled=True,
+                url=self.RESOURCE_URL,
+                auth_mode=auth_mode,
+            )
+        )
+        return SimpleNamespace(preferences=preferences, id=1)
+
+    def test_oauth_mode_injects_bearer_header(self, test_db, monkeypatch):
+        builder = TaskRequestBuilder(test_db)
+        monkeypatch.setattr(
+            user_mcp_oauth_service,
+            "ensure_access_token_sync",
+            lambda *args, **kwargs: "dingtalk-access",
+        )
+
+        skill_data = builder._build_skill_data(
+            self._skill(), user=self._user(MCP_AUTH_MODE_OAUTH)
+        )
+
+        assert skill_data["mcpServers"]["dingtalk_ai_table"]["headers"] == {
+            "Authorization": "Bearer dingtalk-access"
+        }
+
+    def test_oauth_mode_supports_legacy_hyphenated_server_name(
+        self, test_db, monkeypatch
+    ):
+        """Deployed Skill assets may still use hyphenated server names."""
+        builder = TaskRequestBuilder(test_db)
+        monkeypatch.setattr(
+            user_mcp_oauth_service,
+            "ensure_access_token_sync",
+            lambda *args, **kwargs: "dingtalk-access",
+        )
+
+        skill_data = builder._build_skill_data(
+            self._skill("dingtalk-ai-table"),
+            user=self._user(MCP_AUTH_MODE_OAUTH),
+        )
+
+        assert skill_data["mcpServers"]["dingtalk-ai-table"]["headers"] == {
+            "Authorization": "Bearer dingtalk-access"
+        }
+
+    def test_url_mode_keeps_no_authorization_header(self, test_db, monkeypatch):
+        builder = TaskRequestBuilder(test_db)
+
+        def fail(*args, **kwargs):
+            raise AssertionError("URL mode must not refresh OAuth tokens")
+
+        monkeypatch.setattr(user_mcp_oauth_service, "ensure_access_token_sync", fail)
+
+        skill_data = builder._build_skill_data(
+            self._skill(), user=self._user(MCP_AUTH_MODE_URL)
+        )
+
+        assert "headers" not in skill_data["mcpServers"]["dingtalk_ai_table"]
+
+    def test_insecure_resource_url_never_receives_a_bearer_header(
+        self, test_db, monkeypatch
+    ):
+        """An OAuth token is not attached to a cleartext MCP endpoint."""
+        builder = TaskRequestBuilder(test_db)
+        user = self._user(MCP_AUTH_MODE_OAUTH)
+        preferences = user_mcp_service.set_provider_service_config(
+            user.preferences,
+            provider_id="dingtalk",
+            service_id="ai_table",
+            enabled=True,
+            url="http://mcp.example.com/oauth/server/aitable",
+            auth_mode=MCP_AUTH_MODE_OAUTH,
+        )
+        user = SimpleNamespace(
+            preferences=user_mcp_service.dump_preferences(preferences), id=1
+        )
+
+        def fail(*args, **kwargs):
+            raise AssertionError("insecure transports must not request a token")
+
+        monkeypatch.setattr(user_mcp_oauth_service, "ensure_access_token_sync", fail)
+
+        skill_data = builder._build_skill_data(self._skill(), user=user)
+
+        assert "headers" not in skill_data["mcpServers"]["dingtalk_ai_table"]

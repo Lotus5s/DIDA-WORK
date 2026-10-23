@@ -1,0 +1,141 @@
+{
+  "title": "Projects",
+  "newProject": "New Project",
+  "noProjects": "No projects yet",
+  "noProjectsDesc": "Create a project to organize your tasks",
+  "taskCount": "{{count}} tasks",
+  "emptyProject": "No tasks",
+  "emptyProjectDesc": "Drag tasks here",
+  "dropHere": "Drop to this project",
+  "section": {
+    "title": "Chat Groups",
+    "empty": "No groups, click + to create",
+    "noTasks": "No tasks",
+    "loadMore": "Load more",
+    "retryTasks": "Loading failed. Retry"
+  },
+  "workspaceSection": {
+    "title": "Projects",
+    "empty": "No projects, click + to create"
+  },
+  "createMenu": {
+    "title": "Create project or group"
+  },
+  "actions": {
+    "menu": "More actions",
+    "searchTasks": "Search tasks",
+    "edit": "Edit",
+    "delete": "Delete"
+  },
+  "search": {
+    "title": "Search in {{name}}"
+  },
+  "create": {
+    "title": "New Group",
+    "description": "Create a new group to organize your conversations",
+    "nameLabel": "Group Name",
+    "namePlaceholder": "Enter group name",
+    "descriptionLabel": "Description (optional)",
+    "descriptionPlaceholder": "Enter group description",
+    "colorLabel": "Color",
+    "submit": "Create",
+    "cancel": "Cancel"
+  },
+  "workspaceCreate": {
+    "title": "New Project",
+    "description": "Create a project workspace for multiple conversations under the same project",
+    "nameLabel": "Project Name",
+    "namePlaceholder": "Enter project name",
+    "submit": "Create Project",
+    "defaultName": "New Project"
+  },
+  "workspace": {
+    "enable": "Create as workspace project",
+    "device": "Device",
+    "devicePlaceholder": "Select a device",
+    "directoryPath": "Directory Path",
+    "directoryPathPlaceholder": "Enter local directory path",
+    "selectDirectory": "Select device directory",
+    "selectDirectoryHint": "Select the project directory from the chosen device",
+    "projectNamePreview": "Project name: {{name}}",
+    "newConversation": "New Conversation",
+    "greeting": "What do you want to build in {{name}}?",
+    "pathLabel": "Project directory",
+    "switchProject": "Switch Project",
+    "currentProject": "Current Project",
+    "noOnlineDevices": "No online devices. Please start a device first.",
+    "unknownDeviceVersion": "unknown version",
+    "deviceVersionUnsupported": "Selected device version {{version}} is below {{requiredVersion}}. Upgrade to {{requiredVersion}} or later before creating a project.",
+    "defaultPathHint": "If empty, defaults to ~/.wegent-executor/workspace/project{id}",
+    "local": "Local device",
+    "cloud": "Cloud device",
+    "remote": "Remote device",
+    "deviceId": "Local device ID",
+    "teamId": "Agent ID",
+    "git": "Clone from Git",
+    "localPath": "Local path",
+    "gitUrl": "Git URL",
+    "gitRepo": "Repository name (optional)",
+    "gitBranch": "Branch, default main",
+    "checkoutPath": "Checkout path (optional)",
+    "localPathPlaceholder": "Directory path",
+    "directoryPicker": {
+      "title": "Select Project Directory",
+      "description": "Click a directory to select it. Double-click to select and enter a subdirectory.",
+      "loading": "Loading directories...",
+      "error": "Failed to load directories",
+      "empty": "No subdirectories in the current directory",
+      "retry": "Retry",
+      "refresh": "Refresh",
+      "parent": "Parent directory",
+      "selected": "Selected: {{path}}",
+      "selectHint": "Select a directory",
+      "confirm": "Select Directory"
+    }
+  },
+  "edit": {
+    "title": "Edit Project",
+    "description": "Modify project information",
+    "submit": "Save",
+    "cancel": "Cancel"
+  },
+  "delete": {
+    "title": "Delete Project",
+    "description": "Are you sure you want to delete project \"{{name}}\"? Tasks in the project will not be deleted, only the association will be removed.",
+    "confirm": "Delete",
+    "cancel": "Cancel"
+  },
+  "menu": {
+    "edit": "Edit",
+    "delete": "Delete",
+    "removeTask": "Remove from project",
+    "moveToGroup": "Move to Group",
+    "createGroup": "Create Group",
+    "removeFromGroup": "Remove from Group"
+  },
+  "toast": {
+    "createSuccess": "Project created successfully",
+    "createSuccessDesc": "Project \"{{name}}\" has been created",
+    "createFailed": "Failed to create project",
+    "updateSuccess": "Project updated successfully",
+    "updateFailed": "Failed to update project",
+    "deleteSuccess": "Project deleted successfully",
+    "deleteFailed": "Failed to delete project",
+    "addTaskSuccess": "Task added to project",
+    "addTaskFailed": "Failed to add task",
+    "removeTaskSuccess": "Task removed from project",
+    "removeTaskFailed": "Failed to remove task",
+    "groupChatNotSupported": "Group chats cannot be added to chat groups",
+    "taskImportPathlessOnly": "Ordinary tasks can only be imported into pathless projects"
+  },
+  "colors": {
+    "red": "Red",
+    "orange": "Orange",
+    "yellow": "Yellow",
+    "green": "Green",
+    "blue": "Blue",
+    "purple": "Purple",
+    "pink": "Pink",
+    "gray": "Gray"
+  }
+}

@@ -1,0 +1,321 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for OpenAI request conversion defaults."""
+
+from shared.models.execution import (
+    GIT_AUTH_TRANSPORT_ENCRYPTED_REQUEST_TOKEN,
+    ExecutionRequest,
+)
+from shared.models.knowledge import KnowledgeBaseScope, KnowledgeBaseToolAccessMode
+from shared.models.openai_converter import OpenAIRequestConverter
+
+
+def test_resource_owner_and_namespace_survive_both_wire_formats():
+    owner = {"kind": "group", "id": 5, "name": "wecode-ai"}
+    request = ExecutionRequest(
+        team_owner=owner,
+        team_namespace="wecode-ai/design",
+        team_name="designer",
+        user_name="executor-not-owner",
+    )
+
+    wire = OpenAIRequestConverter.from_execution_request(request)
+    restored = OpenAIRequestConverter.to_execution_request(wire)
+
+    assert wire["metadata"]["team_owner"] == owner
+    assert restored.team_owner == owner
+    assert restored.team_namespace == "wecode-ai/design"
+    assert ExecutionRequest.from_dict(request.to_dict()).team_owner == owner
+    assert ExecutionRequest().team_owner == {}
+
+
+def test_legacy_session_bindings_round_trip_without_seeding_inherited_sessions():
+    bindings = [
+        {
+            "task_id": 123,
+            "user_id": 7,
+            "agent": "Codex",
+            "botId": 23,
+            "threadId": "old-thread",
+        }
+    ]
+    request = ExecutionRequest(legacy_session_bindings=bindings)
+
+    wire = OpenAIRequestConverter.from_execution_request(request)
+    restored = OpenAIRequestConverter.to_execution_request(wire)
+
+    assert wire["metadata"]["legacy_session_bindings"] == bindings
+    assert restored.legacy_session_bindings == bindings
+    assert restored.inherited_sessions == []
+    assert (
+        ExecutionRequest.from_dict(request.to_dict()).legacy_session_bindings
+        == bindings
+    )
+
+
+def test_legacy_session_bindings_default_is_empty_and_not_shared():
+    first = ExecutionRequest()
+    second = ExecutionRequest()
+    first.legacy_session_bindings.append({"task_id": 1})
+    assert second.legacy_session_bindings == []
+    restored = OpenAIRequestConverter.to_execution_request(
+        {"model": "test", "input": "hello", "metadata": {}}
+    )
+    assert restored.legacy_session_bindings == []
+
+
+def test_from_execution_request_normalizes_null_kb_tool_access_mode():
+    request = ExecutionRequest(kb_tool_access_mode=None)
+
+    openai_request = OpenAIRequestConverter.from_execution_request(request)
+
+    assert (
+        openai_request["metadata"]["kb_tool_access_mode"]
+        == KnowledgeBaseToolAccessMode.FULL
+    )
+
+
+def test_to_execution_request_normalizes_null_kb_tool_access_mode():
+    openai_request = {
+        "model": "test-model",
+        "input": "hello",
+        "metadata": {
+            "kb_tool_access_mode": None,
+        },
+    }
+
+    request = OpenAIRequestConverter.to_execution_request(openai_request)
+
+    assert request.kb_tool_access_mode == KnowledgeBaseToolAccessMode.FULL
+
+
+def test_round_trip_preserves_skill_reference_metadata():
+    request = ExecutionRequest(
+        skill_names=["analysis-skill"],
+        skill_configs=[
+            {
+                "name": "analysis-skill",
+                "skill_id": 101,
+                "namespace": "team-a",
+                "is_public": False,
+            }
+        ],
+        preload_skills=["analysis-skill"],
+        skill_refs={
+            "analysis-skill": {
+                "skill_id": 101,
+                "namespace": "team-a",
+                "is_public": False,
+            }
+        },
+        preload_skill_refs={
+            "analysis-skill": {
+                "skill_id": 202,
+                "namespace": "team-b",
+                "is_public": False,
+            }
+        },
+    )
+
+    openai_request = OpenAIRequestConverter.from_execution_request(request)
+    converted = OpenAIRequestConverter.to_execution_request(openai_request)
+
+    assert converted.skill_refs == request.skill_refs
+    assert converted.preload_skill_refs == request.preload_skill_refs
+
+
+def test_round_trip_preserves_git_auth_transport():
+    request = ExecutionRequest(
+        git_url="https://github.com/wecode-ai/wegent.git",
+        git_auth_transport=GIT_AUTH_TRANSPORT_ENCRYPTED_REQUEST_TOKEN,
+    )
+
+    openai_request = OpenAIRequestConverter.from_execution_request(request)
+    converted = OpenAIRequestConverter.to_execution_request(openai_request)
+
+    assert (
+        openai_request["metadata"]["git_auth_transport"]
+        == GIT_AUTH_TRANSPORT_ENCRYPTED_REQUEST_TOKEN
+    )
+    assert converted.git_auth_transport == GIT_AUTH_TRANSPORT_ENCRYPTED_REQUEST_TOKEN
+
+
+def test_round_trip_preserves_selected_knowledge_context():
+    request = ExecutionRequest(
+        selected_knowledge_prompt="<selected_knowledge_sources />",
+        provider_native_knowledge=True,
+    )
+
+    openai_request = OpenAIRequestConverter.from_execution_request(request)
+    converted = OpenAIRequestConverter.to_execution_request(openai_request)
+
+    assert "selected_knowledge_refs" not in openai_request["metadata"]
+    assert converted.selected_knowledge_prompt == request.selected_knowledge_prompt
+    assert converted.provider_native_knowledge is True
+
+
+def test_string_false_does_not_enable_provider_native_knowledge() -> None:
+    converted = OpenAIRequestConverter.to_execution_request(
+        {
+            "model": "test-model",
+            "input": "hello",
+            "metadata": {"provider_native_knowledge": "false"},
+        }
+    )
+
+    assert converted.provider_native_knowledge is False
+
+
+def test_round_trip_preserves_interactive_form_answer():
+    request = ExecutionRequest(
+        interactive_form_answer={
+            "type": "interactive_form_question",
+            "tool_use_id": "tool-1",
+            "answers": {"language": "python"},
+            "message": "selected python",
+        }
+    )
+
+    openai_request = OpenAIRequestConverter.from_execution_request(request)
+    converted = OpenAIRequestConverter.to_execution_request(openai_request)
+
+    assert converted.interactive_form_answer == request.interactive_form_answer
+
+
+def test_round_trip_preserves_attachments_for_executor_download():
+    request = ExecutionRequest(
+        attachments=[
+            {
+                "id": 16,
+                "filename": "frontend.zip",
+                "content_type": "application/zip",
+                "size": 1024,
+                "download_url": "/api/attachments/16/download",
+            }
+        ]
+    )
+
+    openai_request = OpenAIRequestConverter.from_execution_request(request)
+    converted = OpenAIRequestConverter.to_execution_request(openai_request)
+
+    assert openai_request["metadata"]["attachments"] == request.attachments
+    assert converted.attachments == request.attachments
+
+
+def test_round_trip_preserves_skip_git_clone_for_archive_recovery():
+    request = ExecutionRequest(skip_git_clone=True)
+
+    openai_request = OpenAIRequestConverter.from_execution_request(request)
+    converted = OpenAIRequestConverter.to_execution_request(openai_request)
+
+    assert openai_request["metadata"]["skip_git_clone"] is True
+    assert converted.skip_git_clone is True
+
+
+def test_round_trip_preserves_executor_identity():
+    request = ExecutionRequest(
+        executor_name="wegent-task-user7-pod7",
+        executor_namespace="default",
+    )
+
+    openai_request = OpenAIRequestConverter.from_execution_request(request)
+    converted = OpenAIRequestConverter.to_execution_request(openai_request)
+
+    assert openai_request["metadata"]["executor_name"] == request.executor_name
+    assert (
+        openai_request["metadata"]["executor_namespace"] == request.executor_namespace
+    )
+    assert converted.executor_name == request.executor_name
+    assert converted.executor_namespace == request.executor_namespace
+
+
+def test_round_trip_preserves_fork_runtime_and_inherited_sessions():
+    request = ExecutionRequest(
+        fork_runtime={
+            "workspaceArchive": {
+                "sourceTaskId": 1,
+                "storageKey": "workspace-archives/1/archive.tar.gz",
+            },
+            "sessions": [
+                {"agent": "ClaudeCode", "sessionId": "claude-session-1"},
+                {"agent": "CodeX", "threadId": "codex-thread-1"},
+            ],
+        },
+        inherited_sessions=[
+            {"agent": "ClaudeCode", "sessionId": "claude-session-1"},
+            {"agent": "CodeX", "threadId": "codex-thread-1"},
+        ],
+    )
+
+    openai_request = OpenAIRequestConverter.from_execution_request(request)
+    converted = OpenAIRequestConverter.to_execution_request(openai_request)
+
+    assert openai_request["metadata"]["fork_runtime"] == request.fork_runtime
+    assert (
+        openai_request["metadata"]["inherited_sessions"] == request.inherited_sessions
+    )
+    assert converted.fork_runtime == request.fork_runtime
+    assert converted.inherited_sessions == request.inherited_sessions
+
+
+def test_to_execution_request_preserves_message_history_and_stateless_flag():
+    openai_request = {
+        "model": "test-model",
+        "input": [
+            {"role": "user", "content": "第一条用户消息"},
+            {"role": "user", "content": "第二条用户消息"},
+        ],
+        "metadata": {
+            "stateless": True,
+            "enable_tools": False,
+        },
+    }
+
+    request = OpenAIRequestConverter.to_execution_request(openai_request)
+
+    assert request.stateless is True
+    assert request.enable_tools is False
+    assert request.history == [{"role": "user", "content": "第一条用户消息"}]
+    assert request.prompt == "第二条用户消息"
+
+
+def test_round_trip_preserves_knowledge_base_scopes():
+    request = ExecutionRequest(
+        knowledge_base_ids=[1, 2],
+        knowledge_base_scopes=[
+            KnowledgeBaseScope(
+                knowledge_base_id=1,
+                scope_restricted=True,
+                document_ids=[101, 102],
+            ),
+            KnowledgeBaseScope(knowledge_base_id=2, scope_restricted=False),
+        ],
+    )
+
+    openai_request = OpenAIRequestConverter.from_execution_request(request)
+    converted = OpenAIRequestConverter.to_execution_request(openai_request)
+
+    assert converted.knowledge_base_scopes == request.knowledge_base_scopes
+
+
+def test_to_execution_request_ignores_malformed_scope_document_ids():
+    request = OpenAIRequestConverter.to_execution_request(
+        {
+            "input": "hello",
+            "metadata": {
+                "knowledge_base_scopes": [
+                    {
+                        "knowledge_base_id": 1,
+                        "scope_restricted": True,
+                        "document_ids": 101,
+                    }
+                ]
+            },
+        }
+    )
+
+    assert request.knowledge_base_scopes == [
+        KnowledgeBaseScope(knowledge_base_id=1, scope_restricted=True)
+    ]

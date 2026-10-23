@@ -1,0 +1,774 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { useState, useEffect, useCallback } from 'react'
+import { Task, TaskType } from '@/types/api'
+import TaskMenu from './TaskMenu'
+import { TaskInlineRename } from '@/components/common/TaskInlineRename'
+import {
+  CheckCircle2,
+  XCircle,
+  StopCircle,
+  PauseCircle,
+  RotateCw,
+  Code2,
+  MessageSquare,
+  Users,
+  BookOpen,
+  Monitor,
+  ChevronDown,
+  ChevronUp,
+} from 'lucide-react'
+
+import { useTaskSession } from '@/features/tasks/session/TaskSession'
+import { useTranslation } from '@/hooks/useTranslation'
+import { taskApis } from '@/apis/tasks'
+import { isTaskUnread } from '@/utils/taskViewStatus'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { useDraggable } from '@dnd-kit/core'
+import { cn } from '@/lib/utils'
+import { useProjectContext } from '@/features/projects'
+import { TeamIconDisplay } from '@/features/settings/components/teams/TeamIconDisplay'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { toast } from 'sonner'
+import { getTaskTargetHref } from '@/utils/taskRouting'
+
+interface TaskListSectionProps {
+  tasks: Task[]
+  title: string
+  titleIcon?: React.ReactNode
+  titleClassName?: string
+  initialVisibleCount?: number
+  unreadCount?: number
+  onTaskClick?: () => void
+  isCollapsed?: boolean
+  showTitle?: boolean
+  enableDrag?: boolean
+  onSelectMultiple?: (taskId: number) => void
+}
+
+import { useRouter } from 'next/navigation'
+
+// Draggable task item wrapper component
+function DraggableTaskItem({
+  task,
+  children,
+  enableDrag,
+}: {
+  task: Task
+  children: React.ReactNode
+  enableDrag: boolean
+}) {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: task.id,
+    data: {
+      type: 'task',
+      task,
+    },
+    disabled: !enableDrag,
+  })
+
+  if (!enableDrag) {
+    return <>{children}</>
+  }
+
+  return (
+    <div
+      ref={setNodeRef}
+      {...listeners}
+      {...attributes}
+      className={cn(
+        'relative group/drag cursor-grab active:cursor-grabbing',
+        isDragging && 'opacity-50 ring-2 ring-primary ring-inset rounded-xl'
+      )}
+    >
+      {children}
+    </div>
+  )
+}
+
+export default function TaskListSection({
+  tasks,
+  title,
+  titleIcon,
+  titleClassName,
+  initialVisibleCount,
+  unreadCount = 0,
+  onTaskClick,
+  isCollapsed = false,
+  showTitle = true,
+  enableDrag = false,
+  onSelectMultiple,
+}: TaskListSectionProps) {
+  const router = useRouter()
+  const {
+    selectedTask,
+    selectedTaskDetail,
+    selectTask,
+    refreshTasks,
+    viewStatusVersion,
+    markTaskAsViewed,
+  } = useTaskSession()
+  const { t } = useTranslation()
+  const { setSelectedProjectTaskId } = useProjectContext()
+  // Use viewStatusVersion to trigger re-render when task view status changes
+  // This is needed to update the unread dot immediately when a task is clicked
+  const _viewStatusVersion = viewStatusVersion
+  const [hoveredTaskId, setHoveredTaskId] = useState<number | null>(null)
+  const [longPressTaskId, setLongPressTaskId] = useState<number | null>(null)
+  const [editingTaskId, setEditingTaskId] = useState<number | null>(null)
+  const [isExpanded, setIsExpanded] = useState(false)
+  // Local task titles for optimistic update during rename
+  const [localTitles, setLocalTitles] = useState<Record<number, string>>({})
+  // Delete confirmation dialog state
+  const [deleteConfirmTask, setDeleteConfirmTask] = useState<Task | null>(null)
+  const [isDeleting, setIsDeleting] = useState(false)
+
+  // Touch interaction state
+  const [touchState, setTouchState] = useState<{
+    startX: number
+    startY: number
+    startTime: number
+    taskId: number | null
+    isScrolling: boolean
+    longPressTimer: NodeJS.Timeout | null
+  }>({
+    startX: 0,
+    startY: 0,
+    startTime: 0,
+    taskId: null,
+    isScrolling: false,
+    longPressTimer: null,
+  })
+
+  const selectTaskForDisplay = (task: Task) => {
+    // Immediately mark task as viewed to clear the unread dot
+    // Use current time as viewedAt to ensure it's always >= task's completed_at/updated_at
+    // This is simpler and more reliable than using task timestamps which may vary
+    // between list items and task details
+    markTaskAsViewed(task.id, task.status)
+
+    // Clear project section selection to remove highlight from project area
+    setSelectedProjectTaskId(null)
+
+    selectTask(task)
+  }
+
+  const navigateToTask = (task: Task) => {
+    if (typeof window !== 'undefined') {
+      router.push(getTaskTargetHref(task))
+
+      // Call the onTaskClick callback if provided (to close mobile sidebar)
+      if (onTaskClick) {
+        onTaskClick()
+      }
+    }
+  }
+
+  // Select task
+  const handleTaskClick = (task: Task) => {
+    selectTaskForDisplay(task)
+    navigateToTask(task)
+  }
+
+  // Touch interaction handlers
+  const handleTouchStart = (task: Task) => (event: React.TouchEvent) => {
+    const touch = event.touches[0]
+    const longPressTimer = setTimeout(() => {
+      // Long press detected - show menu on mobile
+      setLongPressTaskId(task.id)
+      setTouchState(prev => ({ ...prev, isScrolling: true })) // Prevent click after long press
+    }, 500)
+
+    setTouchState({
+      startX: touch.clientX,
+      startY: touch.clientY,
+      startTime: Date.now(),
+      taskId: task.id,
+      isScrolling: false,
+      longPressTimer,
+    })
+  }
+
+  const handleTouchMove = (event: React.TouchEvent) => {
+    if (!touchState.taskId) return
+
+    const touch = event.touches[0]
+    const deltaX = Math.abs(touch.clientX - touchState.startX)
+    const deltaY = Math.abs(touch.clientY - touchState.startY)
+    const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY)
+
+    // If moved more than 10px, consider it as scrolling
+    if (distance > 10) {
+      if (touchState.longPressTimer) {
+        clearTimeout(touchState.longPressTimer)
+      }
+      setTouchState(prev => ({ ...prev, isScrolling: true, longPressTimer: null }))
+    }
+  }
+
+  const handleTouchEnd = (task: Task) => (_event: React.TouchEvent) => {
+    if (touchState.longPressTimer) {
+      clearTimeout(touchState.longPressTimer)
+    }
+
+    const touchDuration = Date.now() - touchState.startTime
+
+    // Only trigger click if:
+    // 1. Not scrolling
+    // 2. Touch duration < 500ms (not a long press)
+    // 3. Touch is on the same task
+    if (!touchState.isScrolling && touchDuration < 500 && touchState.taskId === task.id) {
+      handleTaskClick(task)
+    }
+
+    setTouchState({
+      startX: 0,
+      startY: 0,
+      startTime: 0,
+      taskId: null,
+      isScrolling: false,
+      longPressTimer: null,
+    })
+  }
+
+  // Cleanup effect for touch state
+  useEffect(() => {
+    return () => {
+      if (touchState.longPressTimer) {
+        clearTimeout(touchState.longPressTimer)
+      }
+    }
+  }, [touchState.longPressTimer])
+
+  // Handle clicks outside to close long press menu
+  useEffect(() => {
+    const handleClickOutside = () => {
+      if (longPressTaskId !== null) {
+        setLongPressTaskId(null)
+      }
+    }
+
+    if (longPressTaskId !== null) {
+      document.addEventListener('click', handleClickOutside)
+      return () => {
+        document.removeEventListener('click', handleClickOutside)
+      }
+    }
+  }, [longPressTaskId])
+
+  // Copy task ID
+  const handleCopyTaskId = async (taskId: number) => {
+    const textToCopy = taskId.toString()
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(textToCopy)
+        return
+      } catch (err) {
+        console.error('Copy failed', err)
+      }
+    }
+    try {
+      const textarea = document.createElement('textarea')
+      textarea.value = textToCopy
+      textarea.style.cssText = 'position:fixed;opacity:0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+    } catch (err) {
+      console.error('Fallback copy failed', err)
+    }
+  }
+
+  // Delete task - show confirmation dialog
+  const handleDeleteTask = useCallback(
+    (taskId: number) => {
+      const task = tasks.find(t => t.id === taskId)
+      if (task) {
+        setDeleteConfirmTask(task)
+      }
+    },
+    [tasks]
+  )
+
+  // Confirm delete task
+  const handleConfirmDelete = async () => {
+    if (!deleteConfirmTask) return
+
+    setIsDeleting(true)
+    try {
+      await taskApis.deleteTask(deleteConfirmTask.id)
+      // Show success toast based on task type
+      if (deleteConfirmTask.is_group_chat) {
+        toast.success(t('common:tasks.leave_success'))
+      } else {
+        toast.success(t('common:tasks.delete_success'))
+      }
+      // If the deleted task is the currently selected task, clear selection
+      if (selectedTask?.id === deleteConfirmTask.id) {
+        selectTask(null)
+        if (typeof window !== 'undefined') {
+          const url = new URL(window.location.href)
+          url.searchParams.delete('taskId')
+          router.replace(url.pathname + url.search)
+        }
+      }
+      refreshTasks()
+      setDeleteConfirmTask(null)
+    } catch (err) {
+      console.error('Delete failed', err)
+      toast.error(t('common:tasks.delete_failed'))
+    } finally {
+      setIsDeleting(false)
+    }
+  }
+
+  // Start inline editing for a task
+  const handleStartRename = useCallback((taskId: number) => {
+    setEditingTaskId(taskId)
+    setLongPressTaskId(null) // Close long press menu
+  }, [])
+
+  // Save renamed task
+  const handleSaveRename = useCallback(
+    async (taskId: number, newTitle: string) => {
+      // Call API to update task title
+      await taskApis.updateTask(taskId, { title: newTitle })
+      // Optimistic update: update local state immediately
+      setLocalTitles(prev => ({ ...prev, [taskId]: newTitle }))
+      // Refresh tasks to sync with server
+      refreshTasks()
+    },
+    [refreshTasks]
+  )
+
+  // Cancel rename
+  const handleCancelRename = useCallback(() => {
+    setEditingTaskId(null)
+  }, [])
+
+  if (tasks.length === 0) return null
+
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case 'COMPLETED':
+        return <CheckCircle2 className="w-4 h-4 text-green-500" />
+      case 'FAILED':
+        return <XCircle className="w-4 h-4 text-red-500" />
+      case 'CANCELLED':
+        return <StopCircle className="w-4 h-4 text-gray-400" />
+      case 'RUNNING':
+        return (
+          <RotateCw
+            className="w-4 h-4 text-blue-500 animate-spin"
+            style={{ animationDuration: '2s' }}
+          />
+        )
+      case 'PENDING':
+        return <PauseCircle className="w-4 h-4 text-yellow-500" />
+      default:
+        return <PauseCircle className="w-4 h-4 text-gray-400" />
+    }
+  }
+
+  const formatTimeAgo = (dateString: string) => {
+    const now = new Date()
+    const date = new Date(dateString)
+    const diffMs = now.getTime() - date.getTime()
+
+    const MINUTE_MS = 60 * 1000
+    const HOUR_MS = 60 * MINUTE_MS
+    const DAY_MS = 24 * HOUR_MS
+
+    // Handle negative time difference (client time earlier than server time)
+    // or very small positive differences (< 1 minute)
+    if (diffMs < MINUTE_MS) {
+      return '0m'
+    } else if (diffMs < HOUR_MS) {
+      return `${Math.floor(diffMs / MINUTE_MS)}m`
+    } else if (diffMs < DAY_MS) {
+      return `${Math.floor(diffMs / HOUR_MS)}h`
+    } else {
+      return `${Math.floor(diffMs / DAY_MS)}d`
+    }
+  }
+
+  const getUnreadDotColor = (task: Task) => {
+    // For group chat tasks, always use green to indicate new messages
+    if (task.is_group_chat) {
+      return 'bg-green-500'
+    }
+    // For non-group-chat tasks, use status-based colors
+    switch (task.status) {
+      case 'COMPLETED':
+        return 'bg-green-500'
+      case 'FAILED':
+        return 'bg-red-500'
+      case 'CANCELLED':
+        return 'bg-gray-400'
+      default:
+        return 'bg-gray-400'
+    }
+  }
+
+  // Determine whether to show status icon in expanded mode
+  // Terminal states only show icon when unread, non-terminal states always show
+  // Group chat tasks show icon when there are unread messages
+  const shouldShowStatusIcon = (task: Task): boolean => {
+    // For group chat tasks, show icon when there are unread messages
+    if (task.is_group_chat) {
+      return isTaskUnread(task)
+    }
+    const terminalStates = ['COMPLETED', 'FAILED', 'CANCELLED']
+    if (terminalStates.includes(task.status)) {
+      const unread = isTaskUnread(task)
+      return unread
+    }
+    return true
+  }
+
+  const getTaskTypeIcon = (task: Task) => {
+    if (!task.device_id && task.team_id) {
+      return <TeamIconDisplay iconId={task.team_icon} size="sm" className="text-text-primary" />
+    }
+
+    let taskType: TaskType | undefined = task.task_type
+    if (!taskType) {
+      if (task.git_repo && task.git_repo.trim() !== '') {
+        taskType = 'code'
+      } else {
+        taskType = 'chat'
+      }
+    }
+
+    // Show group chat icon for group chats
+    if (task.is_group_chat) {
+      return <Users className="w-3.5 h-3.5 text-text-primary" />
+    }
+
+    if (taskType === 'knowledge') {
+      return <BookOpen className="w-3.5 h-3.5 text-text-primary" />
+    } else if (taskType === 'task') {
+      return <Monitor className="w-3.5 h-3.5 text-text-primary" />
+    } else if (taskType === 'code') {
+      return <Code2 className="w-3.5 h-3.5 text-text-primary" />
+    } else {
+      return <MessageSquare className="w-3.5 h-3.5 text-text-primary" />
+    }
+  }
+
+  const canToggleVisibleTasks =
+    typeof initialVisibleCount === 'number' &&
+    initialVisibleCount > 0 &&
+    tasks.length > initialVisibleCount
+  const shouldLimitTasks = canToggleVisibleTasks && !isExpanded
+  const visibleTasks = shouldLimitTasks ? tasks.slice(0, initialVisibleCount) : tasks
+  const getTaskSourceLabel = (task: Task) => {
+    if (task.device_id) {
+      return task.device_name || task.device_id
+    }
+
+    return (
+      task.team_display_name ||
+      task.team_name ||
+      (task.team_id
+        ? `${t('common:teamSelector.agent_label')} #${task.team_id}`
+        : t('common:tasks.unknown_agent'))
+    )
+  }
+
+  return (
+    <div className={`mb-2 w-full ${isCollapsed ? 'px-2' : ''}`}>
+      {/* Section title with divider in collapsed mode */}
+      {isCollapsed
+        ? showTitle && <div className="border-t border-border my-2" />
+        : showTitle &&
+          title && (
+            <h3
+              className={cn(
+                'flex items-center gap-1.5 text-sm text-text-primary tracking-wide mb-1 px-2 min-w-0',
+                titleClassName
+              )}
+            >
+              {titleIcon && <span className="flex-shrink-0 text-text-muted">{titleIcon}</span>}
+              <span className="truncate">{title}</span>
+              {unreadCount > 0 && (
+                <span className="flex-shrink-0 text-primary">({unreadCount})</span>
+              )}
+            </h3>
+          )}
+      <div className="space-y-0.5">
+        {visibleTasks.map(task => {
+          const showMenu = hoveredTaskId === task.id || longPressTaskId === task.id
+          const taskSourceLabel = getTaskSourceLabel(task)
+
+          // Collapsed mode: Show only status icon with tooltip
+          if (isCollapsed) {
+            const taskTypeLabel = (() => {
+              let taskType: TaskType | undefined = task.task_type
+              if (!taskType) {
+                if (task.git_repo && task.git_repo.trim() !== '') {
+                  taskType = 'code'
+                } else {
+                  taskType = 'chat'
+                }
+              }
+              if (taskType === 'knowledge') {
+                return t('common:navigation.wiki')
+              }
+              return taskType === 'code' ? t('common:navigation.code') : t('common:navigation.chat')
+            })()
+
+            const truncatedTitle =
+              task.title.length > 30 ? task.title.slice(0, 30) + '...' : task.title
+
+            return (
+              <TooltipProvider key={task.id}>
+                <Tooltip delayDuration={0}>
+                  <TooltipTrigger asChild>
+                    <div
+                      className={`flex items-center justify-center py-1.5 px-2 h-8 rounded-xl cursor-pointer ${
+                        selectedTask?.id === task.id || selectedTaskDetail?.id === task.id
+                          ? 'bg-primary/10'
+                          : 'hover:bg-hover'
+                      }`}
+                      onClick={() => handleTaskClick(task)}
+                    >
+                      <div className="relative flex items-center justify-center">
+                        <div className="w-4 h-4 flex items-center justify-center">
+                          {getStatusIcon(task.status)}
+                        </div>
+                        {isTaskUnread(task) && (
+                          <span
+                            className={`absolute -top-1 -right-1 w-2 h-2 rounded-full ${getUnreadDotColor(task)} animate-pulse-dot`}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent side="right" className="max-w-xs">
+                    <p className="font-medium">{truncatedTitle}</p>
+                    {taskSourceLabel && <p className="text-xs">{taskSourceLabel}</p>}
+                    <p className="text-xs text-text-muted">
+                      {taskTypeLabel} · {formatTimeAgo(task.created_at)}
+                    </p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )
+          }
+
+          // Expanded mode: Show full task item with tooltip
+          const taskTypeLabel = (() => {
+            let taskType: TaskType | undefined = task.task_type
+            if (!taskType) {
+              if (task.git_repo && task.git_repo.trim() !== '') {
+                taskType = 'code'
+              } else {
+                taskType = 'chat'
+              }
+            }
+            if (taskType === 'knowledge') {
+              return t('common:navigation.wiki')
+            }
+            return taskType === 'code' ? t('common:navigation.code') : t('common:navigation.chat')
+          })()
+          const showTrailingStatus =
+            (shouldShowStatusIcon(task) || isTaskUnread(task)) &&
+            editingTaskId !== task.id &&
+            !showMenu
+
+          return (
+            <DraggableTaskItem key={task.id} task={task} enableDrag={enableDrag}>
+              <TooltipProvider>
+                <Tooltip delayDuration={500}>
+                  <TooltipTrigger asChild>
+                    <div
+                      className={cn(
+                        'relative flex items-center gap-2 rounded-xl cursor-pointer py-1.5 pl-3 transition-[padding] duration-150',
+                        editingTaskId === task.id ? 'h-12' : 'h-8',
+                        'pr-3',
+                        selectedTask?.id === task.id || selectedTaskDetail?.id === task.id
+                          ? 'bg-primary/10'
+                          : 'hover:bg-hover'
+                      )}
+                      onClick={() => {
+                        // Don't trigger task click when editing
+                        if (editingTaskId === task.id) return
+
+                        handleTaskClick(task)
+                      }}
+                      onTouchStart={handleTouchStart(task)}
+                      onTouchMove={handleTouchMove}
+                      onTouchEnd={handleTouchEnd(task)}
+                      onMouseEnter={() => setHoveredTaskId(task.id)}
+                      onMouseLeave={() => setHoveredTaskId(null)}
+                      style={{
+                        touchAction: 'pan-y',
+                        WebkitTapHighlightColor: 'transparent',
+                        userSelect: 'none',
+                      }}
+                    >
+                      {/* Task type icon on the left */}
+                      <div className="flex-shrink-0">{getTaskTypeIcon(task)}</div>
+
+                      {/* Task title in the middle - supports inline editing */}
+                      {editingTaskId === task.id ? (
+                        <TaskInlineRename
+                          taskId={task.id}
+                          initialTitle={localTitles[task.id] ?? task.title}
+                          isEditing={true}
+                          onEditEnd={handleCancelRename}
+                          onSave={async (newTitle: string) => {
+                            await handleSaveRename(task.id, newTitle)
+                          }}
+                        />
+                      ) : (
+                        <span
+                          className={cn(
+                            'flex-1 min-w-0 text-sm font-medium text-text-primary leading-5 truncate transition-[padding] duration-150',
+                            showMenu ? 'pr-8' : 'pr-0'
+                          )}
+                        >
+                          {localTitles[task.id] ?? task.title}
+                        </span>
+                      )}
+
+                      {/* Status icon on the right - only render container when needed */}
+                      {showTrailingStatus && (
+                        <div className="flex-shrink-0 relative">
+                          <div className="w-4 h-4 flex items-center justify-center">
+                            {shouldShowStatusIcon(task) && getStatusIcon(task.status)}
+                          </div>
+                          {isTaskUnread(task) && (
+                            <span
+                              className={`absolute -top-1 -right-1 w-2 h-2 rounded-full ${getUnreadDotColor(task)} animate-pulse-dot`}
+                            />
+                          )}
+                        </div>
+                      )}
+
+                      {editingTaskId !== task.id && (
+                        <div
+                          className={`absolute right-2 top-1/2 -translate-y-1/2 transition-opacity duration-150 [@media(hover:none)]:static [@media(hover:none)]:translate-y-0 [@media(hover:none)]:flex-shrink-0 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto ${
+                            showMenu ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                          }`}
+                          onTouchStart={e => e.stopPropagation()}
+                          onTouchEnd={e => e.stopPropagation()}
+                          onClick={e => e.stopPropagation()}
+                        >
+                          <TaskMenu
+                            taskId={task.id}
+                            handleCopyTaskId={handleCopyTaskId}
+                            handleDeleteTask={handleDeleteTask}
+                            onRename={() => handleStartRename(task.id)}
+                            onSelectMultiple={onSelectMultiple}
+                            isGroupChat={task.is_group_chat}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent side="left" className="max-w-xs">
+                    <p className="font-medium">{localTitles[task.id] ?? task.title}</p>
+                    {taskSourceLabel && <p className="text-xs">{taskSourceLabel}</p>}
+                    <p className="text-xs text-text-muted">
+                      {taskTypeLabel} · {formatTimeAgo(task.created_at)}
+                    </p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            </DraggableTaskItem>
+          )
+        })}
+      </div>
+      {canToggleVisibleTasks && !isCollapsed && (
+        <button
+          type="button"
+          data-testid="task-list-section-show-more"
+          onClick={() => setIsExpanded(current => !current)}
+          className="mt-0.5 flex h-11 min-w-[44px] w-full items-center gap-1 rounded-xl px-3 text-xs font-medium text-text-muted transition-colors hover:bg-hover hover:text-text-primary"
+        >
+          {isExpanded ? (
+            <ChevronUp className="h-3.5 w-3.5 flex-shrink-0" />
+          ) : (
+            <ChevronDown className="h-3.5 w-3.5 flex-shrink-0" />
+          )}
+          <span>{isExpanded ? t('common:tasks.show_less') : t('common:tasks.show_more')}</span>
+        </button>
+      )}
+
+      {/* Delete Confirmation Dialog */}
+      <AlertDialog
+        open={deleteConfirmTask !== null}
+        onOpenChange={open => !open && !isDeleting && setDeleteConfirmTask(null)}
+      >
+        <AlertDialogContent className="max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {deleteConfirmTask?.is_group_chat
+                ? t('common:tasks.leave_confirm_title')
+                : t('common:tasks.delete_confirm_title')}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleteConfirmTask?.is_group_chat
+                ? t('common:tasks.leave_confirm_message', { title: deleteConfirmTask?.title })
+                : t('common:tasks.delete_confirm_message', { title: deleteConfirmTask?.title })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isDeleting}>
+              {t('common:actions.cancel')}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleConfirmDelete}
+              disabled={isDeleting}
+              className="bg-error hover:bg-error/90 text-white"
+            >
+              {isDeleting ? (
+                <div className="flex items-center">
+                  <svg
+                    className="animate-spin -ml-1 mr-2 h-4 w-4"
+                    xmlns="http://www.w3.org/2000/svg"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                  >
+                    <circle
+                      className="opacity-25"
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      strokeWidth="4"
+                    />
+                    <path
+                      className="opacity-75"
+                      fill="currentColor"
+                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                    />
+                  </svg>
+                  {t('common:actions.deleting')}
+                </div>
+              ) : (
+                t('common:actions.delete')
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  )
+}

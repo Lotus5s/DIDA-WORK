@@ -1,0 +1,1009 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Task manager for Chat Shell.
+
+This module provides utilities for creating and managing tasks and subtasks
+for the chat functionality.
+"""
+
+import json as json_lib
+import logging
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+import app.stores.tasks as task_stores
+from app.core.constants import CLIENT_ORIGIN_FRONTEND
+from app.models.kind import Kind
+from app.models.project import Project
+from app.models.subtask import Subtask, SubtaskRole, SubtaskStatus
+from app.models.task import TaskResource
+from app.models.user import User
+from app.schemas.kind import Bot, Task, Team
+from app.services.chat.task_default_knowledge_bases import (
+    build_initial_task_knowledge_base_refs,
+)
+from app.services.chat.task_source_group import get_or_create_task_source_group
+from app.services.readers import KindType, kindReader
+from app.services.task_skill_selection import build_task_skill_labels
+from app.services.task_status import mark_task_completed
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TaskCreationResult:
+    """Result of task and subtask creation."""
+
+    task: TaskResource
+    user_subtask: Subtask
+    assistant_subtask: Optional[Subtask]
+    ai_triggered: bool
+    rag_prompt: Optional[str] = None
+
+
+@dataclass
+class TaskCreationParams:
+    """Parameters for task creation."""
+
+    message: str
+    title: Optional[str] = None
+    model_id: Optional[str] = None
+    force_override_bot_model: bool = False
+    force_override_bot_model_type: Optional[str] = (
+        None  # Model type: 'public', 'user', 'group'
+    )
+    # Model selection options, such as reasoning or speed.
+    model_options: Optional[Dict[str, Any]] = None
+    is_group_chat: bool = False
+    git_url: Optional[str] = None
+    git_repo: Optional[str] = None
+    git_repo_id: Optional[int] = None
+    git_domain: Optional[str] = None
+    branch_name: Optional[str] = None
+    task_type: Optional[str] = None  # 'chat', 'code', or 'knowledge'
+    knowledge_base_id: Optional[int] = (
+        None  # Knowledge base ID for knowledge type tasks
+    )
+    # Skill selection - backend determines preload vs download based on executor type
+    additional_skills: Optional[List[Dict[str, Any]]] = None
+    # Pipeline mode: specific bot_ids for the next stage
+    # When set, only create subtask for these bots instead of all team members
+    pipeline_bot_ids: Optional[List[int]] = None
+    # Pipeline mode: previous stage's bot_id for session management
+    # When set and different from current bot_id, a new session will be created
+    # This ensures each pipeline stage has independent context
+    previous_bot_id: Optional[int] = None
+    # Pipeline mode: context to pass from the previous stage to the new stage
+    pipeline_context_passing: Optional[str] = None
+    # Skip the normal running/pending status guard for controlled transitions
+    # such as pipeline stage confirmation. The caller must guarantee the task
+    # state has already been validated.
+    skip_status_check: bool = False
+    # Device ID for local device execution (saved at task creation to avoid race condition)
+    device_id: Optional[str] = None
+    # Project ID to associate task with
+    project_id: Optional[int] = None
+    # Task-specific execution workspace metadata.
+    execution_workspace: Optional[Dict[str, str]] = None
+    # Optional stable Task resource name for workflows requiring DB-level uniqueness.
+    task_name: Optional[str] = None
+    # Client surface that owns the task
+    client_origin: str = CLIENT_ORIGIN_FRONTEND
+    # Task source label (e.g. chat_shell, responses_api)
+    source: str = "chat_shell"
+    # Whether the task originates from API-compatible surfaces
+    is_api_call: bool = False
+    # Optional API key name for tracing/audit
+    api_key_name: Optional[str] = None
+    # Responses API only: replace binary MCP tool output with a placeholder
+    omit_mcp_binary_output: bool = False
+    # Whether executor runtime should be deleted immediately after completion
+    auto_delete_executor: Optional[str] = None
+    # Video generation parameters (user-selected at generation time)
+    # Used to save video_config to user subtask.result for display
+    generate_params: Optional[Dict[str, Any]] = None
+    # Message source metadata for user subtask persistence.
+    message_source: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        """Treat an explicit model_id as an override selection."""
+        if self.model_id:
+            self.force_override_bot_model = True
+
+
+def get_bot_ids_from_team(db: Session, team: Kind) -> List[int]:
+    """
+    Get bot IDs from team members.
+
+    Args:
+        db: Database session
+        team: Team Kind object
+
+    Returns:
+        List of bot IDs
+
+    Raises:
+        HTTPException: If no valid bots found in team
+    """
+    team_crd = Team.model_validate(team.json)
+    bot_ids = []
+
+    for member in team_crd.spec.members:
+        bot = kindReader.get_by_name_and_namespace(
+            db,
+            team.user_id,
+            KindType.BOT,
+            member.botRef.namespace,
+            member.botRef.name,
+        )
+        if bot:
+            bot_ids.append(bot.id)
+
+    if not bot_ids:
+        raise HTTPException(status_code=400, detail="No valid bots found in team")
+
+    return bot_ids
+
+
+def get_task_with_access_check(
+    db: Session, task_id: int, user_id: int
+) -> tuple[Optional[TaskResource], int]:
+    """
+    Get task with access check, supporting both ownership and group membership.
+
+    Args:
+        db: Database session
+        task_id: Task ID to retrieve
+        user_id: User ID requesting access
+
+    Returns:
+        Tuple of (task, subtask_user_id) where subtask_user_id is the user_id
+        to use for creating subtasks (owner's ID for group chats).
+        Returns (None, user_id) if task not found or access denied.
+    """
+    # First try to get task as owner
+    task = task_stores.task_store.get_task_by_states(
+        db,
+        task_id=task_id,
+        states=[TaskResource.STATE_ACTIVE],
+        kind="Task",
+        user_id=user_id,
+    )
+
+    if task:
+        return task, user_id
+
+    # Check if user is a group chat member using ResourceMember
+    if task_stores.task_access_store.is_member(db, task_id=task_id, user_id=user_id):
+        # User is a group member, get task without user_id check
+        task = task_stores.task_store.get_active_task(db, task_id=task_id)
+        if task:
+            # For group members, use task owner's user_id for subtasks
+            return task, task.user_id
+
+    # Task not found or access denied - log error and return None
+    logger.error(
+        "[get_task_with_access_check] Task not found or access denied: task_id=%d, user_id=%d",
+        task_id,
+        user_id,
+    )
+    return None, user_id
+
+
+def check_task_status(db: Session, task: TaskResource) -> None:
+    """
+    Check if task is in a valid state for new messages.
+
+    Args:
+        db: Database session
+        task: Task resource to check
+
+    Raises:
+        HTTPException: If task is still running or pending
+    """
+    task_crd = Task.model_validate(task.json)
+    if task_crd.status and task_crd.status.status in ("RUNNING", "PENDING"):
+        raise HTTPException(status_code=400, detail="Task is still running")
+
+
+def create_new_task(
+    db: Session,
+    user: User,
+    team: Kind,
+    params: TaskCreationParams,
+) -> TaskResource:
+    """
+    Create a new task with workspace.
+
+    Args:
+        db: Database session
+        user: User creating the task
+        team: Team Kind object
+        params: Task creation parameters
+
+    Returns:
+        Created TaskResource
+    """
+    if params.project_id:
+        project_exists = (
+            db.query(Project.id)
+            .filter(
+                Project.id == params.project_id,
+                Project.user_id == user.id,
+                Project.client_origin == params.client_origin,
+                Project.is_active == True,
+            )
+            .first()
+        )
+        if not project_exists:
+            raise HTTPException(status_code=404, detail="Project not found")
+    elif params.is_api_call:
+        params.project_id = get_or_create_task_source_group(
+            db, user_id=user.id, client_origin=params.client_origin, task_source="api"
+        ).id
+    elif (
+        params.message_source
+        and params.message_source.get("source") == "im"
+        and params.message_source.get("channel_type") == "dingtalk"
+    ):
+        params.project_id = get_or_create_task_source_group(
+            db,
+            user_id=user.id,
+            client_origin=params.client_origin,
+            task_source="dingtalk",
+        ).id
+
+    def workspace_factory(task_id_value: int) -> tuple[str, str, dict[str, Any]]:
+        workspace_name = f"workspace-{task_id_value}"
+        workspace_json = {
+            "kind": "Workspace",
+            "spec": {
+                "repository": {
+                    "gitUrl": params.git_url or "",
+                    "gitRepo": params.git_repo or "",
+                    "gitRepoId": params.git_repo_id or 0,
+                    "gitDomain": params.git_domain or "",
+                    "branchName": params.branch_name or "",
+                }
+            },
+            "status": {"state": "Available"},
+            "metadata": {"name": workspace_name, "namespace": "default"},
+            "apiVersion": "agent.wecode.io/v1",
+        }
+        return workspace_name, "default", workspace_json
+
+    task, _workspace = task_stores.task_store.create_pending_task_shell_with_workspace(
+        db,
+        user_id=user.id,
+        is_group_chat=params.is_group_chat,
+        client_origin=params.client_origin,
+        project_id=params.project_id or 0,
+        workspace_factory=workspace_factory,
+    )
+    new_task_id = task.id
+    if not new_task_id:
+        raise HTTPException(status_code=500, detail="Failed to create task ID")
+    workspace_name = f"workspace-{new_task_id}"
+
+    # Create task
+    # Use custom title if provided, otherwise generate from message
+    if params.title:
+        title = params.title
+    else:
+        title = (
+            params.message[:50] + "..." if len(params.message) > 50 else params.message
+        )
+
+    # Use provided task_type, or auto-detect based on git_url presence
+    task_type = params.task_type
+    if not task_type:
+        task_type = "code" if params.git_url else "chat"
+
+    logger.info(
+        f"[create_new_task] Creating task_json with is_group_chat={params.is_group_chat}"
+    )
+
+    knowledge_base_refs = build_initial_task_knowledge_base_refs(
+        db=db,
+        user=user,
+        team=team,
+        knowledge_base_id=params.knowledge_base_id,
+    )
+    task_execution = _build_task_execution(params.execution_workspace)
+    task_name = params.task_name or f"task-{new_task_id}"
+
+    task_json = {
+        "kind": "Task",
+        "spec": {
+            "title": title,
+            "prompt": params.message,
+            "teamRef": {
+                "name": team.name,
+                "namespace": team.namespace,
+                "user_id": team.user_id,
+            },
+            "workspaceRef": {"name": workspace_name, "namespace": "default"},
+            "is_group_chat": params.is_group_chat,
+            **({"device_id": params.device_id} if params.device_id else {}),
+            **(
+                {"knowledgeBaseRefs": knowledge_base_refs}
+                if knowledge_base_refs
+                else {}
+            ),
+            **({"execution": task_execution} if task_execution else {}),
+        },
+        "status": {
+            "state": "Available",
+            "status": "PENDING",
+            "progress": 0,
+            "result": None,
+            "errorMessage": "",
+            "createdAt": datetime.now().isoformat(),
+            "updatedAt": datetime.now().isoformat(),
+            "completedAt": None,
+        },
+        "metadata": {
+            "name": task_name,
+            "namespace": "default",
+            "labels": {
+                "type": "online",
+                "taskType": task_type,
+                "autoDeleteExecutor": params.auto_delete_executor or "false",
+                "source": params.source,
+                **({"projectId": str(params.project_id)} if params.project_id else {}),
+                **({"is_api_call": "true"} if params.is_api_call else {}),
+                **({"modelId": params.model_id} if params.model_id else {}),
+                **(
+                    {"forceOverrideBotModel": "true"}
+                    if params.force_override_bot_model
+                    else {}
+                ),
+                **(
+                    {"forceOverrideBotModelType": params.force_override_bot_model_type}
+                    if params.force_override_bot_model_type
+                    else {}
+                ),
+                **(
+                    {"modelOptions": json_lib.dumps(params.model_options)}
+                    if params.model_options
+                    else {}
+                ),
+                **(
+                    {"api_key_name": params.api_key_name} if params.api_key_name else {}
+                ),
+                **(
+                    {"omitMcpBinaryOutput": "true"}
+                    if params.omit_mcp_binary_output
+                    else {}
+                ),
+                **build_task_skill_labels(params.additional_skills),
+            },
+        },
+        "apiVersion": "agent.wecode.io/v1",
+    }
+
+    task_stores.task_store.update_fields(
+        db,
+        task=task,
+        name=task_name,
+        is_active=TaskResource.STATE_ACTIVE,
+        is_group_chat=params.is_group_chat,
+        client_origin=params.client_origin,
+        project_id=params.project_id or 0,
+    )
+    task_stores.task_store.update_json(db, task=task, payload=task_json)
+
+    logger.info(
+        f"[create_new_task] Created task {new_task_id} with task_json.spec.is_group_chat="
+        f"{task_json.get('spec', {}).get('is_group_chat', 'NOT_SET')}"
+    )
+
+    return task
+
+
+def _build_task_execution(
+    execution_workspace: Optional[Dict[str, str]],
+) -> Optional[Dict[str, Dict[str, str]]]:
+    """Build Task spec.execution from validated creation metadata."""
+
+    if not execution_workspace:
+        return None
+
+    source = str(execution_workspace.get("source") or "").strip()
+    path = str(execution_workspace.get("path") or "").strip()
+    if not source:
+        return None
+
+    workspace = {"source": source}
+    if path:
+        workspace["path"] = path
+    return {"workspace": workspace}
+
+
+def _requires_git_worktree_preparation(
+    task_id: Optional[int],
+    params: TaskCreationParams,
+) -> bool:
+    """Return whether a new chat task needs a task-scoped Git worktree."""
+
+    if task_id is not None:
+        return False
+    workspace = params.execution_workspace or {}
+    return str(workspace.get("source") or "").strip() == "git_worktree"
+
+
+async def _create_task_and_prepare_git_worktree(
+    db: Session,
+    user: User,
+    team: Kind,
+    params: TaskCreationParams,
+) -> TaskResource:
+    """Create the Task first, then create its deterministic Git worktree."""
+
+    if not params.project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Git worktree execution requires a project",
+        )
+
+    task = create_new_task(db, user, team, params)
+    try:
+        from app.services import project_service
+
+        execution_workspace = await project_service.prepare_git_worktree_for_task(
+            db=db,
+            user_id=user.id,
+            project_id=params.project_id,
+            client_origin=params.client_origin,
+            task_id=task.id,
+            base_branch=(params.execution_workspace or {}).get("branch"),
+        )
+        _update_task_execution_workspace(task, execution_workspace)
+        task_stores.task_store.update_json(db, task=task, payload=task.json)
+    except Exception:
+        db.rollback()
+        raise
+    return task
+
+
+def _update_task_execution_workspace(
+    task: TaskResource,
+    execution_workspace: dict[str, str],
+) -> None:
+    """Persist the prepared task execution workspace in the Task CRD."""
+
+    task_json = deepcopy(task.json) if isinstance(task.json, dict) else {}
+    spec = task_json.setdefault("spec", {})
+    execution = spec.setdefault("execution", {})
+    execution["workspace"] = {
+        "source": execution_workspace["source"],
+        "path": execution_workspace["path"],
+    }
+    task.json = task_json
+
+
+def build_user_subtask_result(
+    *,
+    video_config: Optional[Dict[str, Any]] = None,
+    image_config: Optional[Dict[str, Any]] = None,
+    message_source: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build persisted metadata for a user subtask result."""
+    result: Dict[str, Any] = {}
+    if video_config:
+        result["video_config"] = deepcopy(video_config)
+    if image_config:
+        result["image_config"] = deepcopy(image_config)
+    if message_source is not None:
+        result["source"] = deepcopy(message_source)
+    return result or None
+
+
+def create_user_subtask(
+    db: Session,
+    subtask_user_id: int,
+    sender_user_id: int,
+    task_id: int,
+    team_id: int,
+    bot_ids: List[int],
+    message: str,
+    next_message_id: int,
+    parent_id: int,
+    video_config: Optional[Dict[str, Any]] = None,
+    image_config: Optional[Dict[str, Any]] = None,
+    message_source: Optional[Dict[str, Any]] = None,
+) -> Subtask:
+    """
+    Create a USER subtask for the chat message.
+
+    Args:
+        db: Database session
+        subtask_user_id: User ID for subtask ownership (task owner for group chats)
+        sender_user_id: Actual sender's user ID
+        task_id: Task ID
+        team_id: Team ID
+        bot_ids: List of bot IDs
+        message: User message content
+        next_message_id: Message ID for this subtask
+        parent_id: Parent message ID
+        video_config: Optional video generation config (model, resolution, ratio, duration)
+        image_config: Optional image generation config (model, size)
+        message_source: Optional message source metadata
+
+    Returns:
+        Created Subtask
+    """
+    result = build_user_subtask_result(
+        video_config=video_config,
+        image_config=image_config,
+        message_source=message_source,
+    )
+
+    user_subtask = task_stores.subtask_store.create_user_subtask(
+        db,
+        user_id=subtask_user_id,
+        task_id=task_id,
+        team_id=team_id,
+        title="User message",
+        bot_ids=bot_ids,
+        prompt=message,
+        message_id=next_message_id,
+        parent_id=parent_id,
+        result=result,
+        sender_user_id=sender_user_id,
+    )
+    return user_subtask
+
+
+def create_assistant_subtask(
+    db: Session,
+    subtask_user_id: int,
+    task_id: int,
+    team_id: int,
+    bot_ids: List[int],
+    next_message_id: int,
+    parent_id: int,
+    prompt: str = "",
+) -> Subtask:
+    """
+    Create an ASSISTANT subtask for the AI response.
+
+    Args:
+        db: Database session
+        subtask_user_id: User ID for subtask ownership (task owner for group chats)
+        task_id: Task ID
+        team_id: Team ID
+        bot_ids: List of bot IDs
+        next_message_id: Message ID for this subtask
+        parent_id: Parent message ID (user message ID)
+
+    Returns:
+        Created Subtask
+    """
+    # Note: completed_at is set to a placeholder value because the DB column doesn't allow NULL
+    # It will be updated when the stream completes
+    assistant_subtask = task_stores.subtask_store.create_assistant_subtask(
+        db,
+        user_id=subtask_user_id,
+        task_id=task_id,
+        team_id=team_id,
+        title="Assistant response",
+        bot_ids=bot_ids,
+        message_id=next_message_id,
+        parent_id=parent_id,
+    )
+    return assistant_subtask
+
+
+def get_next_message_id(
+    db: Session, task_id: int, subtask_user_id: int
+) -> tuple[int, int]:
+    """
+    Get the next message ID and parent ID for a new subtask.
+
+    Args:
+        db: Database session
+        task_id: Task ID
+        subtask_user_id: User ID for subtask lookup
+
+    Returns:
+        Tuple of (next_message_id, parent_id)
+    """
+    existing_subtasks = task_stores.subtask_store.list_latest_by_task(
+        db,
+        task_id=task_id,
+        user_id=subtask_user_id,
+    )
+
+    next_message_id = 1
+    parent_id = 0
+    if existing_subtasks:
+        latest_subtask = existing_subtasks[-1]
+        next_message_id = latest_subtask.message_id + 1
+        parent_id = latest_subtask.message_id
+
+    return next_message_id, parent_id
+
+
+def get_existing_subtasks(
+    db: Session, task_id: int, subtask_user_id: int
+) -> List[Subtask]:
+    """
+    Get existing subtasks for a task.
+
+    Args:
+        db: Database session
+        task_id: Task ID
+        subtask_user_id: User ID for subtask lookup
+
+    Returns:
+        List of existing subtasks ordered by message_id descending
+    """
+    return task_stores.subtask_store.list_latest_by_task(
+        db,
+        task_id=task_id,
+        user_id=subtask_user_id,
+    )
+
+
+def update_task_timestamp(db: Session, task: TaskResource) -> None:
+    """
+    Update task timestamp for group chat messages.
+
+    Args:
+        db: Database session
+        task: Task resource to update
+    """
+    task.updated_at = datetime.now()
+    # Also update the JSON status.updatedAt for consistency
+    task_crd = Task.model_validate(task.json)
+    if task_crd.status:
+        task_crd.status.updatedAt = datetime.now()
+        task_stores.task_store.update_json(
+            db, task=task, payload=task_crd.model_dump(mode="json")
+        )
+
+
+async def initialize_redis_chat_history(
+    task_id: int, existing_subtasks: List[Subtask]
+) -> None:
+    """
+    Initialize Redis chat history from existing subtasks if needed.
+
+    This is crucial for shared tasks that were copied with historical messages.
+
+    Args:
+        task_id: Task ID
+        existing_subtasks: List of existing subtasks
+    """
+    if not existing_subtasks:
+        return
+
+    from app.services.chat.storage import session_manager
+
+    # Check if history exists in Redis
+    redis_history = await session_manager.get_chat_history(task_id)
+
+    # If Redis history is empty but we have subtasks, rebuild history from DB
+    if not redis_history:
+        logger.info(
+            f"Initializing chat history from DB for task {task_id} with {len(existing_subtasks)} existing subtasks"
+        )
+        history_messages = []
+
+        # Sort subtasks by message_id to ensure correct order
+        sorted_subtasks = sorted(existing_subtasks, key=lambda s: s.message_id)
+
+        for subtask in sorted_subtasks:
+            # Only include completed subtasks with results
+            if subtask.status == SubtaskStatus.COMPLETED:
+                if subtask.role == SubtaskRole.USER:
+                    # User message - use prompt field
+                    if subtask.prompt:
+                        history_messages.append(
+                            {"role": "user", "content": subtask.prompt}
+                        )
+                elif subtask.role == SubtaskRole.ASSISTANT:
+                    # Assistant message - use result.value field
+                    if subtask.result and isinstance(subtask.result, dict):
+                        content = subtask.result.get("value", "")
+                        if content:
+                            history_messages.append(
+                                {"role": "assistant", "content": content}
+                            )
+
+        # Save to Redis if we found any history
+        if history_messages:
+            await session_manager.save_chat_history(task_id, history_messages)
+            logger.info(
+                f"Initialized {len(history_messages)} messages in Redis for task {task_id}"
+            )
+
+
+async def create_task_and_subtasks(
+    db: Session,
+    user: User,
+    team: Kind,
+    message: str,
+    params: TaskCreationParams,
+    task_id: Optional[int] = None,
+    should_trigger_ai: bool = True,
+    rag_prompt: Optional[str] = None,
+    commit: bool = True,
+) -> TaskCreationResult:
+    """
+    Create or get task and create subtasks for chat.
+
+    For group chat members, subtasks are created with the task owner's user_id
+    to ensure proper message history and visibility across all members.
+
+    Args:
+        db: Database session
+        user: User creating the message
+        team: Team Kind object
+        message: Original user message (for storage in subtask.prompt)
+        params: Task creation parameters
+        task_id: Optional existing task ID
+        should_trigger_ai: If True, create both USER and ASSISTANT subtasks.
+                          If False, only create USER subtask (for group chat without @mention)
+        rag_prompt: Optional RAG-enhanced prompt (for AI inference, not stored in subtask)
+        commit: Commit the created Task and subtasks. Transactional callers may
+                defer the commit to atomically persist their own binding fields.
+
+    Returns:
+        TaskCreationResult with task and subtask information
+    """
+    from app.services.chat.trigger.group_chat import (
+        is_task_group_chat,
+        notify_group_members_task_updated,
+    )
+    from app.services.chat.trigger.lifecycle import prepare_execution_session
+
+    # Get bot IDs: use pipeline_bot_ids if provided (for pipeline stage confirmation),
+    # otherwise get all bot IDs from team members
+    if params.pipeline_bot_ids:
+        bot_ids = params.pipeline_bot_ids
+        logger.info(f"[create_task_and_subtasks] Using pipeline_bot_ids: {bot_ids}")
+    else:
+        bot_ids = get_bot_ids_from_team(db, team)
+
+    # Persist user-selected generation parameters for display and retry.
+    video_config = None
+    image_config = None
+    if params.task_type == "image" and params.generate_params:
+        image_config = {
+            "model": params.model_id or params.generate_params.get("model"),
+            "size": params.generate_params.get("size"),
+        }
+        logger.info(
+            f"[create_task_and_subtasks] Building image_config for task {task_id}: {image_config}"
+        )
+    elif params.generate_params and (
+        params.task_type == "video" or params.generate_params.get("model")
+    ):
+        video_config = {
+            "model": params.generate_params.get("model") or params.model_id,
+            "model_display_name": params.generate_params.get("model_display_name"),
+            "resolution": params.generate_params.get("resolution"),
+            "ratio": params.generate_params.get("ratio"),
+            "duration": params.generate_params.get("duration"),
+            "generation_mode_id": params.generate_params.get("generation_mode_id"),
+        }
+        logger.info(
+            f"[create_task_and_subtasks] Building video_config for task {task_id}: {video_config}"
+        )
+
+    prepared_task = None
+    if _requires_git_worktree_preparation(task_id, params):
+        prepared_task = await _create_task_and_prepare_git_worktree(
+            db=db,
+            user=user,
+            team=team,
+            params=params,
+        )
+
+    session = prepare_execution_session(
+        db=db,
+        user=user,
+        team=team,
+        input_text=message,
+        task_params=params,
+        task_id=task_id,
+        should_trigger_ai=should_trigger_ai,
+        bot_ids_override=bot_ids,
+        video_config=video_config,
+        image_config=image_config,
+        prepared_task=prepared_task,
+        commit=commit,
+    )
+    task = session.task
+    task_id = session.task_id
+    user_subtask = session.user_subtask
+    assistant_subtask = session.assistant_subtask
+    existing_subtasks = session.existing_subtasks
+
+    # Update task.updated_at for group chat messages (even without AI trigger)
+    if is_task_group_chat(task, params.is_group_chat):
+        update_task_timestamp(db, task)
+
+    # If no AI is triggered for a group chat message, mark task as COMPLETED so
+    # subsequent messages are not blocked by the "Task is still running" check.
+    # This covers new group tasks created without an @mention (no assistant subtask
+    # will ever update the status, leaving the task stuck at PENDING).
+    if not should_trigger_ai:
+        task_crd_status = (task.json or {}).get("status", {}).get("status")
+        if task_crd_status in ("PENDING", "RUNNING"):
+            mark_task_completed(task)
+            logger.info(
+                f"[create_task_and_subtasks] Marked task {task.id} as COMPLETED "
+                f"(no AI triggered for group chat message)"
+            )
+
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    db.refresh(task)
+    if assistant_subtask:
+        db.refresh(assistant_subtask)
+
+    # Store user message in long-term memory (fire-and-forget)
+    # WebSocket chat (web) respects user preference for memory
+    # This runs in background and doesn't block the main flow
+    import asyncio
+
+    from app.core.config import settings
+    from app.services.memory import (
+        build_context_messages,
+        get_memory_manager,
+        is_memory_enabled_for_user,
+    )
+
+    # Check user preference first
+    if not is_memory_enabled_for_user(user):
+        logger.info(
+            "[task_manager] Long-term memory disabled by user preference, skipping memory save: user_id=%d",
+            user.id,
+        )
+    else:
+        memory_manager = get_memory_manager()
+        if memory_manager.is_enabled:
+            task_crd = Task.model_validate(task.json)
+            workspace_id = (
+                f"{task_crd.spec.workspaceRef.namespace}/{task_crd.spec.workspaceRef.name}"
+                if task_crd.spec.workspaceRef
+                else None
+            )
+            is_group_chat = task_crd.spec.is_group_chat
+
+            # Build context messages using shared utility
+            context_messages = build_context_messages(
+                db=db,
+                existing_subtasks=existing_subtasks,
+                current_message=user_subtask.prompt,
+                current_user=user,
+                is_group_chat=is_group_chat,
+                context_limit=settings.MEMORY_CONTEXT_MESSAGES,
+            )
+
+            # Create task with proper exception handling
+            def _log_memory_task_exception(task_obj: asyncio.Task) -> None:
+                """Log exceptions from background memory storage task."""
+                try:
+                    exc = task_obj.exception()
+                    if exc is not None:
+                        logger.error(
+                            "[create_task_and_subtasks] Memory storage task failed for user %d, task %d, subtask %d: %s",
+                            user.id,
+                            task.id,
+                            user_subtask.id,
+                            exc,
+                            exc_info=exc,
+                        )
+                except asyncio.CancelledError:
+                    logger.info(
+                        "[create_task_and_subtasks] Memory storage task cancelled for user %d, task %d, subtask %d",
+                        user.id,
+                        task.id,
+                        user_subtask.id,
+                    )
+
+            memory_save_task = asyncio.create_task(
+                memory_manager.save_user_message_async(
+                    user_id=str(user.id),
+                    team_id=str(team.id),
+                    task_id=str(task.id),
+                    subtask_id=str(user_subtask.id),
+                    messages=context_messages,
+                    workspace_id=workspace_id,
+                    project_id=str(task.project_id) if task.project_id else None,
+                    is_group_chat=is_group_chat,
+                )
+            )
+            memory_save_task.add_done_callback(_log_memory_task_exception)
+            logger.info(
+                "[create_task_and_subtasks] Started background task to store memory for user %d, task %d, subtask %d",
+                user.id,
+                task.id,
+                user_subtask.id,
+            )
+
+    # Initialize Redis chat history from existing subtasks if needed
+    if existing_subtasks:
+        await initialize_redis_chat_history(task_id, existing_subtasks)
+
+    # Notify all group chat members about the new message via WebSocket
+    if is_task_group_chat(task, params.is_group_chat):
+        await notify_group_members_task_updated(db, task, user.id)
+
+    return TaskCreationResult(
+        task=task,
+        user_subtask=user_subtask,
+        assistant_subtask=assistant_subtask,
+        ai_triggered=should_trigger_ai,
+        rag_prompt=rag_prompt,
+    )
+
+
+async def create_chat_task(
+    db: Session,
+    user: User,
+    team: Kind,
+    message: str,
+    params: TaskCreationParams,
+    task_id: Optional[int] = None,
+    should_trigger_ai: bool = True,
+    rag_prompt: Optional[str] = None,
+    source: str = "web",
+    commit: bool = True,
+) -> TaskCreationResult:
+    """
+    Unified chat task creation entry point.
+
+    Uses unified execution architecture - all tasks go through the same path.
+    ExecutionDispatcher automatically routes based on shell_type configuration.
+
+    Args:
+        db: Database session
+        user: User creating the message
+        team: Team Kind object
+        message: User message
+        params: Task creation parameters
+        task_id: Optional existing task ID
+        should_trigger_ai: If True, create both USER and ASSISTANT subtasks
+        rag_prompt: Optional RAG-enhanced prompt for AI inference
+        source: Source of the task ("web", "flow", "api")
+
+    Returns:
+        TaskCreationResult with task and subtask information
+    """
+    # Log input parameters for debugging (DEBUG level to avoid log noise)
+    logger.debug(
+        f"[create_chat_task] Entry: team_id={team.id}, user_id={user.id}, "
+        f"task_id={task_id}, source={source}, should_trigger_ai={should_trigger_ai}"
+    )
+
+    # Unified path - use create_task_and_subtasks for all cases
+    # ExecutionDispatcher will automatically route based on shell_type
+    result = await create_task_and_subtasks(
+        db=db,
+        user=user,
+        team=team,
+        message=message,
+        params=params,
+        task_id=task_id,
+        should_trigger_ai=should_trigger_ai,
+        rag_prompt=rag_prompt,
+        commit=commit,
+    )
+    logger.debug(
+        f"[create_chat_task] Task created: task_id={result.task.id if result.task else None}"
+    )
+    return result

@@ -1,0 +1,132 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import tailwindcssAnimate from 'tailwindcss-animate'
+import collaborationPreset from '@wegent/collaboration/tailwind-preset'
+
+const withOpacity = variable => `rgb(var(${variable}) / <alpha-value>)`
+
+/** @type {import('tailwindcss').Config} */
+export default {
+  presets: [collaborationPreset],
+  darkMode: ['class', '[data-theme="dark"]'],
+  content: [
+    './src/pages/**/*.{js,ts,jsx,tsx,mdx}',
+    './src/features/**/*.{js,ts,jsx,tsx,mdx}',
+    './src/app/**/*.{js,ts,jsx,tsx,mdx}',
+    './src/components/**/*.{js,ts,jsx,tsx,mdx}',
+    '../packages/collaboration/src/**/*.{js,ts,jsx,tsx}',
+    '../packages/collaboration/node_modules/streamdown/dist/*.js',
+  ],
+  theme: {
+    extend: {
+      fontSize: {
+        xs: ['var(--text-xs)', { lineHeight: '1.333333' }],
+        sm: ['var(--text-sm)', { lineHeight: '1.428571' }],
+        base: ['var(--text-base)', { lineHeight: '1.5' }],
+        lg: ['var(--text-lg)', { lineHeight: '1.555556' }],
+        xl: ['var(--text-xl)', { lineHeight: '1.4' }],
+        '2xl': ['var(--text-2xl)', { lineHeight: '1.333333' }],
+        '3xl': ['var(--text-3xl)', { lineHeight: '1.2' }],
+        '4xl': ['var(--text-4xl)', { lineHeight: '1.111111' }],
+        'heading-sm': ['var(--text-heading-sm)', { lineHeight: '1.33' }],
+        'heading-md': ['var(--text-heading-md)', { lineHeight: '1.33' }],
+        'heading-lg': ['var(--text-heading-lg)', { lineHeight: '1.2' }],
+      },
+      // Keep the surface alias out of text colors: text-base is a font size.
+      backgroundColor: {
+        base: withOpacity('--color-bg-base'),
+      },
+      gradientColorStops: {
+        base: withOpacity('--color-bg-base'),
+      },
+      fontFamily: {
+        sans: ['var(--font-ui)'],
+        mono: [
+          'var(--font-code, ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace)',
+        ],
+      },
+      colors: {
+        // Custom project colors - Wegent Purple Theme
+        surface: withOpacity('--color-bg-surface'),
+        muted: withOpacity('--color-bg-muted'),
+        hover: 'rgb(var(--color-bg-hover))',
+        border: withOpacity('--color-border'),
+        'border-strong': withOpacity('--color-border-strong'),
+        'border-light': withOpacity('--color-border-light'),
+        'text-primary': withOpacity('--color-text-primary'),
+        'text-secondary': withOpacity('--color-text-secondary'),
+        'text-muted': withOpacity('--color-text-muted'),
+        'text-inverted': withOpacity('--color-text-inverted'),
+        primary: withOpacity('--color-primary'),
+        'primary-contrast': withOpacity('--color-primary-contrast'),
+        focus: withOpacity('--color-focus'),
+        success: withOpacity('--color-success'),
+        error: withOpacity('--color-error'),
+        warning: 'rgb(245 158 11)', // Tailwind orange-500
+        link: withOpacity('--color-link'),
+        'code-bg': withOpacity('--color-code-bg'),
+        popover: {
+          DEFAULT: withOpacity('--color-popover'),
+          foreground: withOpacity('--color-popover-foreground'),
+        },
+        tooltip: {
+          DEFAULT: withOpacity('--color-tooltip'),
+          foreground: withOpacity('--color-tooltip-foreground'),
+        },
+        // shadcn/ui standard color aliases (mapped to project colors)
+        background: withOpacity('--color-bg-base'),
+        foreground: withOpacity('--color-text-primary'),
+        card: {
+          DEFAULT: withOpacity('--color-bg-surface'),
+          foreground: withOpacity('--color-text-primary'),
+        },
+        secondary: {
+          DEFAULT: withOpacity('--color-bg-muted'),
+          foreground: withOpacity('--color-text-secondary'),
+        },
+        accent: {
+          DEFAULT: withOpacity('--color-bg-hover'),
+          foreground: withOpacity('--color-text-primary'),
+        },
+        destructive: {
+          DEFAULT: withOpacity('--color-error'),
+          foreground: withOpacity('--color-text-inverted'),
+        },
+        'muted-foreground': withOpacity('--color-text-muted'),
+        input: withOpacity('--color-border'),
+        ring: withOpacity('--color-focus-ring'),
+      },
+      borderRadius: {
+        DEFAULT: 'var(--radius-default, 0.25rem)',
+        lg: 'var(--radius)',
+        md: 'calc(var(--radius) - 2px)',
+        sm: 'var(--radius-sm, calc(var(--radius) - 4px))',
+        '2xl': '1rem',
+        '3xl': '1.5rem',
+      },
+      boxShadow: {
+        sidebar: 'var(--shadow-sidebar)',
+        popover: 'var(--shadow-popover)',
+        'card-hover': '0 4px 24px rgba(93, 94, 201, 0.06)',
+        'input-focus': '0 0 0 2px rgba(93, 94, 201, 0.2)',
+      },
+      keyframes: {
+        'accordion-down': {
+          from: { height: '0' },
+          to: { height: 'var(--radix-accordion-content-height)' },
+        },
+        'accordion-up': {
+          from: { height: 'var(--radix-accordion-content-height)' },
+          to: { height: '0' },
+        },
+      },
+      animation: {
+        'accordion-down': 'accordion-down 0.2s ease-out',
+        'accordion-up': 'accordion-up 0.2s ease-out',
+      },
+    },
+  },
+  plugins: [tailwindcssAnimate],
+}

@@ -1,0 +1,178 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Runtime Configuration API
+ *
+ * This endpoint provides runtime configuration values that can be changed
+ * without rebuilding the application. Environment variables are read at
+ * server startup time, not build time.
+ *
+ * Architecture:
+ * - RUNTIME_INTERNAL_API_URL: Used by Next.js server-side rewrites (next.config.js) to proxy to backend
+ * - RUNTIME_PUBLIC_API_URL: Public backend URL for generated examples such as curl commands
+ * - NEXT_PUBLIC_API_URL: Used by browser for direct API calls (empty = use '/api' proxy mode)
+ *
+ * Recommended setup (browser uses proxy):
+ * - Set RUNTIME_INTERNAL_API_URL=http://backend:8000 (for Next.js server to reach backend)
+ * - Set RUNTIME_PUBLIC_API_URL=https://your-public-backend-domain (for copied API examples)
+ * - Leave NEXT_PUBLIC_API_URL empty or unset (browser uses '/api' which is proxied)
+ *
+ * Direct mode setup (browser calls backend directly):
+ * - Set NEXT_PUBLIC_API_URL=http://backend:8000 (browser calls backend directly)
+ * - RUNTIME_INTERNAL_API_URL is not needed in this case
+ */
+
+import { NextResponse } from 'next/server'
+import { DEFAULT_BIND_GROUP_STEPS } from '@/lib/runtime-config'
+
+export async function GET() {
+  // Helper to parse boolean env vars
+  const parseBoolean = (value: string | undefined, defaultValue: boolean): boolean => {
+    if (value === undefined || value === '') return defaultValue
+    return value.toLowerCase() === 'true'
+  }
+
+  return NextResponse.json(
+    {
+      // Backend API URL for browser
+      // Empty string = use '/api' proxy mode (recommended)
+      // Full URL = browser calls backend directly (not recommended for same-network deployments)
+      apiUrl: process.env.NEXT_PUBLIC_API_URL || '',
+
+      // Public backend API URL for generated examples (curl, external integrations)
+      // Priority: explicit public URL > socket direct URL > legacy browser API URL
+      publicApiUrl:
+        process.env.RUNTIME_PUBLIC_API_URL ||
+        process.env.RUNTIME_SOCKET_DIRECT_URL ||
+        process.env.NEXT_PUBLIC_API_URL ||
+        '',
+
+      // Socket.IO direct URL - can be changed at runtime
+      // Priority: RUNTIME_SOCKET_DIRECT_URL > NEXT_PUBLIC_SOCKET_DIRECT_URL > empty
+      // Note: Empty string means use relative path through Next.js proxy
+      socketDirectUrl:
+        process.env.RUNTIME_SOCKET_DIRECT_URL || process.env.NEXT_PUBLIC_SOCKET_DIRECT_URL || '',
+
+      // Enable chat context feature (knowledge base background)
+      // Priority: RUNTIME_ENABLE_CHAT_CONTEXT > NEXT_PUBLIC_ENABLE_CHAT_CONTEXT > false
+      enableChatContext:
+        parseBoolean(process.env.RUNTIME_ENABLE_CHAT_CONTEXT, true) ||
+        parseBoolean(process.env.NEXT_PUBLIC_ENABLE_CHAT_CONTEXT, true),
+
+      // Login mode: 'password', 'oidc', or 'all'
+      // Priority: RUNTIME_LOGIN_MODE > NEXT_PUBLIC_LOGIN_MODE > 'all'
+      loginMode: process.env.RUNTIME_LOGIN_MODE || process.env.NEXT_PUBLIC_LOGIN_MODE || 'all',
+
+      // OIDC login button text
+      // Priority: RUNTIME_OIDC_LOGIN_TEXT > NEXT_PUBLIC_OIDC_LOGIN_TEXT > empty
+      oidcLoginText:
+        process.env.RUNTIME_OIDC_LOGIN_TEXT || process.env.NEXT_PUBLIC_OIDC_LOGIN_TEXT || '',
+
+      // Enable display quotas in frontend
+      // Priority: RUNTIME_ENABLE_DISPLAY_QUOTAS > NEXT_PUBLIC_FRONTEND_ENABLE_DISPLAY_QUOTAS > false
+      enableDisplayQuotas:
+        process.env.RUNTIME_ENABLE_DISPLAY_QUOTAS === 'enable' ||
+        process.env.NEXT_PUBLIC_FRONTEND_ENABLE_DISPLAY_QUOTAS === 'enable',
+
+      // Enable Wiki module
+      // Priority: RUNTIME_ENABLE_WIKI > NEXT_PUBLIC_ENABLE_WIKI > true (enabled by default)
+      enableWiki:
+        process.env.RUNTIME_ENABLE_WIKI !== 'false' &&
+        process.env.NEXT_PUBLIC_ENABLE_WIKI !== 'false',
+
+      // Enable Code Knowledge add repository feature
+      // Priority: RUNTIME_ENABLE_CODE_KNOWLEDGE_ADD_REPO > NEXT_PUBLIC_ENABLE_CODE_KNOWLEDGE_ADD_REPO > true (enabled by default)
+      enableCodeKnowledgeAddRepo:
+        process.env.RUNTIME_ENABLE_CODE_KNOWLEDGE_ADD_REPO !== 'false' &&
+        process.env.NEXT_PUBLIC_ENABLE_CODE_KNOWLEDGE_ADD_REPO !== 'false',
+
+      // Enable creating code wikis. The UI is available unless a deployment turns
+      // it off explicitly. The backend still enforces WIKI_CODE_WIKI_ENABLED, so
+      // this decides only whether the creation option is offered.
+      enableCodeWiki: process.env.RUNTIME_ENABLE_CODE_WIKI !== 'false',
+
+      // Enable workspace project UI
+      // Priority: RUNTIME_ENABLE_PROJECT_WORKSPACE > NEXT_PUBLIC_ENABLE_PROJECT_WORKSPACE > false
+      enableProjectWorkspace:
+        process.env.RUNTIME_ENABLE_PROJECT_WORKSPACE === 'true' ||
+        process.env.NEXT_PUBLIC_ENABLE_PROJECT_WORKSPACE === 'true',
+
+      // Workspace project user whitelist (comma-separated user_names)
+      // Empty means all users can access when enabled
+      // Priority: RUNTIME_PROJECT_WORKSPACE_WHITELIST > NEXT_PUBLIC_PROJECT_WORKSPACE_WHITELIST > ''
+      projectWorkspaceWhitelist:
+        process.env.RUNTIME_PROJECT_WORKSPACE_WHITELIST ||
+        process.env.NEXT_PUBLIC_PROJECT_WORKSPACE_WHITELIST ||
+        '',
+
+      // VSCode link template for deep linking
+      // Priority: RUNTIME_VSCODE_LINK_TEMPLATE > NEXT_PUBLIC_VSCODE_LINK_TEMPLATE > empty
+      vscodeLinkTemplate:
+        process.env.RUNTIME_VSCODE_LINK_TEMPLATE ||
+        process.env.NEXT_PUBLIC_VSCODE_LINK_TEMPLATE ||
+        '',
+
+      // Feedback URL for issue reporting
+      // Priority: RUNTIME_FEEDBACK_URL > NEXT_PUBLIC_FEEDBACK_URL > default
+      feedbackUrl:
+        process.env.RUNTIME_FEEDBACK_URL ||
+        process.env.NEXT_PUBLIC_FEEDBACK_URL ||
+        'https://github.com/wecode-ai/wegent/issues/new',
+
+      // Documentation URL
+      // Priority: RUNTIME_DOCS_URL > NEXT_PUBLIC_DOCS_URL > default
+      docsUrl:
+        process.env.RUNTIME_DOCS_URL ||
+        process.env.NEXT_PUBLIC_DOCS_URL ||
+        'https://wecode-ai.github.io/wegent-docs',
+
+      // OpenTelemetry configuration
+      // Priority: RUNTIME_OTEL_* > NEXT_PUBLIC_OTEL_* > defaults
+      otelEnabled:
+        parseBoolean(process.env.RUNTIME_OTEL_ENABLED, false) ||
+        parseBoolean(process.env.NEXT_PUBLIC_OTEL_ENABLED, false),
+
+      otelServiceName:
+        process.env.RUNTIME_OTEL_SERVICE_NAME ||
+        process.env.NEXT_PUBLIC_OTEL_SERVICE_NAME ||
+        'wegent-frontend',
+
+      otelCollectorEndpoint:
+        process.env.RUNTIME_OTEL_COLLECTOR_ENDPOINT ||
+        process.env.NEXT_PUBLIC_OTEL_COLLECTOR_ENDPOINT ||
+        'http://localhost:4318',
+
+      // Bind group description text (supports multiple paragraphs separated by |)
+      bindGroupDesc:
+        process.env.RUNTIME_BIND_GROUP_DESC || process.env.NEXT_PUBLIC_BIND_GROUP_DESC || '',
+
+      // Bind group steps configuration (JSON with variables and steps)
+      // Example: {"variables":{"botName":"机器人","featureName":"机器人"},"steps":[{"title":"添加{{botName}}","hint":"打开{{featureName}}..."}]}
+      bindGroupSteps:
+        process.env.RUNTIME_BIND_GROUP_STEPS ||
+        process.env.NEXT_PUBLIC_BIND_GROUP_STEPS ||
+        DEFAULT_BIND_GROUP_STEPS,
+
+      // Application version (injected at Docker build time)
+      // Priority: RUNTIME_APP_VERSION > NEXT_PUBLIC_APP_VERSION > 'dev'
+      appVersion: process.env.RUNTIME_APP_VERSION || process.env.NEXT_PUBLIC_APP_VERSION || 'dev',
+
+      // External Wework URL for coding entry points.
+      // Runtime-only by design; no NEXT_PUBLIC_* fallback.
+      weworkCodeUrl: process.env.RUNTIME_WEWORK_CODE_URL || '',
+
+      // Public model selection guide URL, configured at runtime.
+      modelSelectionGuideUrl: process.env.WEGENT_MODEL_SELECTION_GUIDE_URL?.trim() || '',
+    },
+    {
+      headers: {
+        'Cache-Control':
+          process.env.NODE_ENV === 'development'
+            ? 'no-store'
+            : 'max-age=60, stale-while-revalidate=300',
+      },
+    }
+  )
+}

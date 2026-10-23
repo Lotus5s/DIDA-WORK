@@ -1,0 +1,421 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Schemas for shared cloud projects and local execution bindings."""
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+from app.core.provider_credentials import mask_provider_config
+from app.schemas.base_role import BaseRole
+from app.schemas.issue_workflow import ProjectWorkflowDefinition
+from app.schemas.tagging import MAX_TAGS_PER_ITEM, normalize_tags
+from app.schemas.types import SnowflakeId
+from app.schemas.workspace import (
+    ExecutionEnvironmentConfig,
+    ExecutionEnvironmentDefinition,
+    WorkspaceNavigationContextResponse,
+)
+
+TaskProvider = Literal["local", "github", "gitlab", "dingtalk_aitable"]
+ProjectVisibility = Literal["private", "public"]
+PublicAccessRole = Literal["Viewer"]
+
+
+class PublicAccessGrant(BaseModel):
+    role: PublicAccessRole = "Viewer"
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def read_legacy_public_role(cls, value):
+        return "Viewer" if value == "Developer" else value
+
+
+def _normalize_repository(task_provider: str, repository: str) -> str:
+    normalized = repository.strip().strip("/")
+    if task_provider == "gitlab":
+        normalized = normalized.split("/-/", 1)[0]
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return normalized
+
+
+def normalize_provider_config(
+    task_provider: str, provider_config: dict[str, object]
+) -> dict[str, object]:
+    config = dict(provider_config)
+    if task_provider == "local":
+        return {}
+    if task_provider == "dingtalk_aitable":
+        if "credential" in config:
+            raise ValueError("encrypted provider credentials cannot be supplied")
+        for key in ("base_id", "table_id"):
+            value = config.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"provider_config.{key} is required")
+            config[key] = value.strip()
+        if "token" in config:
+            raise ValueError("DingTalk authentication is managed by the local Executor")
+        mapping = config.get("board_mapping")
+        if mapping is not None and not isinstance(mapping, dict):
+            raise ValueError("provider_config.board_mapping must be an object")
+        return config
+    repository = config.get("repository")
+    if not isinstance(repository, str) or not repository.strip():
+        raise ValueError("provider_config.repository is required")
+    normalized_repository = _normalize_repository(task_provider, repository)
+    if not normalized_repository:
+        raise ValueError("provider_config.repository is required")
+    config["repository"] = normalized_repository
+    if "credential" in config:
+        raise ValueError("encrypted provider credentials cannot be supplied")
+    token = config.get("token")
+    if token is not None and not isinstance(token, str):
+        raise ValueError("provider token must be a string")
+    if isinstance(token, str):
+        config["token"] = token.strip()
+    return config
+
+
+class CloudProjectCreate(BaseModel):
+    workspace_id: SnowflakeId | None = None
+    membership_mode: Literal["inherit", "restricted"] = "inherit"
+    project_key: str | None = Field(
+        default=None, min_length=2, max_length=16, pattern=r"^[A-Za-z0-9]+$"
+    )
+    name: str = Field(min_length=1, max_length=100)
+    description: str = ""
+    task_provider: TaskProvider = "local"
+    provider_config: dict[str, object] = Field(default_factory=dict)
+    visibility: ProjectVisibility = "private"
+    public_access: PublicAccessGrant | None = None
+    default_issue_security: Literal["open", "related"] = "open"
+
+    @field_validator("project_key")
+    @classmethod
+    def normalize_project_key(cls, value: str | None) -> str | None:
+        return value.upper() if value else None
+
+    @model_validator(mode="after")
+    def validate_provider(self) -> "CloudProjectCreate":
+        self.provider_config = normalize_provider_config(
+            self.task_provider, self.provider_config
+        )
+        if self.visibility == "private" and self.public_access is not None:
+            raise ValueError("Private projects cannot grant public access")
+        if self.visibility == "public" and self.public_access is None:
+            self.public_access = PublicAccessGrant()
+        if (
+            self.task_provider == "dingtalk_aitable"
+            and self.default_issue_security != "open"
+        ):
+            raise ValueError("DingTalk table records use DingTalk permissions")
+        return self
+
+
+class CloudProjectCardDisplay(BaseModel):
+    show_assignee: bool = True
+    show_priority: bool = True
+    show_tags: bool = True
+    show_date: bool = True
+
+
+class CloudProjectBoardStatus(BaseModel):
+    id: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=40)
+    color: Literal["gray", "blue", "orange", "purple", "green", "red"] = "gray"
+
+
+def default_board_statuses() -> list[CloudProjectBoardStatus]:
+    return [
+        CloudProjectBoardStatus(id="inbox", name="收集箱", color="gray"),
+        CloudProjectBoardStatus(id="pending", name="待开始", color="blue"),
+        CloudProjectBoardStatus(id="in_progress", name="进行中", color="orange"),
+        CloudProjectBoardStatus(id="in_review", name="待确认", color="purple"),
+        CloudProjectBoardStatus(id="completed", name="已完成", color="green"),
+    ]
+
+
+class CloudProjectScheduleViewConfig(BaseModel):
+    status_filter: str | None = Field(default=None, max_length=32)
+    assignee_filter: str | None = Field(default=None, max_length=128)
+    tag_filter: str | None = Field(default=None, max_length=80)
+    group_by: Literal["none", "status", "priority", "assignee", "tag"] = "none"
+    sort_by: Literal["start_asc", "due_asc", "updated_desc", "priority_desc"] = (
+        "start_asc"
+    )
+
+
+class CloudProjectBoardConfig(BaseModel):
+    group_by: Literal["status", "priority", "assignee", "tag"] = "status"
+    statuses: list[CloudProjectBoardStatus] = Field(
+        default_factory=default_board_statuses
+    )
+    processing_start_status_id: str | None = None
+    schedule_view: CloudProjectScheduleViewConfig = Field(
+        default_factory=CloudProjectScheduleViewConfig
+    )
+
+    @model_validator(mode="after")
+    def validate_statuses(self) -> "CloudProjectBoardConfig":
+        ids = [item.id for item in self.statuses]
+        if len(ids) != len(set(ids)):
+            raise ValueError("board status ids must be unique")
+        if len(self.statuses) > 50:
+            raise ValueError("board supports at most 50 statuses")
+        if not ids:
+            if self.processing_start_status_id is not None:
+                raise ValueError(
+                    "processing_start_status_id requires at least one board status"
+                )
+            return self
+        if self.processing_start_status_id is None:
+            self.processing_start_status_id = ids[1] if len(ids) > 1 else ids[0]
+        elif self.processing_start_status_id not in ids:
+            raise ValueError("processing_start_status_id must reference a board status")
+        return self
+
+
+class CloudProjectAiAutomation(BaseModel):
+    auto_retry_on_failure: bool = False
+    max_retry_count: int = Field(default=1, ge=1, le=10)
+
+
+PullRequestAutoRepairStatus = Literal[
+    "checks_failed",
+    "merge_conflict",
+    "merge_queue_failed",
+    "merge_queue_timed_out",
+    "merge_queue_conflicting",
+]
+
+
+class CloudProjectPullRequestAutomation(BaseModel):
+    enabled: bool = False
+    statuses: list[PullRequestAutoRepairStatus] = Field(
+        default_factory=lambda: [
+            "checks_failed",
+            "merge_conflict",
+            "merge_queue_failed",
+            "merge_queue_timed_out",
+            "merge_queue_conflicting",
+        ],
+        max_length=5,
+    )
+    prompt: str = Field(default="", max_length=10_000)
+
+    @field_validator("statuses")
+    @classmethod
+    def validate_statuses(
+        cls, value: list[PullRequestAutoRepairStatus]
+    ) -> list[PullRequestAutoRepairStatus]:
+        return list(dict.fromkeys(value))
+
+
+class CloudProjectUpdate(BaseModel):
+    membership_mode: Literal["inherit", "restricted"] | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = None
+    tags: list[str] | None = Field(default=None, max_length=MAX_TAGS_PER_ITEM)
+    provider_config: dict[str, object] | None = None
+    visibility: ProjectVisibility | None = None
+    public_access: PublicAccessGrant | None = None
+    default_issue_security: Literal["open", "related"] | None = None
+    card_display: CloudProjectCardDisplay | None = None
+    board_config: CloudProjectBoardConfig | None = None
+    ai_automation: CloudProjectAiAutomation | None = None
+    pull_request_automation: CloudProjectPullRequestAutomation | None = None
+    workflow_definition: ProjectWorkflowDefinition | None = None
+    execution_environment: ExecutionEnvironmentDefinition | None = None
+    version: int = Field(ge=1)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def normalize_tag_list(cls, value: object) -> object:
+        return None if value is None else normalize_tags(value)
+
+    @model_validator(mode="after")
+    def validate_provider(self) -> "CloudProjectUpdate":
+        if self.visibility == "private" and self.public_access is not None:
+            raise ValueError("Private projects cannot grant public access")
+        if self.provider_config is not None:
+            # The provider kind is immutable. The service validates this config
+            # against the project's current provider before persisting it.
+            if "credential" in self.provider_config:
+                raise ValueError("encrypted provider credentials cannot be supplied")
+            token = self.provider_config.get("token")
+            if token is not None and not isinstance(token, str):
+                raise ValueError("provider token must be a string")
+            if isinstance(token, str):
+                self.provider_config["token"] = token.strip()
+        return self
+
+
+class CloudProjectResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: SnowflakeId
+    workspace_id: SnowflakeId | None = None
+    membership_mode: Literal["inherit", "restricted"] = "inherit"
+    workspace_access_role: BaseRole | None = None
+    permission_sources: list[dict] = Field(default_factory=list)
+    workspace_context: WorkspaceNavigationContextResponse | None = None
+    public_id: str
+    project_key: str
+    name: str
+    description: str
+    project_store: Literal["backend"] = "backend"
+    # Responses must remain forward-compatible with provider kinds written by
+    # newer services. Request schemas stay strict so this service only creates
+    # provider kinds it can operate.
+    task_provider: str = "local"
+    provider_config: dict[str, object] = Field(default_factory=dict)
+    card_display: CloudProjectCardDisplay = Field(
+        default_factory=CloudProjectCardDisplay
+    )
+    board_config: CloudProjectBoardConfig = Field(
+        default_factory=CloudProjectBoardConfig
+    )
+    ai_automation: CloudProjectAiAutomation = Field(
+        default_factory=CloudProjectAiAutomation
+    )
+    pull_request_automation: CloudProjectPullRequestAutomation = Field(
+        default_factory=CloudProjectPullRequestAutomation
+    )
+    workflow_definition: ProjectWorkflowDefinition = Field(
+        default_factory=ProjectWorkflowDefinition
+    )
+    workflow_automation_id: str | None = None
+    execution_environment: ExecutionEnvironmentConfig = Field(
+        default_factory=ExecutionEnvironmentConfig
+    )
+    visibility: ProjectVisibility = "private"
+    public_access: PublicAccessGrant | None = None
+    default_issue_security: Literal["open", "related"] = "open"
+    created_by_user_id: int
+    current_user_id: int = 0
+    current_user_name: str = ""
+    access_role: BaseRole = BaseRole.Viewer
+    status: str
+    tags: list[str] = []
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_tags(cls, value: object) -> object:
+        """Fill project routing fields from the metadata JSON."""
+        if isinstance(value, dict):
+            metadata = value.get("metadata_json")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            return {
+                **value,
+                "project_store": "backend",
+                "task_provider": metadata.get("task_provider", "local"),
+                "provider_config": mask_provider_config(
+                    metadata.get("provider_config", {})
+                ),
+                "card_display": metadata.get("card_display", {}),
+                "board_config": metadata.get("board_config", {}),
+                "ai_automation": metadata.get("ai_automation", {}),
+                "pull_request_automation": metadata.get("pull_request_automation", {}),
+                "workflow_definition": metadata.get("workflow_definition", {}),
+                "workflow_automation_id": metadata.get("workflow_automation_id"),
+                "execution_environment": metadata.get("execution_environment", {}),
+                "visibility": value.get("visibility", "private"),
+                "public_access": value.get("public_access"),
+                "default_issue_security": metadata.get(
+                    "default_issue_security", "open"
+                ),
+                "tags": normalize_tags(metadata.get("tags")),
+            }
+        return value
+
+
+class CloudProjectListResponse(BaseModel):
+    items: list[CloudProjectResponse]
+
+
+class CloudProjectMemberCreate(BaseModel):
+    user_id: int = Field(ge=1)
+    role: BaseRole = BaseRole.Developer
+    capability_description: str = Field(default="", max_length=2_000)
+
+    @field_validator("role")
+    @classmethod
+    def reject_owner(cls, value: BaseRole) -> BaseRole:
+        from app.schemas.base_role import COLLABORATION_ROLE_ALIASES
+
+        value = BaseRole(COLLABORATION_ROLE_ALIASES.get(value.value, value.value))
+        if value not in {BaseRole.Maintainer, BaseRole.Developer, BaseRole.Viewer}:
+            raise ValueError("Only project member roles may be assigned")
+        return value
+
+
+class CloudProjectMemberUpdate(BaseModel):
+    role: BaseRole | None = None
+    capability_description: str | None = Field(default=None, max_length=2_000)
+
+    @field_validator("role")
+    @classmethod
+    def reject_owner(cls, value: BaseRole | None) -> BaseRole | None:
+        from app.schemas.base_role import COLLABORATION_ROLE_ALIASES
+
+        if value is not None:
+            value = BaseRole(COLLABORATION_ROLE_ALIASES.get(value.value, value.value))
+        if value is not None and value not in {
+            BaseRole.Maintainer,
+            BaseRole.Developer,
+            BaseRole.Viewer,
+        }:
+            raise ValueError("Only project member roles may be assigned")
+        return value
+
+    @model_validator(mode="after")
+    def require_change(self) -> "CloudProjectMemberUpdate":
+        if self.role is None and self.capability_description is None:
+            raise ValueError("Member update must change role or capability description")
+        return self
+
+
+class CloudProjectMemberResponse(BaseModel):
+    id: int
+    user_id: int
+    user_name: str
+    email: str | None
+    role: BaseRole
+    direct_role: BaseRole | None = None
+    inherited_role: BaseRole | None = None
+    permission_sources: list[dict] = Field(default_factory=list)
+    inherited_from_workspace_id: SnowflakeId | None = None
+    can_be_assignee: bool = False
+    capability_description: str = ""
+
+
+class CollaborationMessageImportTarget(BaseModel):
+    kind: Literal["new_issue", "existing_issue"]
+    issue_id: str | None = Field(default=None, max_length=64)
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> "CollaborationMessageImportTarget":
+        if self.kind == "existing_issue" and not self.issue_id:
+            raise ValueError("issue_id is required for an existing Issue")
+        return self
+
+
+class CollaborationMessageImportCreate(BaseModel):
+    source_task_id: int = Field(ge=1)
+    subtask_ids: list[int] | None = None
+    target: CollaborationMessageImportTarget
+    note: str | None = Field(default=None, max_length=1_000)

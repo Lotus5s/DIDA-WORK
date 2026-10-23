@@ -1,0 +1,19 @@
+{
+  "name": "wegent-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "lint": "pnpm -r --if-present lint",
+    "prepare:builtin-plugins": "node scripts/sync-builtin-plugins.mjs",
+    "test": "pnpm -r --if-present test"
+  },
+  "devDependencies": {
+    "prettier": "^3.8.4",
+    "typescript": "^5.7.3",
+    "vitest": "^4.1.7"
+  }
+}

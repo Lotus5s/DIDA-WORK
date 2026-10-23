@@ -1,0 +1,165 @@
+import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { Button } from '@/components/ui/button'
+import { useEscapeKey } from '@/hooks/useEscapeKey'
+import { useTranslation } from '@/hooks/useTranslation'
+import { isDesktopRuntime } from '@/lib/runtime-environment'
+import { disposeDesktopListener } from '@/desktop/disposeDesktopListener'
+import {
+  cancelMainWindowClose,
+  closeMainWindowToTray,
+  installRuntimeTaskCloseGuard,
+  quitApplication,
+} from '@/desktop/runtimeTaskCloseGuard'
+
+export function RuntimeTaskCloseGuard() {
+  const { t } = useTranslation('common')
+  const [closeDialogOpen, setCloseDialogOpen] = useState(false)
+  const [closing, setClosing] = useState(false)
+
+  useEffect(() => {
+    if (!isDesktopRuntime()) return undefined
+
+    let unlisten: (() => void) | undefined
+    let cancelled = false
+
+    void installRuntimeTaskCloseGuard(() => {
+      setClosing(false)
+      setCloseDialogOpen(true)
+    })
+      .then(nextUnlisten => {
+        if (cancelled) {
+          disposeDesktopListener(nextUnlisten, 'runtime task close guard')
+          return
+        }
+        unlisten = nextUnlisten
+      })
+      .catch(error => {
+        console.error('Failed to install runtime task close guard:', error)
+      })
+
+    return () => {
+      cancelled = true
+      if (unlisten) disposeDesktopListener(unlisten, 'runtime task close guard')
+    }
+  }, [])
+
+  return (
+    <RuntimeTaskCloseConfirmDialog
+      open={closeDialogOpen}
+      closing={closing}
+      title={t('workbench.close_to_tray_hint_title')}
+      description={t('workbench.close_to_tray_hint_description')}
+      quitLabel={t('workbench.close_to_tray_hint_quit_action')}
+      backgroundLabel={t('workbench.close_to_tray_hint_background_action')}
+      onDismiss={async () => {
+        if (closing) return
+        setCloseDialogOpen(false)
+        try {
+          await cancelMainWindowClose()
+        } catch (error) {
+          console.error('Failed to cancel close-to-tray confirmation:', error)
+        }
+      }}
+      onQuit={async () => {
+        setClosing(true)
+        setCloseDialogOpen(false)
+        try {
+          await quitApplication()
+        } catch (error) {
+          console.error('Failed to quit from close-to-tray confirmation:', error)
+          setCloseDialogOpen(true)
+          setClosing(false)
+        }
+      }}
+      onKeepInBackground={async () => {
+        setClosing(true)
+        setCloseDialogOpen(false)
+        try {
+          await closeMainWindowToTray()
+        } catch (error) {
+          console.error('Failed to hide window after close-to-tray hint confirmation:', error)
+          setCloseDialogOpen(true)
+          setClosing(false)
+        }
+      }}
+    />
+  )
+}
+
+interface RuntimeTaskCloseConfirmDialogProps {
+  open: boolean
+  closing: boolean
+  title: string
+  description: string
+  quitLabel: string
+  backgroundLabel: string
+  onDismiss: () => Promise<void>
+  onQuit: () => Promise<void>
+  onKeepInBackground: () => Promise<void>
+}
+
+function RuntimeTaskCloseConfirmDialog({
+  open,
+  closing,
+  title,
+  description,
+  quitLabel,
+  backgroundLabel,
+  onDismiss,
+  onQuit,
+  onKeepInBackground,
+}: RuntimeTaskCloseConfirmDialogProps) {
+  useEscapeKey(() => {
+    if (!closing) void onDismiss()
+  }, open && !closing)
+
+  if (!open) return null
+
+  return createPortal(
+    <div
+      data-testid="runtime-task-close-confirm-overlay"
+      className="fixed inset-0 z-modal flex items-center justify-center bg-black/35 px-4"
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="runtime-task-close-confirm-title"
+        className="w-full max-w-[420px] rounded-lg border border-border bg-base p-5 shadow-2xl"
+      >
+        <h2
+          id="runtime-task-close-confirm-title"
+          className="text-base font-semibold text-text-primary"
+        >
+          {title}
+        </h2>
+        <p className="mt-2 text-sm leading-[18px] text-text-secondary">{description}</p>
+        <div className="mt-6 flex justify-end gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            data-testid="runtime-task-close-cancel-button"
+            disabled={closing}
+            onClick={() => {
+              void onQuit()
+            }}
+          >
+            {quitLabel}
+          </Button>
+          <Button
+            type="button"
+            variant="primary"
+            data-testid="runtime-task-close-confirm-button"
+            disabled={closing}
+            onClick={() => {
+              void onKeepInBackground()
+            }}
+          >
+            {backgroundLabel}
+          </Button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  )
+}

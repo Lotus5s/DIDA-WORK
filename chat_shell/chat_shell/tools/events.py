@@ -1,0 +1,801 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tool event handling for Chat Service.
+
+This module provides handlers for tool start/end events during streaming,
+emitting tool events via unified ResponsesAPIEmitter.
+"""
+
+import asyncio
+import json
+import logging
+import time
+from collections.abc import Coroutine
+from typing import Any, Callable
+
+from chat_shell.services.streaming.core import should_display_tool_details
+from chat_shell.tools.deferred_input import (
+    DeferredUserInputExit,
+    is_deferred_user_input_result,
+)
+from shared.models import ResponsesAPIEmitter, create_card_block
+from shared.telemetry.context.large_data import log_large_attribute
+from shared.telemetry.decorators import add_span_event
+from shared.utils.tool_arguments import sanitize_tool_arguments
+
+logger = logging.getLogger(__name__)
+
+
+def _log_task_error(task: asyncio.Task[Any]) -> None:
+    """Log exceptions from fire-and-forget tasks."""
+    if not task.cancelled() and task.exception() is not None:
+        logger.exception(
+            "[TOOL_EVENT] Async event task failed: %s",
+            task.exception(),
+            exc_info=task.exception(),
+        )
+
+
+def _normalize_protocol_type(tool_protocol: str | None) -> str:
+    if tool_protocol in {"mcp", "mcp_call"}:
+        return "mcp_call"
+    if tool_protocol == "shell_call":
+        return "shell_call"
+    return "function_call"
+
+
+def _infer_tool_completion(
+    tool_protocol: str, serializable_output: Any
+) -> tuple[str, str | None]:
+    """Infer tool completion status from tool output.
+
+    MCP wrappers currently swallow exceptions and return formatted error strings.
+    Convert those back into a failed terminal state so `v1/responses` can emit
+    `response.mcp_call.failed` instead of always reporting completed.
+    """
+    if tool_protocol != "mcp_call":
+        return ("completed", None)
+
+    output_text = (
+        serializable_output
+        if isinstance(serializable_output, str)
+        else str(serializable_output)
+    )
+    if "MCP tool '" in output_text and (
+        " timed out after " in output_text or " failed: " in output_text
+    ):
+        return ("failed", output_text)
+    return ("completed", None)
+
+
+class ToolEventHandler:
+    """Handle tool events and track their asynchronous emitter tasks."""
+
+    def __init__(
+        self,
+        state: Any,
+        emitter: ResponsesAPIEmitter,
+        agent_builder: Any,
+    ) -> None:
+        self._state = state
+        self._emitter = emitter
+        self._agent_builder = agent_builder
+        self._pending_tasks: set[asyncio.Task[Any]] = set()
+
+    def __call__(self, kind: str, event_data: dict[str, Any]) -> None:
+        """Handle tool events and emit tool data via ResponsesAPIEmitter."""
+        tool_name = event_data.get("name", "unknown")
+        run_id = event_data.get("run_id", "")
+
+        if kind == "tool_start":
+            _handle_tool_start(
+                self._state,
+                self._emitter,
+                self._agent_builder,
+                tool_name,
+                run_id,
+                event_data,
+                self._run_async,
+            )
+        elif kind == "tool_end":
+            _handle_tool_end(
+                self._state,
+                self._emitter,
+                self._agent_builder,
+                tool_name,
+                run_id,
+                event_data,
+                self._run_async,
+            )
+        elif kind == "tool_argument_start":
+            _handle_tool_argument_start(
+                self._emitter,
+                event_data,
+                self._run_async,
+            )
+        elif kind == "tool_argument_delta":
+            _handle_tool_argument_delta(
+                self._emitter,
+                event_data,
+                self._run_async,
+            )
+        elif kind == "tool_argument_done":
+            _handle_tool_argument_done(
+                self._emitter,
+                event_data,
+                self._run_async,
+            )
+
+    def _run_async(self, coro: Coroutine[Any, Any, Any]) -> None:
+        """Schedule an emitter coroutine and retain it until completion."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(coro)
+            return
+
+        task = loop.create_task(coro)
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: asyncio.Task[Any]) -> None:
+        self._pending_tasks.discard(task)
+        _log_task_error(task)
+
+    async def wait_pending(self) -> None:
+        """Wait until every scheduled emitter task has finished."""
+        while self._pending_tasks:
+            await asyncio.gather(
+                *tuple(self._pending_tasks),
+                return_exceptions=True,
+            )
+
+
+def create_tool_event_handler(
+    state: Any,
+    emitter: ResponsesAPIEmitter,
+    agent_builder: Any,
+) -> ToolEventHandler:
+    """Create a tracked tool event handler."""
+    return ToolEventHandler(state, emitter, agent_builder)
+
+
+def _handle_tool_start(
+    state: Any,
+    emitter: ResponsesAPIEmitter,
+    agent_builder: Any,
+    tool_name: str,
+    run_id: str,
+    event_data: dict[str, Any],
+    run_async: Callable[[Coroutine[Any, Any, Any]], None],
+) -> None:
+    """Handle tool start event."""
+    logger.info(
+        "[TOOL_START] _handle_tool_start called: tool_name=%s, run_id=%s",
+        tool_name,
+        run_id,
+    )
+    # Extract tool input for better display
+    tool_input = event_data.get("data", {}).get("input", {})
+
+    # Convert input to JSON-serializable format
+    serializable_input = _make_serializable(tool_input)
+
+    # Generate tool_use_id (prefer from event, fallback to run_id + timestamp)
+    tool_use_id = event_data.get("tool_use_id")
+    if not tool_use_id:
+        # Fallback: generate unique ID from run_id + timestamp
+        tool_use_id = f"{run_id}-{int(time.time() * 1000)}"
+
+    # Store tool_use_id mapping for tool_end to use the same ID
+    if not hasattr(state, "_tool_use_id_map"):
+        state._tool_use_id_map = {}
+    state._tool_use_id_map[run_id] = tool_use_id
+
+    # Add OpenTelemetry span event for tool start
+    log_large_attribute(
+        "tool.input",
+        serializable_input,
+        max_attr_length=100,
+        max_event_length=5000,
+        event_name=f"tool_start:{tool_name}",
+        extra_attributes={
+            "tool.name": tool_name,
+            "tool.run_id": run_id,
+            "tool.tool_use_id": tool_use_id,
+        },
+    )
+
+    logger.info(
+        f"[TOOL_START] {tool_name} (run_id={run_id}, tool_use_id={tool_use_id})"
+    )
+
+    # Extract display_name from tool instance for frontend display
+    tool_instance = _get_tool_instance(agent_builder, tool_name)
+    display_name = (
+        getattr(tool_instance, "display_name", None) if tool_instance else None
+    )
+    tool_protocol = (
+        _normalize_protocol_type(
+            getattr(tool_instance, "_wegent_tool_protocol", "function_call")
+        )
+        if tool_instance
+        else "function_call"
+    )
+    server_label = (
+        getattr(tool_instance, "_wegent_mcp_server_label", None)
+        if tool_instance
+        else None
+    )
+
+    # Emit tool_start event via ResponsesAPIEmitter
+    # Only include arguments if tool is in whitelist
+    arguments = (
+        sanitize_tool_arguments(tool_name, serializable_input)
+        if should_display_tool_details(tool_name)
+        else None
+    )
+
+    if not event_data.get("tool_arguments_streamed"):
+        run_async(
+            emitter.tool_start(
+                call_id=tool_use_id,
+                name=tool_name,
+                arguments=arguments,
+                display_name=display_name,
+                tool_protocol=tool_protocol,
+                server_label=server_label,
+            )
+        )
+
+
+def _handle_tool_argument_start(
+    emitter: ResponsesAPIEmitter,
+    event_data: dict[str, Any],
+    run_async: Callable[[Coroutine[Any, Any, Any]], None],
+) -> None:
+    run_async(
+        emitter.tool_argument_start(
+            call_id=event_data["call_id"],
+            name=event_data.get("name", "unknown"),
+            arguments_summary=event_data.get("arguments_summary"),
+        )
+    )
+
+
+def _handle_tool_argument_delta(
+    emitter: ResponsesAPIEmitter,
+    event_data: dict[str, Any],
+    run_async: Callable[[Coroutine[Any, Any, Any]], None],
+) -> None:
+    run_async(
+        emitter.tool_argument_delta(
+            call_id=event_data["call_id"],
+            arguments_delta=event_data.get("arguments_delta", ""),
+            arguments_summary=event_data.get("arguments_summary"),
+        )
+    )
+
+
+def _handle_tool_argument_done(
+    emitter: ResponsesAPIEmitter,
+    event_data: dict[str, Any],
+    run_async: Callable[[Coroutine[Any, Any, Any]], None],
+) -> None:
+    run_async(
+        emitter.tool_argument_done(
+            call_id=event_data["call_id"],
+            arguments_summary=event_data.get("arguments_summary"),
+        )
+    )
+
+
+def _handle_tool_end(
+    state: Any,
+    emitter: ResponsesAPIEmitter,
+    agent_builder: Any,
+    tool_name: str,
+    run_id: str,
+    event_data: dict[str, Any],
+    run_async: Callable[[Coroutine[Any, Any, Any]], None],
+) -> None:
+    """Handle tool end event."""
+    # Extract and serialize tool output
+    tool_output = event_data.get("data", {}).get("output", "")
+
+    serializable_output = _make_output_serializable(tool_output)
+
+    # Extract tool input from event_data for load_skill tracking
+    raw_tool_input = event_data.get("data", {}).get("input", {})
+    tool_input = _make_serializable(raw_tool_input) if raw_tool_input else {}
+
+    # Get tool_use_id from event, or from saved mapping, or generate new one
+    tool_use_id = event_data.get("tool_use_id")
+    if not tool_use_id:
+        # Try to get from saved mapping (set by tool_start)
+        tool_use_id_map = getattr(state, "_tool_use_id_map", {})
+        tool_use_id = tool_use_id_map.get(run_id)
+        if tool_use_id:
+            logger.info(
+                "[TOOL_END] Using saved tool_use_id from tool_start: %s",
+                tool_use_id,
+            )
+            # Clean up the mapping
+            del tool_use_id_map[run_id]
+        else:
+            tool_use_id = f"{run_id}-{int(time.time() * 1000)}"
+            logger.warning(
+                "[TOOL_END] No tool_use_id from event or mapping, generated: %s",
+                tool_use_id,
+            )
+
+    output_str = str(serializable_output)
+
+    logger.info(f"[TOOL_END] {tool_name} (run_id={run_id}, tool_use_id={tool_use_id})")
+
+    # Check for MCP silent_exit marker in tool output
+    _check_silent_exit_marker(state, tool_name, serializable_output)
+    is_deferred_user_input = False
+    if is_deferred_user_input_result(serializable_output):
+        is_deferred_user_input = True
+        state.is_deferred_user_input = True
+        state.deferred_user_input_tool_use_id = tool_use_id
+        state.is_silent_exit = True
+        state.silent_exit_reason = "waiting_for_user_input"
+        add_span_event(
+            "deferred_user_input_detected",
+            attributes={
+                "tool.name": tool_name,
+                "tool_use_id": tool_use_id,
+            },
+        )
+
+    # Process tool output and extract sources for knowledge base citations
+    sources = _extract_sources(tool_name, serializable_output)
+    if sources:
+        state.add_sources(sources)
+    retrieval_summary = _extract_retrieval_summary(tool_name, serializable_output)
+    if retrieval_summary and hasattr(state, "add_retrieval_summary"):
+        state.add_retrieval_summary(retrieval_summary)
+
+    # Track loaded skills for persistence across conversation turns
+    if tool_name == "load_skill":
+        skill_name = (
+            tool_input.get("skill_name") if isinstance(tool_input, dict) else None
+        )
+
+        logger.info(
+            "[TOOL_END] load_skill completed: skill_name=%s, tool_input=%s",
+            skill_name,
+            tool_input,
+        )
+
+        # Add to loaded_skills if we found the skill name
+        if skill_name and hasattr(state, "add_loaded_skill"):
+            state.add_loaded_skill(skill_name)
+            logger.info(
+                "[TOOL_END] Tracked loaded skill: %s for persistence",
+                skill_name,
+            )
+        else:
+            logger.warning(
+                "[TOOL_END] Could not track loaded skill: skill_name=%s",
+                skill_name,
+            )
+
+    _store_card_block(state, tool_name, serializable_output)
+
+    # Emit tool_done event via ResponsesAPIEmitter
+    # Only include arguments if tool is in whitelist
+    arguments = (
+        sanitize_tool_arguments(tool_name, tool_input)
+        if should_display_tool_details(tool_name)
+        else None
+    )
+    tool_instance = _get_tool_instance(agent_builder, tool_name)
+    tool_protocol = (
+        _normalize_protocol_type(
+            getattr(tool_instance, "_wegent_tool_protocol", "function_call")
+        )
+        if tool_instance
+        else "function_call"
+    )
+    server_label = (
+        getattr(tool_instance, "_wegent_mcp_server_label", None)
+        if tool_instance
+        else None
+    )
+    status, error = _infer_tool_completion(tool_protocol, serializable_output)
+
+    log_large_attribute(
+        "tool.output",
+        serializable_output,
+        max_attr_length=100,
+        max_event_length=5000,
+        event_name=f"tool_end:{tool_name}",
+        extra_attributes={
+            "tool.name": tool_name,
+            "tool.run_id": run_id,
+            "tool.tool_use_id": tool_use_id,
+            "tool.output_length": len(output_str),
+            "tool.status": status,
+        },
+    )
+
+    run_async(
+        emitter.tool_done(
+            call_id=tool_use_id,
+            name=tool_name,
+            arguments=arguments,
+            output=serializable_output,
+            tool_protocol=tool_protocol,
+            server_label=server_label,
+            status=status,
+            error=error,
+        )
+    )
+
+    if is_deferred_user_input:
+        raise DeferredUserInputExit()
+
+
+def _get_tool_instance(agent_builder: Any, tool_name: str) -> Any:
+    """Get tool instance from agent builder.
+
+    Args:
+        agent_builder: Agent builder with tool registry
+        tool_name: Name of the tool
+
+    Returns:
+        Tool instance or None
+    """
+    tool_instance = None
+
+    # First try tool_registry
+    if agent_builder.tool_registry:
+        tool_instance = agent_builder.tool_registry.get(tool_name)
+
+    # If not found, search in agent_builder.all_tools (includes skill tools)
+    if not tool_instance and hasattr(agent_builder, "all_tools"):
+        for tool in agent_builder.all_tools:
+            if tool.name == tool_name:
+                tool_instance = tool
+                break
+
+    return tool_instance
+
+
+def _parse_json_object(value: Any) -> dict[str, Any] | None:
+    """Return a dict payload from a raw tool output value."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _extract_card_result(value: Any) -> dict[str, Any] | None:
+    """Extract a card result from plain and MCP text-content outputs."""
+    parsed = _parse_json_object(value)
+    if parsed is not None:
+        return parsed
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, dict) and item.get("type") == "text":
+            parsed = _parse_json_object(item.get("text"))
+        elif getattr(item, "type", None) == "text":
+            parsed = _parse_json_object(getattr(item, "text", None))
+        else:
+            parsed = None
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _store_card_block(
+    state: Any,
+    tool_name: str,
+    tool_output: Any,
+) -> None:
+    """Store a backend-owned card in the final response without re-emitting it."""
+    card = _extract_card_result(tool_output)
+    if not card or card.get("error"):
+        return
+
+    card_id = card.get("id") or card.get("card_id")
+    card_type = card.get("card_type")
+    if not card_id or not card_type:
+        return
+    card_status = str(card.get("status") or card.get("card_status") or "populated")
+    if card_status == "polling":
+        card_status = "pending"
+    block = create_card_block(
+        card_id=card_id,
+        card_type=str(card_type),
+        card_data=(
+            card.get("data")
+            if isinstance(card.get("data"), dict)
+            else (
+                card.get("card_data") if isinstance(card.get("card_data"), dict) else {}
+            )
+        ),
+        card_status=card_status,
+        card_preview_data=(
+            card.get("preview_data")
+            if isinstance(card.get("preview_data"), dict)
+            else (
+                card.get("card_preview_data")
+                if isinstance(card.get("card_preview_data"), dict)
+                else {}
+            )
+        ),
+        card_error=(
+            str(card["card_error"]) if card.get("card_error") is not None else None
+        ),
+    )
+    if hasattr(state, "add_block"):
+        state.add_block(block)
+    logger.info(
+        "[TOOL_END] Stored backend-owned CardBlock: "
+        "tool_name=%s card_id=%s card_type=%s card_status=%s",
+        tool_name,
+        block["card_id"],
+        block["card_type"],
+        block["card_status"],
+    )
+
+
+def _extract_sources(tool_name: str, tool_output: Any) -> list[dict[str, Any]]:
+    """Extract sources from tool output for knowledge base citations.
+
+    Args:
+        tool_name: Name of the tool
+        tool_output: Output from the tool
+
+    Returns:
+        List of source dictionaries
+    """
+    sources: list[dict[str, Any]] = []
+
+    # Extract sources from knowledge_base_search results
+    if tool_name == "knowledge_base_search":
+        parsed = _parse_json_object(tool_output)
+        if parsed is not None:
+            logger.info(
+                f"[TOOL_OUTPUT] knowledge_base_search parsed output: "
+                f"has_sources={'sources' in parsed}, "
+                f"sources_count={len(parsed.get('sources', []))}"
+            )
+            kb_sources = parsed.get("sources", [])
+            if isinstance(kb_sources, list):
+                sources.extend(kb_sources)
+                logger.info(
+                    f"[TOOL_OUTPUT] Extracted {len(kb_sources)} sources from knowledge_base_search"
+                )
+        elif isinstance(tool_output, str):
+            logger.warning("[TOOL_OUTPUT] Failed to parse tool output")
+
+    # Extract sources from web_search results
+    elif tool_name == "web_search":
+        if isinstance(tool_output, str):
+            # Try to extract URLs from the output
+            import re
+
+            urls = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', tool_output)
+            for url in urls[:5]:  # Limit to 5 sources
+                sources.append({"type": "url", "url": url})
+
+    return sources
+
+
+def _source_entry(provider: Any, source_id: Any) -> dict[str, str] | None:
+    """Build a provider/source entry when source identity exists."""
+    if source_id is None:
+        return None
+    return {"provider": str(provider or ""), "source_id": str(source_id)}
+
+
+def _source_key(provider: Any, source_id: Any) -> tuple[str, str] | None:
+    """Build a provider/source key when source identity exists."""
+    entry = _source_entry(provider, source_id)
+    if entry is None:
+        return None
+    return entry["provider"], entry["source_id"]
+
+
+def _dedupe_source_entries(values: list[Any]) -> list[dict[str, str]]:
+    """Return provider/source entries without duplicates, preserving order."""
+    deduped: dict[tuple[str, str], dict[str, str]] = {}
+    for value in values:
+        if isinstance(value, dict):
+            entry = _source_entry(
+                value.get("provider"),
+                value.get("source_id") or value.get("id"),
+            )
+        else:
+            entry = _source_entry("", value)
+        if entry is None:
+            continue
+        deduped.setdefault((entry["provider"], entry["source_id"]), entry)
+    return list(deduped.values())
+
+
+def _normalize_source_status(value: Any) -> dict[str, Any] | None:
+    """Normalize one source status entry from tool output."""
+    if not isinstance(value, dict):
+        return None
+    source_id = value.get("source_id") or value.get("id")
+    if source_id is None:
+        return None
+    status = value.get("status") or "no_hit"
+    if status not in {"hit", "no_hit", "ignored", "failed"}:
+        status = "no_hit"
+    return {
+        "provider": str(value.get("provider") or ""),
+        "source_id": str(source_id),
+        "source_name": value.get("source_name"),
+        "status": status,
+        "record_count": max(0, int(value.get("record_count") or 0)),
+        "citation_count": max(0, int(value.get("citation_count") or 0)),
+        "mode": value.get("mode"),
+    }
+
+
+def _extract_retrieval_summary(
+    tool_name: str, tool_output: Any
+) -> dict[str, Any] | None:
+    """Extract aggregated retrieval coverage summary from tool output."""
+    if tool_name != "knowledge_base_search":
+        return None
+
+    parsed = _parse_json_object(tool_output)
+    if parsed is None:
+        return None
+
+    searched_sources: list[Any] = []
+    ignored_sources: list[Any] = []
+    source_statuses: dict[tuple[str, str], dict[str, Any]] = {}
+
+    summary = parsed.get("retrieval_summary")
+    if isinstance(summary, dict):
+        statuses = summary.get("source_statuses")
+        if isinstance(statuses, list):
+            for status in statuses:
+                normalized = _normalize_source_status(status)
+                if normalized is None:
+                    continue
+                source_key = _source_key(
+                    normalized["provider"], normalized["source_id"]
+                )
+                if source_key is not None:
+                    source_statuses[source_key] = normalized
+        searched = summary.get("searched_sources")
+        ignored = summary.get("ignored_sources")
+        if not isinstance(searched, list):
+            searched = summary.get("searched_source_ids")
+        if not isinstance(ignored, list):
+            ignored = summary.get("ignored_source_ids")
+        if isinstance(searched, list):
+            searched_sources.extend(searched)
+        if isinstance(ignored, list):
+            ignored_sources.extend(ignored)
+
+    source_summaries = parsed.get("source_summaries")
+    if isinstance(source_summaries, list):
+        for source_summary in source_summaries:
+            if not isinstance(source_summary, dict):
+                continue
+            provider = source_summary.get("provider")
+            statuses = source_summary.get("source_statuses")
+            if isinstance(statuses, list):
+                for status in statuses:
+                    normalized = _normalize_source_status(status)
+                    if normalized is None:
+                        continue
+                    source_key = _source_key(
+                        normalized["provider"], normalized["source_id"]
+                    )
+                    if source_key is not None:
+                        source_statuses[source_key] = normalized
+            searched = source_summary.get("searched_source_ids")
+            ignored = source_summary.get("ignored_source_ids")
+            if isinstance(searched, list):
+                searched_sources.extend(
+                    entry
+                    for source_id in searched
+                    if (entry := _source_entry(provider, source_id)) is not None
+                )
+            if isinstance(ignored, list):
+                ignored_sources.extend(
+                    entry
+                    for source_id in ignored
+                    if (entry := _source_entry(provider, source_id)) is not None
+                )
+
+    searched_entries = _dedupe_source_entries(searched_sources)
+    searched_keys = {
+        (entry["provider"], entry["source_id"]) for entry in searched_entries
+    }
+    ignored_entries = [
+        entry
+        for entry in _dedupe_source_entries(ignored_sources)
+        if (entry["provider"], entry["source_id"]) not in searched_keys
+    ]
+    if not searched_entries and not ignored_entries and not source_statuses:
+        return None
+    return {
+        "searched_source_ids": [entry["source_id"] for entry in searched_entries],
+        "ignored_source_ids": [entry["source_id"] for entry in ignored_entries],
+        "searched_sources": searched_entries,
+        "ignored_sources": ignored_entries,
+        "source_statuses": list(source_statuses.values()),
+    }
+
+
+def _make_serializable(value: Any) -> Any:
+    """Convert value to JSON-serializable format."""
+    if isinstance(value, dict):
+        result = {}
+        for key, val in value.items():
+            if isinstance(val, (str, dict, list, int, float, bool, type(None))):
+                result[key] = val
+            else:
+                result[key] = str(val)
+        return result
+    elif isinstance(value, (str, list, int, float, bool, type(None))):
+        return value
+    else:
+        return str(value)
+
+
+def _make_output_serializable(tool_output: Any) -> Any:
+    """Convert tool output to JSON-serializable format."""
+    if hasattr(tool_output, "content"):
+        return tool_output.content
+    elif not isinstance(tool_output, (str, dict, list, int, float, bool, type(None))):
+        return str(tool_output)
+    return tool_output
+
+
+def _check_silent_exit_marker(state: Any, tool_name: str, tool_output: Any) -> None:
+    """Check for MCP silent_exit marker in tool output.
+
+    This detects the "__silent_exit__" marker from MCP tools and sets the
+    silent exit state accordingly.
+
+    Args:
+        state: Streaming state to update
+        tool_name: Name of the tool
+        tool_output: Output from the tool
+    """
+    if not isinstance(tool_output, str):
+        return
+
+    try:
+        parsed = json.loads(tool_output)
+        if isinstance(parsed, dict) and parsed.get("__silent_exit__") is True:
+            reason = parsed.get("reason", "")
+            logger.info(
+                "[TOOL_EVENT] MCP silent_exit detected: tool=%s, reason=%s",
+                tool_name,
+                reason,
+            )
+            # Mark state as silent exit
+            state.is_silent_exit = True
+            state.silent_exit_reason = reason
+            add_span_event(
+                "mcp_silent_exit_detected",
+                attributes={
+                    "tool.name": tool_name,
+                    "silent_exit.reason": reason,
+                },
+            )
+    except json.JSONDecodeError:
+        pass

@@ -1,0 +1,2910 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Team service class using kinds table.
+
+Uses the unified ResourceMember model for team sharing.
+"""
+
+import copy
+import logging
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+from fastapi import HTTPException
+from sqlalchemy import (
+    Integer,
+    and_,
+    func,
+    literal,
+    literal_column,
+    or_,
+    tuple_,
+    union_all,
+)
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
+
+from app.models.kind import Kind
+from app.models.marketplace_resource import MarketplaceResource
+from app.models.namespace import Namespace
+from app.models.resource_member import MemberStatus, ResourceMember
+from app.models.share_link import ResourceType
+from app.models.user import User
+from app.schemas.base_role import has_permission
+from app.schemas.kind import (
+    Bot,
+    Model,
+    ModeSpec,
+    Shell,
+    Team,
+    TeamInputPlaceholder,
+)
+from app.schemas.namespace import GroupRole
+from app.schemas.quick_launch import normalize_quick_phrases
+from app.schemas.team import BotInfo, TeamCreate, TeamUpdate
+from app.schemas.user import UserInDB
+from app.services.adapters.pipeline_context import normalize_context_passing
+from app.services.adapters.public_model import is_public_model_allowed_for_user_id
+from app.services.adapters.shell_utils import get_shell_type
+from app.services.adapters.task_kinds.running_tasks import get_running_tasks_for_team
+from app.services.base import BaseService
+from app.services.readers.kinds import KindType, kindReader
+from app.services.readers.users import userReader
+from app.services.team_access_policy import (
+    TEAM_USE_ROLE,
+    can_edit_team,
+    team_usage_summary,
+)
+from app.stores.tasks import task_store
+from app.stores.tasks.interfaces import RecentTeamMode
+from shared.telemetry.decorators import trace_sync
+from shared.utils.crypto import decrypt_sensitive_data, is_data_encrypted
+
+
+class TeamKindsService(BaseService[Kind, TeamCreate, TeamUpdate]):
+    """
+    Team service class using kinds table
+    """
+
+    ACCESS_SOURCE_NATIVE = "native"
+    ACCESS_SOURCE_USER_SHARE = "user_share"
+    ACCESS_SOURCE_NAMESPACE_AUTHORIZATION = "namespace_authorization"
+    ACCESS_RANK_NATIVE = 0
+    ACCESS_RANK_USER_SHARE = 1
+    ACCESS_RANK_NAMESPACE_AUTHORIZATION = 2
+    RECENT_TEAM_TASK_SCAN_LIMIT = 50
+
+    # List of sensitive keys that should be decrypted when reading
+    SENSITIVE_CONFIG_KEYS = [
+        "DIFY_API_KEY",
+        # Add more sensitive keys here as needed
+    ]
+
+    def _get_accessible_authorization_namespace_ids(
+        self,
+        db: Session,
+        user_id: int,
+        namespaces: list[str],
+        effective_roles: Optional[dict[str, GroupRole]] = None,
+    ) -> list[int]:
+        """Return namespace ids that can activate Team namespace grants."""
+        group_namespaces = [
+            namespace for namespace in namespaces if namespace != "default"
+        ]
+        if not group_namespaces:
+            return []
+
+        if effective_roles is None:
+            from app.services.group_permission import get_effective_roles_in_groups
+
+            effective_roles = get_effective_roles_in_groups(
+                db,
+                user_id,
+                group_namespaces,
+            )
+        accessible_namespaces = [
+            namespace
+            for namespace in group_namespaces
+            if (
+                (role := effective_roles.get(namespace)) is not None
+                and has_permission(role, TEAM_USE_ROLE)
+            )
+        ]
+        if not accessible_namespaces:
+            return []
+
+        return [
+            row.id
+            for row in db.query(Namespace.id)
+            .filter(
+                Namespace.name.in_(accessible_namespaces),
+                Namespace.is_active.is_(True),
+            )
+            .all()
+        ]
+
+    def _decrypt_agent_config(self, agent_config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Decrypt sensitive data in agent_config when reading
+
+        Args:
+            agent_config: Agent config with potentially encrypted fields
+
+        Returns:
+            Agent config with decrypted sensitive fields
+        """
+        # Create a deep copy to avoid modifying the original
+        decrypted_config = copy.deepcopy(agent_config)
+
+        # Decrypt sensitive keys in env section
+        if "env" in decrypted_config:
+            for key in self.SENSITIVE_CONFIG_KEYS:
+                if key in decrypted_config["env"]:
+                    value = decrypted_config["env"][key]
+                    # Only decrypt if it appears to be encrypted
+                    if value and is_data_encrypted(str(value)):
+                        decrypted_value = decrypt_sensitive_data(str(value))
+                        if decrypted_value:
+                            decrypted_config["env"][key] = decrypted_value
+
+        return decrypted_config
+
+    def create_with_user(
+        self,
+        db: Session,
+        *,
+        obj_in: TeamCreate,
+        user_id: int,
+        group_name: Optional[str] = None,
+        commit: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Create user Team using kinds table.
+
+        If group_name is provided, creates the team in that group's namespace.
+        User must have Developer+ permission in the group.
+        """
+        from app.schemas.namespace import GroupRole
+        from app.services.group_permission import check_group_permission
+
+        namespace = "default"
+
+        if group_name:
+            # Validate user has Developer+ permission in group
+            if not check_group_permission(db, user_id, group_name, GroupRole.Developer):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"You need at least Developer role in group '{group_name}' to create teams",
+                )
+            namespace = group_name
+
+        # Check duplicate team name (only active teams)
+        # For personal teams (default namespace): check uniqueness per user
+        # For group teams: check uniqueness within the group namespace
+        existing_query = db.query(Kind).filter(
+            Kind.kind == "Team",
+            Kind.name == obj_in.name,
+            Kind.namespace == namespace,
+            Kind.is_active == True,
+        )
+        if namespace == "default":
+            # Personal team: also filter by user_id
+            existing_query = existing_query.filter(Kind.user_id == user_id)
+        existing = existing_query.first()
+
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="Team name already exists, please modify the name",
+            )
+
+        # Validate bots
+        self._validate_bots(db, obj_in.bots, user_id)
+
+        # Convert bots to members format
+        members = []
+        for bot_info in obj_in.bots:
+            bot_id = (
+                bot_info.bot_id if hasattr(bot_info, "bot_id") else bot_info["bot_id"]
+            )
+            bot_prompt = (
+                bot_info.bot_prompt
+                if hasattr(bot_info, "bot_prompt")
+                else bot_info.get("bot_prompt", "")
+            )
+            role = (
+                bot_info.role if hasattr(bot_info, "role") else bot_info.get("role", "")
+            )
+            require_confirmation = (
+                bot_info.requireConfirmation
+                if hasattr(bot_info, "requireConfirmation")
+                else bot_info.get("requireConfirmation", False)
+            )
+            context_passing = (
+                bot_info.contextPassing
+                if hasattr(bot_info, "contextPassing")
+                else bot_info.get("contextPassing", "none")
+            )
+
+            # Get bot from kinds table
+            bot = kindReader.get_by_id(db, KindType.BOT, bot_id)
+
+            if not bot:
+                raise HTTPException(
+                    status_code=400, detail=f"Bot with id {bot_id} not found"
+                )
+
+            member = {
+                "botRef": {"name": bot.name, "namespace": bot.namespace},
+                "prompt": bot_prompt or "",
+                "role": role or "",
+                "requireConfirmation": require_confirmation or False,
+                "contextPassing": normalize_context_passing(context_passing),
+            }
+            members.append(member)
+
+        # Extract collaboration model from workflow
+        collaboration_model = "pipeline"
+        if obj_in.workflow and "mode" in obj_in.workflow:
+            collaboration_model = obj_in.workflow["mode"]
+
+        # Build spec with bind_mode and description if provided
+        spec = {"members": members, "collaborationModel": collaboration_model}
+
+        # Handle bind_mode - get from obj_in directly (not from workflow)
+        bind_mode = getattr(obj_in, "bind_mode", None)
+        if bind_mode is not None:
+            spec["bind_mode"] = bind_mode
+
+        mode_spec = getattr(obj_in, "mode_spec", None)
+        if mode_spec is not None:
+            spec["modeSpec"] = mode_spec.model_dump(mode="json", exclude_none=True)
+
+        # Handle description - get from obj_in directly
+        description = getattr(obj_in, "description", None)
+        if description is not None:
+            spec["description"] = description
+
+        # Handle icon - get from obj_in directly
+        icon = getattr(obj_in, "icon", None)
+        if icon is not None:
+            spec["icon"] = icon
+
+        # Handle requires_workspace - get from obj_in directly
+        requires_workspace = getattr(obj_in, "requires_workspace", None)
+        if requires_workspace is not None:
+            spec["requiresWorkspace"] = requires_workspace
+
+        quick_phrases = getattr(obj_in, "quick_phrases", None)
+        if quick_phrases is not None:
+            spec["quick_phrases"] = normalize_quick_phrases(quick_phrases)
+
+        input_placeholder = getattr(obj_in, "inputPlaceholder", None)
+        if input_placeholder is not None:
+            spec["inputPlaceholder"] = input_placeholder.model_dump(exclude_none=True)
+
+        metadata = {"name": obj_in.name, "namespace": namespace}
+        display_name = getattr(obj_in, "displayName", None)
+        if display_name is not None:
+            metadata["displayName"] = display_name
+
+        # Create Team JSON
+        team_json = {
+            "kind": "Team",
+            "spec": spec,
+            "status": {"state": "Available"},
+            "metadata": metadata,
+            "apiVersion": "agent.wecode.io/v1",
+        }
+
+        team = Kind(
+            user_id=user_id,
+            kind="Team",
+            name=obj_in.name,
+            namespace=namespace,
+            json=team_json,
+            is_active=True,
+        )
+        db.add(team)
+
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+        db.refresh(team)
+
+        return self._convert_to_team_dict(team, db, user_id)
+
+    def _build_accessible_teams_query(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        scope: str = "personal",
+        group_name: Optional[str] = None,
+        filters: Optional[List[Any]] = None,
+        group_names: Optional[List[str]] = None,
+        shared_only: bool = False,
+    ) -> Optional[tuple[Any, Any]]:
+        """Build the deduplicated accessible-Team query shared by list views."""
+        from app.services.group_permission import get_user_group_roles
+
+        namespaces_to_query = []
+        effective_roles: Optional[dict[str, GroupRole]] = None
+        if scope == "personal":
+            namespaces_to_query = ["default"]
+        elif scope == "group":
+            if group_names is not None:
+                namespaces_to_query = group_names
+            elif group_name:
+                namespaces_to_query = [group_name]
+            else:
+                effective_roles = get_user_group_roles(db, user_id)
+                namespaces_to_query = sorted(effective_roles)
+        elif scope == "all":
+            effective_roles = get_user_group_roles(db, user_id)
+            namespaces_to_query = ["default", *sorted(effective_roles)]
+        else:
+            raise ValueError(f"Invalid scope: {scope}")
+
+        queries = []
+        group_namespaces = [ns for ns in namespaces_to_query if ns != "default"]
+        has_default = "default" in namespaces_to_query
+        team_resource_type_variants = [ResourceType.TEAM.value, ResourceType.TEAM.name]
+        approved_status_variants = [MemberStatus.APPROVED.value, "APPROVED"]
+        if group_namespaces and effective_roles is None:
+            from app.services.group_permission import get_effective_roles_in_groups
+
+            effective_roles = get_effective_roles_in_groups(
+                db, user_id, group_namespaces
+            )
+        restricted_group_namespaces = {
+            namespace
+            for namespace, role in (effective_roles or {}).items()
+            if role == GroupRole.RestrictedAnalyst
+        }
+        authorized_namespace_ids = self._get_accessible_authorization_namespace_ids(
+            db,
+            user_id,
+            group_namespaces,
+            effective_roles,
+        )
+
+        if has_default:
+            own_teams_query = db.query(
+                Kind.id.label("team_id"),
+                Kind.user_id.label("team_user_id"),
+                Kind.name.label("team_name"),
+                Kind.namespace.label("team_namespace"),
+                Kind.json.label("team_json"),
+                Kind.created_at.label("team_created_at"),
+                Kind.updated_at.label("team_updated_at"),
+                literal_column("0").label("share_status"),  # Default 0 for own teams
+                literal_column(str(user_id)).label("context_user_id"),
+                literal(False).label("restricted_guest_access"),
+                literal(self.ACCESS_SOURCE_NATIVE).label("access_source"),
+                literal(self.ACCESS_RANK_NATIVE).label("access_rank"),
+            ).filter(
+                Kind.user_id == user_id,
+                Kind.kind == "Team",
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )
+            queries.append(own_teams_query)
+
+            if scope in ("personal", "all"):
+                shared_teams_query = (
+                    db.query(
+                        Kind.id.label("team_id"),
+                        Kind.user_id.label("team_user_id"),
+                        Kind.name.label("team_name"),
+                        Kind.namespace.label("team_namespace"),
+                        Kind.json.label("team_json"),
+                        Kind.created_at.label("team_created_at"),
+                        Kind.updated_at.label("team_updated_at"),
+                        literal_column("2").label("share_status"),  # 2 for shared teams
+                        Kind.user_id.label(
+                            "context_user_id"
+                        ),  # Use team owner, not inviter
+                        literal(False).label("restricted_guest_access"),
+                        literal(self.ACCESS_SOURCE_USER_SHARE).label("access_source"),
+                        literal(self.ACCESS_RANK_USER_SHARE).label("access_rank"),
+                    )
+                    .join(
+                        ResourceMember,
+                        (ResourceMember.resource_id == Kind.id)
+                        & (
+                            ResourceMember.resource_type.in_(
+                                team_resource_type_variants
+                            )
+                        ),
+                    )
+                    .filter(
+                        ResourceMember.entity_type == "user",
+                        ResourceMember.entity_id == str(user_id),
+                        ResourceMember.status.in_(approved_status_variants),
+                        Kind.is_active == True,
+                        Kind.kind == "Team",
+                    )
+                )
+                queries.append(shared_teams_query)
+
+                public_teams_query = db.query(
+                    Kind.id.label("team_id"),
+                    Kind.user_id.label("team_user_id"),
+                    Kind.name.label("team_name"),
+                    Kind.namespace.label("team_namespace"),
+                    Kind.json.label("team_json"),
+                    Kind.created_at.label("team_created_at"),
+                    Kind.updated_at.label("team_updated_at"),
+                    literal_column("0").label(
+                        "share_status"
+                    ),  # 0 for public teams (system-owned)
+                    literal_column("0").label("context_user_id"),
+                    literal(False).label("restricted_guest_access"),
+                    literal(self.ACCESS_SOURCE_NATIVE).label("access_source"),
+                    literal(self.ACCESS_RANK_NATIVE).label("access_rank"),
+                ).filter(
+                    Kind.user_id == 0,
+                    Kind.kind == "Team",
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+                queries.append(public_teams_query)
+
+        if group_namespaces:
+            group_teams_query = db.query(
+                Kind.id.label("team_id"),
+                Kind.user_id.label("team_user_id"),
+                Kind.name.label("team_name"),
+                Kind.namespace.label("team_namespace"),
+                Kind.json.label("team_json"),
+                Kind.created_at.label("team_created_at"),
+                Kind.updated_at.label("team_updated_at"),
+                literal_column("0").label("share_status"),
+                Kind.user_id.label("context_user_id"),
+                Kind.namespace.in_(restricted_group_namespaces).label(
+                    "restricted_guest_access"
+                ),
+                literal(self.ACCESS_SOURCE_NATIVE).label("access_source"),
+                literal(self.ACCESS_RANK_NATIVE).label("access_rank"),
+            ).filter(
+                Kind.kind == "Team",
+                Kind.namespace.in_(
+                    group_namespaces
+                ),  # Use IN clause for all group namespaces
+                Kind.is_active == True,
+            )
+            queries.append(group_teams_query)
+
+        if authorized_namespace_ids:
+            authorized_namespace_entity_ids = [
+                str(ns_id) for ns_id in authorized_namespace_ids
+            ]
+            authorized_team_query = (
+                db.query(
+                    Kind.id.label("team_id"),
+                    Kind.user_id.label("team_user_id"),
+                    Kind.name.label("team_name"),
+                    Kind.namespace.label("team_namespace"),
+                    Kind.json.label("team_json"),
+                    Kind.created_at.label("team_created_at"),
+                    Kind.updated_at.label("team_updated_at"),
+                    literal_column("2").label("share_status"),
+                    Kind.user_id.label("context_user_id"),
+                    Namespace.name.in_(restricted_group_namespaces).label(
+                        "restricted_guest_access"
+                    ),
+                    literal(self.ACCESS_SOURCE_NAMESPACE_AUTHORIZATION).label(
+                        "access_source"
+                    ),
+                    literal(self.ACCESS_RANK_NAMESPACE_AUTHORIZATION).label(
+                        "access_rank"
+                    ),
+                )
+                .join(
+                    ResourceMember,
+                    (ResourceMember.resource_id == Kind.id)
+                    & ResourceMember.resource_type.in_(team_resource_type_variants),
+                )
+                # Compare numeric IDs without inheriting the connection collation.
+                .join(Namespace, ResourceMember.entity_id.cast(Integer) == Namespace.id)
+                .filter(
+                    ResourceMember.entity_type == "namespace",
+                    ResourceMember.entity_id.in_(authorized_namespace_entity_ids),
+                    ResourceMember.status.in_(approved_status_variants),
+                    Namespace.is_active.is_(True),
+                    Kind.kind == "Team",
+                    Kind.is_active.is_(True),
+                    ~Kind.namespace.in_(group_namespaces),
+                )
+            )
+            queries.append(authorized_team_query)
+
+        if not queries:
+            return None
+
+        if filters:
+            queries = [query.filter(*filters) for query in queries]
+
+        if len(queries) == 1:
+            combined_query = queries[0].subquery()
+        else:
+            combined_query = union_all(*queries).alias("combined_teams")
+        ranked_query = (
+            db.query(
+                combined_query.c.team_id,
+                combined_query.c.team_user_id,
+                combined_query.c.team_name,
+                combined_query.c.team_namespace,
+                combined_query.c.team_json,
+                combined_query.c.team_created_at,
+                combined_query.c.team_updated_at,
+                combined_query.c.share_status,
+                combined_query.c.context_user_id,
+                combined_query.c.restricted_guest_access,
+                combined_query.c.access_source,
+                func.row_number()
+                .over(
+                    partition_by=combined_query.c.team_id,
+                    order_by=(
+                        combined_query.c.access_rank.asc(),
+                        combined_query.c.restricted_guest_access.desc(),
+                        combined_query.c.team_updated_at.desc(),
+                        combined_query.c.team_id.desc(),
+                    ),
+                )
+                .label("access_row_number"),
+            )
+        ).subquery()
+        base_query = db.query(
+            ranked_query.c.team_id,
+            ranked_query.c.team_user_id,
+            ranked_query.c.team_name,
+            ranked_query.c.team_namespace,
+            ranked_query.c.team_json,
+            ranked_query.c.team_created_at,
+            ranked_query.c.team_updated_at,
+            ranked_query.c.share_status,
+            ranked_query.c.context_user_id,
+            ranked_query.c.restricted_guest_access,
+            ranked_query.c.access_source,
+        ).filter(ranked_query.c.access_row_number == 1)
+        if shared_only:
+            base_query = base_query.filter(
+                or_(
+                    ranked_query.c.team_namespace != "default",
+                    ranked_query.c.share_status == 2,
+                )
+            )
+        return base_query, ranked_query
+
+    def get_recent_accessible_teams(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        is_code: bool = False,
+        limit: int = 5,
+        include_fallback: bool = True,
+        mode: RecentTeamMode | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Return recent Teams with optional fallback; exact mode overrides is_code."""
+        if limit <= 0:
+            return []
+
+        recent_refs = self._get_recent_team_refs(
+            db, user_id, is_code=is_code, mode=mode
+        )
+
+        selected_teams, selected_identities = self._query_recent_team_kinds(
+            db,
+            recent_refs,
+            user_id=user_id,
+            limit=limit,
+        )
+
+        fallback_rows = []
+        if include_fallback and len(selected_teams) < limit:
+            accessible_query = self._build_accessible_teams_query(
+                db,
+                user_id=user_id,
+                scope="all",
+            )
+            if accessible_query is not None:
+                base_query, _ = accessible_query
+                fallback_rows = self._query_latest_distinct_team_rows(
+                    db,
+                    base_query,
+                    selected_identities,
+                    limit=limit - len(selected_teams),
+                )
+
+        return [
+            *self._quick_access_team_dicts_from_kinds(selected_teams),
+            *self._quick_access_team_dicts(fallback_rows),
+        ]
+
+    def _get_recent_team_refs(
+        self,
+        db: Session,
+        user_id: int,
+        *,
+        is_code: bool,
+        mode: RecentTeamMode | None = None,
+    ) -> list[tuple[str, str, int | None]]:
+        recent_tasks = task_store.list_recent_task_team_refs(
+            db,
+            user_id=user_id,
+            limit=self.RECENT_TEAM_TASK_SCAN_LIMIT,
+            mode=mode,
+        )
+        recent_refs: list[tuple[str, str, int | None]] = []
+        for task in recent_tasks:
+            task_type = str(task.task_type or "chat")
+            if mode is not None and task_type != mode:
+                continue
+            if mode is None and (task_type == "code") != is_code:
+                continue
+            team_ref = task.team_ref
+            if not isinstance(team_ref, dict):
+                continue
+            name = str(team_ref.get("name") or "")
+            if not name:
+                continue
+            namespace = str(team_ref.get("namespace") or "default")
+            raw_owner_id = team_ref.get("user_id")
+            try:
+                owner_id = int(raw_owner_id) if raw_owner_id is not None else None
+            except (TypeError, ValueError):
+                continue
+            ref = (name, namespace, owner_id)
+            if ref not in recent_refs:
+                recent_refs.append(ref)
+        return recent_refs
+
+    def _query_recent_team_kinds(
+        self,
+        db: Session,
+        recent_refs: list[tuple[str, str, int | None]],
+        *,
+        user_id: int,
+        limit: int,
+    ) -> tuple[list[Kind], set[tuple[str, str]]]:
+        if not recent_refs:
+            return [], set()
+        exact_refs = {
+            (name, namespace, owner_id)
+            for name, namespace, owner_id in recent_refs
+            if owner_id is not None
+        }
+        ownerless_refs = {
+            (name, namespace)
+            for name, namespace, owner_id in recent_refs
+            if owner_id is None
+        }
+        ref_filters = []
+        if exact_refs:
+            ref_filters.append(
+                tuple_(
+                    Kind.user_id,
+                    Kind.kind,
+                    Kind.namespace,
+                    Kind.is_active,
+                    Kind.name,
+                ).in_(
+                    {
+                        (
+                            owner_id,
+                            KindType.TEAM.value,
+                            namespace,
+                            True,
+                            name,
+                        )
+                        for name, namespace, owner_id in exact_refs
+                    }
+                )
+            )
+        if ownerless_refs:
+            ref_filters.append(
+                tuple_(
+                    Kind.name,
+                    Kind.namespace,
+                ).in_(ownerless_refs)
+            )
+        teams = (
+            db.query(Kind)
+            .filter(
+                Kind.kind == KindType.TEAM.value,
+                Kind.is_active.is_(True),
+                or_(*ref_filters),
+            )
+            .all()
+        )
+        exact_team_index = {
+            (team.name, team.namespace, int(team.user_id)): team for team in teams
+        }
+        identity_team_index: dict[tuple[str, str], list[Kind]] = {}
+        for team in teams:
+            identity_team_index.setdefault((team.name, team.namespace), []).append(team)
+
+        selected_teams = []
+        selected_ids: set[int] = set()
+        selected_identities: set[tuple[str, str]] = set()
+        for name, namespace, owner_id in recent_refs:
+            identity = (name, namespace)
+            if identity in selected_identities:
+                continue
+            if owner_id is not None:
+                team = exact_team_index.get((name, namespace, owner_id))
+            else:
+                candidates = identity_team_index.get(identity, [])
+                team = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if int(candidate.user_id) == user_id
+                    ),
+                    candidates[0] if candidates else None,
+                )
+            if team is None or int(team.id) in selected_ids:
+                continue
+            selected_teams.append(team)
+            selected_ids.add(int(team.id))
+            selected_identities.add(identity)
+            if len(selected_teams) == limit:
+                break
+        return selected_teams, selected_identities
+
+    def _query_latest_distinct_team_rows(
+        self,
+        db: Session,
+        base_query: Any,
+        excluded_identities: set[tuple[str, str]],
+        *,
+        limit: int,
+    ) -> list[Any]:
+        accessible_rows = base_query.subquery()
+        identity_ranked = db.query(
+            accessible_rows,
+            func.row_number()
+            .over(
+                partition_by=(
+                    accessible_rows.c.team_name,
+                    accessible_rows.c.team_namespace,
+                ),
+                order_by=(
+                    accessible_rows.c.team_updated_at.desc(),
+                    accessible_rows.c.team_id.desc(),
+                ),
+            )
+            .label("identity_row_number"),
+        ).subquery()
+        fallback_query = db.query(identity_ranked).filter(
+            identity_ranked.c.identity_row_number == 1
+        )
+        if excluded_identities:
+            fallback_query = fallback_query.filter(
+                tuple_(
+                    identity_ranked.c.team_name,
+                    identity_ranked.c.team_namespace,
+                ).notin_(excluded_identities)
+            )
+        return (
+            fallback_query.order_by(
+                identity_ranked.c.team_updated_at.desc(),
+                identity_ranked.c.team_id.desc(),
+            )
+            .limit(limit)
+            .all()
+        )
+
+    def _quick_access_team_dicts(
+        self,
+        rows: list[Any],
+    ) -> list[Dict[str, Any]]:
+        """Build quick-access results from Team rows only."""
+        return [
+            self._quick_access_team_dict(
+                team_id=int(row.team_id),
+                user_id=int(row.team_user_id),
+                name=row.team_name,
+                team_json=row.team_json,
+            )
+            for row in rows
+        ]
+
+    def _quick_access_team_dicts_from_kinds(
+        self,
+        teams: list[Kind],
+    ) -> list[Dict[str, Any]]:
+        return [
+            self._quick_access_team_dict(
+                team_id=int(team.id),
+                user_id=int(team.user_id),
+                name=team.name,
+                team_json=team.json,
+            )
+            for team in teams
+        ]
+
+    def _quick_access_team_dict(
+        self,
+        *,
+        team_id: int,
+        user_id: int,
+        name: str,
+        team_json: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        team = Team.model_validate(team_json)
+        return {
+            "id": team_id,
+            "user_id": user_id,
+            "name": name,
+            "displayName": team.metadata.displayName,
+            "recommended_mode": self._recommended_mode(team.spec.bind_mode),
+            "agent_type": None,
+        }
+
+    @staticmethod
+    def _recommended_mode(bind_mode: Optional[List[str]]) -> str:
+        modes = bind_mode or []
+        if "chat" in modes and "code" in modes:
+            return "both"
+        if "code" in modes:
+            return "code"
+        return "chat"
+
+    def get_user_teams(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        skip: int = 0,
+        limit: int = 100,
+        scope: str = "personal",
+        group_name: Optional[str] = None,
+        filters: Optional[List[Any]] = None,
+        group_names: Optional[List[str]] = None,
+        shared_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get user's Team list (only active teams) including shared teams and public teams.
+        Uses database union query for better performance and pagination.
+
+        Scope behavior:
+        - scope='personal' (default): personal teams + public teams + shared teams
+        - scope='group': group teams + public teams (requires group_name)
+        - scope='all': personal + public + shared + all user's groups
+        """
+        accessible_query = self._build_accessible_teams_query(
+            db,
+            user_id=user_id,
+            scope=scope,
+            group_name=group_name,
+            filters=filters,
+            group_names=group_names,
+            shared_only=shared_only,
+        )
+        return self._load_teams_from_query(
+            db,
+            user_id=user_id,
+            accessible_query=accessible_query,
+            skip=skip,
+            limit=limit,
+        )
+
+    @trace_sync(span_name="teams.list_page", tracer_name="backend.teams")
+    def get_user_teams_page(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        skip: int = 0,
+        limit: int = 100,
+        scope: str = "all",
+        group_name: Optional[str] = None,
+        filters: Optional[List[Any]] = None,
+        group_names: Optional[List[str]] = None,
+        shared_only: bool = False,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Load and count a page using one request-local authorization query."""
+        accessible_query = self._build_accessible_teams_query(
+            db,
+            user_id=user_id,
+            scope=scope,
+            group_name=group_name,
+            filters=filters,
+            group_names=group_names,
+            shared_only=shared_only,
+        )
+        items = self._load_teams_from_query(
+            db,
+            user_id=user_id,
+            accessible_query=accessible_query,
+            skip=skip,
+            limit=limit,
+        )
+        if accessible_query is None:
+            total = 0
+        elif len(items) < limit and (items or skip == 0):
+            total = skip + len(items)
+        else:
+            total = accessible_query[0].count()
+            return items, total
+        return items, total
+
+    def _load_teams_from_query(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        accessible_query: Optional[tuple[Any, Any]],
+        skip: int,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Fetch and hydrate a page from an already-authorized query."""
+        if accessible_query is None:
+            return []
+        base_query, ranked_query = accessible_query
+
+        final_query = (
+            base_query.order_by(
+                ranked_query.c.team_updated_at.desc(), ranked_query.c.team_id.desc()
+            )
+            .offset(skip)
+            .limit(limit)
+        )
+
+        # Execute the query
+        teams_data = final_query.all()
+
+        # Get all unique user IDs for batch fetching user info
+        user_ids = set()
+        for team_data in teams_data:
+            user_ids.add(team_data.team_user_id)
+
+        # Batch fetch user info
+        users_info = {}
+        if user_ids:
+            users = db.query(User).filter(User.id.in_(user_ids)).all()
+            users_info = {user.id: user for user in users}
+
+        # Batch preload all related data (Bots, Shells, Models) to avoid N+1 queries
+
+        # Collect all bot refs from all teams
+        # Separate personal bots from group bots since group bots can be created by any group member
+        all_bot_refs = []  # List of (user_id, name, namespace) for personal teams
+        group_bot_refs = set()  # Set of (name, namespace) for group teams
+        context_user_ids = set()
+        for team_data in teams_data:
+            context_user_ids.add(team_data.context_user_id)
+            team_crd = Team.model_validate(team_data.team_json)
+            is_group_team = (
+                team_data.team_namespace and team_data.team_namespace != "default"
+            )
+            for member in team_crd.spec.members:
+                if is_group_team:
+                    # For group teams, bots can be created by any group member
+                    group_bot_refs.add(
+                        (
+                            member.botRef.name,
+                            member.botRef.namespace,
+                        )
+                    )
+                else:
+                    all_bot_refs.append(
+                        (
+                            team_data.context_user_id,
+                            member.botRef.name,
+                            member.botRef.namespace,
+                        )
+                    )
+
+        # Batch fetch all bots
+        bots_cache = {}  # (user_id, name, namespace) -> Kind for personal bots
+        group_bots_cache = {}  # (name, namespace) -> Kind for group bots
+
+        # Query personal bots (with user_id filter)
+        if all_bot_refs:
+            bot_conditions = []
+            for uid, name, ns in all_bot_refs:
+                bot_conditions.append(
+                    and_(Kind.user_id == uid, Kind.name == name, Kind.namespace == ns)
+                )
+            bots_query = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Bot", Kind.is_active == True, or_(*bot_conditions)
+                )
+                .all()
+            )
+            for bot in bots_query:
+                bots_cache[(bot.user_id, bot.name, bot.namespace)] = bot
+
+        # Query group bots (without user_id filter)
+        if group_bot_refs:
+            group_bot_conditions = []
+            for name, ns in group_bot_refs:
+                group_bot_conditions.append(
+                    and_(Kind.name == name, Kind.namespace == ns)
+                )
+            group_bots_query = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Bot",
+                    Kind.is_active == True,
+                    or_(*group_bot_conditions),
+                )
+                .all()
+            )
+            for bot in group_bots_query:
+                group_bots_cache[(bot.name, bot.namespace)] = bot
+
+        # Collect all shell refs and model refs from bots (both personal and group bots)
+        all_shell_refs = set()  # (user_id, name, namespace)
+        all_model_refs = set()  # (user_id, name, namespace)
+
+        # Collect from personal bots
+        for bot in bots_cache.values():
+            bot_crd = Bot.model_validate(bot.json)
+            all_shell_refs.add(
+                (
+                    bot.user_id,
+                    bot_crd.spec.shellRef.name,
+                    bot_crd.spec.shellRef.namespace,
+                )
+            )
+            if bot_crd.spec.modelRef:
+                all_model_refs.add(
+                    (
+                        bot.user_id,
+                        bot_crd.spec.modelRef.name,
+                        bot_crd.spec.modelRef.namespace,
+                    )
+                )
+
+        # Collect from group bots
+        for bot in group_bots_cache.values():
+            bot_crd = Bot.model_validate(bot.json)
+            all_shell_refs.add(
+                (
+                    bot.user_id,
+                    bot_crd.spec.shellRef.name,
+                    bot_crd.spec.shellRef.namespace,
+                )
+            )
+            if bot_crd.spec.modelRef:
+                all_model_refs.add(
+                    (
+                        bot.user_id,
+                        bot_crd.spec.modelRef.name,
+                        bot_crd.spec.modelRef.namespace,
+                    )
+                )
+
+        # Batch fetch all user shells (user_id > 0)
+        shells_cache = {}  # (user_id, name, namespace) -> Kind
+        user_shell_refs = [
+            (uid, name, ns) for uid, name, ns in all_shell_refs if uid > 0
+        ]
+        if user_shell_refs:
+            shell_conditions = []
+            for uid, name, ns in user_shell_refs:
+                shell_conditions.append(
+                    and_(Kind.user_id == uid, Kind.name == name, Kind.namespace == ns)
+                )
+            shells_query = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Shell", Kind.is_active == True, or_(*shell_conditions)
+                )
+                .all()
+            )
+            for shell in shells_query:
+                shells_cache[(shell.user_id, shell.name, shell.namespace)] = shell
+
+        # Batch fetch public shells (user_id = 0) for shells not found in user shells
+        # Public shells are identified by name only (they are in 'default' namespace)
+        # We need to check all shell refs, not just those with uid > 0
+        public_shell_names = set()
+        for uid, name, ns in all_shell_refs:
+            # Always add to public_shell_names if not found in user shells cache
+            if (uid, name, ns) not in shells_cache:
+                public_shell_names.add(name)
+
+        public_shells_cache = (
+            {}
+        )  # name -> Kind (public shells are looked up by name only)
+        if public_shell_names:
+            public_shells_query = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Shell",
+                    Kind.user_id == 0,  # Public shells have user_id = 0
+                    Kind.is_active == True,
+                    Kind.name.in_(public_shell_names),
+                )
+                .all()
+            )
+            for shell in public_shells_query:
+                public_shells_cache[shell.name] = shell
+
+        # Batch fetch all user models (user_id > 0)
+        models_cache = {}  # (user_id, name, namespace) -> Kind
+        user_model_refs = [
+            (uid, name, ns) for uid, name, ns in all_model_refs if uid > 0
+        ]
+        if user_model_refs:
+            model_conditions = []
+            for uid, name, ns in user_model_refs:
+                model_conditions.append(
+                    and_(Kind.user_id == uid, Kind.name == name, Kind.namespace == ns)
+                )
+            models_query = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Model", Kind.is_active == True, or_(*model_conditions)
+                )
+                .all()
+            )
+            for model in models_query:
+                models_cache[(model.user_id, model.name, model.namespace)] = model
+
+        # Batch fetch public models (user_id = 0) for models not found in user models
+        # Public models are identified by name only (they are in 'default' namespace)
+        public_model_names = set()
+        for uid, name, ns in all_model_refs:
+            if (uid, name, ns) not in models_cache:
+                public_model_names.add(name)
+
+        public_models_cache = (
+            {}
+        )  # name -> Kind (public models are looked up by name only)
+        if public_model_names:
+            public_models_query = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Model",
+                    Kind.user_id == 0,  # Public models have user_id = 0
+                    Kind.is_active == True,
+                    Kind.name.in_(public_model_names),
+                )
+                .all()
+            )
+            for model in public_models_query:
+                if is_public_model_allowed_for_user_id(db, model.json, user_id):
+                    public_models_cache[model.name] = model
+
+        # Build cache dict for passing to conversion methods
+        preloaded_cache = {
+            "bots": bots_cache,
+            "group_bots": group_bots_cache,  # Add group bots cache for group resources
+            "shells": shells_cache,
+            "public_shells": public_shells_cache,
+            "models": models_cache,
+            "public_models": public_models_cache,
+        }
+
+        # Convert to result format
+        result = []
+        for team_data in teams_data:
+            # Create a temporary Kind object for conversion
+            temp_team = Kind(
+                id=team_data.team_id,
+                user_id=team_data.team_user_id,
+                name=team_data.team_name,
+                namespace=team_data.team_namespace,
+                json=team_data.team_json,
+                created_at=team_data.team_created_at,
+                updated_at=team_data.team_updated_at,
+                is_active=True,
+            )
+
+            # Convert to team dict using the appropriate context user ID and preloaded cache
+            team_dict = self._convert_to_team_dict_with_cache(
+                temp_team, db, team_data.context_user_id, preloaded_cache
+            )
+            team_dict["access_source"] = team_data.access_source
+
+            # For own teams, check if share_status is set in metadata.labels
+            if team_data.share_status == 0:  # This is an own team
+                team_crd = Team.model_validate(team_data.team_json)
+                if (
+                    team_crd.metadata.labels
+                    and "share_status" in team_crd.metadata.labels
+                ):
+                    team_dict["share_status"] = int(
+                        team_crd.metadata.labels["share_status"]
+                    )
+            else:  # This is a shared team
+                team_dict["share_status"] = 2
+
+            # Add user info
+            team_user = users_info.get(team_data.team_user_id)
+            if team_user:
+                team_dict["user"] = {
+                    "id": team_user.id,
+                    "user_name": team_user.user_name,
+                }
+
+            if team_data.restricted_guest_access and team_data.team_user_id != user_id:
+                team_dict = team_usage_summary(team_dict)
+            result.append(team_dict)
+
+        return result
+
+    def get_by_id_and_user(
+        self, db: Session, *, team_id: int, user_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get Team by ID and user ID (only active teams)
+        """
+        team = kindReader.get_by_id(db, KindType.TEAM, team_id)
+
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        return self._convert_to_team_dict(team, db, team.user_id)
+
+    def get_team_detail(
+        self, db: Session, *, team_id: int, user_id: int
+    ) -> Dict[str, Any]:
+        """
+        Get detailed team information including related user and bots
+        """
+        # Check if user has access to this team (own, shared, or entity)
+        from app.services.share.team_share_service import team_share_service
+
+        team = team_share_service.get_resource(db, team_id, user_id)
+
+        if not team:
+            # Fallback: check group namespace permission for group teams
+            team = kindReader.get_by_id(db, KindType.TEAM, team_id)
+            logger.warning(
+                "[TeamDetail] Configuration access unresolved: "
+                "team_id=%s viewer_user_id=%s resource_exists=%s",
+                team_id,
+                user_id,
+                team is not None,
+            )
+            if not team:
+                raise HTTPException(status_code=404, detail="Team not found")
+            if team.namespace != "default":
+                from app.schemas.namespace import GroupRole
+                from app.services.group_permission import check_group_permission
+
+                if not check_group_permission(
+                    db, user_id, team.namespace, GroupRole.Reporter
+                ):
+                    raise HTTPException(status_code=404, detail="Team not found")
+            else:
+                raise HTTPException(status_code=404, detail="Team not found")
+
+        is_author = team.user_id == user_id
+
+        # Get team dict using the team owner's context (for loading related resources)
+        team_owner_id = team.user_id
+        team_dict = self._convert_to_team_dict(team, db, team_owner_id)
+
+        # Get related user (original author)
+        user = userReader.get_by_id(db, team_owner_id)
+
+        # Get detailed bot information
+        detailed_bots = []
+        for bot_info in team_dict["bots"]:
+            bot_id = bot_info["bot_id"]
+            from app.services.adapters.bot_kinds import bot_kinds_service
+
+            bot_dict = bot_kinds_service.get_by_id_and_user(
+                db,
+                bot_id=bot_id,
+                user_id=team_owner_id,
+            )
+            if bot_dict:
+                detailed_bots.append(
+                    {
+                        "bot": bot_dict,
+                        "bot_prompt": bot_info.get("bot_prompt"),
+                        "role": bot_info.get("role"),
+                    }
+                )
+
+        # Set share_status: 0-private, 1-sharing, 2-shared from others
+        if is_author:
+            team_crd = Team.model_validate(team.json)
+            share_status = "0"  # Default to private
+
+            if team_crd.metadata.labels and "share_status" in team_crd.metadata.labels:
+                share_status = team_crd.metadata.labels["share_status"]
+
+            team_dict["share_status"] = int(share_status)
+            team_dict["user"] = user
+        else:
+            team_dict["share_status"] = 2  # shared from others
+            # Redact credentials on a response copy only: the owner User row is
+            # session-attached, and mutating it here would let a later commit in
+            # the same session wipe the stored tokens.
+            user_view = {
+                field: getattr(user, field)
+                for field in UserInDB.model_fields
+                if field != "git_info" and hasattr(user, field)
+            }
+            user_view["git_info"] = []
+            team_dict["user"] = user_view
+
+        team_dict["bots"] = detailed_bots
+
+        return team_dict
+
+    def update_with_user(
+        self,
+        db: Session,
+        *,
+        team_id: int,
+        obj_in: TeamUpdate,
+        user_id: int,
+        force_identity_change: bool = False,
+        confirm_name: str | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Update user Team.
+        For group teams, user must have Developer+ permission.
+        """
+        from app.schemas.namespace import GroupRole
+        from app.services.group_permission import check_group_permission
+
+        team = kindReader.get_by_id(db, KindType.TEAM, team_id)
+
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        # Check permissions
+        if not can_edit_team(db, team, user_id):
+            if team.namespace != "default":
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"You need at least Developer role in group '{team.namespace}' to update this team",
+                )
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        update_data = obj_in.model_dump(exclude_unset=True)
+        old_name = team.name
+        old_namespace = team.namespace
+        new_name = update_data.get("name", old_name)
+        new_namespace = update_data.get("namespace", old_namespace)
+        identity_changed = new_name != old_name or new_namespace != old_namespace
+
+        if identity_changed and (not force_identity_change or confirm_name != old_name):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Changing the agent technical name or namespace requires "
+                    "force_identity_change=true and the current technical name"
+                ),
+            )
+
+        if not new_namespace:
+            raise HTTPException(status_code=400, detail="Team namespace is required")
+        if new_namespace != old_namespace:
+            if new_namespace == "default":
+                if team.user_id != user_id:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Only the agent owner can move it to personal scope",
+                    )
+            elif not check_group_permission(
+                db, user_id, new_namespace, GroupRole.Developer
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"You need at least Developer role in group '{new_namespace}' to move this team",
+                )
+
+        # Check uniqueness in the destination scope when name or namespace changes.
+        if identity_changed:
+            conflict_query = db.query(Kind).filter(
+                Kind.kind == "Team",
+                Kind.name == new_name,
+                Kind.namespace == new_namespace,
+                Kind.is_active == True,
+                Kind.id != team.id,
+            )
+            if new_namespace == "default":
+                conflict_query = conflict_query.filter(Kind.user_id == team.user_id)
+            if conflict_query.first():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Team name already exists, please modify the name",
+                )
+
+        # Update team based on update_data
+        team_crd = Team.model_validate(team.json)
+
+        if "name" in update_data:
+            team.name = new_name
+            team_crd.metadata.name = new_name
+
+        if "namespace" in update_data:
+            team.namespace = new_namespace
+            team_crd.metadata.namespace = new_namespace
+
+        if "displayName" in update_data:
+            team_crd.metadata.displayName = update_data["displayName"]
+
+        if "bots" in update_data:
+            # Validate bots
+            self._validate_bots(db, update_data["bots"], user_id)
+
+            # Convert bots to members format
+            from app.schemas.kind import BotTeamRef, TeamMember
+
+            members = []
+            members = []
+            for bot_info in update_data["bots"]:
+                bot_id = (
+                    bot_info.bot_id
+                    if hasattr(bot_info, "bot_id")
+                    else bot_info["bot_id"]
+                )
+                bot_prompt = (
+                    bot_info.bot_prompt
+                    if hasattr(bot_info, "bot_prompt")
+                    else bot_info.get("bot_prompt", "")
+                )
+                role = (
+                    bot_info.role
+                    if hasattr(bot_info, "role")
+                    else bot_info.get("role", "")
+                )
+                require_confirmation = (
+                    bot_info.requireConfirmation
+                    if hasattr(bot_info, "requireConfirmation")
+                    else bot_info.get("requireConfirmation", False)
+                )
+                context_passing = (
+                    bot_info.contextPassing
+                    if hasattr(bot_info, "contextPassing")
+                    else bot_info.get("contextPassing", "none")
+                )
+
+                # Get bot from kinds table
+                bot = kindReader.get_by_id(db, KindType.BOT, bot_id)
+
+                if not bot:
+                    raise HTTPException(
+                        status_code=400, detail=f"Bot with id {bot_id} not found"
+                    )
+
+                member = TeamMember(
+                    botRef=BotTeamRef(name=bot.name, namespace=bot.namespace),
+                    prompt=bot_prompt or "",
+                    role=role or "",
+                    requireConfirmation=require_confirmation or False,
+                    contextPassing=normalize_context_passing(context_passing),
+                )
+                members.append(member)
+            team_crd.spec.members = members
+
+        if "workflow" in update_data:
+            # Extract collaboration model from workflow
+            collaboration_model = "pipeline"
+            if update_data["workflow"] and "mode" in update_data["workflow"]:
+                collaboration_model = update_data["workflow"]["mode"]
+
+            team_crd.spec.collaborationModel = collaboration_model
+
+        # Handle bind_mode update - directly from update_data (not from workflow)
+        if "bind_mode" in update_data:
+            team_crd.spec.bind_mode = update_data["bind_mode"]
+
+        if "mode_spec" in update_data:
+            mode_spec = update_data["mode_spec"]
+            team_crd.spec.modeSpec = (
+                ModeSpec.model_validate(mode_spec) if mode_spec else None
+            )
+
+        # Handle description update
+        if "description" in update_data:
+            team_crd.spec.description = update_data["description"]
+
+        # Handle icon update
+        if "icon" in update_data:
+            team_crd.spec.icon = update_data["icon"]
+
+        # Handle requires_workspace update
+        if "requires_workspace" in update_data:
+            team_crd.spec.requiresWorkspace = update_data["requires_workspace"]
+
+        if "quick_phrases" in update_data:
+            team_crd.spec.quick_phrases = normalize_quick_phrases(
+                update_data["quick_phrases"]
+            )
+
+        if "inputPlaceholder" in update_data:
+            input_placeholder = update_data["inputPlaceholder"]
+            team_crd.spec.inputPlaceholder = (
+                TeamInputPlaceholder.model_validate(input_placeholder)
+                if input_placeholder
+                else None
+            )
+
+        # Save the updated team CRD
+        team.json = team_crd.model_dump(mode="json")
+        flag_modified(team, "json")
+
+        db.commit()
+        db.refresh(team)
+
+        return self._convert_to_team_dict(team, db, user_id)
+
+    def _get_running_tasks_for_team(
+        self, db: Session, team: Kind
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all running tasks for a team.
+
+        Args:
+            db: Database session
+            team: Team resource
+
+        Returns:
+            List of running task info dictionaries
+        """
+        return get_running_tasks_for_team(db, team)
+
+    def check_running_tasks(
+        self, db: Session, *, team_id: int, user_id: int
+    ) -> Dict[str, Any]:
+        """
+        Check if a team has any running tasks.
+
+        Args:
+            db: Database session
+            team_id: Team ID to check
+            user_id: User ID
+
+        Returns:
+            Dictionary with has_running_tasks flag and list of running tasks
+        """
+        team = kindReader.get_by_id(db, KindType.TEAM, team_id)
+
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        # Get running tasks for this team
+        running_tasks = self._get_running_tasks_for_team(db, team)
+
+        return {
+            "has_running_tasks": len(running_tasks) > 0,
+            "running_tasks_count": len(running_tasks),
+            "running_tasks": running_tasks,
+        }
+
+    def delete_with_user(
+        self,
+        db: Session,
+        *,
+        team_id: int,
+        user_id: int,
+        force: bool = False,
+        confirm_name: str | None = None,
+    ) -> None:
+        """
+        Delete user Team.
+        For group teams, user must have Developer+ permission.
+
+        Args:
+            db: Database session
+            team_id: Team ID to delete
+            user_id: User ID
+            force: Whether the caller explicitly confirmed destructive deletion
+            confirm_name: Current technical name entered by the caller
+        """
+        from app.schemas.namespace import GroupRole
+        from app.services.group_permission import check_group_permission
+
+        team = kindReader.get_by_id(db, KindType.TEAM, team_id)
+
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        # delete join shared team entry if any
+        if team.user_id != user_id:
+            # Check if this is a shared team deletion via ResourceMember
+            shared_member = (
+                db.query(ResourceMember)
+                .filter(
+                    ResourceMember.resource_type == ResourceType.TEAM,
+                    ResourceMember.resource_id == team_id,
+                    ResourceMember.entity_type == "user",
+                    ResourceMember.entity_id == str(user_id),
+                    ResourceMember.status == MemberStatus.APPROVED,
+                )
+                .first()
+            )
+
+            if shared_member:
+                # User is deleting their shared team access - mark as rejected
+                shared_member.status = MemberStatus.REJECTED
+                db.commit()
+                return
+
+            # Not a shared team, check if it's a group team
+            if team.namespace != "default":
+                # Group team - check permission
+                if not check_group_permission(
+                    db, user_id, team.namespace, GroupRole.Developer
+                ):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"You need at least Developer role in group '{team.namespace}' to delete this team",
+                    )
+            else:
+                # Personal team but wrong owner
+                raise HTTPException(status_code=403, detail="Access denied")
+
+        if not force or confirm_name != team.name:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Deleting an agent requires force=true and the current "
+                    "technical name"
+                ),
+            )
+
+        # delete share team - use ResourceMember
+        db.query(ResourceMember).filter(
+            ResourceMember.resource_type == ResourceType.TEAM,
+            ResourceMember.resource_id == team_id,
+        ).delete()
+        db.query(MarketplaceResource).filter(
+            MarketplaceResource.kind_id == team_id
+        ).delete()
+
+        db.delete(team)
+        db.commit()
+
+    def _validate_bots(self, db: Session, bots: List[BotInfo], user_id: int) -> None:
+        """
+        Validate bots and check if bots belong to user and are active
+        Also validates Dify runtime constraint: Dify Teams must have exactly one bot
+        """
+        if not bots:
+            raise HTTPException(status_code=400, detail="bots cannot be empty")
+
+        bot_id_list = []
+        for bot in bots:
+            if hasattr(bot, "bot_id"):
+                bot_id_list.append(bot.bot_id)
+            elif isinstance(bot, dict) and "bot_id" in bot:
+                bot_id_list.append(bot["bot_id"])
+            else:
+                raise HTTPException(
+                    status_code=400, detail="Invalid bot format: missing bot_id"
+                )
+
+        # Check if all bots exist, belong to user, and are active in kinds table
+        bots_in_db = kindReader.get_by_ids(db, KindType.BOT, bot_id_list)
+
+        found_bot_ids = {bot.id for bot in bots_in_db}
+        missing_bot_ids = set(bot_id_list) - found_bot_ids
+
+        if missing_bot_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid or inactive bot_ids: {', '.join(map(str, missing_bot_ids))}",
+            )
+
+        # Validate external API shell constraint: must have exactly one bot
+        for bot in bots_in_db:
+            bot_crd = Bot.model_validate(bot.json)
+
+            # Get shell type using utility function
+            shell_type = get_shell_type(
+                db, bot_crd.spec.shellRef.name, bot_crd.spec.shellRef.namespace, user_id
+            )
+
+            if shell_type == "external_api":
+                # Get shell for error message (with public fallback)
+                shell = kindReader.get_by_name_and_namespace(
+                    db,
+                    user_id,
+                    KindType.SHELL,
+                    bot_crd.spec.shellRef.namespace,
+                    bot_crd.spec.shellRef.name,
+                )
+
+                if shell:
+                    shell_crd = Shell.model_validate(shell.json)
+                    # External API shells (like Dify) can only have one bot per team
+                    if len(bots) > 1:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Teams using external API shells ({shell_crd.spec.shellType}) must have exactly one bot. Found {len(bots)} bots.",
+                        )
+
+    def get_team_by_name_and_namespace(
+        self, db: Session, team_name: str, team_namespace: str, user_id: int
+    ) -> Optional[Kind]:
+        # Use kindReader which handles personal and shared teams logic
+        return kindReader.get_by_name_and_namespace(
+            db, user_id, KindType.TEAM, team_namespace, team_name
+        )
+
+    def get_team_by_name_and_namespace_without_user_check(
+        self, db: Session, team_name: str, team_namespace: str
+    ) -> Optional[Kind]:
+        """
+        Get team by name and namespace without checking user ownership.
+        Used for group chat members to access the task's team.
+        """
+        team = (
+            db.query(Kind)
+            .filter(
+                Kind.name == team_name,
+                Kind.namespace == team_namespace,
+                Kind.kind == "Team",
+                Kind.is_active == True,
+            )
+            .first()
+        )
+        return team
+
+    def _convert_to_team_dict(
+        self, team: Kind, db: Session, user_id: int
+    ) -> Dict[str, Any]:
+        """
+        Convert kinds Team to team-like dictionary
+        """
+
+        team_crd = Team.model_validate(team.json)
+
+        # Convert members to bots format and collect shell_types for is_mix_team calculation
+        bots = []
+        shell_types = set()
+
+        # Determine if this is a group resource
+        is_group_resource = team.namespace and team.namespace != "default"
+
+        for member in team_crd.spec.members:
+            # Find bot in kinds table
+            # For group resources, use get_group; otherwise use get_by_name_and_namespace
+            if is_group_resource:
+                bot = kindReader.get_group(
+                    db, KindType.BOT, member.botRef.namespace, member.botRef.name
+                )
+            else:
+                bot = kindReader.get_by_name_and_namespace(
+                    db,
+                    team.user_id,
+                    KindType.BOT,
+                    member.botRef.namespace,
+                    member.botRef.name,
+                )
+
+            if bot:
+                # For group resources, use bot's user_id to find related components
+                summary_user_id = bot.user_id if is_group_resource else user_id
+                bot_summary = self._get_bot_summary(bot, db, summary_user_id)
+                bot_info = {
+                    "bot_id": bot.id,
+                    "bot_prompt": member.prompt or "",
+                    "role": member.role or "",
+                    "requireConfirmation": member.requireConfirmation or False,
+                    "contextPassing": normalize_context_passing(member.contextPassing),
+                    "bot": bot_summary,
+                }
+                bots.append(bot_info)
+
+                # Collect shell_type for is_mix_team calculation
+                if bot_summary.get("shell_type"):
+                    shell_types.add(bot_summary["shell_type"])
+
+        # Calculate is_mix_team: true if there are multiple different shell types
+        is_mix_team = len(shell_types) > 1
+
+        # Get agent_type from the first bot's shell
+        agent_type = None
+        if bots:
+            first_bot_id = bots[0]["bot_id"]
+            # Get first bot using kindReader
+            first_bot = kindReader.get_by_id(db, KindType.BOT, first_bot_id)
+
+            if first_bot:
+                bot_crd = Bot.model_validate(first_bot.json)
+                shell_type = None
+
+                # Get shell using kindReader (handles public fallback automatically)
+                shell_user_id = first_bot.user_id if is_group_resource else user_id
+                shell = kindReader.get_by_name_and_namespace(
+                    db,
+                    shell_user_id,
+                    KindType.SHELL,
+                    bot_crd.spec.shellRef.namespace,
+                    bot_crd.spec.shellRef.name,
+                )
+
+                if shell and shell.json:
+                    shell_crd = Shell.model_validate(shell.json)
+                    shell_type = shell_crd.spec.shellType
+
+                if shell_type:
+                    # Map shellType to agent type
+                    if shell_type == "Agno":
+                        agent_type = "agno"
+                    elif shell_type == "ClaudeCode":
+                        agent_type = "claude"
+                    elif shell_type == "Dify":
+                        agent_type = "dify"
+                    else:
+                        agent_type = shell_type.lower() if shell_type else None
+
+        # Convert collaboration model to workflow format
+        workflow = {"mode": team_crd.spec.collaborationModel}
+
+        # Get bind_mode from spec (directly, not from workflow)
+        bind_mode = team_crd.spec.bind_mode
+        mode_spec = (
+            team_crd.spec.modeSpec.model_dump(mode="json", exclude_none=True)
+            if team_crd.spec.modeSpec
+            else None
+        )
+
+        # Derive recommended_mode from bind_mode
+        # 'both' if both modes, 'code' if only code, 'chat' otherwise
+        recommended_mode = "chat"  # default
+        if bind_mode:
+            has_code = "code" in bind_mode
+            has_chat = "chat" in bind_mode
+            if has_code and has_chat:
+                recommended_mode = "both"
+            elif has_code:
+                recommended_mode = "code"
+
+        # Get description from spec
+        description = team_crd.spec.description
+
+        # Get icon from spec
+        icon = team_crd.spec.icon
+
+        # Get requires_workspace from spec
+        requires_workspace = team_crd.spec.requiresWorkspace
+
+        quick_phrases = normalize_quick_phrases(team_crd.spec.quick_phrases)
+        input_placeholder = (
+            team_crd.spec.inputPlaceholder.model_dump(exclude_none=True)
+            if team_crd.spec.inputPlaceholder
+            else None
+        )
+        capability = (team.json.get("spec") or {}).get("capability") or {}
+        publication_status = capability.get("publishStatus")
+
+        return {
+            "id": team.id,
+            "user_id": team.user_id,
+            "name": team.name,
+            "displayName": team_crd.metadata.displayName,
+            "namespace": team.namespace,  # Add namespace field
+            "description": description,
+            "bots": bots,
+            "workflow": workflow,
+            "bind_mode": bind_mode,
+            "mode_spec": mode_spec,
+            "recommended_mode": recommended_mode,  # Add recommended_mode field
+            "is_mix_team": is_mix_team,
+            "is_active": team.is_active,
+            "created_at": team.created_at,
+            "updated_at": team.updated_at,
+            "agent_type": agent_type,  # Add agent_type field
+            "icon": icon,  # Add icon field
+            "quick_phrases": quick_phrases,
+            "inputPlaceholder": input_placeholder,
+            "requires_workspace": requires_workspace,  # Add requires_workspace field
+            "publication_status": publication_status,
+        }
+
+    def _convert_to_team_dict_with_cache(
+        self, team: Kind, db: Session, user_id: int, cache: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Convert kinds Team to team-like dictionary using preloaded cache.
+        This is an optimized version that avoids N+1 queries by using batch-loaded data.
+
+        Args:
+            team: The team Kind object
+            db: Database session (only used for fallback queries if cache miss)
+            user_id: The user ID for context
+            cache: Preloaded cache containing:
+                - bots: Dict[(user_id, name, namespace), Kind] for personal bots
+                - group_bots: Dict[(name, namespace), Kind] for group bots
+                - shells: Dict[(user_id, name, namespace), Kind]
+                - public_shells: Dict[name, Kind]
+                - models: Dict[(user_id, name, namespace), Kind]
+                - public_models: Dict[name, Kind]
+        """
+        team_crd = Team.model_validate(team.json)
+
+        # Determine if this is a group resource
+        is_group_resource = team.namespace and team.namespace != "default"
+
+        # Convert members to bots format and collect shell_types for is_mix_team calculation
+        bots = []
+        shell_types = set()
+
+        bots_cache = cache.get("bots", {})
+        group_bots_cache = cache.get(
+            "group_bots", {}
+        )  # (name, namespace) -> Kind for group bots
+        shells_cache = cache.get("shells", {})
+        public_shells_cache = cache.get(
+            "public_shells", {}
+        )  # name -> Kind (not (name, namespace))
+        models_cache = cache.get("models", {})
+        public_models_cache = cache.get("public_models", {})
+
+        for member in team_crd.spec.members:
+            # Find bot in cache
+            # For group resources, lookup by (name, namespace) only
+            if is_group_resource:
+                bot = group_bots_cache.get(
+                    (member.botRef.name, member.botRef.namespace)
+                )
+            else:
+                bot = bots_cache.get(
+                    (user_id, member.botRef.name, member.botRef.namespace)
+                )
+
+            if bot:
+                # For group resources, use bot's user_id for shell/model lookup
+                lookup_user_id = bot.user_id if is_group_resource else user_id
+                bot_summary = self._get_bot_summary_with_cache(
+                    bot,
+                    lookup_user_id,
+                    shells_cache,
+                    public_shells_cache,  # This is now name -> Kind
+                    models_cache,
+                    public_models_cache,
+                )
+                bot_info = {
+                    "bot_id": bot.id,
+                    "bot_prompt": member.prompt or "",
+                    "role": member.role or "",
+                    "requireConfirmation": member.requireConfirmation or False,
+                    "contextPassing": normalize_context_passing(member.contextPassing),
+                    "bot": bot_summary,
+                }
+                bots.append(bot_info)
+
+                # Collect shell_type for is_mix_team calculation
+                if bot_summary.get("shell_type"):
+                    shell_types.add(bot_summary["shell_type"])
+
+        # Calculate is_mix_team: true if there are multiple different shell types
+        is_mix_team = len(shell_types) > 1
+
+        # Get agent_type from the first bot's shell
+        agent_type = None
+        if bots:
+            first_bot_id = bots[0]["bot_id"]
+            # Find first bot in cache (check both caches for group resources)
+            first_bot = None
+            if is_group_resource:
+                for key, bot in group_bots_cache.items():
+                    if bot.id == first_bot_id:
+                        first_bot = bot
+                        break
+            else:
+                for key, bot in bots_cache.items():
+                    if bot.id == first_bot_id:
+                        first_bot = bot
+                        break
+
+            if first_bot:
+                bot_crd = Bot.model_validate(first_bot.json)
+                shell_type = None
+                shell_ref_name = bot_crd.spec.shellRef.name
+                shell_ref_namespace = bot_crd.spec.shellRef.namespace
+
+                # First check user's custom shells in cache
+                # For group resources, use bot's user_id
+                shell_lookup_user_id = (
+                    first_bot.user_id if is_group_resource else user_id
+                )
+                shell = shells_cache.get(
+                    (shell_lookup_user_id, shell_ref_name, shell_ref_namespace)
+                )
+
+                if shell:
+                    shell_crd = Shell.model_validate(shell.json)
+                    shell_type = shell_crd.spec.shellType
+                    logger.debug(
+                        f"[_convert_to_team_dict_with_cache] Found user shell: {shell_ref_name}, shell_type={shell_type}"
+                    )
+                else:
+                    # If not found, check public shells in cache (by name only)
+                    public_shell = public_shells_cache.get(shell_ref_name)
+                    if public_shell and public_shell.json:
+                        shell_crd = Shell.model_validate(public_shell.json)
+                        shell_type = shell_crd.spec.shellType
+                        logger.debug(
+                            f"[_convert_to_team_dict_with_cache] Found public shell: {shell_ref_name}, shell_type={shell_type}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[_convert_to_team_dict_with_cache] Shell not found in cache: user_id={shell_lookup_user_id}, name={shell_ref_name}, namespace={shell_ref_namespace}. "
+                            f"public_shells_cache keys: {list(public_shells_cache.keys())}"
+                        )
+
+                if shell_type:
+                    # Map shellType to agent type
+                    if shell_type == "Agno":
+                        agent_type = "agno"
+                    elif shell_type == "ClaudeCode":
+                        agent_type = "claude"
+                    elif shell_type == "Dify":
+                        agent_type = "dify"
+                    elif shell_type == "Chat":
+                        agent_type = "chat"
+                    else:
+                        agent_type = shell_type.lower() if shell_type else None
+                    logger.debug(
+                        f"[_convert_to_team_dict_with_cache] Mapped shell_type={shell_type} to agent_type={agent_type}"
+                    )
+
+        # Convert collaboration model to workflow format
+        workflow = {"mode": team_crd.spec.collaborationModel}
+
+        # Get bind_mode from spec (directly, not from workflow)
+        bind_mode = team_crd.spec.bind_mode
+        mode_spec = (
+            team_crd.spec.modeSpec.model_dump(mode="json", exclude_none=True)
+            if team_crd.spec.modeSpec
+            else None
+        )
+
+        # Derive recommended_mode from bind_mode
+        # 'both' if both modes, 'code' if only code, 'chat' otherwise
+        recommended_mode = "chat"  # default
+        if bind_mode:
+            has_code = "code" in bind_mode
+            has_chat = "chat" in bind_mode
+            if has_code and has_chat:
+                recommended_mode = "both"
+            elif has_code:
+                recommended_mode = "code"
+
+        # Get description from spec
+        description = team_crd.spec.description
+
+        # Get icon from spec
+        icon = team_crd.spec.icon
+
+        # Get requires_workspace from spec
+        requires_workspace = team_crd.spec.requiresWorkspace
+
+        quick_phrases = normalize_quick_phrases(team_crd.spec.quick_phrases)
+        input_placeholder = (
+            team_crd.spec.inputPlaceholder.model_dump(exclude_none=True)
+            if team_crd.spec.inputPlaceholder
+            else None
+        )
+        capability = (team.json.get("spec") or {}).get("capability") or {}
+        publication_status = capability.get("publishStatus")
+
+        return {
+            "id": team.id,
+            "user_id": team.user_id,
+            "name": team.name,
+            "displayName": team_crd.metadata.displayName,
+            "namespace": team.namespace,
+            "description": description,
+            "bots": bots,
+            "workflow": workflow,
+            "bind_mode": bind_mode,
+            "mode_spec": mode_spec,
+            "recommended_mode": recommended_mode,  # Add recommended_mode field
+            "is_mix_team": is_mix_team,
+            "is_active": team.is_active,
+            "created_at": team.created_at,
+            "updated_at": team.updated_at,
+            "agent_type": agent_type,
+            "icon": icon,
+            "quick_phrases": quick_phrases,
+            "inputPlaceholder": input_placeholder,
+            "requires_workspace": requires_workspace,  # Add requires_workspace field
+            "publication_status": publication_status,
+        }
+
+    def _get_bot_summary_with_cache(
+        self,
+        bot: Kind,
+        user_id: int,
+        shells_cache: Dict,
+        public_shells_cache: Dict,
+        models_cache: Dict,
+        public_models_cache: Dict,
+    ) -> Dict[str, Any]:
+        """
+        Get a summary of bot information using preloaded cache.
+        This is an optimized version that avoids database queries.
+        """
+        bot_crd = Bot.model_validate(bot.json)
+
+        # modelRef is optional, handle None case
+        model_ref_name = bot_crd.spec.modelRef.name if bot_crd.spec.modelRef else None
+        model_ref_namespace = (
+            bot_crd.spec.modelRef.namespace if bot_crd.spec.modelRef else None
+        )
+
+        # Get shell from cache to extract shell_type
+        shell = shells_cache.get(
+            (user_id, bot_crd.spec.shellRef.name, bot_crd.spec.shellRef.namespace)
+        )
+        if not shell:
+            # Try public shells (by name only)
+            shell = public_shells_cache.get(bot_crd.spec.shellRef.name)
+
+        shell_type = ""
+        if shell and shell.json:
+            shell_crd = Shell.model_validate(shell.json)
+            shell_type = shell_crd.spec.shellType
+
+        agent_config = {}
+
+        # Only try to find model if modelRef exists
+        if model_ref_name and model_ref_namespace:
+            # Try to find model in user's private models cache first
+            model = models_cache.get((user_id, model_ref_name, model_ref_namespace))
+
+            if model:
+                # Private model - check if it's a custom config or predefined model
+                model_crd = Model.model_validate(model.json)
+                is_custom_config = model_crd.spec.isCustomConfig
+
+                if is_custom_config:
+                    # Custom config - return full modelConfig with protocol for advanced mode
+                    model_config = model_crd.spec.modelConfig or {}
+                    protocol = model_crd.spec.protocol
+                    agent_config = dict(model_config)
+                    if protocol:
+                        agent_config["protocol"] = protocol
+                else:
+                    # Not custom config = predefined model, return bind_model format with type
+                    agent_config = {
+                        "bind_model": model_ref_name,
+                        "bind_model_type": "user",
+                    }
+            else:
+                # Try to find in public_models cache (by name only)
+                public_model = public_models_cache.get(model_ref_name)
+
+                if public_model and public_model.json:
+                    model_crd = Model.model_validate(public_model.json)
+                    if model_crd.spec.isCustomConfig:
+                        model_config = model_crd.spec.modelConfig or {}
+                        agent_config = dict(model_config)
+                        if model_crd.spec.protocol:
+                            agent_config["protocol"] = model_crd.spec.protocol
+                    else:
+                        # Public predefined model - return bind_model format with type
+                        agent_config = {
+                            "bind_model": public_model.name,
+                            "bind_model_type": "public",
+                        }
+
+        return {"agent_config": agent_config, "shell_type": shell_type}
+
+    def _get_bot_summary(self, bot: Kind, db: Session, user_id: int) -> Dict[str, Any]:
+        """
+        Get a summary of bot information including agent_config with only necessary fields.
+        This is used for team list to determine if bots have predefined models.
+        """
+
+        bot_crd = Bot.model_validate(bot.json)
+
+        # modelRef is optional, handle None case
+        model_ref_name = bot_crd.spec.modelRef.name if bot_crd.spec.modelRef else None
+        model_ref_namespace = (
+            bot_crd.spec.modelRef.namespace if bot_crd.spec.modelRef else None
+        )
+
+        # Get shell to extract shell_type (kindReader handles public fallback automatically)
+        shell = kindReader.get_by_name_and_namespace(
+            db,
+            user_id,
+            KindType.SHELL,
+            bot_crd.spec.shellRef.namespace,
+            bot_crd.spec.shellRef.name,
+        )
+
+        shell_type = ""
+        if shell and shell.json:
+            shell_crd = Shell.model_validate(shell.json)
+            shell_type = shell_crd.spec.shellType
+        else:
+            logger.warning(
+                f"[_get_bot_summary] No shell found for bot={bot.name}, shellRef.name={bot_crd.spec.shellRef.name}"
+            )
+
+        agent_config = {}
+
+        # Only try to find model if modelRef exists
+        if model_ref_name and model_ref_namespace:
+            # Get model using kindReader (handles public fallback automatically)
+            model = kindReader.get_by_name_and_namespace(
+                db, user_id, KindType.MODEL, model_ref_namespace, model_ref_name
+            )
+
+            if (
+                model is not None
+                and model.user_id == 0
+                and not is_public_model_allowed_for_user_id(db, model.json, user_id)
+            ):
+                # Restricted public model: treat as if no model was selected.
+                model = None
+
+            if model and model.json:
+                model_crd = Model.model_validate(model.json)
+                is_custom_config = model_crd.spec.isCustomConfig
+                # Determine if this is a user's private model or public model
+                is_user_model = model.user_id == user_id
+
+                if is_custom_config:
+                    # Custom config - return full modelConfig with protocol for advanced mode
+                    model_config = model_crd.spec.modelConfig or {}
+                    protocol = model_crd.spec.protocol
+                    agent_config = dict(model_config)
+                    if protocol:
+                        agent_config["protocol"] = protocol
+                else:
+                    # Not custom config = predefined model, return bind_model format with type
+                    agent_config = {
+                        "bind_model": model_ref_name,
+                        "bind_model_type": "user" if is_user_model else "public",
+                    }
+
+        result = {"agent_config": agent_config, "shell_type": shell_type}
+
+        return result
+
+    def get_team_input_parameters(
+        self, db: Session, *, team_id: int, user_id: int
+    ) -> Dict[str, Any]:
+        """
+        Get input parameters required by the team's external API bots
+        Returns parameter schema if team has external API bots, otherwise empty
+        """
+        from app.services.share.team_share_service import team_share_service
+
+        team = team_share_service.get_resource_for_use(db, team_id, user_id)
+
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        # Get team owner's context for loading related resources
+        team_owner_id = team.user_id
+        team_dict = self._convert_to_team_dict(team, db, team_owner_id)
+
+        # Check if team has any external API bots (like Dify)
+        has_external_api_bot = False
+        external_api_bot = None
+
+        for bot_info in team_dict["bots"]:
+            bot_id = bot_info["bot_id"]
+            bot = kindReader.get_by_id(db, KindType.BOT, bot_id)
+
+            if bot:
+                bot_crd = Bot.model_validate(bot.json)
+                # Check if bot uses external API shell
+                shell_name = bot_crd.spec.shellRef.name
+                shell_namespace = bot_crd.spec.shellRef.namespace
+
+                # Get shell using kindReader (handles public fallback)
+                shell = kindReader.get_by_name_and_namespace(
+                    db, team_owner_id, KindType.SHELL, shell_namespace, shell_name
+                )
+
+                if shell:
+                    # Use utility function to get shell type
+                    shell_type = get_shell_type(
+                        db, shell_name, shell_namespace, team_owner_id
+                    )
+
+                    if shell_type == "external_api":
+                        has_external_api_bot = True
+                        external_api_bot = bot_crd
+                        break
+
+        if not has_external_api_bot:
+            return {"has_parameters": False, "parameters": []}
+
+        # Get bot's model to extract API credentials
+        # modelRef is optional
+        model_ref = external_api_bot.spec.modelRef
+        if not model_ref:
+            return {"has_parameters": False, "parameters": []}
+
+        # Get model using kindReader (handles public fallback)
+        model = kindReader.get_by_name_and_namespace(
+            db, team_owner_id, KindType.MODEL, model_ref.namespace, model_ref.name
+        )
+
+        if not model:
+            return {"has_parameters": False, "parameters": []}
+        if model.user_id == 0 and not is_public_model_allowed_for_user_id(
+            db, model.json, user_id
+        ):
+            return {"has_parameters": False, "parameters": []}
+
+        model_crd = Model.model_validate(model.json)
+        agent_config = model_crd.spec.modelConfig or {}
+
+        # Decrypt sensitive data before using
+        decrypted_agent_config = self._decrypt_agent_config(agent_config)
+        env = decrypted_agent_config.get("env", {})
+
+        # For Dify bots, we need to call Dify API to get parameters
+        api_key = env.get("DIFY_API_KEY", "")
+        base_url = env.get("DIFY_BASE_URL", "https://api.dify.ai")
+
+        if not api_key:
+            return {"has_parameters": False, "parameters": []}
+
+        # Call external API to get parameter schema and app info
+        try:
+            import requests
+
+            # Get app info to retrieve mode
+            app_mode = None
+            try:
+                info_response = requests.get(
+                    f"{base_url}/v1/info",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=10,
+                )
+                if info_response.status_code == 200:
+                    info_data = info_response.json()
+                    app_mode = info_data.get("mode")
+            except Exception as e:
+                logger.warning("Failed to fetch app info: %s", e)
+
+            # Get app parameters
+            response = requests.get(
+                f"{base_url}/v1/parameters",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                user_input_form = data.get("user_input_form", [])
+
+                # Transform Dify's nested format to flat format expected by frontend
+                # Dify format: [{"text-input": {"variable": "x", ...}}, ...]
+                # Frontend expects: [{"variable": "x", "type": "text-input", ...}, ...]
+                transformed_params = []
+                for item in user_input_form:
+                    if isinstance(item, dict):
+                        # Each item is like {"text-input": {...}} or {"select": {...}}
+                        for param_type, param_data in item.items():
+                            if isinstance(param_data, dict):
+                                # Add type field and flatten
+                                transformed_param = {**param_data, "type": param_type}
+                                transformed_params.append(transformed_param)
+
+                # has_parameters is true as long as the API request succeeds (external API bot exists)
+                result = {"has_parameters": True, "parameters": transformed_params}
+
+                # Add app_mode if available
+                if app_mode:
+                    result["app_mode"] = app_mode
+
+                return result
+            else:
+                logger.warning(
+                    "Dify API returned status %s: %s",
+                    response.status_code,
+                    response.text,
+                )
+                # has_parameters is true as long as external API bot exists, even if parameters API fails
+                result = {"has_parameters": True, "parameters": []}
+                if app_mode:
+                    result["app_mode"] = app_mode
+                return result
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch parameters from external API: %s", e, exc_info=True
+            )
+            # has_parameters is true as long as external API bot exists, even if API call fails
+            return {"has_parameters": True, "parameters": []}
+
+    def copy_team(
+        self,
+        db: Session,
+        *,
+        team_id: int,
+        user_id: int,
+        target_namespace: Optional[str] = None,
+        copy_skills: bool = False,
+        commit: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Copy a team. Creates a new team with 'Copy of {name}'.
+
+        Solo mode always clones the leader bot. Non-solo mode clones every bot when
+        moving across namespaces.
+
+        If target_namespace is provided, the copy is placed in that namespace.
+        Otherwise, copies to the original team's namespace.
+        """
+        from app.schemas.team import BotInfo, TeamCreate
+        from app.services.adapters.bot_kinds import bot_kinds_service
+
+        # Fetch the original team
+        original = (
+            db.query(Kind)
+            .filter(
+                Kind.id == team_id,
+                Kind.kind == "Team",
+                Kind.is_active == True,
+            )
+            .first()
+        )
+        if not original:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        spec = original.json.get("spec", {})
+        collaboration_model = spec.get("collaborationModel", "pipeline")
+        members = spec.get("members", [])
+        bind_mode = spec.get("bind_mode", ["chat"])
+        description = spec.get("description", "")
+        icon = spec.get("icon")
+        requires_workspace = spec.get("requiresWorkspace", True)
+        display_name = (original.json.get("metadata") or {}).get("displayName")
+        quick_phrases = normalize_quick_phrases(spec.get("quick_phrases"))
+        workflow = {"mode": collaboration_model}
+
+        # Determine the effective target namespace
+        dest_namespace = (
+            target_namespace if target_namespace is not None else original.namespace
+        )
+
+        # Build bots list — for solo mode, clone the leader bot
+        new_bots: list[Dict[str, Any]] = []
+
+        if collaboration_model == "solo" and members:
+            leader_member = next(
+                (m for m in members if m.get("role") == "leader"), members[0]
+            )
+            bot_ref = leader_member.get("botRef", {})
+
+            # Find the original bot Kind record
+            original_bot = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Bot",
+                    Kind.name == bot_ref.get("name"),
+                    Kind.namespace == bot_ref.get("namespace", original.namespace),
+                    Kind.user_id == original.user_id,
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+            if not original_bot:
+                raise HTTPException(status_code=400, detail="Leader bot not found")
+
+            # Find available bot name in the destination namespace
+            bot_name = bot_kinds_service._find_available_name(
+                db,
+                base_name=f"Copy of {original_bot.name}",
+                kind="Bot",
+                user_id=user_id,
+                namespace=dest_namespace,
+            )
+
+            # Grant the destination access to the source Skills.
+            skill_mapping: Dict[int, int] = {}
+            if dest_namespace == "default":
+                skill_mapping = self._bind_bot_skills_to_personal_space(
+                    db,
+                    bot=original_bot,
+                    user_id=user_id,
+                    commit=commit,
+                )
+            elif copy_skills and dest_namespace != original.namespace:
+                skill_mapping = self._bind_bot_skills_to_namespace(
+                    db,
+                    bot=original_bot,
+                    target_namespace=dest_namespace,
+                    user_id=user_id,
+                    commit=commit,
+                )
+
+            # Clone the bot into the destination namespace
+            cloned_bot = bot_kinds_service.clone_bot(
+                db,
+                bot_id=original_bot.id,
+                user_id=user_id,
+                new_name=bot_name,
+                namespace=dest_namespace,
+                skill_id_mapping=skill_mapping if skill_mapping else None,
+                commit=commit,
+            )
+            new_bots.append(
+                {
+                    "bot_id": cloned_bot["id"],
+                    "bot_prompt": leader_member.get("prompt", ""),
+                    "role": "leader",
+                    "contextPassing": normalize_context_passing(
+                        leader_member.get("contextPassing")
+                    ),
+                }
+            )
+        else:
+            # Non-solo: resolve bot_ids from member botRefs.
+            # When copying to a different namespace, clone each bot into the target namespace.
+            for member in members:
+                bot_ref = member.get("botRef", {})
+                bot = (
+                    db.query(Kind)
+                    .filter(
+                        Kind.kind == "Bot",
+                        Kind.name == bot_ref.get("name"),
+                        Kind.namespace == bot_ref.get("namespace", original.namespace),
+                        Kind.user_id == original.user_id,
+                        Kind.is_active == True,
+                    )
+                    .first()
+                )
+                if bot:
+                    if dest_namespace != original.namespace:
+                        # Clone the bot into the destination namespace
+                        bot_name = bot_kinds_service._find_available_name(
+                            db,
+                            base_name=bot.name,
+                            kind="Bot",
+                            user_id=user_id,
+                            namespace=dest_namespace,
+                        )
+                        skill_mapping: Dict[int, int] = {}
+                        if dest_namespace == "default":
+                            skill_mapping = self._bind_bot_skills_to_personal_space(
+                                db,
+                                bot=bot,
+                                user_id=user_id,
+                                commit=commit,
+                            )
+                        elif copy_skills:
+                            skill_mapping = self._bind_bot_skills_to_namespace(
+                                db,
+                                bot=bot,
+                                target_namespace=dest_namespace,
+                                user_id=user_id,
+                                commit=commit,
+                            )
+                        cloned = bot_kinds_service.clone_bot(
+                            db,
+                            bot_id=bot.id,
+                            user_id=user_id,
+                            new_name=bot_name,
+                            namespace=dest_namespace,
+                            skill_id_mapping=skill_mapping if skill_mapping else None,
+                            commit=commit,
+                        )
+                        new_bots.append(
+                            {
+                                "bot_id": cloned["id"],
+                                "bot_prompt": member.get("prompt", ""),
+                                "role": member.get("role", ""),
+                                "requireConfirmation": member.get(
+                                    "requireConfirmation", False
+                                ),
+                                "contextPassing": normalize_context_passing(
+                                    member.get("contextPassing")
+                                ),
+                            }
+                        )
+                    else:
+                        new_bots.append(
+                            {
+                                "bot_id": bot.id,
+                                "bot_prompt": member.get("prompt", ""),
+                                "role": member.get("role", ""),
+                                "requireConfirmation": member.get(
+                                    "requireConfirmation", False
+                                ),
+                                "contextPassing": normalize_context_passing(
+                                    member.get("contextPassing")
+                                ),
+                            }
+                        )
+
+        # Determine group_name for permission check
+        group_name = dest_namespace if dest_namespace != "default" else None
+
+        team_name = bot_kinds_service._find_available_name(
+            db,
+            base_name=f"Copy of {original.name}",
+            kind="Team",
+            user_id=user_id,
+            namespace=dest_namespace,
+        )
+
+        team_create = TeamCreate(
+            name=team_name,
+            displayName=display_name,
+            description=description or None,
+            workflow=workflow,
+            bind_mode=bind_mode,
+            bots=[BotInfo(**b) for b in new_bots],
+            namespace=dest_namespace,
+            icon=icon,
+            requires_workspace=requires_workspace,
+            quick_phrases=quick_phrases,
+        )
+
+        return self.create_with_user(
+            db=db,
+            obj_in=team_create,
+            user_id=user_id,
+            group_name=group_name,
+            commit=commit,
+        )
+
+    def _collect_private_skill_ids(self, db: Session, bot: Kind) -> Dict[str, int]:
+        """Return private Skill refs that must be copied with a distributed agent.
+
+        Skills are stored in the ghost's spec, not the bot's spec.
+        """
+        # Look up the ghost that holds skill_refs
+        bot_spec = bot.json.get("spec", {})
+        ghost_ref = bot_spec.get("ghostRef", {})
+        ghost = (
+            db.query(Kind)
+            .filter(
+                Kind.kind == "Ghost",
+                Kind.name == ghost_ref.get("name"),
+                Kind.namespace == ghost_ref.get("namespace", bot.namespace),
+                Kind.user_id == bot.user_id,
+                Kind.is_active == True,
+            )
+            .first()
+        )
+        if not ghost:
+            return {}
+        spec = ghost.json.get("spec", {})
+        result: Dict[str, int] = {}
+        for ref_map in (
+            spec.get("skill_refs") or {},
+            spec.get("preload_skill_refs") or {},
+        ):
+            for skill_name, meta in ref_map.items():
+                if isinstance(meta, dict):
+                    is_public = meta.get("is_public", False)
+                    skill_id = meta.get("skill_id")
+                else:
+                    is_public = getattr(meta, "is_public", False)
+                    skill_id = getattr(meta, "skill_id", None)
+                if not is_public and skill_id is not None:
+                    result[skill_name] = skill_id
+        return result
+
+    def _bind_bot_skills_to_personal_space(
+        self,
+        db: Session,
+        *,
+        bot: Kind,
+        user_id: int,
+        commit: bool = True,
+    ) -> Dict[int, int]:
+        """Grant the copier personal access to a bot's private Skills.
+
+        Cloning a bot into personal space (namespace 'default') keeps the Skill
+        references pointing at the canonical Skill assets. Those references only
+        resolve in the personal space when the Skill is public, owned by the
+        copier in the personal namespace, or bound to the copier's user defaults.
+
+        Bindings created here only affect the copier, so an agent the copier
+        already manages (own agent or group agent) can be copied into personal
+        space without the group consent dialog used for group destinations.
+        Skills the copier cannot access in any source context are left untouched,
+        so the clone-time permission check still reports the denial.
+        """
+        from app.services.skill_binding_service import skill_binding_service
+
+        private_skill_ids = self._collect_private_skill_ids(db, bot)
+        user_default_skill_ids = skill_binding_service.list_user_default_skill_ids(
+            db, user_id
+        )
+        mapping: Dict[int, int] = {}
+        for _skill_name, skill_id in private_skill_ids.items():
+            skill = (
+                db.query(Kind)
+                .filter(
+                    Kind.id == skill_id,
+                    Kind.kind == "Skill",
+                    Kind.is_active.is_(True),
+                )
+                .first()
+            )
+            if not skill or skill.user_id == 0:
+                continue
+            if skill.user_id == user_id and skill.namespace == "default":
+                continue
+            if skill_id in user_default_skill_ids:
+                continue
+            if not skill_binding_service.can_user_access_skill(
+                db, skill=skill, user_id=user_id
+            ):
+                continue
+            skill_binding_service.add_user_default_skill(
+                db,
+                user_id=user_id,
+                skill_id=skill_id,
+                created_by=user_id,
+                commit=False,
+            )
+            mapping[skill_id] = skill_id
+        if commit:
+            db.commit()
+        return mapping
+
+    def _bind_bot_skills_to_namespace(
+        self,
+        db: Session,
+        *,
+        bot: Kind,
+        target_namespace: str,
+        user_id: int,
+        commit: bool = True,
+    ) -> Dict[int, int]:
+        """Grant a target namespace access to a bot's private Skills.
+
+        The source Skill remains canonical so every Agent sees future updates.
+        The identity mapping keeps cloned Bot refs on the source Skill ids.
+        """
+        from app.services.skill_binding_service import skill_binding_service
+
+        private_skill_ids = self._collect_private_skill_ids(db, bot)
+        mapping: Dict[int, int] = {}
+        for _skill_name, skill_id in private_skill_ids.items():
+            if target_namespace == "default":
+                skill_binding_service.add_user_default_skill(
+                    db,
+                    user_id=user_id,
+                    skill_id=skill_id,
+                    created_by=user_id,
+                    commit=False,
+                )
+            else:
+                skill_binding_service.add_group_skill(
+                    db,
+                    group_namespace=target_namespace,
+                    skill_id=skill_id,
+                    created_by=user_id,
+                    commit=False,
+                )
+            mapping[skill_id] = skill_id
+        if commit:
+            db.commit()
+        return mapping
+
+    def get_copy_preflight(
+        self,
+        db: Session,
+        *,
+        team_id: int,
+        user_id: int,
+        target_namespace: str,
+    ) -> Dict[str, Any]:
+        """Identify personal skills on a team's bots that would need copying.
+
+        A personal skill is one where the skill_ref has namespace="default"
+        and is_public=False, and the skill Kind is owned by the team owner.
+
+        Returns:
+            {"personal_skills": [{id, name, description}, ...]}
+        """
+        team = (
+            db.query(Kind)
+            .filter(Kind.id == team_id, Kind.kind == "Team", Kind.is_active == True)
+            .first()
+        )
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        spec = team.json.get("spec", {})
+        members = spec.get("members", [])
+
+        personal_skills: List[Dict[str, Any]] = []
+        seen_skill_ids: set = set()
+
+        for member in members:
+            bot_ref = member.get("botRef", {})
+            bot = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Bot",
+                    Kind.name == bot_ref.get("name"),
+                    Kind.namespace == bot_ref.get("namespace", team.namespace),
+                    Kind.user_id == team.user_id,
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+            if not bot:
+                continue
+
+            bot_spec = bot.json.get("spec", {})
+            # Skills are stored in the ghost's spec, not the bot's spec
+            ghost_ref = bot_spec.get("ghostRef", {})
+            ghost = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Ghost",
+                    Kind.name == ghost_ref.get("name"),
+                    Kind.namespace == ghost_ref.get("namespace", bot.namespace),
+                    Kind.user_id == bot.user_id,
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+            if not ghost:
+                continue
+            ghost_spec = ghost.json.get("spec", {})
+            skill_refs = ghost_spec.get("skill_refs") or {}
+            preload_skill_refs = ghost_spec.get("preload_skill_refs") or {}
+
+            for ref_map in (skill_refs, preload_skill_refs):
+                for skill_name, ref_meta in ref_map.items():
+                    if isinstance(ref_meta, dict):
+                        ref_ns = ref_meta.get("namespace", "default")
+                        is_public = ref_meta.get("is_public", False)
+                        skill_id = ref_meta.get("skill_id")
+                    else:
+                        ref_ns = getattr(ref_meta, "namespace", "default")
+                        is_public = getattr(ref_meta, "is_public", False)
+                        skill_id = getattr(ref_meta, "skill_id", None)
+
+                    if (
+                        ref_ns == "default"
+                        and not is_public
+                        and skill_id is not None
+                        and skill_id not in seen_skill_ids
+                    ):
+                        skill = (
+                            db.query(Kind)
+                            .filter(
+                                Kind.id == skill_id,
+                                Kind.kind == "Skill",
+                                Kind.user_id == team.user_id,
+                                Kind.is_active == True,
+                            )
+                            .first()
+                        )
+                        if skill:
+                            seen_skill_ids.add(skill_id)
+                            personal_skills.append(
+                                {
+                                    "id": skill.id,
+                                    "name": skill.name,
+                                    "description": skill.json.get("spec", {}).get(
+                                        "description", ""
+                                    ),
+                                }
+                            )
+
+        return {"personal_skills": personal_skills}
+
+
+team_kinds_service = TeamKindsService(Kind)

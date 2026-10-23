@@ -1,0 +1,3176 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for local device command RPC service."""
+
+import base64
+import gzip
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+
+def _run_git(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
+def _create_turn_file_changes_artifact(tmp_path, task_id=10, subtask_id=20):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "tests@example.com")
+    _run_git(repo, "config", "user.name", "Tests")
+    changed_file = repo / "changed.txt"
+    changed_file.write_text("before\n", encoding="utf-8")
+    _run_git(repo, "add", "--all")
+    _run_git(repo, "commit", "-qm", "initial")
+    changed_file.write_text("after\n", encoding="utf-8")
+    patch = _run_git(repo, "diff", "--binary", "HEAD")
+    executor_home = tmp_path / "executor-home"
+    artifact_dir = (
+        executor_home
+        / "artifacts"
+        / "turn-file-changes"
+        / str(task_id)
+        / str(subtask_id)
+    )
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "changes.patch.gz").write_bytes(gzip.compress(patch))
+    (artifact_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "workspace_path": str(repo.resolve()),
+                "checksum": hashlib.sha256(patch).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return repo, executor_home
+
+
+def _create_turn_file_changes_sequence_artifact(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "tests@example.com")
+    _run_git(repo, "config", "user.name", "Tests")
+    changed_file = repo / "changed.txt"
+    changed_file.write_text("before\n", encoding="utf-8")
+    _run_git(repo, "add", "--all")
+    _run_git(repo, "commit", "-qm", "initial")
+    changed_file.write_text("final\n", encoding="utf-8")
+    patches = [
+        "\n".join(
+            [
+                "diff --git a/changed.txt b/changed.txt",
+                "--- a/changed.txt",
+                "+++ b/changed.txt",
+                "@@ -1 +1 @@",
+                "-before",
+                "+middle",
+            ]
+        )
+        + "\n",
+        "\n".join(
+            [
+                "diff --git a/changed.txt b/changed.txt",
+                "--- a/changed.txt",
+                "+++ b/changed.txt",
+                "@@ -1 +1 @@",
+                "-middle",
+                "+final",
+            ]
+        )
+        + "\n",
+    ]
+    patch = json.dumps(patches).encode("utf-8")
+    executor_home = tmp_path / "executor-home"
+    artifact_dir = executor_home / "artifacts" / "turn-file-changes" / "10" / "21"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "changes.patch.gz").write_bytes(gzip.compress(patch))
+    (artifact_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "task_id": 10,
+                "subtask_id": 21,
+                "workspace_path": str(repo.resolve()),
+                "checksum": hashlib.sha256(patch).hexdigest(),
+                "patch_sequence": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return repo, executor_home
+
+
+def test_git_apply_patch_command_stages_unstages_and_reverts(tmp_path):
+    from app.services.device.command_registry import resolve_local_device_command
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "tests@example.com")
+    _run_git(repo, "config", "user.name", "Tests")
+    changed_file = repo / "changed.txt"
+    changed_file.write_text("before\n", encoding="utf-8")
+    _run_git(repo, "add", "--all")
+    _run_git(repo, "commit", "-qm", "initial")
+    changed_file.write_text("after\n", encoding="utf-8")
+    patch = _run_git(repo, "diff", "--binary", "--")
+    encoded_patch = base64.b64encode(patch).decode("ascii")
+    definition = resolve_local_device_command("git_apply_patch", {})
+
+    assert definition is not None
+
+    stage = subprocess.run(
+        [*shlex.split(definition.command), "stage", encoded_patch],
+        cwd=repo,
+        capture_output=True,
+        check=False,
+    )
+    assert stage.returncode == 0, stage.stderr.decode()
+    assert _run_git(repo, "diff", "--cached", "--") == patch
+
+    unstage = subprocess.run(
+        [*shlex.split(definition.command), "unstage", encoded_patch],
+        cwd=repo,
+        capture_output=True,
+        check=False,
+    )
+    assert unstage.returncode == 0, unstage.stderr.decode()
+    assert _run_git(repo, "diff", "--cached", "--") == b""
+
+    revert = subprocess.run(
+        [*shlex.split(definition.command), "revert", encoded_patch],
+        cwd=repo,
+        capture_output=True,
+        check=False,
+    )
+    assert revert.returncode == 0, revert.stderr.decode()
+    assert changed_file.read_text(encoding="utf-8") == "before\n"
+
+
+def _create_plain_workspace_add_sequence_artifact(tmp_path):
+    workspace = tmp_path / "plain-workspace"
+    workspace.mkdir()
+    changed_file = workspace / "note.txt"
+    changed_file.write_text("hello\n", encoding="utf-8")
+    patches = [
+        "\n".join(
+            [
+                "diff --git a/note.txt b/note.txt",
+                "new file mode 100644",
+                "--- /dev/null",
+                "+++ b/note.txt",
+                "@@ -0,0 +1,1 @@",
+                "+hello",
+            ]
+        )
+        + "\n"
+    ]
+    patch = json.dumps(patches).encode("utf-8")
+    executor_home = tmp_path / "executor-home"
+    artifact_dir = executor_home / "artifacts" / "turn-file-changes" / "10" / "22"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "changes.patch.gz").write_bytes(gzip.compress(patch))
+    (artifact_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "task_id": 10,
+                "subtask_id": 22,
+                "workspace_path": str(workspace.resolve()),
+                "checksum": hashlib.sha256(patch).hexdigest(),
+                "patch_sequence": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return workspace, executor_home
+
+
+def test_turn_file_changes_commands_are_registered():
+    from app.services.device.command_registry import resolve_local_device_command
+
+    review = resolve_local_device_command("turn_file_changes_review", {})
+    revert = resolve_local_device_command("turn_file_changes_revert", {})
+
+    assert review is not None
+    assert revert is not None
+    assert review.post_processor == "json"
+    assert revert.post_processor == "json"
+
+
+def test_git_hosting_cli_status_commands_are_registered() -> None:
+    from app.services.device.command_registry import resolve_local_device_command
+
+    github = resolve_local_device_command("git_github_cli_status", {})
+    gitlab = resolve_local_device_command("git_gitlab_cli_status", {})
+
+    assert github is not None
+    assert gitlab is not None
+    assert "python3 -c" in github.command
+    assert github.command.endswith(" gh")
+    assert github.post_processor == "json"
+    assert gitlab.command.endswith(" glab")
+    assert gitlab.post_processor == "json"
+
+
+def test_git_hosting_cli_status_reports_missing_tool(tmp_path: Path) -> None:
+    from app.services.device.command_registry import GIT_HOSTING_CLI_STATUS_SCRIPT
+
+    result = subprocess.run(
+        [sys.executable, "-c", GIT_HOSTING_CLI_STATUS_SCRIPT, "gh"],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": str(tmp_path)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {
+        "tool": "gh",
+        "installed": False,
+        "authenticated": False,
+        "executablePath": None,
+        "version": None,
+        "detectionError": None,
+    }
+
+
+def test_git_hosting_cli_status_reports_timeout(tmp_path: Path) -> None:
+    from app.services.device.command_registry import GIT_HOSTING_CLI_STATUS_SCRIPT
+
+    executable = tmp_path / "gh"
+    executable.write_text("#!/bin/sh\nexec /bin/sleep 1\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            GIT_HOSTING_CLI_STATUS_SCRIPT,
+            "gh",
+            "0.01",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": str(tmp_path)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {
+        "tool": "gh",
+        "installed": True,
+        "authenticated": False,
+        "executablePath": str(executable),
+        "version": None,
+        "detectionError": "timeout",
+    }
+
+
+def test_gitlab_cli_status_accepts_any_authenticated_host(tmp_path: Path) -> None:
+    from app.services.device.command_registry import GIT_HOSTING_CLI_STATUS_SCRIPT
+
+    executable = tmp_path / "glab"
+    executable.write_text(
+        """#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "glab 1.113.0"
+  exit 0
+fi
+printf '%s\\n' \\
+  'gitlab.com' \\
+  '  x gitlab.com: API call failed: 401 Unauthorized' \\
+  'internal.example.com' \\
+  '  ✓ Logged in to internal.example.com as user (keyring)' >&2
+exit 1
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    result = subprocess.run(
+        [sys.executable, "-c", GIT_HOSTING_CLI_STATUS_SCRIPT, "glab"],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": str(tmp_path)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {
+        "tool": "glab",
+        "installed": True,
+        "authenticated": True,
+        "executablePath": str(executable),
+        "version": "glab 1.113.0",
+        "detectionError": None,
+    }
+
+
+def test_gitlab_cli_status_rejects_when_every_host_fails(tmp_path: Path) -> None:
+    from app.services.device.command_registry import GIT_HOSTING_CLI_STATUS_SCRIPT
+
+    executable = tmp_path / "glab"
+    executable.write_text(
+        """#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "glab 1.113.0"
+  exit 0
+fi
+printf '%s\\n' \\
+  'gitlab.com' \\
+  '  x gitlab.com: API call failed: 401 Unauthorized' >&2
+exit 1
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    result = subprocess.run(
+        [sys.executable, "-c", GIT_HOSTING_CLI_STATUS_SCRIPT, "glab"],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": str(tmp_path)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout)["authenticated"] is False
+
+
+@pytest.mark.parametrize(
+    "artifact_id",
+    [
+        "../../etc/passwd",
+        "turn-file-changes/1/2/../../../secret",
+    ],
+)
+def test_turn_file_changes_command_rejects_invalid_artifact_id(
+    tmp_path,
+    artifact_id,
+):
+    from app.services.device.command_registry import TURN_FILE_CHANGES_SCRIPT
+
+    result = subprocess.run(
+        [sys.executable, "-c", TURN_FILE_CHANGES_SCRIPT, "review", artifact_id],
+        cwd=tmp_path,
+        env={**os.environ, "WEGENT_EXECUTOR_HOME": str(tmp_path / "home")},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "invalid artifact id" in result.stdout
+
+
+def test_turn_file_changes_review_returns_validated_diff(tmp_path):
+    from app.services.device.command_registry import TURN_FILE_CHANGES_SCRIPT
+
+    repo, executor_home = _create_turn_file_changes_artifact(tmp_path)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            TURN_FILE_CHANGES_SCRIPT,
+            "review",
+            "turn-file-changes/10/20",
+        ],
+        cwd=repo,
+        env={**os.environ, "WEGENT_EXECUTOR_HOME": str(executor_home)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["success"] is True
+    assert payload["diff"].startswith("diff --git a/changed.txt b/changed.txt")
+
+
+def test_runtime_local_turn_file_changes_review_accepts_zero_task_id(tmp_path):
+    """Native Codex runtime turns persist artifacts with task_id=0 (no DB task)."""
+    from app.services.device.command_registry import TURN_FILE_CHANGES_SCRIPT
+
+    repo, executor_home = _create_turn_file_changes_artifact(
+        tmp_path, task_id=0, subtask_id=1700000000000
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            TURN_FILE_CHANGES_SCRIPT,
+            "review",
+            "turn-file-changes/0/1700000000000",
+        ],
+        cwd=repo,
+        env={**os.environ, "WEGENT_EXECUTOR_HOME": str(executor_home)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["success"] is True
+    assert payload["diff"].startswith("diff --git a/changed.txt b/changed.txt")
+
+
+def test_runtime_local_turn_file_changes_review_accepts_named_artifact_id(tmp_path):
+    from app.services.device.command_registry import TURN_FILE_CHANGES_SCRIPT
+
+    repo, executor_home = _create_turn_file_changes_artifact(
+        tmp_path, task_id="codex", subtask_id="turn-abc_123"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            TURN_FILE_CHANGES_SCRIPT,
+            "review",
+            "turn-file-changes/codex/turn-abc_123",
+        ],
+        cwd=repo,
+        env={**os.environ, "WEGENT_EXECUTOR_HOME": str(executor_home)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["success"] is True
+    assert payload["diff"].startswith("diff --git a/changed.txt b/changed.txt")
+
+
+def test_turn_file_changes_revert_is_conflict_safe(tmp_path):
+    from app.services.device.command_registry import TURN_FILE_CHANGES_SCRIPT
+
+    repo, executor_home = _create_turn_file_changes_artifact(tmp_path)
+    (repo / "changed.txt").write_text("later change\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            TURN_FILE_CHANGES_SCRIPT,
+            "revert",
+            "turn-file-changes/10/20",
+        ],
+        cwd=repo,
+        env={**os.environ, "WEGENT_EXECUTOR_HOME": str(executor_home)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout)["status"] == "conflicted"
+    assert (repo / "changed.txt").read_text(encoding="utf-8") == "later change\n"
+
+
+def test_turn_file_changes_revert_applies_reverse_patch(tmp_path):
+    from app.services.device.command_registry import TURN_FILE_CHANGES_SCRIPT
+
+    repo, executor_home = _create_turn_file_changes_artifact(tmp_path)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            TURN_FILE_CHANGES_SCRIPT,
+            "revert",
+            "turn-file-changes/10/20",
+        ],
+        cwd=repo,
+        env={**os.environ, "WEGENT_EXECUTOR_HOME": str(executor_home)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {"success": True, "status": "reverted"}
+    assert (repo / "changed.txt").read_text(encoding="utf-8") == "before\n"
+
+
+def test_turn_file_changes_revert_applies_patch_sequence(tmp_path):
+    from app.services.device.command_registry import TURN_FILE_CHANGES_SCRIPT
+
+    repo, executor_home = _create_turn_file_changes_sequence_artifact(tmp_path)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            TURN_FILE_CHANGES_SCRIPT,
+            "revert",
+            "turn-file-changes/10/21",
+        ],
+        cwd=repo,
+        env={**os.environ, "WEGENT_EXECUTOR_HOME": str(executor_home)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {"success": True, "status": "reverted"}
+    assert (repo / "changed.txt").read_text(encoding="utf-8") == "before\n"
+
+
+def test_turn_file_changes_revert_applies_plain_workspace_add_sequence(tmp_path):
+    from app.services.device.command_registry import TURN_FILE_CHANGES_SCRIPT
+
+    workspace, executor_home = _create_plain_workspace_add_sequence_artifact(tmp_path)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            TURN_FILE_CHANGES_SCRIPT,
+            "revert",
+            "turn-file-changes/10/22",
+        ],
+        cwd=workspace,
+        env={**os.environ, "WEGENT_EXECUTOR_HOME": str(executor_home)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {"success": True, "status": "reverted"}
+    assert not (workspace / "note.txt").exists()
+
+
+@pytest.mark.parametrize("platform", ["Linux", "Darwin", "MINGW64_NT", "MSYS_NT"])
+def test_home_directory_command_returns_native_device_path(tmp_path, platform):
+    from app.services.device.command_registry import DEFAULT_LOCAL_DEVICE_COMMANDS
+
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    uname = tools / "uname"
+    uname.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_PLATFORM"\n')
+    uname.chmod(0o755)
+    cygpath = tools / "cygpath"
+    cygpath.write_text(
+        '#!/bin/sh\n[ "$1" = "-w" ] && [ "$2" = "$HOME" ] || exit 1\n'
+        'printf "%s\\n" "D:\\agent home"\n'
+    )
+    cygpath.chmod(0o755)
+    home = "/d/agent home" if platform.startswith(("MINGW", "MSYS")) else "/agent home"
+
+    result = subprocess.run(
+        shlex.split(DEFAULT_LOCAL_DEVICE_COMMANDS["home_dir"].command),
+        env={
+            **os.environ,
+            "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
+            "HOME": home,
+            "TEST_PLATFORM": platform,
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    expected = "D:\\agent home" if platform.startswith(("MINGW", "MSYS")) else home
+    assert result.stdout.strip() == expected
+
+
+def test_local_device_command_registry_default_includes_diagnostic_commands():
+    """Default command registry should include basic diagnostic commands."""
+    from app.core.config import Settings
+    from app.services.device.command_registry import resolve_local_device_command
+
+    settings = Settings()
+
+    pwd_definition = resolve_local_device_command("pwd", settings.LOCAL_DEVICE_COMMANDS)
+    ls_definition = resolve_local_device_command("ls_a", settings.LOCAL_DEVICE_COMMANDS)
+    home_dir_definition = resolve_local_device_command(
+        "home_dir", settings.LOCAL_DEVICE_COMMANDS
+    )
+    project_workspace_root_definition = resolve_local_device_command(
+        "project_workspace_root", settings.LOCAL_DEVICE_COMMANDS
+    )
+    ls_dirs_definition = resolve_local_device_command(
+        "ls_dirs", settings.LOCAL_DEVICE_COMMANDS
+    )
+    mkdir_definition = resolve_local_device_command(
+        "mkdir_p", settings.LOCAL_DEVICE_COMMANDS
+    )
+    path_exists_definition = resolve_local_device_command(
+        "path_exists", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_clone_definition = resolve_local_device_command(
+        "git_clone", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_config_definition = resolve_local_device_command(
+        "git_config", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_is_worktree_definition = resolve_local_device_command(
+        "git_is_worktree", settings.LOCAL_DEVICE_COMMANDS
+    )
+    find_worktree_dirs_definition = resolve_local_device_command(
+        "find_worktree_dirs", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_worktree_remove_definition = resolve_local_device_command(
+        "git_worktree_remove", settings.LOCAL_DEVICE_COMMANDS
+    )
+    remove_worktree_dir_definition = resolve_local_device_command(
+        "remove_worktree_dir", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_branch_definition = resolve_local_device_command(
+        "git_branch", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_branch_list_definition = resolve_local_device_command(
+        "git_branch_list", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_checkout_definition = resolve_local_device_command(
+        "git_checkout", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_checkout_new_definition = resolve_local_device_command(
+        "git_checkout_new", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_diff_shortstat_definition = resolve_local_device_command(
+        "git_diff_shortstat", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_diff_definition = resolve_local_device_command(
+        "git_diff", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_branch_diff_definition = resolve_local_device_command(
+        "git_branch_diff", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_branch_diff_shortstat_definition = resolve_local_device_command(
+        "git_branch_diff_shortstat", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_remote_url_definition = resolve_local_device_command(
+        "git_remote_url", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_github_pull_requests_definition = resolve_local_device_command(
+        "git_github_pull_requests", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_github_pull_request_merge_queue_definition = resolve_local_device_command(
+        "git_github_pull_request_merge_queue", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_github_pull_requests_batch_definition = resolve_local_device_command(
+        "git_github_pull_requests_batch", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_github_pull_request_merge_queue_batch_definition = resolve_local_device_command(
+        "git_github_pull_request_merge_queue_batch",
+        settings.LOCAL_DEVICE_COMMANDS,
+    )
+    git_gitlab_merge_requests_definition = resolve_local_device_command(
+        "git_gitlab_merge_requests", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_gitlab_merge_requests_batch_definition = resolve_local_device_command(
+        "git_gitlab_merge_requests_batch", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_add_all_definition = resolve_local_device_command(
+        "git_add_all", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_commit_definition = resolve_local_device_command(
+        "git_commit", settings.LOCAL_DEVICE_COMMANDS
+    )
+    git_push_definition = resolve_local_device_command(
+        "git_push", settings.LOCAL_DEVICE_COMMANDS
+    )
+    ls_skills_definition = resolve_local_device_command(
+        "ls_skills", settings.LOCAL_DEVICE_COMMANDS
+    )
+    setup_shared_skills_definition = resolve_local_device_command(
+        "setup_shared_skills", settings.LOCAL_DEVICE_COMMANDS
+    )
+    open_terminal_definition = resolve_local_device_command(
+        "open_terminal", settings.LOCAL_DEVICE_COMMANDS
+    )
+    sync_runtime_auth_file_definition = resolve_local_device_command(
+        "sync_runtime_auth_file", settings.LOCAL_DEVICE_COMMANDS
+    )
+    read_runtime_auth_file_definition = resolve_local_device_command(
+        "read_runtime_auth_file", settings.LOCAL_DEVICE_COMMANDS
+    )
+    codex_threads_list_definition = resolve_local_device_command(
+        "codex_threads_list", settings.LOCAL_DEVICE_COMMANDS
+    )
+
+    assert pwd_definition is not None
+    assert pwd_definition.command == "pwd"
+    assert pwd_definition.post_processor is None
+    assert ls_definition is not None
+    assert ls_definition.command == "ls -a"
+    assert ls_definition.post_processor == "file_list"
+    assert home_dir_definition is not None
+    assert 'cygpath -w "$HOME"' in home_dir_definition.command
+    assert 'printf "%s\\n" "$HOME"' in home_dir_definition.command
+    assert home_dir_definition.post_processor is None
+    assert project_workspace_root_definition is not None
+    assert "WEGENT_EXECUTOR_PROJECTS_DIR" in project_workspace_root_definition.command
+    assert "WECODE_HOME" in project_workspace_root_definition.command
+    assert project_workspace_root_definition.post_processor is None
+    assert ls_dirs_definition is not None
+    assert ls_dirs_definition.command == "ls -a -p"
+    assert ls_dirs_definition.post_processor == "directory_list"
+    assert mkdir_definition is not None
+    assert mkdir_definition.command == "mkdir -p"
+    assert mkdir_definition.post_processor is None
+    assert path_exists_definition is not None
+    assert path_exists_definition.command == "test -e"
+    assert path_exists_definition.post_processor is None
+    assert git_clone_definition is not None
+    assert git_clone_definition.command == "git clone"
+    assert git_clone_definition.post_processor is None
+    assert git_config_definition is not None
+    assert git_config_definition.command == "git config"
+    assert git_config_definition.post_processor is None
+    assert git_is_worktree_definition is not None
+    assert "rev-parse --is-inside-work-tree" in git_is_worktree_definition.command
+    assert git_is_worktree_definition.post_processor is None
+    assert find_worktree_dirs_definition is not None
+    assert "find" in find_worktree_dirs_definition.command
+    assert "mindepth 2" in find_worktree_dirs_definition.command
+    assert find_worktree_dirs_definition.post_processor == "file_list"
+    assert git_worktree_remove_definition is not None
+    assert "worktree remove --force" in git_worktree_remove_definition.command
+    assert git_worktree_remove_definition.post_processor is None
+    assert remove_worktree_dir_definition is not None
+    assert "rm -rf" in remove_worktree_dir_definition.command
+    assert "refusing unsafe worktree path" in remove_worktree_dir_definition.command
+    assert remove_worktree_dir_definition.post_processor is None
+    assert git_branch_definition is not None
+    assert git_branch_definition.command == "git branch --show-current"
+    assert git_branch_definition.post_processor is None
+    assert git_branch_list_definition is not None
+    assert git_branch_list_definition.command == "git branch --format=%(refname:short)"
+    assert git_branch_list_definition.post_processor is None
+    assert git_checkout_definition is not None
+    assert git_checkout_definition.command == "git checkout"
+    assert git_checkout_definition.post_processor is None
+    assert git_checkout_new_definition is not None
+    assert git_checkout_new_definition.command == "git checkout -b"
+    assert git_checkout_new_definition.post_processor is None
+    assert git_diff_shortstat_definition is not None
+    assert git_diff_shortstat_definition.command == "git diff --shortstat"
+    assert git_diff_shortstat_definition.post_processor is None
+    assert git_diff_definition is not None
+    assert git_diff_definition.command.startswith("bash -c ")
+    assert not git_diff_definition.command.startswith("bash -lc ")
+    assert "git diff --binary HEAD --" in git_diff_definition.command
+    assert "git ls-files --others --exclude-standard" in git_diff_definition.command
+    assert git_diff_definition.post_processor is None
+    assert git_branch_diff_definition is not None
+    assert git_branch_diff_definition.command.startswith("bash -c ")
+    assert not git_branch_diff_definition.command.startswith("bash -lc ")
+    assert "git merge-base" in git_branch_diff_definition.command
+    assert "git diff --binary" in git_branch_diff_definition.command
+    assert (
+        "git ls-files --others --exclude-standard" in git_branch_diff_definition.command
+    )
+    assert git_branch_diff_definition.post_processor is None
+    assert git_branch_diff_shortstat_definition is not None
+    assert git_branch_diff_shortstat_definition.command.startswith("bash -c ")
+    assert not git_branch_diff_shortstat_definition.command.startswith("bash -lc ")
+    assert "git merge-base" in git_branch_diff_shortstat_definition.command
+    assert "git diff --shortstat" in git_branch_diff_shortstat_definition.command
+    assert (
+        "git diff --shortstat HEAD --" in git_branch_diff_shortstat_definition.command
+    )
+    assert git_branch_diff_shortstat_definition.post_processor is None
+    assert git_remote_url_definition is not None
+    assert git_remote_url_definition.command == "git remote get-url origin"
+    assert git_remote_url_definition.post_processor is None
+    assert git_github_pull_requests_definition is not None
+    assert "gh pr list --state all" in git_github_pull_requests_definition.command
+    assert "mergeStateStatus" in git_github_pull_requests_definition.command
+    assert git_github_pull_requests_definition.post_processor == "json"
+    assert git_github_pull_request_merge_queue_definition is not None
+    assert "mergeQueueEntry" in git_github_pull_request_merge_queue_definition.command
+    assert git_github_pull_request_merge_queue_definition.post_processor == "json"
+    assert git_github_pull_requests_batch_definition is not None
+    assert "gh api --method GET" in git_github_pull_requests_batch_definition.command
+    assert "per_page=100" in git_github_pull_requests_batch_definition.command
+    assert "--jq" in git_github_pull_requests_batch_definition.command
+    assert git_github_pull_request_merge_queue_batch_definition is not None
+    assert "credential_paths()" in (
+        git_github_pull_request_merge_queue_batch_definition.command
+    )
+    assert git_github_pull_request_merge_queue_batch_definition.command.endswith(
+        "gh api graphql"
+    )
+    assert git_gitlab_merge_requests_definition is not None
+    assert "glab mr list --all" in git_gitlab_merge_requests_definition.command
+    assert git_gitlab_merge_requests_definition.post_processor == "json"
+    assert git_gitlab_merge_requests_batch_definition is not None
+    assert "--source-branch" not in git_gitlab_merge_requests_batch_definition.command
+    assert git_add_all_definition is not None
+    assert git_add_all_definition.command == "git add --all"
+    assert git_add_all_definition.post_processor is None
+    assert git_commit_definition is not None
+    assert git_commit_definition.command == "git commit"
+    assert git_commit_definition.post_processor is None
+    assert git_push_definition is not None
+    assert "@{u}" not in git_push_definition.command
+    assert 'exec git push -u origin "$branch"' in git_push_definition.command
+    assert git_push_definition.post_processor is None
+    assert ls_skills_definition is not None
+    assert "python3 -c" in ls_skills_definition.command
+    assert ".claude" in ls_skills_definition.command
+    assert ".codex" in ls_skills_definition.command
+    assert ".agents" in ls_skills_definition.command
+    assert "plugins" in ls_skills_definition.command
+    assert ls_skills_definition.post_processor == "json"
+    assert setup_shared_skills_definition is not None
+    assert "python3 -c" in setup_shared_skills_definition.command
+    assert ".agents" in setup_shared_skills_definition.command
+    assert ".codex" in setup_shared_skills_definition.command
+    assert ".claude" in setup_shared_skills_definition.command
+    assert setup_shared_skills_definition.post_processor == "json"
+    assert open_terminal_definition is not None
+    assert "open -a Terminal" in open_terminal_definition.command
+    assert "x-terminal-emulator" in open_terminal_definition.command
+    assert open_terminal_definition.post_processor is None
+    assert sync_runtime_auth_file_definition is not None
+    assert "WEGENT_RUNTIME_CONFIG_CONTENT" in sync_runtime_auth_file_definition.command
+    assert "WEGENT_EXECUTOR_HOME" in sync_runtime_auth_file_definition.command
+    assert "WEGENT_CODEX_HOME" in sync_runtime_auth_file_definition.command
+    assert ".expanduser()" not in sync_runtime_auth_file_definition.command
+    assert (
+        "WEGENT_RUNTIME_CONFIG_TARGET_PATH"
+        not in sync_runtime_auth_file_definition.command
+    )
+    assert sync_runtime_auth_file_definition.post_processor == "json"
+    assert read_runtime_auth_file_definition is not None
+    assert "WEGENT_EXECUTOR_HOME" in read_runtime_auth_file_definition.command
+    assert "WEGENT_CODEX_HOME" in read_runtime_auth_file_definition.command
+    assert ".expanduser()" not in read_runtime_auth_file_definition.command
+    assert (
+        "WEGENT_RUNTIME_CONFIG_TARGET_PATH"
+        not in read_runtime_auth_file_definition.command
+    )
+    assert read_runtime_auth_file_definition.post_processor == "json"
+    assert codex_threads_list_definition is not None
+    assert "openai_codex" in codex_threads_list_definition.command
+    assert "thread_list" in codex_threads_list_definition.command
+    assert "session_index.jsonl" not in codex_threads_list_definition.command
+    assert "transcript" not in codex_threads_list_definition.command
+    assert codex_threads_list_definition.post_processor == "json"
+
+
+def _write_fake_openai_codex_sdk(root):
+    package_root = root / "openai_codex"
+    generated_root = package_root / "generated"
+    generated_root.mkdir(parents=True)
+    (package_root / "__init__.py").write_text(
+        """
+from types import SimpleNamespace
+
+
+class CodexConfig:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class Codex:
+    def __init__(self, config):
+        self.config = config
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        return None
+
+    def thread_list(self, **kwargs):
+        if kwargs.get("archived") is not False:
+            raise AssertionError("archived must be false")
+        if kwargs.get("use_state_db_only") is not True:
+            raise AssertionError("use_state_db_only must be true")
+        limit = kwargs.get("limit", 100)
+        threads = [
+            SimpleNamespace(
+                id="018f2d6b-8c7a-7abc-9def-0123456789ac",
+                name="Newer",
+                preview=None,
+                cwd=SimpleNamespace(root="/tmp/newer-project"),
+                updated_at=1782008158,
+                archived=False,
+                status=SimpleNamespace(type="running"),
+            ),
+            SimpleNamespace(
+                id="018f2d6b-8c7a-7abc-9def-0123456789ab",
+                name=None,
+                preview="Older",
+                cwd="/tmp/older-project",
+                updated_at=1781979275,
+                archived=False,
+                status=SimpleNamespace(type="notLoaded"),
+            ),
+            SimpleNamespace(
+                id="018f2d6b-8c7a-7abc-9def-0123456789aa",
+                name="Oldest",
+                preview=None,
+                cwd="/tmp/oldest-project",
+                updated_at=1781970000,
+                archived=False,
+                status=None,
+            ),
+        ]
+        return SimpleNamespace(data=threads[:limit])
+""".strip(),
+        encoding="utf-8",
+    )
+    (generated_root / "__init__.py").write_text("", encoding="utf-8")
+    (generated_root / "v2_all.py").write_text(
+        """
+class SortDirection(str):
+    pass
+
+
+class ThreadSortKey(str):
+    pass
+""".strip(),
+        encoding="utf-8",
+    )
+    return root
+
+
+def _write_failing_openai_codex_sdk(root):
+    package_root = root / "openai_codex"
+    generated_root = package_root / "generated"
+    generated_root.mkdir(parents=True)
+    (package_root / "__init__.py").write_text(
+        """
+class CodexConfig:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class Codex:
+    def __init__(self, config):
+        self.config = config
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        return None
+
+    def thread_list(self, **kwargs):
+        raise RuntimeError("sdk exploded")
+""".strip(),
+        encoding="utf-8",
+    )
+    (generated_root / "__init__.py").write_text("", encoding="utf-8")
+    (generated_root / "v2_all.py").write_text(
+        """
+class SortDirection(str):
+    pass
+
+
+class ThreadSortKey(str):
+    pass
+""".strip(),
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_codex_threads_list_command_reads_sdk_thread_list(tmp_path):
+    """codex_threads_list should expose SDK thread summaries without transcripts."""
+    from app.services.device.command_registry import CODEX_THREADS_LIST_SCRIPT
+
+    fake_sdk_root = _write_fake_openai_codex_sdk(tmp_path / "fake-sdk")
+
+    result = subprocess.run(
+        [sys.executable, "-c", CODEX_THREADS_LIST_SCRIPT],
+        env={
+            **os.environ,
+            "CODEX_HOME": str(tmp_path / "codex-home"),
+            "PYTHONPATH": str(fake_sdk_root),
+            "WEGENT_CODEX_THREADS_LIMIT": "1000",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert [thread["title"] for thread in payload["threads"]] == [
+        "Newer",
+        "Older",
+        "Oldest",
+    ]
+    assert set(payload["threads"][0]) == {
+        "threadId",
+        "title",
+        "cwd",
+        "updatedAt",
+        "archived",
+        "running",
+    }
+    assert payload["threads"][0]["threadId"] == "018f2d6b-8c7a-7abc-9def-0123456789ac"
+    assert payload["threads"][0]["cwd"] == "/tmp/newer-project"
+    assert payload["threads"][0]["archived"] is False
+    assert payload["threads"][0]["running"] is True
+    assert payload["threads"][1]["running"] is False
+    assert "transcript" not in json.dumps(payload)
+    assert "session_index" not in json.dumps(payload)
+    assert (tmp_path / "codex-home").is_dir()
+
+
+def test_codex_threads_list_command_surfaces_sdk_errors(tmp_path):
+    """codex_threads_list should report SDK discovery failures."""
+    from app.services.device.command_registry import CODEX_THREADS_LIST_SCRIPT
+
+    fake_sdk_root = _write_failing_openai_codex_sdk(tmp_path / "fake-sdk")
+
+    result = subprocess.run(
+        [sys.executable, "-c", CODEX_THREADS_LIST_SCRIPT],
+        env={
+            **os.environ,
+            "CODEX_HOME": str(tmp_path / "codex-home"),
+            "PYTHONPATH": str(fake_sdk_root),
+            "WEGENT_CODEX_THREADS_LIMIT": "1000",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["threads"] == []
+    assert payload["error"] == "sdk exploded"
+
+
+def test_codex_threads_list_command_stops_after_limit(tmp_path):
+    """codex_threads_list should pass a bounded limit to the SDK."""
+    from app.services.device.command_registry import CODEX_THREADS_LIST_SCRIPT
+
+    fake_sdk_root = _write_fake_openai_codex_sdk(tmp_path / "fake-sdk")
+
+    result = subprocess.run(
+        [sys.executable, "-c", CODEX_THREADS_LIST_SCRIPT],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(fake_sdk_root),
+            "CODEX_HOME": str(tmp_path / "codex-home"),
+            "WEGENT_CODEX_THREADS_LIMIT": "2",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert [thread["title"] for thread in payload["threads"]] == [
+        "Newer",
+        "Older",
+    ]
+
+
+def test_local_device_command_registry_default_includes_workspace_file_commands():
+    """Workspace file commands should be narrow JSON-producing commands."""
+    from app.services.device.command_registry import resolve_local_device_command
+
+    tree_definition = resolve_local_device_command("workspace_tree", {})
+    read_definition = resolve_local_device_command("workspace_read_text_file", {})
+
+    assert tree_definition is not None
+    assert tree_definition.post_processor == "json"
+    assert "json.dumps" in tree_definition.command
+
+    assert read_definition is not None
+    assert read_definition.post_processor == "json"
+    assert "MAX_BYTES = 262144" in read_definition.command
+
+
+def test_branch_diff_prefers_fork_parent_default_branch(tmp_path: Path) -> None:
+    """Fork branches should compare with their parent base instead of stale origin."""
+    from app.services.device.command_registry import resolve_local_device_command
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "tests@example.com")
+    _run_git(repo, "config", "user.name", "Tests")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _run_git(repo, "add", "--all")
+    _run_git(repo, "commit", "-qm", "initial")
+    _run_git(repo, "branch", "-M", "main")
+    stale_origin_main = _run_git(repo, "rev-parse", "HEAD").decode().strip()
+
+    _run_git(repo, "remote", "add", "origin", "https://example.com/fork.git")
+    _run_git(repo, "update-ref", "refs/remotes/origin/main", stale_origin_main)
+    _run_git(
+        repo,
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    )
+
+    canonical_lines = "".join(f"canonical-{index}\n" for index in range(300))
+    (repo / "canonical.txt").write_text(canonical_lines, encoding="utf-8")
+    _run_git(repo, "add", "--all")
+    _run_git(repo, "commit", "-qm", "canonical update")
+    canonical_main = _run_git(repo, "rev-parse", "HEAD").decode().strip()
+
+    _run_git(repo, "remote", "add", "upstream", "https://example.com/parent.git")
+    _run_git(repo, "update-ref", "refs/remotes/upstream/main", canonical_main)
+    _run_git(
+        repo,
+        "symbolic-ref",
+        "refs/remotes/upstream/HEAD",
+        "refs/remotes/upstream/main",
+    )
+
+    _run_git(repo, "checkout", "-qb", "feature/fork-base")
+    (repo / "feature.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    _run_git(repo, "add", "--all")
+    _run_git(repo, "commit", "-qm", "feature change")
+
+    shortstat_definition = resolve_local_device_command("git_branch_diff_shortstat", {})
+    diff_definition = resolve_local_device_command("git_branch_diff", {})
+    assert shortstat_definition is not None
+    assert diff_definition is not None
+
+    shortstat = subprocess.run(
+        shlex.split(shortstat_definition.command),
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    diff = subprocess.run(
+        shlex.split(diff_definition.command),
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    assert "1 file changed" in shortstat
+    assert "3 insertions(+)" in shortstat
+    assert "canonical.txt" not in diff
+    assert "feature.txt" in diff
+
+
+def test_remote_command_policy_separates_read_only_and_mutating_keys():
+    from app.services.device.command_service import (
+        INTERNAL_DEVICE_COMMAND_KEYS,
+        REMOTE_DEVICE_COMMAND_KEYS,
+        REMOTE_MUTATING_COMMAND_KEYS,
+        REMOTE_READ_ONLY_COMMAND_KEYS,
+        RUNTIME_AUTH_COMMAND_KEYS,
+    )
+
+    assert REMOTE_READ_ONLY_COMMAND_KEYS.isdisjoint(REMOTE_MUTATING_COMMAND_KEYS)
+    assert RUNTIME_AUTH_COMMAND_KEYS == {
+        "read_runtime_auth_file",
+        "sync_runtime_auth_file",
+    }
+    assert {
+        "workspace_tree",
+        "workspace_read_text_file",
+        "workspace_read_file_chunk",
+    } <= REMOTE_READ_ONLY_COMMAND_KEYS
+    assert {
+        "environment_prepare",
+        "git_checkout",
+        "git_commit",
+        "git_push",
+    } <= REMOTE_MUTATING_COMMAND_KEYS
+    assert INTERNAL_DEVICE_COMMAND_KEYS == {
+        "environment_prepare",
+        "sync_git_credentials",
+    }
+    assert REMOTE_DEVICE_COMMAND_KEYS == (
+        REMOTE_READ_ONLY_COMMAND_KEYS
+        | REMOTE_MUTATING_COMMAND_KEYS
+        | RUNTIME_AUTH_COMMAND_KEYS
+    )
+
+
+def test_workspace_tree_script_lists_files_and_directories(
+    tmp_path, monkeypatch, capsys
+):
+    """workspace_tree should emit stable JSON metadata for direct children."""
+    import json
+
+    from app.services.device.command_registry import WORKSPACE_TREE_SCRIPT
+
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "README.md").write_text("hello", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    exec(WORKSPACE_TREE_SCRIPT, {"__name__": "__main__"})
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["path"] == str(tmp_path.resolve())
+    assert output["entries"][0]["name"] == "backend"
+    assert output["entries"][0]["is_directory"] is True
+    assert output["entries"][1]["name"] == "README.md"
+    assert output["entries"][1]["is_directory"] is False
+    assert output["entries"][1]["size"] == 5
+
+
+def test_workspace_tree_script_does_not_classify_symlinked_directory_as_directory(
+    tmp_path, monkeypatch, capsys
+):
+    """workspace_tree should not expose symlinked directories as traversable."""
+    import json
+
+    from app.services.device.command_registry import WORKSPACE_TREE_SCRIPT
+
+    external_dir = tmp_path.parent / "external"
+    external_dir.mkdir()
+    (tmp_path / "linked-dir").symlink_to(external_dir, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+
+    exec(WORKSPACE_TREE_SCRIPT, {"__name__": "__main__"})
+    output = json.loads(capsys.readouterr().out)
+
+    linked_entry = next(
+        entry for entry in output["entries"] if entry["name"] == "linked-dir"
+    )
+    assert linked_entry["is_directory"] is False
+
+
+def test_workspace_tree_script_keeps_lstat_operations_guarded(
+    tmp_path, monkeypatch, capsys
+):
+    """workspace_tree should skip lstat failures without unguarded stat calls."""
+    import json
+    from pathlib import Path
+
+    from app.services.device.command_registry import WORKSPACE_TREE_SCRIPT
+
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "README.md").write_text("hello", encoding="utf-8")
+    (tmp_path / "blocked.txt").write_text("skip", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    workspace_root = tmp_path.resolve()
+    original_is_dir = Path.is_dir
+    original_lstat = Path.lstat
+    tracked_names = {"backend", "README.md"}
+    lstat_calls = {name: 0 for name in tracked_names}
+
+    def fail_for_workspace_children(self):
+        if self.parent == workspace_root and self.name in {
+            *tracked_names,
+            "blocked.txt",
+        }:
+            raise AssertionError("workspace_tree should not call Path.is_dir")
+        return original_is_dir(self)
+
+    def guarded_lstat(self):
+        if self.parent != workspace_root:
+            return original_lstat(self)
+        if self.name == "blocked.txt":
+            raise OSError("lstat is unavailable")
+        if self.name in lstat_calls:
+            lstat_calls[self.name] += 1
+            if lstat_calls[self.name] > 1:
+                raise OSError("workspace_tree should not lstat children twice")
+        return original_lstat(self)
+
+    monkeypatch.setattr(Path, "is_dir", fail_for_workspace_children)
+    monkeypatch.setattr(Path, "lstat", guarded_lstat)
+
+    exec(WORKSPACE_TREE_SCRIPT, {"__name__": "__main__"})
+    output = json.loads(capsys.readouterr().out)
+
+    assert [entry["name"] for entry in output["entries"]] == ["backend", "README.md"]
+    assert output["entries"][0]["is_directory"] is True
+    assert output["entries"][1]["is_directory"] is False
+    assert lstat_calls == {"backend": 1, "README.md": 1}
+
+
+def test_workspace_read_text_file_script_reads_text_and_reports_truncation(
+    tmp_path, monkeypatch, capsys
+):
+    """workspace_read_text_file should read only the first 256 KiB."""
+    import json
+    import sys
+
+    from app.services.device.command_registry import WORKSPACE_READ_TEXT_FILE_SCRIPT
+
+    content = "a" * (262144 + 8)
+    (tmp_path / "large.py").write_text(content, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["workspace_read_text_file", "large.py"])
+
+    exec(WORKSPACE_READ_TEXT_FILE_SCRIPT, {"__name__": "__main__"})
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["path"] == str((tmp_path / "large.py").resolve())
+    assert output["content"] == "a" * 262144
+    assert output["truncated"] is True
+    assert output["size"] == 262152
+
+
+def test_workspace_read_text_file_script_reads_at_most_limit_plus_one(
+    tmp_path, monkeypatch, capsys
+):
+    """workspace_read_text_file should cap file I/O before decoding content."""
+    import json
+    import sys
+    from pathlib import Path
+
+    from app.services.device.command_registry import WORKSPACE_READ_TEXT_FILE_SCRIPT
+
+    file_path = tmp_path / "large.py"
+    file_path.write_text("a" * (262144 + 8), encoding="utf-8")
+    resolved_file_path = file_path.resolve()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["workspace_read_text_file", "large.py"])
+
+    original_open = Path.open
+    original_read_bytes = Path.read_bytes
+    read_sizes = []
+
+    class RecordingFile:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return self.handle.__exit__(exc_type, exc, traceback)
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            return self.handle.read(size)
+
+    def fail_read_bytes(self):
+        if self == resolved_file_path:
+            raise AssertionError("workspace_read_text_file should not read all bytes")
+        return original_read_bytes(self)
+
+    def recording_open(self, *args, **kwargs):
+        handle = original_open(self, *args, **kwargs)
+        if self == resolved_file_path and args and args[0] == "rb":
+            return RecordingFile(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    monkeypatch.setattr(Path, "open", recording_open)
+
+    exec(WORKSPACE_READ_TEXT_FILE_SCRIPT, {"__name__": "__main__"})
+    output = json.loads(capsys.readouterr().out)
+
+    assert read_sizes == [262145]
+    assert output["content"] == "a" * 262144
+    assert output["truncated"] is True
+
+
+def test_local_device_command_registry_supports_inline_post_processor():
+    """One command config object should contain command and post processor."""
+    from app.services.device.command_registry import resolve_local_device_command
+
+    definition = resolve_local_device_command(
+        "repo_files",
+        {
+            "repo_files": {
+                "command": "ls -a",
+                "post_processor": "file_list",
+            }
+        },
+    )
+
+    assert definition is not None
+    assert definition.command == "ls -a"
+    assert definition.post_processor == "file_list"
+
+
+def test_local_device_command_registry_keeps_default_processor_for_string_override():
+    """A simple string override should not drop a built-in post processor."""
+    from app.services.device.command_registry import resolve_local_device_command
+
+    definition = resolve_local_device_command("ls_a", {"ls_a": "ls -a"})
+
+    assert definition is not None
+    assert definition.command == "ls -a"
+    assert definition.post_processor == "file_list"
+
+
+def test_local_device_command_registry_builds_argv_with_request_args():
+    """Command argv should append request args without shell string concatenation."""
+    from app.services.device.command_registry import build_local_device_command_argv
+
+    argv = build_local_device_command_argv("ls -a", ["backend", "docs"])
+
+    assert argv == ["ls", "-a", "backend", "docs"]
+
+
+def test_local_device_command_registry_builds_git_clone_argv():
+    """git_clone should support repository URL and target directory args."""
+    from app.services.device.command_registry import (
+        build_local_device_command_argv,
+        resolve_local_device_command,
+    )
+
+    definition = resolve_local_device_command("git_clone")
+
+    assert definition is not None
+    assert build_local_device_command_argv(
+        definition.command,
+        ["https://github.com/wecode-ai/Wegent.git", "Wegent"],
+    ) == ["git", "clone", "https://github.com/wecode-ai/Wegent.git", "Wegent"]
+
+
+def test_local_device_command_registry_builds_git_config_argv():
+    """git_config should support repo-local config key and value args."""
+    from app.services.device.command_registry import (
+        build_local_device_command_argv,
+        resolve_local_device_command,
+    )
+
+    definition = resolve_local_device_command("git_config")
+
+    assert definition is not None
+    assert build_local_device_command_argv(
+        definition.command,
+        ["user.email", "alice@example.com"],
+    ) == ["git", "config", "user.email", "alice@example.com"]
+
+
+def test_local_device_command_registry_builds_git_worktree_add_argv():
+    """git_worktree_add should bind args to the fixed worktree subcommand."""
+    from app.services.device.command_registry import (
+        build_local_device_command_argv,
+        resolve_local_device_command,
+    )
+
+    definition = resolve_local_device_command("git_worktree_add")
+    expected_script = (
+        'source=$1; target=$2; ref=$3; mkdir -p "$(dirname "$target")"; '
+        'if git -C "$target" rev-parse --is-inside-work-tree '
+        ">/dev/null 2>&1; then "
+        'if [ -n "$ref" ]; then '
+        'git -C "$target" checkout --force --detach "$ref"; fi; '
+        "else "
+        'if [ -e "$target" ]; then '
+        'echo "target exists and is not a Git worktree" >&2; exit 64; fi; '
+        'if [ -n "$ref" ]; then '
+        'git -C "$source" worktree add --detach "$target" "$ref"; '
+        'else git -C "$source" worktree add --detach "$target"; fi; '
+        "fi"
+    )
+
+    assert definition is not None
+    assert build_local_device_command_argv(
+        definition.command,
+        ["/workspace/projects/d837/Wegent", "/workspace/worktrees/1386/Wegent"],
+    ) == [
+        "sh",
+        "-c",
+        expected_script,
+        "--",
+        "/workspace/projects/d837/Wegent",
+        "/workspace/worktrees/1386/Wegent",
+    ]
+
+
+def test_local_device_command_registry_builds_git_worktree_add_argv_with_branch():
+    """git_worktree_add should accept an optional source branch ref."""
+    from app.services.device.command_registry import (
+        build_local_device_command_argv,
+        resolve_local_device_command,
+    )
+
+    definition = resolve_local_device_command("git_worktree_add")
+    expected_script = (
+        'source=$1; target=$2; ref=$3; mkdir -p "$(dirname "$target")"; '
+        'if git -C "$target" rev-parse --is-inside-work-tree '
+        ">/dev/null 2>&1; then "
+        'if [ -n "$ref" ]; then '
+        'git -C "$target" checkout --force --detach "$ref"; fi; '
+        "else "
+        'if [ -e "$target" ]; then '
+        'echo "target exists and is not a Git worktree" >&2; exit 64; fi; '
+        'if [ -n "$ref" ]; then '
+        'git -C "$source" worktree add --detach "$target" "$ref"; '
+        'else git -C "$source" worktree add --detach "$target"; fi; '
+        "fi"
+    )
+
+    assert definition is not None
+    assert build_local_device_command_argv(
+        definition.command,
+        [
+            "/workspace/projects/d837/Wegent",
+            "/workspace/worktrees/1386/Wegent",
+            "develop",
+        ],
+    ) == [
+        "sh",
+        "-c",
+        expected_script,
+        "--",
+        "/workspace/projects/d837/Wegent",
+        "/workspace/worktrees/1386/Wegent",
+        "develop",
+    ]
+
+
+def test_local_device_command_registry_builds_git_worktree_remove_argv():
+    """git_worktree_remove should bind args to the fixed remove subcommand."""
+    from app.services.device.command_registry import (
+        build_local_device_command_argv,
+        resolve_local_device_command,
+    )
+
+    definition = resolve_local_device_command("git_worktree_remove")
+
+    assert definition is not None
+    assert build_local_device_command_argv(
+        definition.command,
+        ["/workspace/projects/d837/Wegent", "/workspace/worktrees/1386/Wegent"],
+    ) == [
+        "sh",
+        "-c",
+        'git -C "$1" worktree remove --force "$2"',
+        "--",
+        "/workspace/projects/d837/Wegent",
+        "/workspace/worktrees/1386/Wegent",
+    ]
+
+
+def test_file_list_post_processor_filters_special_entries():
+    """file_list post processor should return a clean file name list."""
+    from app.services.device.command_post_processor import apply_command_post_processor
+
+    result = {
+        "success": True,
+        "exit_code": 0,
+        "stdout": ".\n..\n.env\nbackend\n\n",
+        "stderr": "",
+        "duration": 0.01,
+    }
+
+    processed = apply_command_post_processor(result, "file_list")
+
+    assert processed["stdout"] == [".env", "backend"]
+
+
+def test_directory_list_post_processor_keeps_only_directories():
+    """directory_list post processor should return clean directory names."""
+    from app.services.device.command_post_processor import apply_command_post_processor
+
+    result = {
+        "success": True,
+        "exit_code": 0,
+        "stdout": "./\n../\n.env\nbackend/\nfrontend/\nREADME.md\n",
+        "stderr": "",
+        "duration": 0.01,
+    }
+
+    processed = apply_command_post_processor(result, "directory_list")
+
+    assert processed["stdout"] == ["backend", "frontend"]
+
+
+def test_json_post_processor_parses_structured_output():
+    """json post processor should return parsed command output."""
+    from app.services.device.command_post_processor import apply_command_post_processor
+
+    result = {
+        "success": True,
+        "exit_code": 0,
+        "stdout": '[{"name": "env-context", "source": "codex"}]',
+        "stderr": "",
+        "duration": 0.01,
+    }
+
+    processed = apply_command_post_processor(result, "json")
+
+    assert processed["stdout"] == [{"name": "env-context", "source": "codex"}]
+
+
+def test_json_post_processor_reports_parse_failure():
+    """json post processor should mark malformed JSON results as failed."""
+    from app.services.device.command_post_processor import apply_command_post_processor
+
+    result = {
+        "success": True,
+        "exit_code": 0,
+        "stdout": "not-json",
+        "stderr": "",
+        "duration": 0.01,
+    }
+
+    processed = apply_command_post_processor(result, "json")
+
+    assert processed["success"] is False
+    assert "Failed to parse command JSON output" in processed["error"]
+
+
+def test_json_post_processor_promotes_failed_json_error():
+    """json post processor should expose JSON error payloads from failed commands."""
+    from app.services.device.command_post_processor import apply_command_post_processor
+
+    result = {
+        "success": False,
+        "exit_code": 64,
+        "stdout": '{"success": false, "error": "file does not exist"}',
+        "stderr": "",
+        "duration": 0.01,
+    }
+
+    processed = apply_command_post_processor(result, "json")
+
+    assert processed["success"] is False
+    assert processed["stdout"] == {
+        "success": False,
+        "error": "file does not exist",
+    }
+    assert processed["error"] == "file does not exist"
+
+
+def test_json_post_processor_reports_truncated_output():
+    """json post processor should fail early when stdout was truncated."""
+    from app.services.device.command_post_processor import apply_command_post_processor
+
+    result = {
+        "success": True,
+        "exit_code": 0,
+        "stdout": '[{"name": "skill-a", "description": "very long',
+        "stderr": "",
+        "duration": 0.5,
+        "stdout_truncated": True,
+    }
+
+    processed = apply_command_post_processor(result, "json")
+
+    assert processed["success"] is False
+    assert "truncated" in processed["error"]
+
+
+def test_ls_skills_command_parses_yaml_block_description(tmp_path):
+    """ls_skills should parse YAML block scalars without keeping the marker."""
+    from app.services.device.command_registry import LS_SKILLS_SCRIPT
+
+    skill_dir = tmp_path / ".codex" / "skills" / "chronicle"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        """---
+name: chronicle
+description: |
+  Allows you to view the user's screen as well as several hours of history.
+
+  Use when the user refers to recent work.
+metadata:
+  short-description: |
+    Screen history context.
+---
+
+# Chronicle
+""",
+        encoding="utf-8",
+    )
+
+    env = {**os.environ, "HOME": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, "-c", LS_SKILLS_SCRIPT],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    skills = json.loads(result.stdout)
+
+    assert skills == [
+        {
+            "name": "chronicle",
+            "description": (
+                "Allows you to view the user's screen as well as several hours "
+                "of history. Use when the user refers to recent work."
+            ),
+            "short_description": "Screen history context.",
+            "path": str(skill_dir / "SKILL.md"),
+            "source": "codex",
+            "origin": "local",
+            "mtime": skills[0]["mtime"],
+        }
+    ]
+    assert "|" not in skills[0]["description"]
+
+
+def test_ls_skills_command_prefers_shared_agents_source(tmp_path):
+    """ls_skills should expose unified shared skills as agents skills."""
+    from app.services.device.command_registry import LS_SKILLS_SCRIPT
+
+    skill_dir = tmp_path / ".agents" / "skills" / "shared-context"
+    skill_dir.mkdir(parents=True)
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".codex" / "skills").symlink_to(
+        tmp_path / ".agents" / "skills",
+        target_is_directory=True,
+    )
+    (tmp_path / ".claude" / "skills").symlink_to(
+        tmp_path / ".agents" / "skills",
+        target_is_directory=True,
+    )
+    (skill_dir / "SKILL.md").write_text(
+        """---
+name: shared-context
+description: Shared local context.
+---
+
+# Shared Context
+""",
+        encoding="utf-8",
+    )
+
+    env = {**os.environ, "HOME": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, "-c", LS_SKILLS_SCRIPT],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    skills = json.loads(result.stdout)
+
+    assert len(skills) == 1
+    assert skills[0]["name"] == "shared-context"
+    assert skills[0]["source"] == "agents"
+    assert skills[0]["path"] == str(skill_dir / "SKILL.md")
+
+
+def test_ls_skills_command_follows_agents_skill_directory_symlinks(tmp_path):
+    """ls_skills should include skill directories symlinked under ~/.agents/skills."""
+    from app.services.device.command_registry import LS_SKILLS_SCRIPT
+
+    agents_skills_dir = tmp_path / ".agents" / "skills"
+    agents_skills_dir.mkdir(parents=True)
+    external_skill_dir = tmp_path / "external-skills" / "linked-helper"
+    external_skill_dir.mkdir(parents=True)
+    (agents_skills_dir / "linked-helper").symlink_to(
+        external_skill_dir,
+        target_is_directory=True,
+    )
+    (agents_skills_dir / "missing-helper").symlink_to(
+        tmp_path / "missing-helper",
+        target_is_directory=True,
+    )
+    (external_skill_dir / "SKILL.md").write_text(
+        """---
+name: linked-helper
+description: Linked helper skill.
+---
+
+# Linked Helper
+""",
+        encoding="utf-8",
+    )
+
+    env = {**os.environ, "HOME": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, "-c", LS_SKILLS_SCRIPT],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    skills = json.loads(result.stdout)
+
+    assert len(skills) == 1
+    assert skills[0]["name"] == "linked-helper"
+    assert skills[0]["source"] == "agents"
+    assert skills[0]["origin"] == "local"
+    assert skills[0]["path"] == str(agents_skills_dir / "linked-helper" / "SKILL.md")
+
+
+def test_ls_skills_command_scans_legacy_symlink_when_not_shared_root(tmp_path):
+    """ls_skills should scan legacy skill roots linked outside ~/.agents/skills."""
+    from app.services.device.command_registry import LS_SKILLS_SCRIPT
+
+    codex_target_dir = tmp_path / "custom-codex-skills"
+    codex_skill_dir = codex_target_dir / "codex-only"
+    codex_skill_dir.mkdir(parents=True)
+    (tmp_path / ".agents" / "skills").mkdir(parents=True)
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "skills").symlink_to(
+        codex_target_dir,
+        target_is_directory=True,
+    )
+    (codex_skill_dir / "SKILL.md").write_text(
+        """---
+name: codex-only
+description: Codex-only linked skill.
+---
+
+# Codex Only
+""",
+        encoding="utf-8",
+    )
+
+    env = {**os.environ, "HOME": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, "-c", LS_SKILLS_SCRIPT],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    skills = json.loads(result.stdout)
+
+    assert len(skills) == 1
+    assert skills[0]["name"] == "codex-only"
+    assert skills[0]["source"] == "codex"
+    assert skills[0]["path"] == str(
+        tmp_path / ".codex" / "skills" / "codex-only" / "SKILL.md"
+    )
+
+
+def test_setup_shared_skills_command_migrates_legacy_skill_dirs(tmp_path):
+    """setup_shared_skills should move existing skills and link legacy dirs."""
+    from app.services.device.command_registry import SETUP_SHARED_SKILLS_SCRIPT
+
+    codex_skill_dir = tmp_path / ".codex" / "skills" / "shared"
+    claude_skill_dir = tmp_path / ".claude" / "skills" / "shared"
+    codex_skill_dir.mkdir(parents=True)
+    claude_skill_dir.mkdir(parents=True)
+    (codex_skill_dir / "SKILL.md").write_text("# Codex\n", encoding="utf-8")
+    (claude_skill_dir / "SKILL.md").write_text("# Claude\n", encoding="utf-8")
+
+    env = {**os.environ, "HOME": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, "-c", SETUP_SHARED_SKILLS_SCRIPT],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+    shared_dir = tmp_path / ".agents" / "skills"
+
+    assert payload["success"] is True
+    assert payload["status"] == "configured"
+    assert payload["shared_path"] == str(shared_dir)
+    assert payload["moved_count"] == 2
+    assert (shared_dir / "shared" / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "# Codex\n"
+    assert (shared_dir / "shared-claude" / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "# Claude\n"
+    assert (tmp_path / ".codex" / "skills").is_symlink()
+    assert (tmp_path / ".claude" / "skills").is_symlink()
+    assert (tmp_path / ".codex" / "skills").resolve() == shared_dir
+    assert (tmp_path / ".claude" / "skills").resolve() == shared_dir
+
+
+def test_setup_shared_skills_command_is_idempotent(tmp_path):
+    """setup_shared_skills should be safe to run after links already exist."""
+    from app.services.device.command_registry import SETUP_SHARED_SKILLS_SCRIPT
+
+    shared_dir = tmp_path / ".agents" / "skills"
+    shared_dir.mkdir(parents=True)
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".codex" / "skills").symlink_to(
+        shared_dir,
+        target_is_directory=True,
+    )
+    (tmp_path / ".claude" / "skills").symlink_to(
+        shared_dir,
+        target_is_directory=True,
+    )
+
+    env = {**os.environ, "HOME": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, "-c", SETUP_SHARED_SKILLS_SCRIPT],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+
+    assert payload["success"] is True
+    assert payload["moved_count"] == 0
+    assert {link["status"] for link in payload["links"]} == {"already_configured"}
+
+
+def test_sync_runtime_auth_file_command_writes_json_object(tmp_path):
+    """sync_runtime_auth_file should create auth JSON with private permissions."""
+    from app.services.device.command_registry import SYNC_RUNTIME_AUTH_FILE_SCRIPT
+
+    executor_home = tmp_path / "executor-home"
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "WEGENT_EXECUTOR_HOME": str(executor_home),
+        "WEGENT_CODEX_HOME": "",
+        "WEGENT_RUNTIME_CONFIG_RUNTIME": "codex",
+        "WEGENT_RUNTIME_CONFIG_CONTENT": '{"token":"secret","account":{"id":"u1"}}',
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", SYNC_RUNTIME_AUTH_FILE_SCRIPT],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+    target = executor_home / "codex" / "auth.json"
+
+    assert payload == {
+        "status": "written",
+        "runtime": "codex",
+        "path": str(target),
+    }
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "account": {"id": "u1"},
+        "token": "secret",
+    }
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_sync_runtime_auth_file_command_does_not_overwrite_existing_file(tmp_path):
+    """sync_runtime_auth_file should skip when auth JSON already exists."""
+    from app.services.device.command_registry import SYNC_RUNTIME_AUTH_FILE_SCRIPT
+
+    executor_home = tmp_path / "executor-home"
+    target = executor_home / "codex" / "auth.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"token":"existing"}\n', encoding="utf-8")
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "WEGENT_EXECUTOR_HOME": str(executor_home),
+        "WEGENT_CODEX_HOME": "",
+        "WEGENT_RUNTIME_CONFIG_RUNTIME": "codex",
+        "WEGENT_RUNTIME_CONFIG_CONTENT": '{"token":"new"}',
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", SYNC_RUNTIME_AUTH_FILE_SCRIPT],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {
+        "status": "skipped_existing",
+        "runtime": "codex",
+        "path": str(target),
+    }
+    assert target.read_text(encoding="utf-8") == '{"token":"existing"}\n'
+
+
+def test_read_runtime_auth_file_command_returns_existing_json(tmp_path):
+    """read_runtime_auth_file should return the auth JSON content."""
+    from app.services.device.command_registry import READ_RUNTIME_AUTH_FILE_SCRIPT
+
+    codex_home = tmp_path / "custom-codex-home"
+    target = codex_home / "auth.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"token":"existing"}\n', encoding="utf-8")
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "WEGENT_EXECUTOR_HOME": str(tmp_path / "executor-home"),
+        "WEGENT_CODEX_HOME": str(codex_home),
+        "WEGENT_RUNTIME_CONFIG_RUNTIME": "codex",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", READ_RUNTIME_AUTH_FILE_SCRIPT],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {
+        "status": "read",
+        "runtime": "codex",
+        "path": str(target),
+        "content": '{"token":"existing"}\n',
+    }
+
+
+def test_ls_skills_command_includes_plugin_skills(tmp_path):
+    """ls_skills should include skills bundled by installed Claude and Codex plugins."""
+    from app.services.device.command_registry import LS_SKILLS_SCRIPT
+
+    claude_skill_dir = (
+        tmp_path
+        / ".claude"
+        / "plugins"
+        / "cache"
+        / "claude-plugins-official"
+        / "superpowers"
+        / "5.0.7"
+        / "skills"
+        / "test-driven-development"
+    )
+    codex_skill_dir = (
+        tmp_path
+        / ".codex"
+        / "plugins"
+        / "cache"
+        / "openai-curated"
+        / "github"
+        / "83d1f0d2"
+        / "skills"
+        / "github"
+    )
+    claude_skill_dir.mkdir(parents=True)
+    codex_skill_dir.mkdir(parents=True)
+    manifest_path = tmp_path / ".wegent-executor" / "capabilities.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision": 1,
+                "skills": {},
+                "plugins": {
+                    "superpowers@claude-plugins-official": {
+                        "installed_plugin_id": 9,
+                        "managed": True,
+                    }
+                },
+                "mcps": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (claude_skill_dir / "SKILL.md").write_text(
+        """---
+name: test-driven-development
+description: Use when implementing features.
+---
+
+# TDD
+""",
+        encoding="utf-8",
+    )
+    (codex_skill_dir / "SKILL.md").write_text(
+        """---
+name: github
+description: Inspect repositories and pull requests.
+metadata:
+  short-description: GitHub workflow support.
+---
+
+# GitHub
+""",
+        encoding="utf-8",
+    )
+
+    env = {**os.environ, "HOME": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, "-c", LS_SKILLS_SCRIPT],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    skills = json.loads(result.stdout)
+
+    assert {
+        (
+            skill["name"],
+            skill["source"],
+            skill["origin"],
+            skill["plugin_name"],
+            skill["path"],
+        )
+        for skill in skills
+    } == {
+        (
+            "test-driven-development",
+            "claude-plugin",
+            "wegent",
+            "superpowers",
+            str(claude_skill_dir / "SKILL.md"),
+        ),
+        (
+            "github",
+            "codex-plugin",
+            "local",
+            "github",
+            str(codex_skill_dir / "SKILL.md"),
+        ),
+    }
+    assert (
+        next(skill for skill in skills if skill["name"] == "github")[
+            "short_description"
+        ]
+        == "GitHub workflow support."
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_command_calls_registered_device_socket(monkeypatch):
+    """Service should send command RPC to the target device socket."""
+    from app.services.device import command_service
+
+    mock_sio = AsyncMock()
+    mock_sio.call.return_value = {
+        "success": True,
+        "exit_code": 0,
+        "stdout": "ok\n",
+        "stderr": "",
+        "duration": 0.01,
+        "timed_out": False,
+    }
+
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_online_info",
+        AsyncMock(return_value={"socket_id": "socket-123"}),
+    )
+    monkeypatch.setattr(command_service, "get_sio", lambda: mock_sio)
+
+    result = await command_service.local_device_command_service.execute_command(
+        user_id=7,
+        device_id="device-abc",
+        command="pwd",
+        path="/tmp",
+        args=["-P"],
+        env={"A": "B"},
+        timeout_seconds=5,
+        max_output_bytes=1024,
+    )
+
+    assert result["success"] is True
+    assert result["stdout"] == "ok\n"
+    mock_sio.call.assert_awaited_once_with(
+        "device:execute_command",
+        {
+            "command": "pwd",
+            "cwd": "/tmp",
+            "args": ["-P"],
+            "argv": ["pwd", "-P"],
+            "env": {"A": "B"},
+            "timeout_seconds": 5,
+            "max_output_bytes": 1024,
+        },
+        to="socket-123",
+        namespace="/local-executor",
+        timeout=10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_command_reports_socket_timeout_with_actionable_detail(
+    monkeypatch,
+):
+    """Socket.IO timeout errors should not produce an empty API detail."""
+    from socketio.exceptions import TimeoutError as SocketTimeoutError
+
+    from app.services.device import command_service
+
+    mock_sio = AsyncMock()
+    mock_sio.call.side_effect = SocketTimeoutError()
+
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_online_info",
+        AsyncMock(return_value={"socket_id": "socket-123"}),
+    )
+    monkeypatch.setattr(command_service, "get_sio", lambda: mock_sio)
+
+    with pytest.raises(command_service.DeviceCommandError) as exc_info:
+        await command_service.local_device_command_service.execute_command(
+            user_id=7,
+            device_id="device-abc",
+            command="printenv HOME",
+            timeout_seconds=10,
+            max_output_bytes=4096,
+        )
+
+    message = str(exc_info.value)
+    assert "timed out after 15 seconds" in message
+    assert "device-abc" in message
+    assert "device:execute_command" in message
+    assert "Reconnect or upgrade" in message
+    assert message != "Command RPC failed: "
+
+
+@pytest.mark.asyncio
+async def test_execute_command_rejects_offline_device(monkeypatch):
+    """Service should reject devices without online socket information."""
+    from app.services.device import command_service
+
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_online_info",
+        AsyncMock(return_value=None),
+    )
+
+    with pytest.raises(command_service.DeviceCommandError) as exc_info:
+        await command_service.local_device_command_service.execute_command(
+            user_id=7,
+            device_id="offline-device",
+            command="pwd",
+        )
+
+    assert "offline" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_execute_configured_device_command_resolves_executes_and_post_processes(
+    monkeypatch,
+):
+    """Internal service API should resolve key, execute command, and post-process."""
+    from app.services.device import command_service
+
+    execute_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "exit_code": 0,
+            "stdout": ".\n..\nbackend\n",
+            "stderr": "",
+            "duration": 0.02,
+            "timed_out": False,
+        }
+    )
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda db, user_id, device_id: object(),
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    result = await command_service.execute_configured_device_command(
+        db=object(),
+        user_id=7,
+        device_id="device-abc",
+        command_key="repo_files",
+        path="/tmp",
+        args=["backend"],
+        env={"A": "B"},
+        timeout_seconds=5,
+        max_output_bytes=1024,
+        command_config={
+            "repo_files": {
+                "command": "ls -a",
+                "post_processor": "file_list",
+            }
+        },
+    )
+
+    assert result["stdout"] == ["backend"]
+    execute_mock.assert_awaited_once_with(
+        user_id=7,
+        device_id="device-abc",
+        command="ls -a",
+        path="/tmp",
+        args=["backend"],
+        env={"A": "B"},
+        timeout_seconds=5,
+        max_output_bytes=1024,
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_configured_device_command_rejects_unowned_device(monkeypatch):
+    """Internal service API should reject devices the user does not own."""
+    from app.services.device import command_service
+
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda db, user_id, device_id: None,
+    )
+
+    with pytest.raises(command_service.DeviceCommandNotFoundError):
+        await command_service.execute_configured_device_command(
+            db=object(),
+            user_id=7,
+            device_id="device-abc",
+            command_key="pwd",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command_key",
+    ["environment_prepare", "sync_git_credentials"],
+)
+async def test_execute_configured_device_command_hides_internal_keys(
+    monkeypatch,
+    command_key,
+):
+    """The generic command API must not expose service-only commands."""
+    from app.services.device import command_service
+
+    execute_mock = AsyncMock()
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda *_args: object(),
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    with pytest.raises(command_service.DeviceCommandUnknownKeyError):
+        await command_service.execute_configured_device_command(
+            db=object(),
+            user_id=7,
+            device_id="device-abc",
+            command_key=command_key,
+        )
+
+    execute_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_configured_device_command_allows_internal_environment_prepare(
+    monkeypatch,
+):
+    """Initialization may explicitly dispatch the internal prepare command."""
+    from app.services.device import command_service
+
+    execute_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "exit_code": 0,
+            "stdout": {"workspacePath": "/workspace/environment"},
+            "stderr": "",
+        }
+    )
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda *_args: object(),
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    result = await command_service.execute_configured_device_command(
+        db=object(),
+        user_id=7,
+        device_id="device-abc",
+        command_key="environment_prepare",
+        args=["{}"],
+        command_config={
+            "environment_prepare": {
+                "command": "prepare-environment",
+            }
+        },
+        allow_internal=True,
+    )
+
+    assert result["success"] is True
+    execute_mock.assert_awaited_once_with(
+        user_id=7,
+        device_id="device-abc",
+        command="prepare-environment",
+        path=None,
+        args=["{}"],
+        env={},
+        timeout_seconds=60,
+        max_output_bytes=1048576,
+        command_key="environment_prepare",
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_configured_device_command_routes_cloud_directory_command_to_runtime_id(
+    monkeypatch,
+):
+    """Cloud CRD IDs should resolve to runtime executor IDs before dispatch."""
+    from app.schemas.device import DeviceType
+    from app.services.device import command_service
+
+    execute_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "exit_code": 0,
+            "stdout": "./\n../\nrepo/\n",
+            "stderr": "",
+            "duration": 0.02,
+            "timed_out": False,
+        }
+    )
+    online_mock = AsyncMock(return_value={"socket_id": "socket-cloud"})
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda db, user_id, device_id: SimpleNamespace(
+            name="cloud-crd",
+            json={
+                "spec": {
+                    "deviceType": "cloud",
+                    "cloudConfig": {"deviceId": "runtime-cloud"},
+                }
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_online_info_by_type",
+        online_mock,
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    result = await command_service.execute_configured_device_command(
+        db=object(),
+        user_id=7,
+        device_id="cloud-crd",
+        command_key="ls_dirs",
+        path="/",
+    )
+
+    assert result["stdout"] == ["repo"]
+    online_mock.assert_awaited_once_with(
+        7,
+        "runtime-cloud",
+        DeviceType.CLOUD,
+    )
+    execute_mock.assert_awaited_once_with(
+        user_id=7,
+        device_id="runtime-cloud",
+        command="ls -a -p",
+        path="/",
+        args=[],
+        env={},
+        timeout_seconds=60,
+        max_output_bytes=1024 * 1024,
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_configured_device_command_routes_remote_home_directory_command(
+    monkeypatch,
+):
+    """Remote devices should use their submitted device ID for dispatch."""
+    from app.schemas.device import DeviceType
+    from app.services.device import command_service
+    from app.services.device.command_registry import DEFAULT_LOCAL_DEVICE_COMMANDS
+
+    execute_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "exit_code": 0,
+            "stdout": "/home/ubuntu\n",
+            "stderr": "",
+            "duration": 0.02,
+            "timed_out": False,
+        }
+    )
+    online_mock = AsyncMock(return_value={"socket_id": "socket-remote"})
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda db, user_id, device_id: SimpleNamespace(
+            name="remote-device",
+            json={"spec": {"deviceType": "remote"}},
+        ),
+    )
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_online_info_by_type",
+        online_mock,
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    result = await command_service.execute_configured_device_command(
+        db=object(),
+        user_id=7,
+        device_id="remote-device",
+        command_key="home_dir",
+    )
+
+    assert result["stdout"] == "/home/ubuntu\n"
+    online_mock.assert_awaited_once_with(
+        7,
+        "remote-device",
+        DeviceType.REMOTE,
+    )
+    assert execute_mock.await_args.kwargs["device_id"] == "remote-device"
+    assert (
+        execute_mock.await_args.kwargs["command"]
+        == DEFAULT_LOCAL_DEVICE_COMMANDS["home_dir"].command
+    )
+
+
+@pytest.mark.asyncio
+async def test_external_device_command_rejects_app_device_when_remote_control_is_disabled(
+    monkeypatch,
+):
+    from app.services.device import command_service
+
+    execute_mock = AsyncMock(return_value={"success": True})
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda db, user_id, device_id: SimpleNamespace(
+            id=123,
+            name="app-device",
+            json={"spec": {"deviceType": "app"}},
+        ),
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    with pytest.raises(command_service.DeviceCommandError) as exc_info:
+        await command_service.execute_configured_device_command(
+            db=object(),
+            user_id=7,
+            device_id="app-device",
+            command_key="repo_status",
+            command_config={"repo_status": {"command": "git status --short"}},
+            allow_app_device=False,
+        )
+
+    assert str(exc_info.value) == "Remote control is disabled for this app device"
+    execute_mock.assert_not_awaited()
+
+    result = await command_service.execute_configured_device_command(
+        db=object(),
+        user_id=7,
+        device_id="app-device",
+        command_key="repo_status",
+        command_config={"repo_status": {"command": "git status --short"}},
+    )
+
+    assert result == {"success": True}
+    execute_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("device_type", "submitted_device_id", "dispatch_device_id"),
+    [
+        ("cloud", "cloud-crd", "runtime-cloud"),
+        ("remote", "remote-device", "remote-device"),
+    ],
+)
+async def test_execute_configured_device_command_allows_remote_directory_creation(
+    monkeypatch,
+    device_type,
+    submitted_device_id,
+    dispatch_device_id,
+):
+    """Cloud and remote projects should be able to create workspace directories."""
+    from app.services.device import command_service
+
+    execute_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration": 0.02,
+            "timed_out": False,
+        }
+    )
+    online_mock = AsyncMock(return_value={"socket_id": "socket-remote"})
+    device_spec = {"deviceType": device_type}
+    if device_type == "cloud":
+        device_spec["cloudConfig"] = {"deviceId": dispatch_device_id}
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda db, user_id, device_id: SimpleNamespace(
+            name=submitted_device_id,
+            json={"spec": device_spec},
+        ),
+    )
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_online_info_by_type",
+        online_mock,
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    result = await command_service.execute_configured_device_command(
+        db=object(),
+        user_id=7,
+        device_id=submitted_device_id,
+        command_key="mkdir_p",
+        args=["/workspace/project"],
+    )
+
+    assert result["success"] is True
+    execute_mock.assert_awaited_once_with(
+        user_id=7,
+        device_id=dispatch_device_id,
+        command="mkdir -p",
+        path=None,
+        args=["/workspace/project"],
+        env={},
+        timeout_seconds=60,
+        max_output_bytes=1024 * 1024,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command_key", "stdout", "env"),
+    [
+        (
+            "read_runtime_auth_file",
+            '{"status":"read","path":"/runtime/codex/auth.json","content":"{}"}',
+            {
+                "WEGENT_RUNTIME_CONFIG_RUNTIME": "codex",
+            },
+        ),
+        (
+            "sync_runtime_auth_file",
+            '{"status":"written","path":"/runtime/codex/auth.json"}',
+            {
+                "WEGENT_RUNTIME_CONFIG_RUNTIME": "codex",
+                "WEGENT_RUNTIME_CONFIG_CONTENT": "{}",
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("device_type", "submitted_device_id", "dispatch_device_id"),
+    [
+        ("cloud", "cloud-crd", "runtime-cloud"),
+        ("remote", "remote-device", "remote-device"),
+    ],
+)
+async def test_execute_configured_device_command_allows_runtime_auth_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    command_key: str,
+    stdout: str,
+    env: dict[str, str],
+    device_type: str,
+    submitted_device_id: str,
+    dispatch_device_id: str,
+) -> None:
+    """Cloud and remote devices should support constrained runtime auth commands."""
+    from app.schemas.device import DeviceType
+    from app.services.device import command_service
+    from app.services.device.command_registry import resolve_local_device_command
+
+    execute_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "exit_code": 0,
+            "stdout": stdout,
+            "stderr": "",
+            "duration": 0.02,
+            "timed_out": False,
+        }
+    )
+    online_mock = AsyncMock(return_value={"socket_id": f"socket-{device_type}"})
+
+    device_spec = {"deviceType": device_type}
+    if device_type == "cloud":
+        device_spec["cloudConfig"] = {"deviceId": dispatch_device_id}
+
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda db, user_id, device_id: SimpleNamespace(
+            name=submitted_device_id,
+            json={"spec": device_spec},
+        ),
+    )
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_online_info_by_type",
+        online_mock,
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    result = await command_service.execute_configured_device_command(
+        db=object(),
+        user_id=7,
+        device_id=submitted_device_id,
+        command_key=command_key,
+        env=env,
+    )
+
+    command_definition = resolve_local_device_command(command_key)
+    assert command_definition is not None
+    assert result["success"] is True
+    assert isinstance(result["stdout"], dict)
+    online_mock.assert_awaited_once_with(
+        7,
+        dispatch_device_id,
+        DeviceType(device_type),
+    )
+    execute_mock.assert_awaited_once_with(
+        user_id=7,
+        device_id=dispatch_device_id,
+        command=command_definition.command,
+        path=None,
+        args=[],
+        env=env,
+        timeout_seconds=60,
+        max_output_bytes=1024 * 1024,
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_configured_device_command_rejects_cloud_unsupported_command_key(
+    monkeypatch,
+):
+    """Cloud workspace tooling must not enable the full command registry."""
+    from app.services.device import command_service
+
+    execute_mock = AsyncMock()
+    online_mock = AsyncMock(return_value={"socket_id": "socket-cloud"})
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda db, user_id, device_id: SimpleNamespace(
+            name="cloud-crd",
+            json={
+                "spec": {
+                    "deviceType": "cloud",
+                    "cloudConfig": {"deviceId": "runtime-cloud"},
+                }
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_online_info_by_type",
+        online_mock,
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    with pytest.raises(command_service.DeviceCommandError) as exc_info:
+        await command_service.execute_configured_device_command(
+            db=object(),
+            user_id=7,
+            device_id="cloud-crd",
+            command_key="ls_a",
+        )
+
+    assert "not supported for cloud devices" in str(exc_info.value)
+    online_mock.assert_not_awaited()
+    execute_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command_key", "path", "expected_runtime_command_key"),
+    [
+        ("workspace_tree", "/workspace/repo", "workspace_tree"),
+        ("git_apply_patch", "/workspace/repo", "git_apply_patch"),
+        ("git_status_porcelain", "/workspace/repo", None),
+    ],
+)
+async def test_execute_configured_device_command_allows_cloud_workspace_tools(
+    monkeypatch,
+    command_key,
+    path,
+    expected_runtime_command_key,
+):
+    """Cloud file and Git tools should execute on the resolved Runtime."""
+    from app.services.device import command_service
+
+    execute_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration": 0.01,
+            "timed_out": False,
+        }
+    )
+    online_mock = AsyncMock(return_value={"socket_id": "socket-cloud"})
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda db, user_id, device_id: SimpleNamespace(
+            name="cloud-crd",
+            json={
+                "spec": {
+                    "deviceType": "cloud",
+                    "cloudConfig": {"deviceId": "runtime-cloud"},
+                }
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_online_info_by_type",
+        online_mock,
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    await command_service.execute_configured_device_command(
+        db=object(),
+        user_id=7,
+        device_id="cloud-crd",
+        command_key=command_key,
+        path=path,
+    )
+
+    online_mock.assert_awaited_once_with(
+        7,
+        "runtime-cloud",
+        command_service.DeviceType.CLOUD,
+    )
+    execute_mock.assert_awaited_once()
+    _, kwargs = execute_mock.await_args
+    assert kwargs["device_id"] == "runtime-cloud"
+    assert kwargs["path"] == path
+    assert kwargs.get("command_key") == expected_runtime_command_key
+
+
+@pytest.mark.asyncio
+async def test_execute_configured_device_command_rejects_unknown_device_type(
+    monkeypatch,
+):
+    """Unknown Device CRD types should fail before Socket.IO dispatch."""
+    from app.services.device import command_service
+
+    execute_mock = AsyncMock()
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda db, user_id, device_id: SimpleNamespace(
+            name="unknown-device",
+            json={"spec": {"deviceType": "satellite"}},
+        ),
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    with pytest.raises(command_service.DeviceCommandError) as exc_info:
+        await command_service.execute_configured_device_command(
+            db=object(),
+            user_id=7,
+            device_id="unknown-device",
+            command_key="pwd",
+        )
+
+    assert "not supported for unknown device type" in str(exc_info.value)
+    execute_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_configured_device_command_rejects_offline_remote_before_dispatch(
+    monkeypatch,
+):
+    """Offline remote devices should fail directly instead of timing out on ACK."""
+    from app.services.device import command_service
+
+    execute_mock = AsyncMock()
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_by_device_id",
+        lambda db, user_id, device_id: SimpleNamespace(
+            name="remote-device",
+            json={"spec": {"deviceType": "remote"}},
+        ),
+    )
+    monkeypatch.setattr(
+        command_service.device_service,
+        "get_device_online_info_by_type",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        command_service.local_device_command_service,
+        "execute_command",
+        execute_mock,
+    )
+
+    with pytest.raises(command_service.DeviceCommandError) as exc_info:
+        await command_service.execute_configured_device_command(
+            db=object(),
+            user_id=7,
+            device_id="remote-device",
+            command_key="pwd",
+        )
+
+    assert "remote device 'remote-device' is offline" in str(exc_info.value).lower()
+    execute_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_device_command_endpoint_maps_request_to_service(monkeypatch):
+    """Endpoint should delegate HTTP request data to the internal service API."""
+    from app.api.endpoints import devices
+    from app.schemas.device import DeviceCommandRequest
+
+    service_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "exit_code": 0,
+            "stdout": "ok",
+            "stderr": "",
+            "duration": 0.02,
+            "timed_out": False,
+        }
+    )
+    monkeypatch.setattr(devices, "execute_configured_device_command", service_mock)
+    db = object()
+
+    response = await devices.execute_device_command(
+        device_id="device-abc",
+        request=DeviceCommandRequest(
+            command_key="repo_status",
+            path="/tmp",
+            args=["--short"],
+            env={"A": "B"},
+            timeout_seconds=5,
+            max_output_bytes=1024,
+        ),
+        db=db,
+        current_user=SimpleNamespace(id=7),
+    )
+
+    assert response.success is True
+    assert response.stdout == "ok"
+    service_mock.assert_awaited_once_with(
+        db=db,
+        user_id=7,
+        device_id="device-abc",
+        command_key="repo_status",
+        path="/tmp",
+        args=["--short"],
+        env={"A": "B"},
+        timeout_seconds=5,
+        max_output_bytes=1024,
+        allow_app_device=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_device_runtime_settings_update_uses_runtime_rpc(monkeypatch):
+    from app.api.endpoints import devices
+
+    rpc_mock = AsyncMock(
+        side_effect=[
+            {"maxConcurrentTasks": 4},
+            {"limit": 4, "active": 2, "queued": 1},
+        ]
+    )
+    monkeypatch.setattr(devices.runtime_rpc_service, "call", rpc_mock)
+
+    response = await devices.update_device_runtime_settings(
+        device_id="device-abc",
+        request=devices.DeviceRuntimeSettingsUpdate(max_concurrent_tasks=4),
+        current_user=SimpleNamespace(id=7),
+    )
+
+    assert response.model_dump() == {
+        "device_id": "device-abc",
+        "max_concurrent_tasks": 4,
+        "active_tasks": 2,
+        "queued_tasks": 1,
+    }
+    assert rpc_mock.await_args_list[0].kwargs == {
+        "user_id": 7,
+        "device_id": "device-abc",
+        "method": "runtime.settings.update",
+        "payload": {"maxConcurrentTasks": 4},
+    }
+    assert rpc_mock.await_args_list[1].kwargs["method"] == "runtime.capacity.get"
+
+
+@pytest.mark.asyncio
+async def test_device_runtime_settings_get_maps_offline_to_service_unavailable(
+    monkeypatch,
+):
+    from fastapi import HTTPException
+
+    from app.api.endpoints import devices
+
+    rpc_mock = AsyncMock(side_effect=devices.RuntimeRpcError("Device is offline"))
+    monkeypatch.setattr(devices.runtime_rpc_service, "call", rpc_mock)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await devices.get_device_runtime_settings(
+            device_id="offline-device",
+            current_user=SimpleNamespace(id=7),
+        )
+
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_execute_device_command_endpoint_applies_configured_post_processor(
+    monkeypatch,
+):
+    """Endpoint should return post-processed internal service results."""
+    from app.api.endpoints import devices
+    from app.schemas.device import DeviceCommandRequest
+
+    service_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "exit_code": 0,
+            "stdout": [".env", "backend"],
+            "stderr": "",
+            "duration": 0.02,
+            "timed_out": False,
+        }
+    )
+    monkeypatch.setattr(devices, "execute_configured_device_command", service_mock)
+
+    response = await devices.execute_device_command(
+        device_id="device-abc",
+        request=DeviceCommandRequest(command_key="repo_files"),
+        db=object(),
+        current_user=SimpleNamespace(id=7),
+    )
+
+    assert response.success is True
+    assert response.stdout == [".env", "backend"]
+
+
+@pytest.mark.asyncio
+async def test_execute_device_command_endpoint_returns_structured_stdout(monkeypatch):
+    """Endpoint should allow command processors to return object lists."""
+    from app.api.endpoints import devices
+    from app.schemas.device import DeviceCommandRequest
+
+    skills = [
+        {
+            "name": "env-context",
+            "description": "Environment facts.",
+            "short_description": "Environment facts.",
+            "path": "/Users/crystal/.codex/skills/env-context/SKILL.md",
+            "source": "codex",
+            "mtime": 1780462034.0,
+        }
+    ]
+    service_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "exit_code": 0,
+            "stdout": skills,
+            "stderr": "",
+            "duration": 0.02,
+            "timed_out": False,
+        }
+    )
+    monkeypatch.setattr(devices, "execute_configured_device_command", service_mock)
+
+    response = await devices.execute_device_command(
+        device_id="device-abc",
+        request=DeviceCommandRequest(command_key="ls_skills"),
+        db=object(),
+        current_user=SimpleNamespace(id=7),
+    )
+
+    assert response.success is True
+    assert response.stdout == skills
+
+
+@pytest.mark.asyncio
+async def test_execute_device_command_endpoint_returns_dict_stdout(monkeypatch):
+    """Endpoint should allow JSON processors to return object stdout."""
+    from app.api.endpoints import devices
+    from app.schemas.device import DeviceCommandRequest
+
+    workspace_tree = {"path": "/workspace/project", "entries": []}
+    service_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "exit_code": 0,
+            "stdout": workspace_tree,
+            "stderr": "",
+            "duration": 0.02,
+            "timed_out": False,
+        }
+    )
+    monkeypatch.setattr(devices, "execute_configured_device_command", service_mock)
+
+    response = await devices.execute_device_command(
+        device_id="device-abc",
+        request=DeviceCommandRequest(command_key="workspace_tree"),
+        db=object(),
+        current_user=SimpleNamespace(id=7),
+    )
+
+    assert response.success is True
+    assert response.stdout == workspace_tree
+
+
+@pytest.mark.asyncio
+async def test_execute_device_command_endpoint_rejects_unknown_command_key(monkeypatch):
+    """Endpoint should reject command keys missing from backend configuration."""
+    from fastapi import HTTPException
+
+    from app.api.endpoints import devices
+    from app.schemas.device import DeviceCommandRequest
+
+    async def raise_unknown_key(**kwargs):
+        raise devices.DeviceCommandUnknownKeyError(
+            "Device command key 'repo_status' is not configured"
+        )
+
+    monkeypatch.setattr(devices, "execute_configured_device_command", raise_unknown_key)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await devices.execute_device_command(
+            device_id="device-abc",
+            request=DeviceCommandRequest(command_key="repo_status"),
+            db=object(),
+            current_user=SimpleNamespace(id=7),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "not configured" in exc_info.value.detail

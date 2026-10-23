@@ -1,0 +1,392 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { useState, useCallback, useRef, useEffect } from 'react'
+import { GitRepoInfo, TaskDetail } from '@/types/api'
+import { useUser } from '@/features/common/UserContext'
+import { useToast } from '@/hooks/use-toast'
+import { useTranslation } from '@/hooks/useTranslation'
+import { githubApis } from '@/apis/github'
+import { getLastRepo } from '@/utils/userPreferences'
+import { getRepositoryIdentity } from '@/features/tasks/components/selector/repositoryIdentity'
+
+export interface UseRepositorySearchOptions {
+  selectedRepo: GitRepoInfo | null
+  handleRepoChange: (repo: GitRepoInfo | null) => void
+  disabled: boolean
+  selectedTaskDetail?: TaskDetail | null
+  autoRestore?: boolean // Whether to auto-restore last selected repo from localStorage
+}
+
+export interface UseRepositorySearchReturn {
+  // State
+  repos: GitRepoInfo[]
+  cachedRepos: GitRepoInfo[]
+  loading: boolean
+  isSearching: boolean
+  isRefreshing: boolean
+  error: string | null
+  currentSearchQuery: string
+
+  // Methods
+  handleSearchChange: (query: string) => void
+  handleRefreshCache: () => Promise<void>
+  handleChange: (value: string) => void
+  resetSearch: () => void
+
+  // Helpers
+  hasGitInfo: () => boolean
+}
+
+/**
+ * Custom hook for repository search functionality
+ * Handles loading, caching, searching (local + remote), and refreshing repositories
+ */
+export function useRepositorySearch({
+  selectedRepo,
+  handleRepoChange,
+  disabled,
+  selectedTaskDetail,
+  autoRestore = true,
+}: UseRepositorySearchOptions): UseRepositorySearchReturn {
+  const { toast } = useToast()
+  const { t } = useTranslation()
+  const { user } = useUser()
+
+  // State
+  const [repos, setRepos] = useState<GitRepoInfo[]>([])
+  const [cachedRepos, setCachedRepos] = useState<GitRepoInfo[]>([])
+  const [loading, setLoading] = useState<boolean>(false)
+  const [isSearching, setIsSearching] = useState<boolean>(false)
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false)
+  const [currentSearchQuery, setCurrentSearchQuery] = useState<string>('')
+  const [error, setError] = useState<string | null>(null)
+  const [hasInitiallyLoaded, setHasInitiallyLoaded] = useState<boolean>(false)
+
+  // Refs for debouncing and race condition handling
+  const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const searchRequestIdRef = useRef<number>(0)
+
+  /**
+   * Check if user has git_info configured
+   */
+  const hasGitInfo = useCallback((): boolean => {
+    return !!(user && user.git_info && user.git_info.length > 0)
+  }, [user])
+
+  /**
+   * Load repositories from API
+   */
+  const loadRepositories = useCallback(async (): Promise<GitRepoInfo[]> => {
+    if (!hasGitInfo()) {
+      return []
+    }
+
+    setLoading(true)
+    setError(null)
+
+    try {
+      const data = await githubApis.getRepositories()
+      setRepos(data)
+      setCachedRepos(data)
+      setHasInitiallyLoaded(true)
+      setError(null)
+      return data
+    } catch {
+      setError('Failed to load repositories')
+      toast({
+        variant: 'destructive',
+        title: 'Failed to load repositories',
+      })
+      return []
+    } finally {
+      setLoading(false)
+    }
+  }, [hasGitInfo, toast])
+
+  /**
+   * Search repositories locally (in cache)
+   */
+  const searchLocalRepos = useCallback(
+    (query: string): GitRepoInfo[] => {
+      if (!query.trim()) {
+        return cachedRepos
+      }
+      const lowerQuery = query.toLowerCase()
+      return cachedRepos.filter(repo => repo.git_repo.toLowerCase().includes(lowerQuery))
+    },
+    [cachedRepos]
+  )
+
+  /**
+   * Search repositories remotely (delayed execution)
+   */
+  const searchRemoteRepos = useCallback(
+    async (query: string) => {
+      if (!query.trim()) {
+        setRepos(cachedRepos)
+        setIsSearching(false)
+        return
+      }
+
+      const requestId = ++searchRequestIdRef.current
+
+      try {
+        const results = await githubApis.searchRepositories(query, {
+          fullmatch: false,
+          timeout: 30,
+        })
+
+        if (requestId !== searchRequestIdRef.current) {
+          return
+        }
+
+        // Use remote search results directly (replace, not merge)
+        setRepos(results)
+        setError(null)
+      } catch {
+        if (requestId === searchRequestIdRef.current) {
+          console.error('Remote search failed, keeping local results')
+        }
+      } finally {
+        if (requestId === searchRequestIdRef.current) {
+          setIsSearching(false)
+        }
+      }
+    },
+    [cachedRepos]
+  )
+
+  /**
+   * Handle search input changes with debouncing
+   */
+  const handleSearchChange = useCallback(
+    (query: string) => {
+      setCurrentSearchQuery(query)
+
+      if (searchTimeoutRef.current) {
+        clearTimeout(searchTimeoutRef.current)
+      }
+
+      if (!query.trim()) {
+        searchRequestIdRef.current++
+        setRepos(cachedRepos)
+        setIsSearching(false)
+        return
+      }
+
+      setIsSearching(true)
+
+      // Immediately perform local search
+      const localResults = searchLocalRepos(query)
+      setRepos(localResults)
+
+      // Delay remote search for better responsiveness
+      searchTimeoutRef.current = setTimeout(() => {
+        searchRemoteRepos(query)
+      }, 300)
+    },
+    [searchLocalRepos, searchRemoteRepos, cachedRepos]
+  )
+
+  /**
+   * Handle refresh cache button click
+   */
+  const handleRefreshCache = useCallback(async () => {
+    if (isRefreshing) return
+
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current)
+    }
+    searchRequestIdRef.current++
+    setIsSearching(false)
+
+    setIsRefreshing(true)
+    try {
+      await githubApis.refreshRepositories()
+
+      if (currentSearchQuery.trim()) {
+        const requestId = ++searchRequestIdRef.current
+        const results = await githubApis.searchRepositories(currentSearchQuery, {
+          fullmatch: false,
+          timeout: 30,
+        })
+        if (requestId === searchRequestIdRef.current) {
+          setRepos(results)
+        }
+      } else {
+        const data = await githubApis.getRepositories()
+        setRepos(data)
+        setCachedRepos(data)
+      }
+
+      toast({ title: t('branches.refresh_success') })
+    } catch {
+      toast({ variant: 'destructive', title: t('branches.refresh_failed') })
+    } finally {
+      setIsRefreshing(false)
+    }
+  }, [isRefreshing, currentSearchQuery, toast, t])
+
+  /**
+   * Handle repository selection change
+   */
+  const handleChange = useCallback(
+    (value: string) => {
+      let repo = repos.find(r => getRepositoryIdentity(r) === value)
+
+      if (!repo) {
+        repo = cachedRepos.find(r => getRepositoryIdentity(r) === value)
+      }
+
+      // Backward-compatibility for legacy values that only pass git_repo_id
+      if (!repo) {
+        repo = repos.find(r => r.git_repo_id === Number(value))
+      }
+
+      if (!repo) {
+        repo = cachedRepos.find(r => r.git_repo_id === Number(value))
+      }
+
+      if (repo) {
+        handleRepoChange(repo)
+      }
+    },
+    [repos, cachedRepos, handleRepoChange]
+  )
+
+  /**
+   * Reset search state - clear query and restore cached repos
+   */
+  const resetSearch = useCallback(() => {
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current)
+      searchTimeoutRef.current = null
+    }
+    searchRequestIdRef.current++
+    setCurrentSearchQuery('')
+    setRepos(cachedRepos)
+    setIsSearching(false)
+    setError(null)
+  }, [cachedRepos])
+
+  // Cleanup timer on unmount
+  useEffect(() => {
+    return () => {
+      if (searchTimeoutRef.current) {
+        clearTimeout(searchTimeoutRef.current)
+      }
+    }
+  }, [])
+
+  /**
+   * Centralized repository selection logic
+   * Handles all scenarios: mount, task selection, and restoration
+   */
+  useEffect(() => {
+    let canceled = false
+
+    const selectRepository = async () => {
+      const hasGit = hasGitInfo()
+
+      if (!hasGit) {
+        return
+      }
+
+      // Scenario 1: Task is selected - use task's repository
+      if (selectedTaskDetail?.git_repo) {
+        if (selectedRepo?.git_repo === selectedTaskDetail.git_repo) {
+          return
+        }
+
+        const repoInList = repos.find(r => r.git_repo === selectedTaskDetail.git_repo)
+        if (repoInList) {
+          handleRepoChange(repoInList)
+          return
+        }
+
+        try {
+          setLoading(true)
+          const result = await githubApis.searchRepositories(selectedTaskDetail.git_repo, {
+            fullmatch: true,
+          })
+
+          if (canceled) return
+
+          if (result && result.length > 0) {
+            const matched =
+              result.find(r => r.git_repo === selectedTaskDetail.git_repo) ?? result[0]
+            handleRepoChange(matched)
+            setError(null)
+          } else {
+            toast({
+              variant: 'destructive',
+              title: 'No repositories found',
+            })
+          }
+        } catch {
+          setError('Failed to search repositories')
+          toast({
+            variant: 'destructive',
+            title: 'Failed to search repositories',
+          })
+        } finally {
+          if (!canceled) {
+            setLoading(false)
+          }
+        }
+        return
+      }
+
+      // Load available repositories even when restoring the previous selection is disabled.
+      if (!selectedTaskDetail && !selectedRepo && !disabled) {
+        let repoList = repos
+        if (repoList.length === 0 && !hasInitiallyLoaded) {
+          repoList = await loadRepositories()
+          if (canceled || repoList.length === 0) {
+            return
+          }
+        }
+
+        if (!autoRestore) return
+
+        const lastRepo = getLastRepo()
+
+        if (lastRepo) {
+          const repoToRestore =
+            repoList.find(
+              r => r.git_repo_id === lastRepo.repoId && r.git_repo === lastRepo.repoName
+            ) ?? repoList.find(r => r.git_repo_id === lastRepo.repoId)
+          if (repoToRestore) {
+            handleRepoChange(repoToRestore)
+          }
+        }
+      }
+    }
+
+    selectRepository()
+
+    return () => {
+      canceled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTaskDetail?.git_repo, disabled, user, hasInitiallyLoaded, autoRestore])
+
+  return {
+    repos,
+    cachedRepos,
+    loading,
+    isSearching,
+    isRefreshing,
+    error,
+    currentSearchQuery,
+    handleSearchChange,
+    handleRefreshCache,
+    handleChange,
+    resetSearch,
+    hasGitInfo,
+  }
+}

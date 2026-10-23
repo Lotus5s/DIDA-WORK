@@ -1,0 +1,119 @@
+import { describe, expect, test } from 'vitest'
+import { splitCodexInlineVisualizations, stripCodexUiDirectives } from './codex-directives'
+
+describe('stripCodexUiDirectives', () => {
+  test('strips Codex UI directive lines outside code fences', () => {
+    expect(
+      stripCodexUiDirectives(
+        [
+          '当前分支已经准备好。',
+          '::git-stage{cwd="/workspace/project"} ::git-commit{cwd="/workspace/project"}',
+          '可以继续提交。',
+        ].join('\n')
+      )
+    ).toBe('当前分支已经准备好。\n\n可以继续提交。')
+  })
+
+  test('preserves directive-like text inside code fences', () => {
+    const content = [
+      '```text',
+      '::git-stage{cwd="/workspace/project"}',
+      '::git-commit{cwd="/workspace/project"}',
+      '```',
+    ].join('\n')
+
+    expect(stripCodexUiDirectives(content)).toBe(content)
+  })
+
+  test('keeps mixed directive and non-directive content readable', () => {
+    expect(
+      stripCodexUiDirectives(
+        [
+          '已完成 rebase。',
+          '::git-push{cwd="/workspace/project" branch="codex/example"}',
+          'PR 已更新。',
+          '普通的 ::git-push 文本不会被处理。',
+        ].join('\n')
+      )
+    ).toBe(['已完成 rebase。', '', 'PR 已更新。', '普通的 ::git-push 文本不会被处理。'].join('\n'))
+  })
+
+  test('collapses blank lines introduced by multiple stripped directives', () => {
+    expect(
+      stripCodexUiDirectives(
+        [
+          '第一段',
+          '',
+          '::git-stage{cwd="/workspace/project"}',
+          '',
+          '::git-commit{cwd="/workspace/project"}',
+          '',
+          '第二段',
+        ].join('\n')
+      )
+    ).toBe('第一段\n\n第二段')
+  })
+
+  test('keeps valid inline visualization directives for the message renderer', () => {
+    const content = ['已生成图表。', '', '::codex-inline-vis{file="reports/trend.html"}'].join('\n')
+
+    expect(stripCodexUiDirectives(content)).toBe(content)
+    expect(splitCodexInlineVisualizations(content)).toEqual([
+      { kind: 'markdown', content: '已生成图表。\n' },
+      { kind: 'visualization', file: 'reports/trend.html' },
+    ])
+  })
+
+  test('parses ChatGPT visualize content references with absolute paths', () => {
+    const content = [
+      '这里是可视化结果。',
+      '',
+      'visualize{"path":"/tmp/codex/visualizations/latency.html","mode":"wide","title":"Latency"}',
+    ].join('\n')
+
+    expect(splitCodexInlineVisualizations(content)).toEqual([
+      { kind: 'markdown', content: '这里是可视化结果。\n' },
+      {
+        kind: 'visualization',
+        file: '/tmp/codex/visualizations/latency.html',
+        mode: 'wide',
+        title: 'Latency',
+      },
+    ])
+  })
+
+  test('parses visualize references from any absolute HTML path', () => {
+    const content = [
+      'visualize{"path":"/Users/me/project/output/task-board.html","mode":"wide","title":"Task board"}',
+      'visualize{"path":"/tmp/private.html"}',
+    ].join('\n')
+
+    expect(splitCodexInlineVisualizations(content)).toEqual([
+      {
+        kind: 'visualization',
+        file: '/Users/me/project/output/task-board.html',
+        mode: 'wide',
+        title: 'Task board',
+      },
+      {
+        kind: 'visualization',
+        file: '/tmp/private.html',
+      },
+    ])
+  })
+
+  test('preserves malformed, unsafe, and code-fenced visualization directives as markdown', () => {
+    const content = [
+      '::codex-inline-vis{file="../private.html"}',
+      'visualize{"path":"relative/visualizations/trend.html"}',
+      'visualize{"path":"/Users/me/project/../private.html"}',
+      '```text',
+      '::codex-inline-vis{file="trend.html"}',
+      'visualize{"path":"/tmp/visualizations/trend.html"}',
+      '```',
+      '::codex-inline-vis{file="trend.txt"}',
+    ].join('\n')
+
+    expect(splitCodexInlineVisualizations(content)).toEqual([{ kind: 'markdown', content }])
+  })
+})

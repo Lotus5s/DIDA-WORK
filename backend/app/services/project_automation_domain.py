@@ -1,0 +1,187 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared domain rules for project automation configuration and execution."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from croniter import croniter
+from fastapi import HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.models.delivery import ProjectChatAgent
+from app.models.kind import Kind
+from app.services.execution.team_readiness import (
+    validate_team_execution_readiness,
+)
+from app.services.project_event_sources import supported_event_type
+from app.services.share import team_share_service
+
+TERMINAL_RUN_STATUSES = {"succeeded", "failed", "cancelled", "skipped"}
+ACTIVE_RUN_STATUSES = {
+    "pending",
+    "queued",
+    "waiting_runtime",
+    "waiting_device",
+    "running",
+}
+
+
+@dataclass(frozen=True)
+class ProjectAutomationEvent:
+    event_type: str
+    project_id: str
+    subject_id: str
+    source: str
+    actor_user_id: int | None
+    payload: dict
+    subject_type: str = "task"
+    event_id: str | None = None
+    subscription_id: str | None = None
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def utc_aware(
+    value: datetime | None,
+    naive_timezone: tzinfo = timezone.utc,
+) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=naive_timezone)
+    return value.astimezone(timezone.utc)
+
+
+def metadata(row: object) -> dict:
+    value = getattr(row, "metadata_json", None)
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def next_run(expression: str, timezone_name: str, after: datetime) -> datetime:
+    try:
+        tz = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown timezone"
+        ) from exc
+    if not croniter.is_valid(expression):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid cron expression"
+        )
+    aware = after.replace(tzinfo=timezone.utc).astimezone(tz)
+    result = croniter(expression, aware).get_next(datetime)
+    return result.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def integer(value: object) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def text(value: object) -> str | None:
+    return str(value) if isinstance(value, str) and value else None
+
+
+def runtime_config(value: dict) -> dict:
+    runtime = value.get("runtime")
+    return dict(runtime) if isinstance(runtime, dict) else {}
+
+
+def project_agent(
+    db: Session, project_id: str, agent_id: str | None
+) -> ProjectChatAgent:
+    from app.services.collaboration_permissions import collaboration_permission_service
+
+    return collaboration_permission_service.require_project_agent(
+        db, project_id, agent_id or ""
+    )
+
+
+def wegent_team(
+    db: Session,
+    user_id: int,
+    team_id: int | None,
+    *,
+    project_id: str | int | None = None,
+    require_binding: bool = True,
+) -> Kind:
+    """Resolve execution access through personal sharing or a project grant."""
+
+    if project_id is not None and team_id is not None:
+        from app.services.collaboration_permissions import (
+            collaboration_permission_service,
+        )
+
+        team = collaboration_permission_service.require_project_team(
+            db, project_id, team_id, require_binding=require_binding
+        )
+    else:
+        team = (
+            team_share_service.get_resource_for_use(db, team_id, user_id)
+            if team_id is not None
+            else None
+        )
+    if team is None or team.kind != "Team" or not team.is_active:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Wegent Team is not accessible or active",
+        )
+    return team
+
+
+def runnable_wegent_team(
+    db: Session,
+    user_id: int,
+    team_id: int | None,
+    *,
+    project_id: str | int | None = None,
+    require_binding: bool = True,
+) -> Kind:
+    """Resolve an accessible Team and prove its execution dependencies exist."""
+
+    team = wegent_team(
+        db, user_id, team_id, project_id=project_id, require_binding=require_binding
+    )
+    try:
+        validate_team_execution_readiness(
+            db,
+            team=team,
+            execution_user_id=user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Wegent Team is not runnable: {exc}",
+        ) from exc
+    return team
+
+
+def validate_trigger(
+    trigger_type: str, event_type: str | None, cron_expression: str | None
+) -> None:
+    if trigger_type == "manual" and event_type is None and cron_expression is None:
+        return
+    if trigger_type == "schedule":
+        if not cron_expression:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "cron_expression is required for schedule trigger",
+            )
+        next_run(str(cron_expression), "UTC", utcnow())
+        return
+    if trigger_type == "event" and event_type and supported_event_type(event_type):
+        return
+    if trigger_type == "workflow" and event_type is None and cron_expression is None:
+        return
+    raise HTTPException(
+        status.HTTP_422_UNPROCESSABLE_ENTITY, "Unsupported automation trigger"
+    )

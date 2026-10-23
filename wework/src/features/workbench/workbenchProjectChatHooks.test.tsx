@@ -1,0 +1,1280 @@
+import { act, renderHook, waitFor } from '@testing-library/react'
+import { describe, expect, test, vi } from 'vitest'
+import { useWorkbenchAttachments } from './useWorkbenchAttachments'
+import { useWorkbenchModels } from './useWorkbenchModels'
+import { useWorkbenchSkills } from './useWorkbenchSkills'
+import { LOCAL_MODEL_SETTINGS_CHANGED_EVENT } from '@/features/model-settings/localModelSettings'
+import type { Attachment, ModelSelectionConfig, UnifiedModel, UnifiedSkill } from '@/types/api'
+
+describe('workbench project chat hooks', () => {
+  test('loads models and ignores model changes when locked', async () => {
+    const model: UnifiedModel = { name: 'wecode-claude-sonnet-4-5', type: 'user' }
+    const api = {
+      listModels: vi.fn().mockResolvedValue({ data: [model] }),
+    }
+
+    const { result, rerender } = renderHook(
+      ({ locked }: { locked: boolean }) => useWorkbenchModels({ api, locked }),
+      { initialProps: { locked: false } }
+    )
+
+    await waitFor(() => expect(result.current.models).toEqual([model]))
+
+    act(() => result.current.setSelectedModel(model))
+    expect(result.current.selectedModel).toEqual(model)
+    expect(result.current.selectedModelOptions).toEqual({})
+
+    rerender({ locked: true })
+    act(() => result.current.setSelectedModel(null))
+
+    expect(result.current.selectedModel).toEqual(model)
+  })
+
+  test('keeps known and uncategorized coding model families', async () => {
+    const claudeModel: UnifiedModel = { name: 'wecode-claude-sonnet-4-5', type: 'public' }
+    const gptModel: UnifiedModel = { name: 'wecode-gpt-4.1', type: 'public' }
+    const unknownModel: UnifiedModel = { name: 'unknown-model', type: 'public' }
+    const api = {
+      listModels: vi.fn().mockResolvedValue({ data: [claudeModel, gptModel, unknownModel] }),
+    }
+
+    const { result } = renderHook(() => useWorkbenchModels({ api, locked: false }))
+
+    await waitFor(() =>
+      expect(result.current.models).toEqual([claudeModel, gptModel, unknownModel])
+    )
+  })
+
+  test('reloads models after local model settings change', async () => {
+    const codexModel: UnifiedModel = {
+      name: 'codex-runtime',
+      type: 'runtime',
+      displayName: '本机 Codex',
+      runtime: { family: 'openai.openai-responses', provider: 'local' },
+    }
+    const localModel: UnifiedModel = {
+      name: 'local-model:ollama',
+      type: 'runtime',
+      displayName: 'Ollama',
+      runtime: { family: 'openai.openai-responses', provider: 'local' },
+    }
+    const api = {
+      listModels: vi
+        .fn()
+        .mockResolvedValueOnce({ data: [codexModel] })
+        .mockResolvedValueOnce({ data: [codexModel, localModel] }),
+    }
+
+    const { result } = renderHook(() => useWorkbenchModels({ api, locked: false }))
+
+    await waitFor(() => expect(result.current.models).toEqual([codexModel]))
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(LOCAL_MODEL_SETTINGS_CHANGED_EVENT))
+    })
+
+    await waitFor(() => expect(api.listModels).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(result.current.models).toEqual([codexModel, localModel]))
+  })
+
+  test('keeps an existing model selection ready while refreshing the catalog', async () => {
+    const model: UnifiedModel = {
+      name: 'codex-runtime',
+      type: 'runtime',
+      displayName: '本机 Codex',
+      runtime: { family: 'openai.openai-responses', provider: 'local' },
+    }
+    let resolveRefresh: ((value: { data: UnifiedModel[] }) => void) | undefined
+    const refresh = new Promise<{ data: UnifiedModel[] }>(resolve => {
+      resolveRefresh = resolve
+    })
+    const api = {
+      listModels: vi
+        .fn()
+        .mockResolvedValueOnce({ data: [model] })
+        .mockReturnValueOnce(refresh),
+    }
+    const { result } = renderHook(() =>
+      useWorkbenchModels({
+        api,
+        locked: false,
+        selectionConfig: {
+          modelName: model.name,
+          modelType: model.type,
+        },
+      })
+    )
+
+    expect(result.current.isSelectionReady).toBe(false)
+    await waitFor(() => expect(result.current.isSelectionReady).toBe(true))
+    expect(result.current.selectedModel).toEqual(model)
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(LOCAL_MODEL_SETTINGS_CHANGED_EVENT))
+    })
+
+    await waitFor(() => expect(api.listModels).toHaveBeenCalledTimes(2))
+    expect(result.current.isLoading).toBe(true)
+    expect(result.current.isSelectionReady).toBe(true)
+    expect(result.current.selectedModel).toEqual(model)
+
+    await act(async () => {
+      resolveRefresh?.({ data: [model] })
+      await refresh
+    })
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+    expect(result.current.isSelectionReady).toBe(true)
+  })
+
+  test('ignores an older model reload that settles after the latest request', async () => {
+    const initialModel: UnifiedModel = { name: 'initial-model', type: 'runtime' }
+    const recoveredModel: UnifiedModel = { name: 'recovered-model', type: 'runtime' }
+    let rejectStaleReload: ((reason: Error) => void) | undefined
+    let resolveRecoveredReload: ((value: { data: UnifiedModel[] }) => void) | undefined
+    const staleReload = new Promise<{ data: UnifiedModel[] }>((_resolve, reject) => {
+      rejectStaleReload = reject
+    })
+    const recoveredReload = new Promise<{ data: UnifiedModel[] }>(resolve => {
+      resolveRecoveredReload = resolve
+    })
+    const api = {
+      listModels: vi
+        .fn()
+        .mockResolvedValueOnce({ data: [initialModel] })
+        .mockReturnValueOnce(staleReload)
+        .mockReturnValueOnce(recoveredReload),
+    }
+    const { result } = renderHook(() => useWorkbenchModels({ api, locked: false }))
+
+    await waitFor(() => expect(result.current.models).toEqual([initialModel]))
+    act(() => {
+      window.dispatchEvent(new CustomEvent(LOCAL_MODEL_SETTINGS_CHANGED_EVENT))
+      window.dispatchEvent(new CustomEvent(LOCAL_MODEL_SETTINGS_CHANGED_EVENT))
+    })
+    await waitFor(() => expect(api.listModels).toHaveBeenCalledTimes(3))
+
+    await act(async () => {
+      rejectStaleReload?.(new Error('stale reload failed'))
+      await staleReload.catch(() => undefined)
+    })
+    expect(result.current.models).toEqual([initialModel])
+    expect(result.current.isLoading).toBe(true)
+    expect(result.current.error).toBeNull()
+
+    await act(async () => {
+      resolveRecoveredReload?.({ data: [recoveredModel] })
+      await recoveredReload
+    })
+    await waitFor(() => expect(result.current.models).toEqual([recoveredModel]))
+    expect(result.current.isLoading).toBe(false)
+    expect(result.current.error).toBeNull()
+  })
+
+  test('refreshes the selected model metadata while preserving supported options', async () => {
+    const originalModel: UnifiedModel = {
+      name: 'local-model:api-sol',
+      type: 'runtime',
+      displayName: 'API Sol',
+      config: {
+        weworkModelKind: 'model-interface',
+        ui: {
+          family: 'model-interface',
+          reasoningEfforts: ['low', 'high'],
+          defaultReasoningEffort: 'low',
+        },
+      },
+    }
+    const refreshedModel: UnifiedModel = {
+      ...originalModel,
+      displayName: 'API Sol Updated',
+      config: {
+        weworkModelKind: 'model-interface',
+        ui: {
+          family: 'model-interface',
+          reasoningEfforts: ['minimal', 'high', 'max'],
+          defaultReasoningEffort: 'max',
+        },
+      },
+    }
+    const onSelectionChange = vi.fn()
+    const api = {
+      listModels: vi
+        .fn()
+        .mockResolvedValueOnce({ data: [originalModel] })
+        .mockResolvedValueOnce({ data: [refreshedModel] }),
+    }
+    const { result } = renderHook(() =>
+      useWorkbenchModels({
+        api,
+        locked: false,
+        selectionConfig: {
+          modelName: originalModel.name,
+          modelType: originalModel.type,
+          options: { reasoning: 'high' },
+        },
+        onSelectionChange,
+      })
+    )
+
+    await waitFor(() => expect(result.current.selectedModel).toBe(originalModel))
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(LOCAL_MODEL_SETTINGS_CHANGED_EVENT))
+    })
+
+    await waitFor(() => expect(result.current.selectedModel).toBe(refreshedModel))
+    expect(result.current.selectedModelOptions).toEqual({ reasoning: 'high' })
+    expect(onSelectionChange).not.toHaveBeenCalled()
+  })
+
+  test('preserves a task composer override when the model catalog refreshes', async () => {
+    const projectModel: UnifiedModel = {
+      name: 'project-model',
+      type: 'runtime',
+      config: {
+        weworkModelKind: 'codex-provider',
+        ui: {
+          family: 'codex-provider',
+          reasoningEfforts: ['low', 'medium', 'high'],
+        },
+      },
+    }
+    const overrideModel: UnifiedModel = {
+      name: 'override-model',
+      type: 'runtime',
+      config: {
+        weworkModelKind: 'codex-provider',
+        ui: {
+          family: 'codex-provider',
+          reasoningEfforts: ['low', 'medium', 'high'],
+        },
+      },
+    }
+    const refreshedProjectModel = { ...projectModel, displayName: 'Project Model Updated' }
+    const refreshedOverrideModel = { ...overrideModel, displayName: 'Override Model Updated' }
+    const api = {
+      listModels: vi
+        .fn()
+        .mockResolvedValueOnce({ data: [projectModel, overrideModel] })
+        .mockResolvedValueOnce({ data: [refreshedProjectModel, refreshedOverrideModel] }),
+    }
+    const { result } = renderHook(() =>
+      useWorkbenchModels({
+        api,
+        locked: false,
+        scopeKey: 'new-task:project:7',
+        persistSelection: false,
+        selectionConfig: {
+          modelName: projectModel.name,
+          modelType: projectModel.type,
+          options: { reasoning: 'medium' },
+        },
+      })
+    )
+
+    await waitFor(() => expect(result.current.selectedModel).toBe(projectModel))
+    act(() => {
+      result.current.setSelectedModel(overrideModel)
+      result.current.setSelectedModelOption('reasoning', 'high')
+    })
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(LOCAL_MODEL_SETTINGS_CHANGED_EVENT))
+    })
+
+    await waitFor(() => expect(result.current.selectedModel).toBe(refreshedOverrideModel))
+    expect(result.current.selectedModelOptions).toEqual({ reasoning: 'high' })
+  })
+
+  test('falls back to the refreshed model default when the selected option is removed', async () => {
+    const originalModel: UnifiedModel = {
+      name: 'local-model:api-sol',
+      type: 'runtime',
+      config: {
+        weworkModelKind: 'model-interface',
+        ui: {
+          family: 'model-interface',
+          reasoningEfforts: ['low', 'high'],
+          defaultReasoningEffort: 'low',
+        },
+      },
+    }
+    const refreshedModel: UnifiedModel = {
+      ...originalModel,
+      config: {
+        weworkModelKind: 'model-interface',
+        ui: {
+          family: 'model-interface',
+          reasoningEfforts: ['minimal', 'max'],
+          defaultReasoningEffort: 'max',
+        },
+      },
+    }
+    const onSelectionChange = vi.fn()
+    const api = {
+      listModels: vi
+        .fn()
+        .mockResolvedValueOnce({ data: [originalModel] })
+        .mockResolvedValueOnce({ data: [refreshedModel] }),
+    }
+    const { result } = renderHook(() =>
+      useWorkbenchModels({
+        api,
+        locked: false,
+        selectionConfig: {
+          modelName: originalModel.name,
+          modelType: originalModel.type,
+          options: { reasoning: 'high' },
+        },
+        onSelectionChange,
+      })
+    )
+
+    await waitFor(() => expect(result.current.selectedModelOptions).toEqual({ reasoning: 'high' }))
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(LOCAL_MODEL_SETTINGS_CHANGED_EVENT))
+    })
+
+    await waitFor(() => expect(result.current.selectedModel).toBe(refreshedModel))
+    expect(result.current.selectedModelOptions).toEqual({ reasoning: 'max' })
+    expect(onSelectionChange).not.toHaveBeenCalled()
+  })
+
+  test('falls back to the first refreshed option when the configured default is invalid', async () => {
+    const originalModel: UnifiedModel = {
+      name: 'local-model:api-sol',
+      type: 'runtime',
+      config: {
+        weworkModelKind: 'model-interface',
+        ui: {
+          family: 'model-interface',
+          reasoningEfforts: ['high'],
+          defaultReasoningEffort: 'high',
+        },
+      },
+    }
+    const refreshedModel: UnifiedModel = {
+      ...originalModel,
+      config: {
+        weworkModelKind: 'model-interface',
+        ui: {
+          family: 'model-interface',
+          reasoningEfforts: ['minimal', 'max'],
+          defaultReasoningEffort: 'high',
+        },
+      },
+    }
+    const api = {
+      listModels: vi
+        .fn()
+        .mockResolvedValueOnce({ data: [originalModel] })
+        .mockResolvedValueOnce({ data: [refreshedModel] }),
+    }
+    const { result } = renderHook(() =>
+      useWorkbenchModels({
+        api,
+        locked: false,
+        selectionConfig: {
+          modelName: originalModel.name,
+          modelType: originalModel.type,
+          options: { reasoning: 'high' },
+        },
+      })
+    )
+
+    await waitFor(() => expect(result.current.selectedModelOptions).toEqual({ reasoning: 'high' }))
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(LOCAL_MODEL_SETTINGS_CHANGED_EVENT))
+    })
+
+    await waitFor(() => expect(result.current.selectedModel).toBe(refreshedModel))
+    expect(result.current.selectedModelOptions).toEqual({ reasoning: 'minimal' })
+  })
+
+  test('clears removed controls for every cached model selection scope', async () => {
+    const originalModel: UnifiedModel = {
+      name: 'local-model:api-sol',
+      type: 'runtime',
+      config: {
+        weworkModelKind: 'model-interface',
+        ui: {
+          family: 'model-interface',
+          reasoningEfforts: ['minimal', 'max'],
+          defaultReasoningEffort: 'minimal',
+        },
+      },
+    }
+    const refreshedModel: UnifiedModel = {
+      ...originalModel,
+      config: {
+        weworkModelKind: 'model-interface',
+        ui: {
+          family: 'model-interface',
+          reasoningEfforts: [],
+        },
+      },
+    }
+    const api = {
+      listModels: vi
+        .fn()
+        .mockResolvedValueOnce({ data: [originalModel] })
+        .mockResolvedValueOnce({ data: [refreshedModel] }),
+    }
+    const { result, rerender } = renderHook(
+      ({ scopeKey }: { scopeKey: string }) =>
+        useWorkbenchModels({
+          api,
+          locked: false,
+          scopeKey,
+          persistSelection: false,
+        }),
+      { initialProps: { scopeKey: 'blank:1' } }
+    )
+
+    await waitFor(() => expect(result.current.models).toEqual([originalModel]))
+    act(() => {
+      result.current.setSelectionForScope('blank:1', originalModel, { reasoning: 'max' })
+      result.current.setSelectionForScope('runtime:task-1', originalModel, { reasoning: 'minimal' })
+    })
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(LOCAL_MODEL_SETTINGS_CHANGED_EVENT))
+    })
+
+    await waitFor(() => expect(result.current.selectedModel).toBe(refreshedModel))
+    expect(result.current.selectedModelOptions).toEqual({})
+
+    rerender({ scopeKey: 'runtime:task-1' })
+
+    expect(result.current.selectedModel).toBe(refreshedModel)
+    expect(result.current.selectedModelOptions).toEqual({})
+  })
+
+  test('reloads models after a background cloud model refresh', async () => {
+    const localModel: UnifiedModel = { name: 'local-model', type: 'runtime' }
+    const cloudModel: UnifiedModel = { name: 'cloud-model', type: 'public' }
+    const unsubscribe = vi.fn()
+    const subscribe = vi.fn<(onChange: () => void) => () => void>().mockReturnValue(unsubscribe)
+    const api = {
+      subscribe,
+      listModels: vi
+        .fn()
+        .mockResolvedValueOnce({ data: [localModel] })
+        .mockResolvedValueOnce({ data: [localModel, cloudModel] }),
+    }
+    const { result, unmount } = renderHook(() => useWorkbenchModels({ api, locked: false }))
+
+    await waitFor(() => expect(result.current.models).toEqual([localModel]))
+    await act(async () => {
+      await subscribe.mock.calls[0][0]()
+    })
+
+    await waitFor(() => expect(result.current.models).toEqual([localModel, cloudModel]))
+    unmount()
+    expect(unsubscribe).toHaveBeenCalledOnce()
+  })
+
+  test('keeps an explicit background task model when that task becomes active', async () => {
+    const deepseekModel: UnifiedModel = {
+      name: 'deepseek-v4-flash-vision-exp',
+      type: 'public',
+      runtime: { family: 'openai.openai-responses' },
+    }
+    const gptModel: UnifiedModel = {
+      name: 'gpt-5.6-sol',
+      type: 'public',
+      runtime: { family: 'openai.openai-responses' },
+    }
+    const taskSelection: ModelSelectionConfig = {
+      modelName: gptModel.name,
+      modelType: gptModel.type,
+      options: { reasoning: 'high' },
+    }
+    const api = {
+      listModels: vi.fn().mockResolvedValue({ data: [deepseekModel, gptModel] }),
+    }
+    const { result, rerender } = renderHook(
+      ({ scopeKey, selectionConfig }) =>
+        useWorkbenchModels({
+          api,
+          locked: false,
+          scopeKey,
+          persistSelection: false,
+          selectionConfig,
+        }),
+      {
+        initialProps: {
+          scopeKey: 'new-task',
+          selectionConfig: {
+            modelName: deepseekModel.name,
+            modelType: deepseekModel.type,
+            options: {},
+          } as ModelSelectionConfig,
+        },
+      }
+    )
+
+    await waitFor(() => expect(result.current.selectedModel).toEqual(deepseekModel))
+    act(() => {
+      result.current.setSelectionForScope(
+        'runtime:task-1',
+        gptModel,
+        taskSelection.options,
+        taskSelection
+      )
+    })
+
+    expect(result.current.selectedModel).toEqual(deepseekModel)
+    rerender({ scopeKey: 'runtime:task-1', selectionConfig: taskSelection })
+
+    await waitFor(() => expect(result.current.selectedModel).toEqual(gptModel))
+    expect(result.current.selectedModelOptions).toEqual({ reasoning: 'high' })
+  })
+
+  test('keeps executor-backed model choices selectable across protocol families', async () => {
+    const currentGptModel: UnifiedModel = {
+      name: 'wecode-gpt-5.5(海外)',
+      type: 'public',
+      displayName: '海外:GPT5.5',
+      runtime: { family: 'openai.openai-responses' },
+    }
+    const nextGptModel: UnifiedModel = {
+      name: 'wecode-gpt-5.4(海外)',
+      type: 'public',
+      displayName: '海外:GPT5.4',
+      runtime: { family: 'openai.openai-responses' },
+    }
+    const claudeCompatibleKimi: UnifiedModel = {
+      name: 'kimi-k2.5(内网)',
+      type: 'public',
+      displayName: '内网:Kimi-K2.5',
+      runtime: { family: 'claude.claude' },
+    }
+    const unknownDeepseek: UnifiedModel = {
+      name: 'deepseek-without-env-model',
+      type: 'public',
+      displayName: 'DeepSeek Without env.model',
+    }
+    const api = {
+      listModels: vi.fn().mockResolvedValue({
+        data: [currentGptModel, nextGptModel, claudeCompatibleKimi, unknownDeepseek],
+      }),
+    }
+
+    const { result } = renderHook(() =>
+      useWorkbenchModels({
+        api,
+        locked: false,
+        selectionConfig: {
+          modelName: 'wecode-gpt-5.5(海外)',
+          modelType: 'public',
+        },
+      })
+    )
+
+    await waitFor(() =>
+      expect(result.current.models.map(model => model.name)).toEqual([
+        'wecode-gpt-5.5(海外)',
+        'wecode-gpt-5.4(海外)',
+        'kimi-k2.5(内网)',
+        'deepseek-without-env-model',
+      ])
+    )
+    expect(result.current.models.filter(model => model.compatibilityDisabled)).toEqual([])
+  })
+
+  test('restores model selection config and emits user changes', async () => {
+    const claudeModel: UnifiedModel = { name: 'wecode-claude-sonnet-4-5', type: 'public' }
+    const gptModel: UnifiedModel = {
+      name: 'overseas-gpt-5.4',
+      type: 'user',
+      config: {
+        ui: {
+          family: 'gpt',
+          region: 'overseas',
+          modelLabel: 'gpt-5.4',
+          sortOrder: 10,
+        },
+      },
+    }
+    const onSelectionChange = vi.fn()
+    const api = {
+      listModels: vi.fn().mockResolvedValue({ data: [claudeModel, gptModel] }),
+    }
+
+    const { result } = renderHook(() =>
+      useWorkbenchModels({
+        api,
+        locked: false,
+        selectionConfig: {
+          modelName: 'overseas-gpt-5.4',
+          modelType: 'user',
+          options: { reasoning: 'medium' },
+        },
+        onSelectionChange,
+      })
+    )
+
+    await waitFor(() => expect(result.current.selectedModel).toEqual(gptModel))
+    expect(result.current.selectedModelOptions).toEqual({ reasoning: 'medium' })
+
+    act(() => result.current.setSelectedModelOption('reasoning', 'high'))
+
+    expect(onSelectionChange).toHaveBeenCalledWith({
+      modelName: 'overseas-gpt-5.4',
+      modelType: 'user',
+      options: { reasoning: 'high' },
+    })
+  })
+
+  test('updates the model and power setting atomically', async () => {
+    const solModel: UnifiedModel = {
+      name: 'gpt-5.6-sol',
+      type: 'runtime',
+      config: {
+        ui: {
+          family: 'codex-official',
+          reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+          controls: ['speed'],
+        },
+      },
+    }
+    const terraModel: UnifiedModel = {
+      name: 'gpt-5.6-terra',
+      type: 'runtime',
+      config: {
+        ui: {
+          family: 'codex-official',
+          reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+          controls: ['speed'],
+        },
+      },
+    }
+    const onSelectionChange = vi.fn()
+    const api = { listModels: vi.fn().mockResolvedValue({ data: [solModel, terraModel] }) }
+    const { result } = renderHook(() =>
+      useWorkbenchModels({
+        api,
+        locked: false,
+        selectionConfig: {
+          modelName: solModel.name,
+          modelType: solModel.type,
+          options: { reasoning: 'high', speed: 'standard' },
+        },
+        onSelectionChange,
+      })
+    )
+
+    await waitFor(() => expect(result.current.selectedModel).toEqual(solModel))
+    act(() =>
+      result.current.setSelectedModelAndOptions(terraModel, {
+        reasoning: 'low',
+        speed: 'standard',
+      })
+    )
+
+    expect(result.current.selectedModel).toEqual(terraModel)
+    expect(result.current.selectedModelOptions).toEqual({
+      reasoning: 'low',
+      speed: 'standard',
+    })
+    expect(onSelectionChange).toHaveBeenCalledWith({
+      modelName: terraModel.name,
+      modelType: terraModel.type,
+      options: { reasoning: 'low', speed: 'standard' },
+    })
+  })
+
+  test('copies the selected model into a new runtime task scope', async () => {
+    const gptModel: UnifiedModel = {
+      name: 'gpt-5.5',
+      type: 'public',
+      runtime: { family: 'openai.openai-responses' },
+    }
+    const customModel: UnifiedModel = {
+      name: 'mimo-v2.5-pro',
+      type: 'runtime',
+      config: {
+        ui: {
+          family: 'gpt',
+          modelLabel: 'mimo-v2.5-pro',
+          sortOrder: 20,
+        },
+      },
+      runtime: { family: 'openai.openai-responses', provider: 'local' },
+    }
+    const api = {
+      listModels: vi.fn().mockResolvedValue({ data: [gptModel, customModel] }),
+    }
+
+    const { result, rerender } = renderHook(
+      ({ scopeKey }: { scopeKey: string }) =>
+        useWorkbenchModels({
+          api,
+          locked: false,
+          scopeKey,
+          persistSelection: false,
+          defaultSelectionConfig: () => ({
+            modelName: 'gpt-5.5',
+            modelType: 'public',
+            options: { reasoning: 'ultra' },
+          }),
+        }),
+      { initialProps: { scopeKey: 'blank:1' } }
+    )
+
+    await waitFor(() => expect(result.current.selectedModel).toEqual(gptModel))
+
+    act(() => result.current.setSelectedModel(customModel))
+    act(() =>
+      result.current.setSelectionForScope('runtime:local-device:task-1', customModel, {
+        reasoning: 'high',
+      })
+    )
+
+    rerender({ scopeKey: 'runtime:local-device:task-1' })
+
+    expect(result.current.selectedModel).toEqual(customModel)
+    expect(result.current.selectedModelOptions).toEqual({
+      reasoning: 'high',
+    })
+  })
+
+  test('waits for selection readiness before restoring configured model', async () => {
+    const claudeModel: UnifiedModel = { name: 'wecode-claude-sonnet-4-5', type: 'public' }
+    const gptModel: UnifiedModel = {
+      name: 'overseas-gpt-5.4',
+      type: 'user',
+      config: {
+        ui: {
+          family: 'gpt',
+          region: 'overseas',
+          modelLabel: 'gpt-5.4',
+          sortOrder: 10,
+        },
+      },
+    }
+    const api = {
+      listModels: vi.fn().mockResolvedValue({ data: [claudeModel, gptModel] }),
+    }
+    const selectionConfig = {
+      modelName: 'overseas-gpt-5.4',
+      modelType: 'user' as const,
+      options: { reasoning: 'high' },
+    }
+
+    const { result, rerender } = renderHook(
+      ({ selectionReady }: { selectionReady: boolean }) =>
+        useWorkbenchModels({
+          api,
+          locked: false,
+          selectionConfig,
+          selectionReady,
+        }),
+      { initialProps: { selectionReady: false } }
+    )
+
+    await waitFor(() => expect(result.current.models).toEqual([claudeModel, gptModel]))
+    expect(result.current.selectedModel).toBeNull()
+    expect(result.current.selectedModelOptions).toEqual({})
+
+    rerender({ selectionReady: true })
+
+    await waitFor(() => expect(result.current.selectedModel).toEqual(gptModel))
+    expect(result.current.selectedModelOptions).toEqual({ reasoning: 'high' })
+  })
+
+  test('does not auto-select the first model without saved selection config', async () => {
+    const claudeModel: UnifiedModel = { name: 'wecode-claude-sonnet-4-5', type: 'public' }
+    const api = {
+      listModels: vi.fn().mockResolvedValue({ data: [claudeModel] }),
+    }
+
+    const { result } = renderHook(() => useWorkbenchModels({ api, locked: false }))
+
+    await waitFor(() => expect(result.current.models).toEqual([claudeModel]))
+    expect(result.current.selectedModel).toBeNull()
+    expect(result.current.selectedModelOptions).toEqual({})
+  })
+
+  test('keeps empty model options stable when another scope changes', () => {
+    const api = { listModels: vi.fn().mockResolvedValue({ data: [] }) }
+    const { result, rerender } = renderHook(() =>
+      useWorkbenchModels({ api, locked: false, enabled: false, scopeKey: 'current' })
+    )
+    const emptyOptions = result.current.selectedModelOptions
+
+    rerender()
+    expect(result.current.selectedModelOptions).toBe(emptyOptions)
+    expect(result.current.getSelectedModelOptions()).toBe(emptyOptions)
+
+    act(() => result.current.setSelectionForScope('other', null, { reasoning: 'high' }))
+    expect(result.current.selectedModelOptions).toBe(emptyOptions)
+  })
+
+  test('does not replace an unavailable configured task model with the default model', async () => {
+    const deepseekModel: UnifiedModel = {
+      name: 'deepseek-v4-flash-responses(公网)',
+      type: 'public',
+    }
+    const api = {
+      listModels: vi.fn().mockResolvedValue({ data: [deepseekModel] }),
+    }
+    const onSelectionChange = vi.fn()
+
+    const { result } = renderHook(() =>
+      useWorkbenchModels({
+        api,
+        locked: false,
+        persistSelection: false,
+        selectionConfig: {
+          modelName: 'gpt-5.6-sol',
+          modelType: 'runtime',
+        },
+        defaultSelectionConfig: () => ({
+          modelName: deepseekModel.name,
+          modelType: deepseekModel.type,
+        }),
+        fallbackWhenConfiguredModelUnavailable: false,
+        onSelectionChange,
+      })
+    )
+
+    await waitFor(() => expect(result.current.models).toEqual([deepseekModel]))
+    expect(result.current.selectedModel).toBeNull()
+    expect(result.current.isSelectionReady).toBe(false)
+    expect(result.current.isConfiguredModelUnavailable).toBe(true)
+
+    act(() => result.current.setSelectedModel(deepseekModel))
+
+    expect(result.current.selectedModel).toEqual(deepseekModel)
+    expect(result.current.isSelectionReady).toBe(true)
+    expect(result.current.isConfiguredModelUnavailable).toBe(false)
+    expect(onSelectionChange).not.toHaveBeenCalled()
+  })
+
+  test.each(['public', 'runtime'] as const)(
+    'recovers a deleted %s task model when the catalog starts empty',
+    async modelType => {
+      const replacement: UnifiedModel = { name: 'replacement', type: modelType }
+      const api = { listModels: vi.fn().mockResolvedValue({ data: [] }) }
+      const { result } = renderHook(() =>
+        useWorkbenchModels({
+          api,
+          locked: false,
+          persistSelection: false,
+          selectionConfig: { modelName: 'deleted', modelType },
+          fallbackWhenConfiguredModelUnavailable: false,
+        })
+      )
+
+      await waitFor(() => expect(api.listModels).toHaveBeenCalledOnce())
+      await waitFor(() => expect(result.current.isLoading).toBe(false))
+      expect(result.current.selectedModel).toBeNull()
+      expect(result.current.isSelectionReady).toBe(false)
+      expect(result.current.isConfiguredModelUnavailable).toBe(true)
+
+      api.listModels.mockResolvedValue({ data: [replacement] })
+      act(() => result.current.refreshModels())
+      await waitFor(() => expect(result.current.models).toEqual([replacement]))
+      act(() => result.current.setSelectedModel(replacement))
+      expect(result.current.isSelectionReady).toBe(true)
+      expect(result.current.isConfiguredModelUnavailable).toBe(false)
+      expect(result.current.getSelectedModel()).toEqual(replacement)
+
+      act(() => result.current.refreshModels())
+      await waitFor(() => expect(result.current.isLoading).toBe(false))
+      expect(result.current.getSelectedModel()).toEqual(replacement)
+      expect(result.current.isSelectionReady).toBe(true)
+    }
+  )
+
+  test('persists options when using the default model selection', async () => {
+    const gptModel: UnifiedModel = {
+      name: 'overseas-gpt-5.4',
+      type: 'user',
+      config: {
+        ui: {
+          family: 'gpt',
+          region: 'overseas',
+          modelLabel: 'gpt-5.4',
+          sortOrder: 10,
+        },
+      },
+    }
+    const onSelectionChange = vi.fn()
+    const api = {
+      listModels: vi.fn().mockResolvedValue({ data: [gptModel] }),
+    }
+
+    const { result } = renderHook(() =>
+      useWorkbenchModels({
+        api,
+        locked: false,
+        selectionConfig: {
+          modelName: '',
+          modelType: null,
+          options: { collaborationMode: 'plan' },
+        },
+        onSelectionChange,
+      })
+    )
+
+    await waitFor(() => expect(result.current.models).toEqual([gptModel]))
+    await waitFor(() =>
+      expect(result.current.selectedModelOptions).toEqual({ collaborationMode: 'plan' })
+    )
+    expect(result.current.selectedModel).toBeNull()
+
+    act(() => result.current.setSelectedModelOption('collaborationMode', 'default'))
+
+    expect(onSelectionChange).toHaveBeenCalledWith({
+      modelName: '',
+      modelType: null,
+      options: { collaborationMode: 'default' },
+    })
+  })
+
+  test('loads skills and ignores skill changes when locked', async () => {
+    const skill: UnifiedSkill = {
+      id: 1,
+      name: 'project-summary',
+      namespace: 'default',
+      description: 'Summarize project context',
+      is_active: true,
+      is_public: false,
+      user_id: 1,
+    }
+    const api = {
+      listSkills: vi.fn().mockResolvedValue([skill]),
+      getTeamSkills: vi.fn().mockResolvedValue({
+        skills: ['project-summary'],
+        preload_skills: [],
+      }),
+    }
+
+    const { result, rerender } = renderHook(
+      ({ locked }: { locked: boolean }) => useWorkbenchSkills({ api, locked }),
+      { initialProps: { locked: false } }
+    )
+
+    await waitFor(() => expect(result.current.skills).toEqual([skill]))
+
+    act(() =>
+      result.current.toggleSkill({
+        name: 'project-summary',
+        namespace: 'default',
+        is_public: false,
+      })
+    )
+    expect(result.current.selectedSkills).toEqual([
+      { name: 'project-summary', namespace: 'default', is_public: false },
+    ])
+
+    rerender({ locked: true })
+    act(() => result.current.setSelectedSkills([]))
+
+    expect(result.current.selectedSkills).toEqual([
+      { name: 'project-summary', namespace: 'default', is_public: false },
+    ])
+  })
+
+  test('keeps empty skills stable when disabled and another scope changes', () => {
+    const api = { listSkills: vi.fn().mockResolvedValue([]) }
+    const { result, rerender } = renderHook(() =>
+      useWorkbenchSkills({ api, locked: false, enabled: false, scopeKey: 'current' })
+    )
+    const emptySkills = result.current.skills
+    const emptySelection = result.current.selectedSkills
+    const emptyNames = result.current.selectedSkillNames
+
+    rerender()
+    expect(result.current.skills).toBe(emptySkills)
+    expect(result.current.selectedSkills).toBe(emptySelection)
+    expect(result.current.selectedSkillNames).toBe(emptyNames)
+
+    act(() =>
+      result.current.setSelectedSkillsForScope('other', [
+        { name: 'project-summary', namespace: 'default', is_public: false },
+      ])
+    )
+    expect(result.current.skills).toBe(emptySkills)
+    expect(result.current.selectedSkills).toBe(emptySelection)
+    expect(result.current.selectedSkillNames).toBe(emptyNames)
+  })
+
+  test('uploads, removes, and resets attachments', async () => {
+    const attachment: Attachment = {
+      id: 42,
+      filename: 'brief.pdf',
+      file_size: 1200,
+      mime_type: 'application/pdf',
+      status: 'ready',
+      file_extension: '.pdf',
+      created_at: '2026-05-27T00:00:00.000Z',
+    }
+    const upload = vi.fn().mockResolvedValue(attachment)
+    const remove = vi.fn().mockResolvedValue(undefined)
+
+    const { result } = renderHook(() =>
+      useWorkbenchAttachments({
+        uploadAttachment: upload,
+        deleteAttachment: remove,
+      })
+    )
+
+    const file = new File(['hello'], 'brief.pdf', { type: 'application/pdf' })
+    await act(async () => {
+      await result.current.handleFileSelect(file)
+    })
+
+    expect(result.current.attachments).toEqual([attachment])
+    expect(result.current.isAttachmentReadyToSend).toBe(true)
+
+    await act(async () => {
+      await result.current.removeAttachment(42)
+    })
+
+    expect(remove).toHaveBeenCalledWith(42)
+    expect(result.current.attachments).toEqual([])
+
+    act(() => result.current.addExistingAttachment(attachment))
+    act(() => result.current.resetAttachments())
+    expect(result.current.attachments).toEqual([])
+  })
+
+  test('shows an immediate image preview while persistence finishes', async () => {
+    const attachment: Attachment = {
+      id: -42,
+      filename: 'clipboard.png',
+      file_size: 5,
+      mime_type: 'image/png',
+      status: 'ready',
+      file_extension: '.png',
+      created_at: '2026-08-29T00:00:00.000Z',
+      local_path: '/tmp/clipboard.png',
+    }
+    let finishUpload: ((attachment: Attachment) => void) | undefined
+    const upload = vi.fn(
+      () =>
+        new Promise<Attachment>(resolve => {
+          finishUpload = resolve
+        })
+    )
+    const createObjectUrl = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:clipboard')
+    const revokeObjectUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    const { result } = renderHook(() =>
+      useWorkbenchAttachments({
+        uploadAttachment: upload,
+        deleteAttachment: vi.fn(),
+      })
+    )
+    const file = new File(['image'], attachment.filename, { type: attachment.mime_type })
+
+    let uploadPromise: Promise<void> | undefined
+    act(() => {
+      uploadPromise = result.current.handleFileSelect(file)
+    })
+
+    await waitFor(() => {
+      expect(result.current.uploadingFiles.values().next().value).toEqual({
+        file,
+        progress: 0,
+        previewUrl: 'blob:clipboard',
+      })
+    })
+    expect(result.current.attachments).toEqual([])
+    expect(result.current.isAttachmentReadyToSend).toBe(false)
+
+    await act(async () => {
+      finishUpload?.(attachment)
+      await uploadPromise
+    })
+
+    expect(result.current.attachments).toEqual([
+      {
+        ...attachment,
+        local_preview_url: 'blob:clipboard',
+      },
+    ])
+    expect(result.current.uploadingFiles.size).toBe(0)
+    expect(createObjectUrl).toHaveBeenCalledWith(file)
+    expect(revokeObjectUrl).not.toHaveBeenCalled()
+
+    act(() => {
+      result.current.resetAttachments()
+    })
+
+    expect(revokeObjectUrl).toHaveBeenCalledWith('blob:clipboard')
+    createObjectUrl.mockRestore()
+    revokeObjectUrl.mockRestore()
+  })
+
+  test('keeps attachments isolated between composer scopes', async () => {
+    const attachment: Attachment = {
+      id: 46,
+      filename: 'left-pane.png',
+      file_size: 68,
+      mime_type: 'image/png',
+      status: 'ready',
+      file_extension: '.png',
+      created_at: '2026-08-16T00:00:00.000Z',
+    }
+    const upload = vi.fn().mockResolvedValue(attachment)
+    const { result } = renderHook(() =>
+      useWorkbenchAttachments({
+        uploadAttachment: upload,
+        deleteAttachment: vi.fn(),
+        scopeKey: 'right-pane',
+      })
+    )
+
+    await act(async () => {
+      await result.current.handleFileSelectForScope(
+        'left-pane',
+        new File(['image'], attachment.filename, { type: attachment.mime_type })
+      )
+    })
+
+    expect(result.current.stateByScope['left-pane']?.attachments).toEqual([
+      expect.objectContaining(attachment),
+    ])
+    expect(result.current.attachments).toEqual([])
+  })
+
+  test('releases temporary image previews when attachments leave the composer', async () => {
+    const revokeObjectUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    const firstAttachment: Attachment = {
+      id: 44,
+      filename: 'first.png',
+      file_size: 1200,
+      mime_type: 'image/png',
+      status: 'ready',
+      file_extension: '.png',
+      created_at: '2026-05-27T00:00:00.000Z',
+      local_preview_url: 'blob:first-preview',
+    }
+    const secondAttachment: Attachment = {
+      ...firstAttachment,
+      id: 45,
+      filename: 'second.png',
+      local_preview_url: 'blob:second-preview',
+    }
+    const remove = vi.fn().mockResolvedValue(undefined)
+    const { result } = renderHook(() => useWorkbenchAttachments({ deleteAttachment: remove }))
+
+    act(() => {
+      result.current.addExistingAttachment(firstAttachment)
+      result.current.addExistingAttachment(secondAttachment)
+    })
+    await act(async () => result.current.removeAttachment(firstAttachment.id))
+    expect(revokeObjectUrl).toHaveBeenCalledWith('blob:first-preview')
+
+    act(() => result.current.resetAttachments())
+    expect(revokeObjectUrl).toHaveBeenCalledWith('blob:second-preview')
+  })
+
+  test('removes an Appshot image and its hidden text context together', async () => {
+    const appshot: Attachment = {
+      id: -10,
+      filename: 'appshot.png',
+      file_size: 1200,
+      mime_type: 'image/png',
+      status: 'ready',
+      file_extension: '.png',
+      created_at: '2026-07-15T00:00:00.000Z',
+      ui_group_id: 'appshot-capture-1',
+      ui_group_role: 'primary',
+      ui_kind: 'appshot',
+    }
+    const textContext: Attachment = {
+      ...appshot,
+      id: -11,
+      filename: 'appshot-context.txt',
+      mime_type: 'text/plain',
+      file_extension: '.txt',
+      ui_group_role: 'companion',
+    }
+    const remove = vi.fn().mockResolvedValue(undefined)
+    const { result } = renderHook(() => useWorkbenchAttachments({ deleteAttachment: remove }))
+
+    act(() => {
+      result.current.addExistingAttachment(appshot)
+      result.current.addExistingAttachment(textContext)
+    })
+    await act(async () => result.current.removeAttachment(appshot.id))
+
+    expect(result.current.attachments).toEqual([])
+    expect(remove).not.toHaveBeenCalled()
+  })
+
+  test('uploads attachments without restricting file extensions', async () => {
+    const attachment: Attachment = {
+      id: 43,
+      filename: 'init_env.sh',
+      file_size: 1200,
+      mime_type: 'application/x-sh',
+      status: 'ready',
+      file_extension: '.sh',
+      created_at: '2026-05-27T00:00:00.000Z',
+    }
+    const upload = vi.fn().mockResolvedValue(attachment)
+
+    const { result } = renderHook(() =>
+      useWorkbenchAttachments({
+        uploadAttachment: upload,
+        deleteAttachment: vi.fn(),
+      })
+    )
+
+    const file = new File(['#!/bin/sh'], 'init_env.sh', {
+      type: 'application/x-sh',
+    })
+    await act(async () => {
+      await result.current.handleFileSelect(file)
+    })
+
+    expect(upload).toHaveBeenCalledWith(file, expect.any(Function))
+    expect(result.current.attachments).toEqual([attachment])
+    expect(result.current.errors.size).toBe(0)
+  })
+
+  test('adds text preview metadata for pasted text attachments', async () => {
+    const attachment: Attachment = {
+      id: 44,
+      filename: 'clipboard-text-1783070360990.txt',
+      file_size: 1200,
+      mime_type: 'text/plain',
+      status: 'ready',
+      file_extension: '.txt',
+      created_at: '2026-05-27T00:00:00.000Z',
+    }
+    const upload = vi.fn().mockResolvedValue(attachment)
+
+    const { result } = renderHook(() =>
+      useWorkbenchAttachments({
+        uploadAttachment: upload,
+        deleteAttachment: vi.fn(),
+      })
+    )
+
+    const file = new File(
+      ['{\n  "event_type": "http_exchange",\n  "id": "e9972aac"\n}'],
+      'clipboard-text-1783070360990.txt',
+      { type: 'text/plain' }
+    )
+    await act(async () => {
+      await result.current.handleFileSelect(file)
+    })
+
+    expect(result.current.attachments[0]).toEqual(
+      expect.objectContaining({
+        text_preview: '{ "event_type": "http_exchange", "id": "e9972aac" }',
+        text_content: '{\n  "event_type": "http_exchange",\n  "id": "e9972aac"\n}',
+        text_length: 55,
+      })
+    )
+  })
+})

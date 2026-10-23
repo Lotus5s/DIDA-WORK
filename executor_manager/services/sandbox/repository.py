@@ -1,0 +1,787 @@
+# SPDX-FileCopyrightText: 2025 WeCode, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Repository layer for Sandbox and Execution persistence.
+
+This module encapsulates all Redis data access for sandbox and execution
+objects, separating persistence logic from business logic in SandboxManager.
+
+Redis Data Structure:
+- Session Hash: wegent-sandbox-session:{task_id}
+  - __sandbox__ field: Sandbox metadata JSON
+  - {subtask_id} fields: Execution data JSON
+  - TTL: session_hash_ttl (longer than redis_ttl to ensure GC can load data)
+- Active Sandboxes ZSet: wegent-sandbox:active:{manager_scope}
+  (score = last_activity timestamp)
+  - GC uses redis_ttl to determine which sandboxes are expired
+
+GC Design:
+- GC runs every GC_INTERVAL (default 3600s) to clean up expired sandboxes
+- Sandboxes are considered expired if last_activity > redis_ttl (default 86400s)
+- Session hash has TTL = session_hash_ttl = redis_ttl + GC_INTERVAL + buffer
+- This ensures GC can still load sandbox data even when it's marked as expired
+"""
+
+import hashlib
+import json
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import redis
+import redis.asyncio as aioredis
+
+from executor_manager.common.config import get_config
+from executor_manager.common.redis_factory import RedisClientFactory
+from executor_manager.common.singleton import SingletonMeta
+from executor_manager.models.sandbox import (
+    Execution,
+    ExecutionStatus,
+    Sandbox,
+    SandboxStatus,
+)
+from shared.logger import setup_logger
+
+logger = setup_logger(__name__)
+
+# Redis key prefixes
+SESSION_HASH_PREFIX = "wegent-sandbox-session:"
+SANDBOX_FIELD_NAME = "__sandbox__"
+LEGACY_ACTIVE_SANDBOXES_ZSET = "wegent-sandbox:active"
+ACTIVE_SANDBOXES_ZSET_PREFIX = f"{LEGACY_ACTIVE_SANDBOXES_ZSET}:"
+E2B_SANDBOX_ID_INDEX_PREFIX = "wegent-sandbox-e2b-index:"
+
+
+def _build_active_sandboxes_zset(manager_scope: str) -> str:
+    """Build a readable, collision-resistant Redis key for a manager scope."""
+    normalized_scope = manager_scope.strip().lower() or "default"
+    scope_slug = re.sub(r"[^a-z0-9]+", "-", normalized_scope).strip("-")
+    scope_digest = hashlib.sha256(normalized_scope.encode()).hexdigest()[:12]
+    return f"{ACTIVE_SANDBOXES_ZSET_PREFIX}{scope_slug[:48]}-{scope_digest}"
+
+
+class SandboxRepository(metaclass=SingletonMeta):
+    """Repository for Sandbox and Execution persistence.
+
+    This class handles all Redis operations for sandbox and execution data,
+    providing a clean separation between persistence and business logic.
+    """
+
+    def __init__(self):
+        """Initialize the repository."""
+        self._config = get_config()
+        self._active_sandboxes_zset = _build_active_sandboxes_zset(
+            self._config.sandbox.manager_scope
+        )
+        self._redis_client: Optional[redis.Redis] = None
+        self._async_redis_client: Optional[aioredis.Redis] = None
+        logger.info(
+            "[SandboxRepository] Using deployment-scoped active sandbox index: %s",
+            self._active_sandboxes_zset,
+        )
+
+    @property
+    def active_sandboxes_zset(self) -> str:
+        """Return the active sandbox index owned by this deployment."""
+        return self._active_sandboxes_zset
+
+    def _mark_sandbox_active(self, sandbox_id: str, timestamp: float) -> None:
+        """Move a sandbox into this deployment's active index.
+
+        Removing the legacy membership prevents old executor-manager replicas
+        from treating a sandbox created by a different deployment as their own
+        during a rolling upgrade.
+        """
+        assert self.redis_client is not None
+        self.redis_client.zrem(LEGACY_ACTIVE_SANDBOXES_ZSET, sandbox_id)
+        self.redis_client.zadd(self._active_sandboxes_zset, {sandbox_id: timestamp})
+
+    def _remove_sandbox_from_active_indexes(self, sandbox_id: str) -> None:
+        """Remove a sandbox from scoped and legacy active indexes."""
+        assert self.redis_client is not None
+        self.redis_client.zrem(self._active_sandboxes_zset, sandbox_id)
+        self.redis_client.zrem(LEGACY_ACTIVE_SANDBOXES_ZSET, sandbox_id)
+
+    @property
+    def redis_client(self) -> Optional[redis.Redis]:
+        """Lazy-load Redis client."""
+        if self._redis_client is None:
+            self._redis_client = RedisClientFactory.get_sync_client()
+        return self._redis_client
+
+    async def _get_async_client(self) -> Optional[aioredis.Redis]:
+        """Lazy-load async Redis client."""
+        if self._async_redis_client is None:
+            self._async_redis_client = await RedisClientFactory.get_async_client()
+        return self._async_redis_client
+
+    # =========================================================================
+    # Sandbox Operations
+    # =========================================================================
+
+    def save_sandbox(self, sandbox: Sandbox) -> bool:
+        """Save sandbox metadata to session Hash.
+
+        Stores minimal sandbox info in the __sandbox__ field of the session Hash.
+
+        Args:
+            sandbox: Sandbox to save
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.redis_client is None:
+            logger.error("[SandboxRepository] Redis client not available")
+            return False
+
+        try:
+            task_id = sandbox.metadata.get("task_id")
+            if task_id is None:
+                logger.error(
+                    "[SandboxRepository] Cannot save sandbox: missing task_id in metadata"
+                )
+                return False
+
+            sandbox_info = {
+                "sandbox_id": sandbox.sandbox_id,
+                "container_name": sandbox.container_name,
+                "base_url": sandbox.base_url,
+                "status": sandbox.status.value,
+                "error_message": sandbox.error_message,
+                "created_at": sandbox.created_at,
+                "shell_type": sandbox.shell_type,
+                "user_id": sandbox.user_id,
+                "user_name": sandbox.user_name,
+                "executor_namespace": sandbox.executor_namespace,
+                "metadata": sandbox.metadata,
+                "started_at": sandbox.started_at,
+                "last_activity_at": sandbox.last_activity_at,
+                "expires_at": sandbox.expires_at,
+            }
+
+            hash_key = f"{SESSION_HASH_PREFIX}{task_id}"
+            data = json.dumps(sandbox_info)
+            self.redis_client.hset(hash_key, SANDBOX_FIELD_NAME, data)
+            # Use session_hash_ttl (longer than redis_ttl) to ensure GC can load data
+            self.redis_client.expire(hash_key, self._config.timeout.session_hash_ttl)
+
+            # Claim ownership in this deployment's active sandbox index.
+            self._mark_sandbox_active(str(task_id), time.time())
+
+            # Save e2b_sandbox_id index for O(1) lookup
+            e2b_sandbox_id = sandbox.metadata.get("e2b_sandbox_id")
+            if e2b_sandbox_id:
+                self._save_e2b_index(e2b_sandbox_id, str(task_id))
+
+            return True
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to save sandbox: {e}")
+            return False
+
+    def load_sandbox(self, sandbox_id: str) -> Optional[Sandbox]:
+        """Load sandbox by sandbox_id from session Hash.
+
+        Note: sandbox_id is actually the task_id (as string)
+
+        Args:
+            sandbox_id: Sandbox ID (which is task_id as string)
+
+        Returns:
+            Sandbox if found, None otherwise
+        """
+        if self.redis_client is None:
+            return None
+
+        try:
+            task_id = int(sandbox_id)
+            hash_key = f"{SESSION_HASH_PREFIX}{task_id}"
+            sandbox_data_str = self.redis_client.hget(hash_key, SANDBOX_FIELD_NAME)
+            if sandbox_data_str is None:
+                return None
+
+            sandbox_info = json.loads(sandbox_data_str)
+
+            container_name = sandbox_info["container_name"]
+            base_url = sandbox_info.get("base_url")
+
+            # Determine status: use saved status if available, otherwise infer from base_url
+            saved_status = sandbox_info.get("status")
+            if saved_status:
+                status = SandboxStatus(saved_status)
+            elif base_url:
+                status = SandboxStatus.RUNNING
+            else:
+                status = SandboxStatus.PENDING
+
+            sandbox = Sandbox(
+                sandbox_id=sandbox_id,
+                container_name=container_name,
+                shell_type=sandbox_info["shell_type"],
+                status=status,
+                user_id=sandbox_info["user_id"],
+                user_name=sandbox_info["user_name"],
+                base_url=base_url,
+                executor_namespace=sandbox_info.get("executor_namespace"),
+                created_at=sandbox_info["created_at"],
+                started_at=sandbox_info.get("started_at"),
+                last_activity_at=sandbox_info.get(
+                    "last_activity_at", sandbox_info["created_at"]
+                ),
+                expires_at=sandbox_info.get("expires_at"),
+                error_message=sandbox_info.get("error_message"),
+                metadata=sandbox_info.get("metadata", {}),
+            )
+
+            return sandbox
+        except Exception as e:
+            logger.error(
+                f"[SandboxRepository] Failed to load sandbox: {e}", exc_info=True
+            )
+            return None
+
+    async def load_sandbox_async(self, sandbox_id: str) -> Optional[Sandbox]:
+        """Load sandbox by sandbox_id from session Hash (async version).
+
+        Use this method in async contexts to avoid blocking the event loop.
+
+        Note: sandbox_id is actually the task_id (as string)
+
+        Args:
+            sandbox_id: Sandbox ID (which is task_id as string)
+
+        Returns:
+            Sandbox if found, None otherwise
+        """
+        client = await self._get_async_client()
+        if client is None:
+            return None
+
+        try:
+            task_id = int(sandbox_id)
+            hash_key = f"{SESSION_HASH_PREFIX}{task_id}"
+            sandbox_data_str = await client.hget(hash_key, SANDBOX_FIELD_NAME)
+            if sandbox_data_str is None:
+                return None
+
+            sandbox_info = json.loads(sandbox_data_str)
+
+            container_name = sandbox_info["container_name"]
+            base_url = sandbox_info.get("base_url")
+
+            # Determine status: use saved status if available, otherwise infer from base_url
+            saved_status = sandbox_info.get("status")
+            if saved_status:
+                status = SandboxStatus(saved_status)
+            elif base_url:
+                status = SandboxStatus.RUNNING
+            else:
+                status = SandboxStatus.PENDING
+
+            sandbox = Sandbox(
+                sandbox_id=sandbox_id,
+                container_name=container_name,
+                shell_type=sandbox_info["shell_type"],
+                status=status,
+                user_id=sandbox_info["user_id"],
+                user_name=sandbox_info["user_name"],
+                base_url=base_url,
+                executor_namespace=sandbox_info.get("executor_namespace"),
+                created_at=sandbox_info["created_at"],
+                started_at=sandbox_info.get("started_at"),
+                last_activity_at=sandbox_info.get(
+                    "last_activity_at", sandbox_info["created_at"]
+                ),
+                expires_at=sandbox_info.get("expires_at"),
+                error_message=sandbox_info.get("error_message"),
+                metadata=sandbox_info.get("metadata", {}),
+            )
+
+            return sandbox
+        except Exception as e:
+            logger.error(
+                f"[SandboxRepository] Failed to load sandbox async: {e}", exc_info=True
+            )
+            return None
+
+    def delete_sandbox(self, sandbox_id: str) -> bool:
+        """Delete sandbox data from Redis.
+
+        Args:
+            sandbox_id: Sandbox ID (task_id as string)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.redis_client is None:
+            return False
+
+        try:
+            task_id = int(sandbox_id)
+
+            # Load sandbox first to get e2b_sandbox_id for index cleanup
+            sandbox = self.load_sandbox(sandbox_id)
+            if sandbox:
+                e2b_sandbox_id = sandbox.metadata.get("e2b_sandbox_id")
+                if e2b_sandbox_id:
+                    self._delete_e2b_index(e2b_sandbox_id)
+
+            # Remove from both the scoped index and any legacy membership.
+            self._remove_sandbox_from_active_indexes(str(task_id))
+
+            # Delete entire session Hash
+            hash_key = f"{SESSION_HASH_PREFIX}{task_id}"
+            self.redis_client.delete(hash_key)
+
+            logger.debug(
+                f"[SandboxRepository] Cleaned Redis for sandbox: sandbox_id={sandbox_id}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to delete sandbox: {e}")
+            return False
+
+    def get_active_sandbox_ids(self) -> List[str]:
+        """Get all active sandbox IDs from ZSet.
+
+        Returns:
+            List of sandbox IDs (task_id strings)
+        """
+        if self.redis_client is None:
+            return []
+
+        try:
+            return self.redis_client.zrange(self._active_sandboxes_zset, 0, -1)
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to get active sandboxes: {e}")
+            return []
+
+    async def get_active_sandbox_ids_async(self) -> List[str]:
+        """Get all active sandbox IDs from ZSet (async version).
+
+        Use this method in async contexts to avoid blocking the event loop.
+
+        Returns:
+            List of sandbox IDs (task_id strings)
+        """
+        client = await self._get_async_client()
+        if client is None:
+            return []
+
+        try:
+            return await client.zrange(self._active_sandboxes_zset, 0, -1)
+        except Exception as e:
+            logger.error(
+                f"[SandboxRepository] Failed to get active sandboxes async: {e}"
+            )
+            return []
+
+    def get_expired_sandbox_ids(self, max_age_seconds: int) -> List[str]:
+        """Get sandbox IDs that have been inactive for longer than max_age.
+
+        Uses ZRANGEBYSCORE to efficiently find sandboxes whose last_activity_timestamp
+        is older than the cutoff time.
+
+        Args:
+            max_age_seconds: Maximum age in seconds (e.g., 86400 for 24 hours)
+
+        Returns:
+            List of expired sandbox IDs
+        """
+        if self.redis_client is None:
+            return []
+
+        try:
+            cutoff_timestamp = time.time() - max_age_seconds
+            return self.redis_client.zrangebyscore(
+                self._active_sandboxes_zset,
+                min=0,
+                max=cutoff_timestamp,
+            )
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to get expired sandboxes: {e}")
+            return []
+
+    def remove_from_active_set(self, sandbox_id: str) -> bool:
+        """Remove a sandbox from the active sandboxes ZSet.
+
+        Args:
+            sandbox_id: Sandbox ID to remove
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.redis_client is None:
+            return False
+
+        try:
+            self._remove_sandbox_from_active_indexes(sandbox_id)
+            return True
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to remove from active set: {e}")
+            return False
+
+    def update_activity_timestamp(self, sandbox_id: str) -> bool:
+        """Update the last activity timestamp for a sandbox.
+
+        Args:
+            sandbox_id: Sandbox ID
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.redis_client is None:
+            return False
+
+        try:
+            self._mark_sandbox_active(sandbox_id, time.time())
+            return True
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to update activity: {e}")
+            return False
+
+    # =========================================================================
+    # Execution Operations
+    # =========================================================================
+
+    def save_execution(
+        self, execution: Execution, update_activity: bool = False
+    ) -> bool:
+        """Save execution to session Hash with field {subtask_id}.
+
+        Args:
+            execution: Execution to save
+            update_activity: If True, update the ZSet timestamp (only for new executions)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.redis_client is None:
+            logger.error(
+                "[SandboxRepository] Redis client not available for save_execution"
+            )
+            return False
+
+        try:
+            task_id = execution.metadata.get("task_id", 0)
+            subtask_id = execution.metadata.get("subtask_id", 0)
+
+            hash_key = f"{SESSION_HASH_PREFIX}{task_id}"
+            field = str(subtask_id)
+            data = json.dumps(execution.to_dict())
+
+            logger.info(
+                f"[SandboxRepository] Saving execution: hash_key={hash_key}, "
+                f"field={field}, execution_id={execution.execution_id}"
+            )
+
+            self.redis_client.hset(hash_key, field, data)
+            # Use session_hash_ttl (longer than redis_ttl) to ensure GC can load data
+            self.redis_client.expire(hash_key, self._config.timeout.session_hash_ttl)
+
+            # Only update ZSet timestamp for new executions (not status updates)
+            # This ensures GC only considers "last new task time" for expiration
+            if update_activity:
+                self._mark_sandbox_active(str(task_id), time.time())
+
+            logger.info(
+                f"[SandboxRepository] Execution saved successfully: task_id={task_id}, subtask_id={subtask_id}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to save execution: {e}")
+            return False
+
+    def load_execution(self, task_id: int, subtask_id: int) -> Optional[Execution]:
+        """Load execution from session Hash by task_id and subtask_id.
+
+        Args:
+            task_id: Task ID
+            subtask_id: Subtask ID
+
+        Returns:
+            Execution if found, None otherwise
+        """
+        if self.redis_client is None:
+            logger.error(
+                "[SandboxRepository] Redis client not available for load_execution"
+            )
+            return None
+
+        try:
+            hash_key = f"{SESSION_HASH_PREFIX}{task_id}"
+            field = str(subtask_id)
+
+            logger.info(
+                f"[SandboxRepository] Loading execution: hash_key={hash_key}, field={field}"
+            )
+
+            data = self.redis_client.hget(hash_key, field)
+            if data is None:
+                # Debug: list all fields in hash
+                all_fields = self.redis_client.hkeys(hash_key)
+                logger.warning(
+                    f"[SandboxRepository] Execution not found. Hash {hash_key} has fields: {all_fields}"
+                )
+                return None
+
+            exec_dict = json.loads(data)
+            logger.info(
+                f"[SandboxRepository] Execution loaded successfully: execution_id={exec_dict.get('execution_id')}"
+            )
+            return self._dict_to_execution(exec_dict)
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to load execution: {e}")
+            return None
+
+    def list_executions(self, sandbox_id: str) -> Tuple[List[Execution], Optional[str]]:
+        """List all executions in a sandbox.
+
+        Args:
+            sandbox_id: Sandbox ID (task_id as string)
+
+        Returns:
+            Tuple of (list of Executions, error_message or None)
+        """
+        if self.redis_client is None:
+            return [], "Redis client not initialized"
+
+        try:
+            task_id = int(sandbox_id)
+            hash_key = f"{SESSION_HASH_PREFIX}{task_id}"
+
+            all_fields = self.redis_client.hgetall(hash_key)
+            if not all_fields:
+                return [], f"Sandbox {sandbox_id} not found"
+
+            executions = []
+            for field, data_str in all_fields.items():
+                if field == SANDBOX_FIELD_NAME:
+                    continue
+
+                try:
+                    exec_dict = json.loads(data_str)
+                    executions.append(self._dict_to_execution(exec_dict))
+                except Exception as e:
+                    logger.debug(
+                        f"[SandboxRepository] Failed to parse execution field {field}: {e}"
+                    )
+                    continue
+
+            return executions, None
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to list executions: {e}")
+            return [], str(e)
+
+    def _dict_to_execution(self, data: Dict[str, Any]) -> Execution:
+        """Convert dictionary to Execution object.
+
+        Args:
+            data: Dictionary representation
+
+        Returns:
+            Execution object
+        """
+        return Execution(
+            execution_id=data["execution_id"],
+            sandbox_id=data["sandbox_id"],
+            prompt=data["prompt"],
+            status=ExecutionStatus(data["status"]),
+            result=data.get("result"),
+            error_message=data.get("error_message"),
+            created_at=data["created_at"],
+            started_at=data.get("started_at"),
+            completed_at=data.get("completed_at"),
+            progress=data.get("progress", 0),
+            metadata=data.get("metadata", {}),
+        )
+
+    # =========================================================================
+    # Executor Binding Operations
+    # =========================================================================
+
+    def save_executor_binding(
+        self,
+        task_id: int,
+        executor_name: str,
+        ttl: Optional[int] = None,
+        **extra_fields,
+    ) -> bool:
+        """Save executor binding for task continuity.
+
+        Args:
+            task_id: Task ID
+            executor_name: Executor container name
+            ttl: TTL in seconds (defaults to config value)
+            **extra_fields: Additional fields to store
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.redis_client is None:
+            return False
+
+        try:
+            binding_key = f"task_executor:{task_id}"
+            binding_value = {
+                "executor_name": executor_name,
+                "task_id": task_id,
+                "created_at": time.time(),
+                **extra_fields,  # Merge any additional fields
+            }
+
+            if ttl is None:
+                ttl = self._config.executor.executor_binding_ttl
+
+            self.redis_client.setex(binding_key, ttl, json.dumps(binding_value))
+            logger.info(
+                f"[SandboxRepository] Stored executor binding: "
+                f"task_id={task_id} -> executor={executor_name}, "
+                f"extra={list(extra_fields.keys())}, ttl={ttl}s"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to save executor binding: {e}")
+            return False
+
+    def load_executor_binding(self, task_id: int) -> Optional[str]:
+        """Load executor binding for task continuity.
+
+        Args:
+            task_id: Task ID
+
+        Returns:
+            Executor name if found, None otherwise
+        """
+        binding = self.load_executor_binding_full(task_id)
+        return binding.get("executor_name") if binding else None
+
+    def load_executor_binding_full(self, task_id: int) -> Optional[Dict[str, Any]]:
+        """Load full executor binding info for task continuity.
+
+        Args:
+            task_id: Task ID
+
+        Returns:
+            Binding dict with executor_name, sandbox_claim_name, etc. if found
+        """
+        if self.redis_client is None:
+            return None
+
+        try:
+            binding_key = f"task_executor:{task_id}"
+            binding_json = self.redis_client.get(binding_key)
+
+            if binding_json:
+                return json.loads(binding_json)
+            return None
+        except Exception as e:
+            logger.warning(f"[SandboxRepository] Failed to load executor binding: {e}")
+            return None
+
+    def delete_executor_binding(self, task_id: int) -> bool:
+        """Delete a task-to-executor binding after runtime cleanup."""
+        if self.redis_client is None:
+            return False
+
+        try:
+            binding_key = f"task_executor:{task_id}"
+            self.redis_client.delete(binding_key)
+            logger.info(
+                "[SandboxRepository] Deleted executor binding: task_id=%s",
+                task_id,
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "[SandboxRepository] Failed to delete executor binding for task %s: %s",
+                task_id,
+                e,
+            )
+            return False
+
+    # =========================================================================
+    # E2B Sandbox ID Index Operations
+    # =========================================================================
+
+    def _save_e2b_index(self, e2b_sandbox_id: str, sandbox_id: str) -> bool:
+        """Save e2b_sandbox_id -> sandbox_id index for O(1) lookup.
+
+        Args:
+            e2b_sandbox_id: E2B format sandbox UUID
+            sandbox_id: Internal sandbox ID (task_id as string)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.redis_client is None:
+            return False
+
+        try:
+            index_key = f"{E2B_SANDBOX_ID_INDEX_PREFIX}{e2b_sandbox_id}"
+            # Use session_hash_ttl to keep index alive as long as the session
+            self.redis_client.setex(
+                index_key, self._config.timeout.session_hash_ttl, sandbox_id
+            )
+            logger.debug(
+                f"[SandboxRepository] Saved e2b index: {e2b_sandbox_id} -> {sandbox_id}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to save e2b index: {e}")
+            return False
+
+    def _delete_e2b_index(self, e2b_sandbox_id: str) -> bool:
+        """Delete e2b_sandbox_id index.
+
+        Args:
+            e2b_sandbox_id: E2B format sandbox UUID
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.redis_client is None:
+            return False
+
+        try:
+            index_key = f"{E2B_SANDBOX_ID_INDEX_PREFIX}{e2b_sandbox_id}"
+            self.redis_client.delete(index_key)
+            logger.debug(f"[SandboxRepository] Deleted e2b index: {e2b_sandbox_id}")
+            return True
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to delete e2b index: {e}")
+            return False
+
+    def lookup_sandbox_id_by_e2b_id(self, e2b_sandbox_id: str) -> Optional[str]:
+        """Lookup sandbox_id by e2b_sandbox_id using index (O(1) lookup).
+
+        Args:
+            e2b_sandbox_id: E2B format sandbox UUID
+
+        Returns:
+            sandbox_id if found, None otherwise
+        """
+        if self.redis_client is None:
+            return None
+
+        try:
+            index_key = f"{E2B_SANDBOX_ID_INDEX_PREFIX}{e2b_sandbox_id}"
+            sandbox_id = self.redis_client.get(index_key)
+            if sandbox_id:
+                logger.debug(
+                    f"[SandboxRepository] E2B index lookup hit: {e2b_sandbox_id} -> {sandbox_id}"
+                )
+                return sandbox_id
+            return None
+        except Exception as e:
+            logger.error(f"[SandboxRepository] Failed to lookup e2b index: {e}")
+            return None
+
+
+def get_sandbox_repository() -> SandboxRepository:
+    """Get the SandboxRepository singleton instance.
+
+    Returns:
+        SandboxRepository instance
+    """
+    return SandboxRepository()

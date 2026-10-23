@@ -1,0 +1,1715 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Work Queue Service for managing work queues and queue messages."""
+
+import logging
+import secrets
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from app.core.exceptions import (
+    ConflictException,
+    ForbiddenException,
+    NotFoundException,
+)
+from app.db.session import SessionLocal
+from app.models.kind import Kind
+from app.models.user import User
+from app.models.work_queue import (
+    QueueMessage,
+    QueueMessagePriority,
+    QueueMessageStatus,
+    QueueVisibility,
+    RecentContact,
+)
+from app.schemas.work_queue import (
+    AutoProcessConfig,
+    MessageContentSnapshot,
+    QueueMessageCreate,
+    QueueMessageResponse,
+    ResultFeedbackConfig,
+    SenderInfo,
+    WorkQueueCreate,
+    WorkQueueResponse,
+    WorkQueueUpdate,
+)
+from app.services.group_permission import check_user_group_permission
+
+logger = logging.getLogger(__name__)
+
+# System user ID for welcome messages
+SYSTEM_USER_ID = 1
+
+# Welcome message content in different languages
+WELCOME_MESSAGE_ZH = """👋 欢迎使用待办！
+
+待办是一个用于协作的消息收件箱，你可以在这里接收其他用户的消息，并使用AI进行进一步处理。
+
+### 主要功能：
+* 接收其他用户转发给你的对话消息
+* 管理和处理收到的消息
+* 将重要消息保存到你的队列中
+
+### 如何接收消息：
+其他用户可以在对话消息下方点击「转发✈️」按钮，选择转发人，消息将会发送到你的待办收件箱
+
+### 如何处理消息：
+* 在「待办」列表中点击消息，在弹出的对话框中选择「处理」按钮，这条消息会自动附加到聊天输入框中
+* 点「待办」列表上方的选择按钮，可以一次性选择多个并消息附加到新任务
+
+开始使用吧！"""
+
+WELCOME_MESSAGE_EN = """👋 Welcome to Inbox!
+
+Inbox is a collaborative message inbox where you can receive messages from other users and process them further with AI.
+
+### Key Features:
+* Receive conversation messages forwarded by other users
+* Manage and process received messages
+* Save important messages to your queue
+
+### How to Receive Messages:
+Other users can click the "Forward ✈️" button below a conversation message, select the recipient, and the message will be sent to your Inbox.
+
+### How to Process Messages:
+* Click a message in the "Inbox" list, then click the "Process" button in the popup dialog - the message will be automatically attached to the chat input box
+* Click the select button at the top of the "Inbox" list to select multiple messages and attach them to a new task at once
+
+Get started!"""
+
+
+class WorkQueueService:
+    """Service for managing work queues."""
+
+    WORK_QUEUE_KIND = "WorkQueue"
+
+    def get_db(self) -> Session:
+        """Get database session."""
+        return SessionLocal()
+
+    def _generate_invite_code(self) -> str:
+        """Generate a random invite code."""
+        return secrets.token_urlsafe(16)
+
+    def _build_queue_response(
+        self,
+        db_queue: Kind,
+        message_counts: Optional[Dict[int, Tuple[int, int]]] = None,
+    ) -> WorkQueueResponse:
+        """Build WorkQueueResponse from Kind model."""
+        spec = db_queue.json.get("spec", {})
+        status = db_queue.json.get("status", {})
+
+        # Get message counts if not provided
+        if message_counts is None:
+            total, unread = self._get_queue_message_counts(db_queue.id)
+        else:
+            total, unread = message_counts.get(db_queue.id, (0, 0))
+
+        # Parse autoProcess config
+        auto_process_data = spec.get("autoProcess")
+        auto_process = None
+        if auto_process_data:
+            auto_process = AutoProcessConfig(**auto_process_data)
+
+        # Parse resultFeedback config
+        result_feedback_data = spec.get("resultFeedback")
+        result_feedback = None
+        if result_feedback_data:
+            result_feedback = ResultFeedbackConfig(**result_feedback_data)
+
+        return WorkQueueResponse(
+            id=db_queue.id,
+            name=db_queue.name,
+            displayName=spec.get("displayName", db_queue.name),
+            description=spec.get("description"),
+            isDefault=spec.get("isDefault", False),
+            visibility=QueueVisibility(spec.get("visibility", "private")),
+            visibleToGroups=spec.get("visibleToGroups"),
+            inviteCode=spec.get("inviteCode"),
+            autoProcess=auto_process,
+            resultFeedback=result_feedback,
+            messageCount=total,
+            unreadCount=unread,
+            createdAt=db_queue.created_at,
+            updatedAt=db_queue.updated_at,
+        )
+
+    def _get_queue_message_counts(self, queue_id: int) -> Tuple[int, int]:
+        """Get total and unread message counts for a queue."""
+        with self.get_db() as db:
+            total = (
+                db.query(func.count(QueueMessage.id))
+                .filter(
+                    QueueMessage.queue_id == queue_id,
+                    QueueMessage.status != QueueMessageStatus.ARCHIVED,
+                )
+                .scalar()
+                or 0
+            )
+            unread = (
+                db.query(func.count(QueueMessage.id))
+                .filter(
+                    QueueMessage.queue_id == queue_id,
+                    QueueMessage.status == QueueMessageStatus.UNREAD,
+                )
+                .scalar()
+                or 0
+            )
+            return total, unread
+
+    def _get_batch_message_counts(
+        self, queue_ids: List[int]
+    ) -> Dict[int, Tuple[int, int]]:
+        """Get message counts for multiple queues in batch."""
+        if not queue_ids:
+            return {}
+
+        with self.get_db() as db:
+            # Get total counts
+            total_counts = (
+                db.query(QueueMessage.queue_id, func.count(QueueMessage.id))
+                .filter(
+                    QueueMessage.queue_id.in_(queue_ids),
+                    QueueMessage.status != QueueMessageStatus.ARCHIVED,
+                )
+                .group_by(QueueMessage.queue_id)
+                .all()
+            )
+
+            # Get unread counts
+            unread_counts = (
+                db.query(QueueMessage.queue_id, func.count(QueueMessage.id))
+                .filter(
+                    QueueMessage.queue_id.in_(queue_ids),
+                    QueueMessage.status == QueueMessageStatus.UNREAD,
+                )
+                .group_by(QueueMessage.queue_id)
+                .all()
+            )
+
+            total_map = {qid: count for qid, count in total_counts}
+            unread_map = {qid: count for qid, count in unread_counts}
+
+            return {
+                qid: (total_map.get(qid, 0), unread_map.get(qid, 0))
+                for qid in queue_ids
+            }
+
+    def list_queues(self, user_id: int) -> List[WorkQueueResponse]:
+        """List all work queues for a user.
+
+        If the user has no public default queue, automatically creates one
+        and inserts a welcome message.
+        """
+        with self.get_db() as db:
+            queues = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+                .order_by(Kind.created_at.desc())
+                .all()
+            )
+
+            # Check if user has a public default queue
+            has_public_default = False
+            existing_inbox = None
+            for q in queues:
+                spec = q.json.get("spec", {})
+                if (
+                    spec.get("isDefault")
+                    and spec.get("visibility") == QueueVisibility.PUBLIC.value
+                ):
+                    has_public_default = True
+                    break
+                # Track existing inbox for potential update
+                if q.name == "inbox":
+                    existing_inbox = q
+
+            # If no public default queue, create or update one
+            if not has_public_default:
+                new_queue = self._initialize_default_inbox_with_db(
+                    db, user_id, queues, existing_inbox
+                )
+                if new_queue and new_queue not in queues:
+                    queues.insert(0, new_queue)
+
+            # Get message counts in batch
+            queue_ids = [q.id for q in queues]
+            message_counts = self._get_batch_message_counts(queue_ids)
+
+            return [self._build_queue_response(q, message_counts) for q in queues]
+
+    def _initialize_default_inbox_with_db(
+        self,
+        db: Session,
+        user_id: int,
+        existing_queues: List[Kind],
+        existing_inbox: Optional[Kind],
+    ) -> Optional[Kind]:
+        """Initialize default inbox for a user with welcome message.
+
+        Uses the provided db session to avoid multiple connections.
+        Creates a public inbox queue and inserts a system welcome message.
+        Returns the created/updated queue or None if creation failed.
+        """
+        try:
+            if existing_inbox:
+                # Update existing inbox to be public and default
+                # First unset other defaults
+                for q in existing_queues:
+                    if (
+                        q.json.get("spec", {}).get("isDefault")
+                        and q.id != existing_inbox.id
+                    ):
+                        q.json = {
+                            **q.json,
+                            "spec": {**q.json.get("spec", {}), "isDefault": False},
+                        }
+                        q.updated_at = datetime.now()
+
+                spec = dict(existing_inbox.json.get("spec", {}))
+                spec["visibility"] = QueueVisibility.PUBLIC.value
+                spec["isDefault"] = True
+                existing_inbox.json = {**existing_inbox.json, "spec": spec}
+                existing_inbox.updated_at = datetime.now()
+                db.commit()
+                logger.info(
+                    f"Updated existing inbox to public default: id={existing_inbox.id}, user_id={user_id}"
+                )
+                return existing_inbox
+
+            # First unset other defaults
+            for q in existing_queues:
+                if q.json.get("spec", {}).get("isDefault"):
+                    q.json = {
+                        **q.json,
+                        "spec": {**q.json.get("spec", {}), "isDefault": False},
+                    }
+                    q.updated_at = datetime.now()
+
+            # Create new inbox directly in the same session
+            spec = {
+                "displayName": "Inbox",
+                "description": "Default public inbox for receiving messages",
+                "isDefault": True,
+                "visibility": QueueVisibility.PUBLIC.value,
+                "visibleToGroups": None,
+                "inviteCode": None,
+            }
+
+            resource_json = {
+                "apiVersion": "agent.wecode.io/v1",
+                "kind": self.WORK_QUEUE_KIND,
+                "metadata": {
+                    "name": "inbox",
+                    "namespace": "default",
+                },
+                "spec": spec,
+                "status": {"state": "Available"},
+            }
+
+            db_queue = Kind(
+                user_id=user_id,
+                kind=self.WORK_QUEUE_KIND,
+                name="inbox",
+                namespace="default",
+                json=resource_json,
+            )
+            db.add(db_queue)
+            db.flush()  # Get the ID without committing
+
+            # Insert welcome message in the same transaction
+            self._insert_welcome_message_with_db(db, db_queue.id, user_id)
+
+            db.commit()
+
+            logger.info(
+                f"Initialized default inbox with welcome message: queue_id={db_queue.id}, user_id={user_id}"
+            )
+
+            return db_queue
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to initialize default inbox for user {user_id}: {e}")
+            return None
+
+    def _insert_welcome_message_with_db(
+        self, db: Session, queue_id: int, recipient_user_id: int
+    ) -> None:
+        """Insert a welcome message into the queue using provided db session.
+
+        The message is sent from the system user (ID=1) with bilingual content.
+        """
+        # Check if welcome message already exists for this queue
+        existing_welcome = (
+            db.query(QueueMessage)
+            .filter(
+                QueueMessage.queue_id == queue_id,
+                QueueMessage.sender_user_id == SYSTEM_USER_ID,
+                QueueMessage.source_task_id == 0,
+            )
+            .first()
+        )
+
+        if existing_welcome:
+            logger.debug(f"Welcome message already exists for queue {queue_id}")
+            return
+
+        # Create welcome message with bilingual content
+        welcome_message = QueueMessage(
+            queue_id=queue_id,
+            sender_user_id=SYSTEM_USER_ID,
+            recipient_user_id=recipient_user_id,
+            source_task_id=0,
+            source_subtask_ids=[],
+            content_snapshot=[
+                {
+                    "role": "ASSISTANT",
+                    "content": WELCOME_MESSAGE_ZH,
+                    "senderUserName": "wegent",
+                    "createdAt": datetime.now(timezone.utc).isoformat(),
+                },
+                {
+                    "role": "ASSISTANT",
+                    "content": WELCOME_MESSAGE_EN,
+                    "senderUserName": "wegent",
+                    "createdAt": datetime.now(timezone.utc).isoformat(),
+                },
+            ],
+            note="",
+            priority=QueueMessagePriority.NORMAL,
+            status=QueueMessageStatus.UNREAD,
+            process_result={},
+            process_task_id=0,
+        )
+        db.add(welcome_message)
+
+        logger.info(
+            f"Inserted welcome message for queue {queue_id}, recipient {recipient_user_id}"
+        )
+
+    def get_queue(self, user_id: int, queue_id: int) -> Optional[WorkQueueResponse]:
+        """Get a specific work queue."""
+        with self.get_db() as db:
+            queue = (
+                db.query(Kind)
+                .filter(
+                    Kind.id == queue_id,
+                    Kind.user_id == user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+            if not queue:
+                return None
+            return self._build_queue_response(queue)
+
+    def get_queue_by_id(self, queue_id: int) -> Optional[Kind]:
+        """Get a queue Kind by ID (internal use)."""
+        with self.get_db() as db:
+            return (
+                db.query(Kind)
+                .filter(
+                    Kind.id == queue_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+
+    def get_queue_by_name(self, user_id: int, queue_name: str) -> Optional[Kind]:
+        """Get a queue Kind by name for a specific user (internal use)."""
+        with self.get_db() as db:
+            return (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == user_id,
+                    Kind.name == queue_name,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+
+    def create_queue(self, user_id: int, data: WorkQueueCreate) -> WorkQueueResponse:
+        """Create a new work queue."""
+        with self.get_db() as db:
+            # Check if queue with same name already exists
+            existing = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.namespace == "default",
+                    Kind.name == data.name,
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+            if existing:
+                raise ConflictException(f"Work queue '{data.name}' already exists")
+
+            # Generate invite code if visibility is invite_only
+            invite_code = None
+            if data.visibility == QueueVisibility.INVITE_ONLY:
+                invite_code = self._generate_invite_code()
+
+            # Build spec
+            spec = {
+                "displayName": data.displayName,
+                "description": data.description,
+                "isDefault": False,
+                "visibility": data.visibility.value,
+                "visibleToGroups": data.visibleToGroups,
+                "inviteCode": invite_code,
+            }
+
+            if data.autoProcess:
+                spec["autoProcess"] = data.autoProcess.model_dump(mode="json")
+                # Validate subscriptionRef if auto-process is enabled
+                if data.autoProcess.enabled and data.autoProcess.subscriptionRef:
+                    ref = data.autoProcess.subscriptionRef
+                    # Resolve under authenticated user to prevent cross-tenant access
+                    subscription = (
+                        db.query(Kind)
+                        .filter(
+                            Kind.kind == "Subscription",
+                            Kind.namespace == ref.namespace,
+                            Kind.name == ref.name,
+                            Kind.user_id == user_id,
+                            Kind.is_active == True,
+                        )
+                        .first()
+                    )
+                    if not subscription:
+                        raise NotFoundException(
+                            "Referenced subscription not found or not accessible"
+                        )
+            if data.resultFeedback:
+                spec["resultFeedback"] = data.resultFeedback.model_dump()
+
+            # Build resource JSON
+            resource_json = {
+                "apiVersion": "agent.wecode.io/v1",
+                "kind": self.WORK_QUEUE_KIND,
+                "metadata": {
+                    "name": data.name,
+                    "namespace": "default",
+                },
+                "spec": spec,
+                "status": {"state": "Available"},
+            }
+
+            # Create Kind record
+            db_queue = Kind(
+                user_id=user_id,
+                kind=self.WORK_QUEUE_KIND,
+                name=data.name,
+                namespace="default",
+                json=resource_json,
+            )
+            db.add(db_queue)
+            db.commit()
+            db.refresh(db_queue)
+
+            logger.info(
+                f"Created work queue: id={db_queue.id}, name={data.name}, user_id={user_id}"
+            )
+
+            return self._build_queue_response(db_queue)
+
+    def update_queue(
+        self, user_id: int, queue_id: int, data: WorkQueueUpdate
+    ) -> WorkQueueResponse:
+        """Update a work queue."""
+        with self.get_db() as db:
+            queue = (
+                db.query(Kind)
+                .filter(
+                    Kind.id == queue_id,
+                    Kind.user_id == user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+            if not queue:
+                raise NotFoundException(f"Work queue not found")
+
+            # Update spec - build a new dict to ensure SQLAlchemy detects the change.
+            # Mutating queue.json in-place does not trigger dirty tracking on the JSON
+            # column, so we must replace the entire json object with a new dict.
+            spec = dict(queue.json.get("spec", {}))
+
+            if data.displayName is not None:
+                spec["displayName"] = data.displayName
+            if data.description is not None:
+                spec["description"] = data.description
+            if data.visibility is not None:
+                spec["visibility"] = data.visibility.value
+                # Generate new invite code if switching to invite_only
+                if data.visibility == QueueVisibility.INVITE_ONLY and not spec.get(
+                    "inviteCode"
+                ):
+                    spec["inviteCode"] = self._generate_invite_code()
+            if data.visibleToGroups is not None:
+                spec["visibleToGroups"] = data.visibleToGroups
+            if data.autoProcess is not None:
+                spec["autoProcess"] = data.autoProcess.model_dump(mode="json")
+                # Validate subscriptionRef if auto-process is enabled
+                if data.autoProcess.enabled and data.autoProcess.subscriptionRef:
+                    ref = data.autoProcess.subscriptionRef
+                    # Resolve under authenticated user to prevent cross-tenant access
+                    subscription = (
+                        db.query(Kind)
+                        .filter(
+                            Kind.kind == "Subscription",
+                            Kind.namespace == ref.namespace,
+                            Kind.name == ref.name,
+                            Kind.user_id == user_id,
+                            Kind.is_active == True,
+                        )
+                        .first()
+                    )
+                    if not subscription:
+                        raise NotFoundException(
+                            "Referenced subscription not found or not accessible"
+                        )
+            if data.resultFeedback is not None:
+                spec["resultFeedback"] = data.resultFeedback.model_dump()
+
+            # Replace the entire json object so SQLAlchemy detects the mutation
+            queue.json = {**queue.json, "spec": spec}
+            queue.updated_at = datetime.now()
+            db.commit()
+            db.refresh(queue)
+
+            logger.info(f"Updated work queue: id={queue_id}, user_id={user_id}")
+
+            return self._build_queue_response(queue)
+
+    def delete_queue(self, user_id: int, queue_id: int) -> bool:
+        """Soft delete a work queue."""
+        with self.get_db() as db:
+            queue = (
+                db.query(Kind)
+                .filter(
+                    Kind.id == queue_id,
+                    Kind.user_id == user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+            if not queue:
+                raise NotFoundException(f"Work queue not found")
+
+            queue.is_active = False
+            queue.updated_at = datetime.now()
+            db.commit()
+
+            logger.info(f"Deleted work queue: id={queue_id}, user_id={user_id}")
+
+            return True
+
+    def set_default_queue(self, user_id: int, queue_id: int) -> WorkQueueResponse:
+        """Set a queue as the default queue."""
+        with self.get_db() as db:
+            # First, unset all other default queues (Python-level update for PostgreSQL compatibility)
+            queues = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.is_active.is_(True),
+                )
+                .all()
+            )
+            for q in queues:
+                if q.json.get("spec", {}).get("isDefault"):
+                    q.json = {
+                        **q.json,
+                        "spec": {**q.json.get("spec", {}), "isDefault": False},
+                    }
+                    q.updated_at = datetime.now()
+
+            # Set the specified queue as default
+            queue = (
+                db.query(Kind)
+                .filter(
+                    Kind.id == queue_id,
+                    Kind.user_id == user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.is_active.is_(True),
+                )
+                .first()
+            )
+            if not queue:
+                raise NotFoundException(f"Work queue not found")
+
+            spec = dict(queue.json.get("spec", {}))
+            spec["isDefault"] = True
+            queue.json = {**queue.json, "spec": spec}
+            queue.updated_at = datetime.now()
+            db.commit()
+            db.refresh(queue)
+
+            logger.info(f"Set default work queue: id={queue_id}, user_id={user_id}")
+
+            return self._build_queue_response(queue)
+
+    def regenerate_invite_code(self, user_id: int, queue_id: int) -> WorkQueueResponse:
+        """Regenerate the invite code for a queue."""
+        with self.get_db() as db:
+            queue = (
+                db.query(Kind)
+                .filter(
+                    Kind.id == queue_id,
+                    Kind.user_id == user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+            if not queue:
+                raise NotFoundException(f"Work queue not found")
+
+            spec = dict(queue.json.get("spec", {}))
+            if spec.get("visibility") != QueueVisibility.INVITE_ONLY.value:
+                raise ConflictException(
+                    "Cannot regenerate invite code for non-invite-only queue"
+                )
+
+            spec["inviteCode"] = self._generate_invite_code()
+            queue.json = {**queue.json, "spec": spec}
+            queue.updated_at = datetime.now()
+            db.commit()
+            db.refresh(queue)
+
+            logger.info(
+                f"Regenerated invite code for queue: id={queue_id}, user_id={user_id}"
+            )
+
+            return self._build_queue_response(queue)
+
+    def get_user_default_queue(self, user_id: int) -> Optional[Kind]:
+        """Get user's default queue."""
+        with self.get_db() as db:
+            # Try to find explicit default
+            queues = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+                .all()
+            )
+
+            for q in queues:
+                if q.json.get("spec", {}).get("isDefault"):
+                    return q
+
+            # Return the first queue if no default is set
+            return queues[0] if queues else None
+
+    def get_user_public_default_queue(self, user_id: int) -> Optional[Kind]:
+        """Get user's default public queue that others can send to.
+
+        This method prioritizes:
+        1. A public queue marked as default
+        2. Any public queue
+        3. None (caller should create a default public queue)
+        """
+        with self.get_db() as db:
+            queues = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+                .all()
+            )
+
+            # First, try to find a public queue marked as default
+            for q in queues:
+                spec = q.json.get("spec", {})
+                if (
+                    spec.get("isDefault")
+                    and spec.get("visibility") == QueueVisibility.PUBLIC.value
+                ):
+                    return q
+
+            # Then, try to find any public queue
+            for q in queues:
+                spec = q.json.get("spec", {})
+                if spec.get("visibility") == QueueVisibility.PUBLIC.value:
+                    return q
+
+            # No public queue found
+            return None
+
+    def get_user_public_queues(self, target_user_id: int) -> List[Dict[str, Any]]:
+        """Get public queues of a user (for message forwarding)."""
+        with self.get_db() as db:
+            queues = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == target_user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+                .all()
+            )
+
+            result = []
+            for q in queues:
+                spec = q.json.get("spec", {})
+                visibility = spec.get("visibility", "private")
+                if visibility in ["public", "invite_only"]:
+                    result.append(
+                        {
+                            "id": q.id,
+                            "name": q.name,
+                            "displayName": spec.get("displayName", q.name),
+                            "description": spec.get("description"),
+                            "isDefault": spec.get("isDefault", False),
+                        }
+                    )
+
+            return result
+
+    def can_send_to_queue(
+        self,
+        sender_user_id: int,
+        queue: Kind,
+        invite_code: Optional[str] = None,
+    ) -> bool:
+        """Check if a user can send messages to a queue."""
+        spec = queue.json.get("spec", {})
+        visibility = spec.get("visibility", "private")
+
+        if visibility == QueueVisibility.PRIVATE.value:
+            # Only owner can send to private queue
+            return queue.user_id == sender_user_id
+
+        if visibility == QueueVisibility.PUBLIC.value:
+            return True
+
+        if visibility == QueueVisibility.GROUP_VISIBLE.value:
+            # Check if sender is member of any visible groups
+            visible_groups = spec.get("visibleToGroups", [])
+            for group_namespace in visible_groups:
+                if check_user_group_permission(
+                    sender_user_id, group_namespace, "Reporter"
+                ):
+                    return True
+            return False
+
+        if visibility == QueueVisibility.INVITE_ONLY.value:
+            # Check invite code
+            return invite_code == spec.get("inviteCode")
+
+        return False
+
+    def ensure_default_queue(self, user_id: int) -> Kind:
+        """Ensure user has a public queue that others can send to.
+
+        If user has no public queue, creates a new one named 'inbox'.
+        If 'inbox' already exists but is not public, updates it to be public.
+        """
+        # First check if user already has a public queue
+        public_queue = self.get_user_public_default_queue(user_id)
+        if public_queue:
+            return public_queue
+
+        with self.get_db() as db:
+            # Check if 'inbox' already exists (might be private)
+            existing_inbox = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == user_id,
+                    Kind.kind == self.WORK_QUEUE_KIND,
+                    Kind.namespace == "default",
+                    Kind.name == "inbox",
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+
+            if existing_inbox:
+                # Update existing inbox to be public
+                spec = dict(existing_inbox.json.get("spec", {}))
+                spec["visibility"] = QueueVisibility.PUBLIC.value
+                existing_inbox.json = {**existing_inbox.json, "spec": spec}
+                existing_inbox.updated_at = datetime.now()
+                db.commit()
+                db.refresh(existing_inbox)
+                logger.info(
+                    f"Updated existing inbox to public: id={existing_inbox.id}, user_id={user_id}"
+                )
+                return existing_inbox
+
+        # Create new public inbox
+        inbox_data = WorkQueueCreate(
+            name="inbox",
+            displayName="Inbox",
+            description="Default public inbox for receiving messages",
+            visibility=QueueVisibility.PUBLIC,
+        )
+        response = self.create_queue(user_id, inbox_data)
+
+        # Set as default
+        self.set_default_queue(user_id, response.id)
+
+        logger.info(f"Created public inbox: id={response.id}, user_id={user_id}")
+        return self.get_queue_by_id(response.id)
+
+
+class QueueMessageService:
+    """Service for managing queue messages."""
+
+    def get_db(self) -> Session:
+        """Get database session."""
+        return SessionLocal()
+
+    def _build_message_response(
+        self, db_message: QueueMessage, sender: User
+    ) -> QueueMessageResponse:
+        """Build QueueMessageResponse from QueueMessage model."""
+        content_snapshot = self._enrich_snapshot_with_attachments(db_message)
+        return QueueMessageResponse(
+            id=db_message.id,
+            queueId=db_message.queue_id,
+            sender=SenderInfo(
+                id=sender.id,
+                userName=sender.user_name,
+                email=sender.email,
+            ),
+            sourceTaskId=db_message.source_task_id,
+            sourceSubtaskIds=db_message.source_subtask_ids,
+            contentSnapshot=content_snapshot,
+            note=db_message.note,
+            priority=db_message.priority,
+            status=db_message.status,
+            processResult=db_message.process_result,
+            processTaskId=db_message.process_task_id,
+            processSubscriptionId=getattr(db_message, "process_subscription_id", None),
+            retryCount=(db_message.process_result or {}).get("retry_count", 0),
+            createdAt=db_message.created_at,
+            updatedAt=db_message.updated_at,
+            processedAt=db_message.processed_at,
+        )
+
+    def _enrich_snapshot_with_attachments(self, db_message: QueueMessage) -> list:
+        """Enrich content_snapshot with attachment info from attachmentContextIds.
+
+        When a message is ingested with file uploads, the files are stored as
+        SubtaskContext records and their IDs are saved in the USER message's
+        attachmentContextIds field inside content_snapshot.
+        This method queries the attachment metadata and injects it into the
+        USER message's attachments field so the frontend can display them.
+        """
+        raw_snapshot = db_message.content_snapshot or []
+
+        # Collect all attachment context IDs from USER messages in the snapshot
+        attachment_ids: list = []
+        for msg in raw_snapshot:
+            ids = msg.get("attachmentContextIds") or []
+            attachment_ids.extend(ids)
+
+        if not attachment_ids:
+            # No file attachments to enrich - return snapshot as-is
+            return [MessageContentSnapshot(**msg) for msg in raw_snapshot]
+
+        # Query attachment metadata from SubtaskContext
+        try:
+            from app.models.subtask_context import SubtaskContext
+            from app.schemas.subtask_context import SubtaskContextBrief
+
+            with self.get_db() as db:
+                contexts = (
+                    db.query(SubtaskContext)
+                    .filter(SubtaskContext.id.in_(attachment_ids))
+                    .all()
+                )
+                # Filter out system-generated inbox_message_*.md files
+                # These are created by auto_process_handler for LLM context injection
+                # and should not be shown to users as user-uploaded attachments
+                context_map = {
+                    ctx.id: SubtaskContextBrief.from_model(ctx).model_dump()
+                    for ctx in contexts
+                    if not (
+                        ctx.name.startswith("inbox_message_")
+                        and ctx.name.endswith(".md")
+                    )
+                }
+        except Exception as e:
+            logger.warning(
+                f"[_enrich_snapshot_with_attachments] Failed to query attachments "
+                f"for message {db_message.id}: {e}"
+            )
+            return [MessageContentSnapshot(**msg) for msg in raw_snapshot]
+
+        if not context_map:
+            return [MessageContentSnapshot(**msg) for msg in raw_snapshot]
+
+        # Inject attachment info into each USER message based on its own attachmentContextIds
+        enriched = []
+        for msg in raw_snapshot:
+            msg_copy = dict(msg)
+            msg_attachment_ids = msg_copy.get("attachmentContextIds") or []
+            if msg_attachment_ids and not msg_copy.get("attachments"):
+                briefs = [
+                    context_map[aid] for aid in msg_attachment_ids if aid in context_map
+                ]
+                if briefs:
+                    msg_copy["attachments"] = briefs
+            enriched.append(MessageContentSnapshot(**msg_copy))
+
+        return enriched
+
+    def list_messages(
+        self,
+        user_id: int,
+        queue_id: int,
+        status: Optional[QueueMessageStatus] = None,
+        priority: Optional[QueueMessagePriority] = None,
+        sender_user_id: Optional[int] = None,
+        skip: int = 0,
+        limit: int = 50,
+        sort_by: str = "created_at",
+        sort_order: str = "desc",
+    ) -> Tuple[List[QueueMessageResponse], int, int]:
+        """List messages in a queue with filtering and pagination."""
+        with self.get_db() as db:
+            # Build base query
+            query = db.query(QueueMessage).filter(
+                QueueMessage.queue_id == queue_id,
+                QueueMessage.recipient_user_id == user_id,
+                QueueMessage.status != QueueMessageStatus.ARCHIVED,
+            )
+
+            # Apply filters
+            if status:
+                query = query.filter(QueueMessage.status == status)
+            if priority:
+                query = query.filter(QueueMessage.priority == priority)
+            if sender_user_id:
+                query = query.filter(QueueMessage.sender_user_id == sender_user_id)
+
+            # Get total count
+            total = query.count()
+
+            # Get unread count for this queue
+            unread = (
+                db.query(func.count(QueueMessage.id))
+                .filter(
+                    QueueMessage.queue_id == queue_id,
+                    QueueMessage.recipient_user_id == user_id,
+                    QueueMessage.status == QueueMessageStatus.UNREAD,
+                )
+                .scalar()
+                or 0
+            )
+
+            # Apply sorting
+            sort_col = getattr(QueueMessage, sort_by, QueueMessage.created_at)
+            if sort_order == "desc":
+                query = query.order_by(sort_col.desc())
+            else:
+                query = query.order_by(sort_col.asc())
+
+            # Apply pagination
+            messages = query.offset(skip).limit(limit).all()
+
+            # Get sender info in batch
+            sender_ids = list(set(m.sender_user_id for m in messages))
+            senders = (
+                db.query(User).filter(User.id.in_(sender_ids)).all()
+                if sender_ids
+                else []
+            )
+            sender_map = {s.id: s for s in senders}
+
+            return (
+                [
+                    self._build_message_response(m, sender_map.get(m.sender_user_id))
+                    for m in messages
+                    if sender_map.get(m.sender_user_id)
+                ],
+                total,
+                unread,
+            )
+
+    def get_message(
+        self, user_id: int, message_id: int
+    ) -> Optional[QueueMessageResponse]:
+        """Get a specific queue message."""
+        with self.get_db() as db:
+            message = (
+                db.query(QueueMessage)
+                .filter(
+                    QueueMessage.id == message_id,
+                    QueueMessage.recipient_user_id == user_id,
+                )
+                .first()
+            )
+            if not message:
+                return None
+
+            sender = db.query(User).filter(User.id == message.sender_user_id).first()
+            if not sender:
+                return None
+
+            return self._build_message_response(message, sender)
+
+    def create_message(self, data: QueueMessageCreate) -> QueueMessage:
+        """Create a new queue message."""
+        with self.get_db() as db:
+            db_message = QueueMessage(
+                queue_id=data.queue_id,
+                sender_user_id=data.sender_user_id,
+                recipient_user_id=data.recipient_user_id,
+                source_task_id=data.source_task_id,
+                source_subtask_ids=data.source_subtask_ids,
+                content_snapshot=[msg.model_dump() for msg in data.content_snapshot],
+                note=data.note
+                or "",  # Use empty string if note is None (DB constraint)
+                priority=data.priority,
+                process_result={},  # Default empty dict (DB constraint: NOT NULL)
+                process_task_id=0,  # Default 0 means not processed (DB constraint: NOT NULL)
+            )
+            db.add(db_message)
+            db.commit()
+            db.refresh(db_message)
+
+            # Publish event for auto-processing
+            try:
+                from app.core.events import (
+                    QueueMessageCreatedEvent,
+                    get_event_bus,
+                )
+
+                event_bus = get_event_bus()
+                event_bus.publish_sync(
+                    QueueMessageCreatedEvent(
+                        message_id=db_message.id,
+                        queue_id=data.queue_id,
+                        recipient_user_id=data.recipient_user_id,
+                        sender_user_id=data.sender_user_id,
+                        priority=(
+                            data.priority.value
+                            if hasattr(data.priority, "value")
+                            else str(data.priority)
+                        ),
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"Failed to publish QueueMessageCreatedEvent: {e}")
+
+            logger.info(
+                f"Created queue message: id={db_message.id}, "
+                f"queue_id={data.queue_id}, sender={data.sender_user_id}"
+            )
+
+            return db_message
+
+    def update_status(
+        self, user_id: int, message_id: int, status: QueueMessageStatus
+    ) -> QueueMessageResponse:
+        """Update message status."""
+        with self.get_db() as db:
+            message = (
+                db.query(QueueMessage)
+                .filter(
+                    QueueMessage.id == message_id,
+                    QueueMessage.recipient_user_id == user_id,
+                )
+                .first()
+            )
+            if not message:
+                raise NotFoundException("Queue message not found")
+
+            message.status = status
+            message.updated_at = datetime.now()
+            if status == QueueMessageStatus.PROCESSED:
+                message.processed_at = datetime.now()
+
+            db.commit()
+            db.refresh(message)
+
+            sender = db.query(User).filter(User.id == message.sender_user_id).first()
+            return self._build_message_response(message, sender)
+
+    def update_priority(
+        self, user_id: int, message_id: int, priority: QueueMessagePriority
+    ) -> QueueMessageResponse:
+        """Update message priority."""
+        with self.get_db() as db:
+            message = (
+                db.query(QueueMessage)
+                .filter(
+                    QueueMessage.id == message_id,
+                    QueueMessage.recipient_user_id == user_id,
+                )
+                .first()
+            )
+            if not message:
+                raise NotFoundException("Queue message not found")
+
+            message.priority = priority
+            message.updated_at = datetime.now()
+            db.commit()
+            db.refresh(message)
+
+            sender = db.query(User).filter(User.id == message.sender_user_id).first()
+            return self._build_message_response(message, sender)
+
+    def delete_message(self, user_id: int, message_id: int) -> bool:
+        """Archive (soft delete) a queue message."""
+        with self.get_db() as db:
+            message = (
+                db.query(QueueMessage)
+                .filter(
+                    QueueMessage.id == message_id,
+                    QueueMessage.recipient_user_id == user_id,
+                )
+                .first()
+            )
+            if not message:
+                raise NotFoundException("Queue message not found")
+
+            message.status = QueueMessageStatus.ARCHIVED
+            message.updated_at = datetime.now()
+            db.commit()
+
+            logger.info(f"Archived queue message: id={message_id}, user_id={user_id}")
+
+            return True
+
+    def batch_update_status(
+        self, user_id: int, message_ids: List[int], status: QueueMessageStatus
+    ) -> Tuple[int, int, List[int]]:
+        """Batch update message status.
+
+        Returns:
+            Tuple of (success_count, failed_count, failed_ids)
+        """
+        with self.get_db() as db:
+            # Get all messages that belong to the user
+            messages = (
+                db.query(QueueMessage)
+                .filter(
+                    QueueMessage.id.in_(message_ids),
+                    QueueMessage.recipient_user_id == user_id,
+                )
+                .all()
+            )
+
+            found_ids = {m.id for m in messages}
+            failed_ids = [mid for mid in message_ids if mid not in found_ids]
+
+            # Update all found messages
+            now = datetime.now()
+            for message in messages:
+                message.status = status
+                message.updated_at = now
+                if status == QueueMessageStatus.PROCESSED:
+                    message.processed_at = now
+
+            db.commit()
+
+            success_count = len(messages)
+            failed_count = len(failed_ids)
+
+            logger.info(
+                f"Batch updated message status: user_id={user_id}, "
+                f"status={status}, success={success_count}, failed={failed_count}"
+            )
+
+            return success_count, failed_count, failed_ids
+
+    def batch_delete_messages(
+        self, user_id: int, message_ids: List[int]
+    ) -> Tuple[int, int, List[int]]:
+        """Batch archive (soft delete) messages.
+
+        Returns:
+            Tuple of (success_count, failed_count, failed_ids)
+        """
+        with self.get_db() as db:
+            # Get all messages that belong to the user
+            messages = (
+                db.query(QueueMessage)
+                .filter(
+                    QueueMessage.id.in_(message_ids),
+                    QueueMessage.recipient_user_id == user_id,
+                )
+                .all()
+            )
+
+            found_ids = {m.id for m in messages}
+            failed_ids = [mid for mid in message_ids if mid not in found_ids]
+
+            # Archive all found messages
+            now = datetime.now()
+            for message in messages:
+                message.status = QueueMessageStatus.ARCHIVED
+                message.updated_at = now
+
+            db.commit()
+
+            success_count = len(messages)
+            failed_count = len(failed_ids)
+
+            logger.info(
+                f"Batch deleted messages: user_id={user_id}, "
+                f"success={success_count}, failed={failed_count}"
+            )
+
+            return success_count, failed_count, failed_ids
+
+    def ingest_message(
+        self,
+        user_id: int,
+        queue_id: int,
+        request: Any,
+    ) -> QueueMessageResponse:
+        """Ingest a message into a queue from external source.
+
+        Args:
+            user_id: Current user ID (queue owner)
+            queue_id: Target work queue ID
+            request: IngestMessageRequest with content, note, priority, etc.
+        """
+        with self.get_db() as db:
+            # Validate queue exists and belongs to user
+            queue = (
+                db.query(Kind)
+                .filter(
+                    Kind.id == queue_id,
+                    Kind.kind == "WorkQueue",
+                    Kind.user_id == user_id,
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+            if not queue:
+                raise NotFoundException("Work queue not found")
+
+            # Build content snapshot from ingested content
+            snapshot_entry = {
+                "role": "USER",
+                "content": request.content or "",
+                "senderUserName": (
+                    request.sender.displayName if request.sender else None
+                ),
+                "createdAt": datetime.now(timezone.utc).isoformat(),
+            }
+            if request.attachments:
+                snapshot_entry["attachments"] = request.attachments
+            content_snapshot = [snapshot_entry]
+
+            # Embed pre-written attachment context IDs into the USER message snapshot
+            attachment_context_ids = list(request.attachmentContextIds or [])
+            if attachment_context_ids:
+                # Store IDs on the first (and only) snapshot entry so they travel
+                # with the message without requiring a separate DB column.
+                content_snapshot[0]["attachmentContextIds"] = attachment_context_ids
+
+            # Create message
+            db_message = QueueMessage(
+                queue_id=queue_id,
+                sender_user_id=user_id,
+                recipient_user_id=user_id,
+                source_task_id=0,
+                source_subtask_ids=[],
+                content_snapshot=content_snapshot,
+                note=request.note or "",
+                priority=request.priority,
+                process_result={},
+                process_task_id=0,
+            )
+            db.add(db_message)
+            db.commit()
+            db.refresh(db_message)
+
+            logger.info(
+                f"[ingest_message] DB INSERT: message_id={db_message.id}, "
+                f"queue_id={queue_id}, user_id={user_id}, "
+                f"status={db_message.status}, priority={db_message.priority}, "
+                f"content_snapshot_len={len(content_snapshot)}, "
+                f"attachment_context_ids={attachment_context_ids}"
+            )
+
+            # Read back queue spec to confirm auto-process config
+            queue_spec = queue.json.get("spec", {})
+            auto_process_data = queue_spec.get("autoProcess")
+            logger.info(
+                f"[ingest_message] Queue spec auto_process config: "
+                f"queue_id={queue_id}, auto_process={auto_process_data}"
+            )
+
+            # Publish event for auto-processing
+            try:
+                from app.core.events import (
+                    QueueMessageCreatedEvent,
+                    get_event_bus,
+                )
+
+                event_bus = get_event_bus()
+                event_priority = (
+                    request.priority.value
+                    if hasattr(request.priority, "value")
+                    else str(request.priority)
+                )
+                logger.info(
+                    f"[ingest_message] Publishing QueueMessageCreatedEvent: "
+                    f"message_id={db_message.id}, queue_id={queue_id}, "
+                    f"recipient_user_id={user_id}, sender_user_id={user_id}, "
+                    f"priority={event_priority}, "
+                    f"event_bus_main_loop={event_bus._main_loop is not None}, "
+                    f"event_bus_main_loop_running={event_bus._main_loop.is_running() if event_bus._main_loop else False}"
+                )
+                event_bus.publish_sync(
+                    QueueMessageCreatedEvent(
+                        message_id=db_message.id,
+                        queue_id=queue_id,
+                        recipient_user_id=user_id,
+                        sender_user_id=user_id,
+                        priority=event_priority,
+                    )
+                )
+                logger.info(
+                    f"[ingest_message] QueueMessageCreatedEvent published successfully: "
+                    f"message_id={db_message.id}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[ingest_message] Failed to publish QueueMessageCreatedEvent "
+                    f"for message_id={db_message.id}: {e}",
+                    exc_info=True,
+                )
+
+            sender = db.query(User).filter(User.id == user_id).first()
+            return self._build_message_response(db_message, sender)
+
+    def ingest_message_by_name(
+        self,
+        user_id: int,
+        queue_name: str,
+        request: Any,
+    ) -> QueueMessageResponse:
+        """Ingest a message into a queue identified by name.
+
+        Resolves the queue by (user_id, queue_name) then delegates to ingest_message.
+
+        Args:
+            user_id: Current user ID (queue owner)
+            queue_name: Target work queue name (e.g. "inbox")
+            request: IngestMessageRequest with content, note, priority, etc.
+        """
+        queue = work_queue_service.get_queue_by_name(user_id, queue_name)
+        if not queue:
+            raise NotFoundException(f"Work queue '{queue_name}' not found")
+        return self.ingest_message(user_id, queue.id, request)
+
+    def retry_message(self, user_id: int, message_id: int) -> QueueMessageResponse:
+        """Retry processing a failed message.
+
+        Only messages with status 'failed' can be retried.
+        Resets the message to 'unread' and re-triggers auto-processing.
+        """
+        with self.get_db() as db:
+            message = (
+                db.query(QueueMessage).filter(QueueMessage.id == message_id).first()
+            )
+            if not message:
+                raise NotFoundException("Message not found")
+
+            # Verify ownership
+            if message.recipient_user_id != user_id:
+                raise ForbiddenException("Not authorized to retry this message")
+
+            # Only failed messages can be retried
+            if message.status != QueueMessageStatus.FAILED:
+                raise ConflictException(
+                    f"Only failed messages can be retried, "
+                    f"current status: {message.status}"
+                )
+
+            # Reset message for re-processing
+            message.status = QueueMessageStatus.UNREAD
+            message.process_subscription_id = None
+            message.process_result = {}
+            message.processed_at = None
+            process_result = dict(message.process_result or {})
+            process_result["retry_count"] = process_result.get("retry_count", 0) + 1
+            message.process_result = process_result
+            db.commit()
+            db.refresh(message)
+
+            logger.info(
+                f"Retrying message: id={message_id}, "
+                f"retry_count={message.process_result.get('retry_count', 0)}"
+            )
+
+            # Re-publish event for auto-processing
+            try:
+                from app.core.events import (
+                    QueueMessageCreatedEvent,
+                    get_event_bus,
+                )
+
+                event_bus = get_event_bus()
+                event_bus.publish_sync(
+                    QueueMessageCreatedEvent(
+                        message_id=message.id,
+                        queue_id=message.queue_id,
+                        recipient_user_id=message.recipient_user_id,
+                        sender_user_id=message.sender_user_id,
+                        priority=(
+                            message.priority.value
+                            if hasattr(message.priority, "value")
+                            else str(message.priority)
+                        ),
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"Failed to publish QueueMessageCreatedEvent: {e}")
+
+            sender = db.query(User).filter(User.id == message.sender_user_id).first()
+            return self._build_message_response(message, sender)
+
+    async def process_message(
+        self, user_id: int, message_id: int
+    ) -> QueueMessageResponse:
+        """Manually trigger direct-agent processing of an inbox message.
+
+        Dispatches the message through the queue's configured auto-process
+        pipeline.  For direct_agent mode this creates a new Task directly;
+        for subscription mode it re-uses the existing dispatch path.
+
+        Only messages that are not already processing or processed can be
+        triggered.
+        """
+        from app.core.events import QueueMessageCreatedEvent, get_event_bus
+        from app.db.session import get_db_session
+        from app.models.kind import Kind
+        from app.schemas.work_queue import AutoProcessConfig
+
+        with self.get_db() as db:
+            message = (
+                db.query(QueueMessage).filter(QueueMessage.id == message_id).first()
+            )
+            if not message:
+                raise NotFoundException("Message not found")
+
+            if message.recipient_user_id != user_id:
+                raise ForbiddenException("Not authorized to process this message")
+
+            if message.status in (
+                QueueMessageStatus.PROCESSING,
+                QueueMessageStatus.PROCESSED,
+            ):
+                raise ConflictException(
+                    f"Message is already in status {message.status}"
+                )
+
+            # Load the queue to determine processing mode
+            work_queue = (
+                db.query(Kind)
+                .filter(
+                    Kind.id == message.queue_id,
+                    Kind.kind == "WorkQueue",
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+            if not work_queue:
+                raise NotFoundException("Work queue not found")
+
+            spec = work_queue.json.get("spec", {})
+            auto_process_data = spec.get("autoProcess")
+            if not auto_process_data:
+                raise ConflictException("Queue has no auto-process configuration")
+
+            try:
+                auto_process = AutoProcessConfig.model_validate(auto_process_data)
+            except Exception as exc:
+                raise ConflictException(f"Invalid auto-process configuration: {exc}")
+
+            if not auto_process.enabled:
+                raise ConflictException("Auto-process is not enabled for this queue")
+
+            sender = db.query(User).filter(User.id == message.sender_user_id).first()
+
+        # Dispatch via the auto-process handler for the correct mode
+        if auto_process.mode == "direct_agent":
+            from app.services.inbox.direct_agent_handler import (
+                inbox_direct_agent_handler,
+            )
+
+            # Re-open a fresh session for the handler (it may commit internally)
+            with get_db_session() as handler_db:
+                msg = (
+                    handler_db.query(QueueMessage)
+                    .filter(QueueMessage.id == message_id)
+                    .first()
+                )
+                wq = (
+                    handler_db.query(Kind)
+                    .filter(Kind.id == msg.queue_id, Kind.kind == "WorkQueue")
+                    .first()
+                )
+                fake_event = QueueMessageCreatedEvent(
+                    message_id=msg.id,
+                    queue_id=msg.queue_id,
+                    recipient_user_id=msg.recipient_user_id,
+                    sender_user_id=msg.sender_user_id,
+                    priority=(
+                        msg.priority.value
+                        if hasattr(msg.priority, "value")
+                        else str(msg.priority)
+                    ),
+                )
+                await inbox_direct_agent_handler.handle(
+                    event=fake_event,
+                    auto_process=auto_process,
+                    message=msg,
+                    work_queue=wq,
+                    db=handler_db,
+                )
+                handler_db.refresh(msg)
+                return self._build_message_response(msg, sender)
+        else:
+            # Subscription mode: re-publish the event so the existing handler fires
+            event_bus = get_event_bus()
+            with self.get_db() as db:
+                message = (
+                    db.query(QueueMessage).filter(QueueMessage.id == message_id).first()
+                )
+                # Reset to UNREAD so the handler won't skip it
+                message.status = QueueMessageStatus.UNREAD
+                db.commit()
+                db.refresh(message)
+
+            event_bus.publish_sync(
+                QueueMessageCreatedEvent(
+                    message_id=message_id,
+                    queue_id=message.queue_id,
+                    recipient_user_id=message.recipient_user_id,
+                    sender_user_id=message.sender_user_id,
+                    priority=(
+                        message.priority.value
+                        if hasattr(message.priority, "value")
+                        else str(message.priority)
+                    ),
+                )
+            )
+            with self.get_db() as db:
+                message = (
+                    db.query(QueueMessage).filter(QueueMessage.id == message_id).first()
+                )
+                return self._build_message_response(message, sender)
+
+
+class ContactService:
+    """Service for managing recent contacts."""
+
+    def get_db(self) -> Session:
+        """Get database session."""
+        return SessionLocal()
+
+    def record_contact(self, user_id: int, contact_user_id: int) -> None:
+        """Record a contact interaction."""
+        if user_id == contact_user_id:
+            logger.debug(f"Skipping self-contact: user_id={user_id}")
+            return
+
+        logger.info(
+            f"Recording contact: user_id={user_id}, contact_user_id={contact_user_id}"
+        )
+        with self.get_db() as db:
+            contact = (
+                db.query(RecentContact)
+                .filter(
+                    RecentContact.user_id == user_id,
+                    RecentContact.contact_user_id == contact_user_id,
+                )
+                .first()
+            )
+
+            if contact:
+                contact.last_contact_at = datetime.now()
+                contact.contact_count += 1
+            else:
+                contact = RecentContact(
+                    user_id=user_id,
+                    contact_user_id=contact_user_id,
+                )
+                db.add(contact)
+
+            db.commit()
+
+    def get_recent_contacts(
+        self, user_id: int, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Get recent contacts for a user."""
+        with self.get_db() as db:
+            contacts = (
+                db.query(RecentContact)
+                .filter(RecentContact.user_id == user_id)
+                .order_by(RecentContact.last_contact_at.desc())
+                .limit(limit)
+                .all()
+            )
+
+            if not contacts:
+                return []
+
+            # Get user info in batch
+            contact_user_ids = [c.contact_user_id for c in contacts]
+            users = (
+                db.query(User)
+                .filter(User.id.in_(contact_user_ids), User.is_active == True)
+                .all()
+            )
+            user_map = {u.id: u for u in users}
+
+            return [
+                {
+                    "id": c.id,
+                    "userId": c.contact_user_id,
+                    "userName": user_map[c.contact_user_id].user_name,
+                    "email": user_map[c.contact_user_id].email,
+                    "lastContactAt": c.last_contact_at,
+                    "contactCount": c.contact_count,
+                }
+                for c in contacts
+                if c.contact_user_id in user_map
+            ]
+
+
+# Global service instances
+work_queue_service = WorkQueueService()
+queue_message_service = QueueMessageService()
+contact_service = ContactService()

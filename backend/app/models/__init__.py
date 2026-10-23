@@ -1,0 +1,173 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Models package
+
+Note: Import order matters for SQLAlchemy relationship resolution.
+Models with relationships should be imported after their related models.
+
+The legacy SharedTask, SharedTeam, and TaskMember models have been removed.
+Use ResourceMember for all resource sharing functionality.
+"""
+from app.models.api_key import APIKey
+from app.models.cloud_project import (
+    CloudProject,
+    CloudProjectFile,
+    LoopItemTaskBinding,
+)
+from app.models.delivery import (
+    Delivery,
+    DeliveryAsset,
+    LoopItem,
+    LoopItemAttachment,
+    LoopItemCollaborator,
+    ProjectAutomationRule,
+    ProjectAutomationRun,
+    ProjectIncomingEvent,
+    ProjectIncomingHook,
+    WorkspaceCleanupIntent,
+)
+from app.models.dingtalk_doc import DingtalkSyncedNode
+from app.models.im_session import IMPrivateSession, IMSessionMode, IMSessionState
+from app.models.kind import Kind
+from app.models.knowledge import KnowledgeDocument, KnowledgeDocumentExternalSource
+from app.models.knowledge_artifact import KnowledgeArtifactRecord
+from app.models.loop_item_execution import LoopItemExecution
+from app.models.marketplace_resource import MarketplaceResource
+from app.models.namespace import Namespace
+from app.models.namespace_member import NamespaceMember
+from app.models.oauth_refresh_token import OAuthRefreshToken
+from app.models.plugin_marketplace import (
+    Plugin,
+    PluginDeviceInstallation,
+    PluginRelease,
+    PluginSubmission,
+    PluginUpstream,
+)
+from app.models.plugin_publication import (
+    PluginPublicationCheck,
+    PluginPublicationEvent,
+    PluginPublicationIdempotency,
+    PluginPublicationRequest,
+    PluginPublicationRevision,
+    PluginReleaseIdempotency,
+)
+from app.models.project import Project
+from app.models.project_chat_message import ProjectChatMessage
+from app.models.resource_member import MemberStatus, ResourceMember, ResourceRole
+from app.models.share_link import ResourceType, ShareLink
+from app.models.skill_binary import SkillBinary
+from app.models.smart_app_marketplace import (
+    SmartApp,
+    SmartAppRelease,
+    SmartAppSubmission,
+)
+from app.models.subscription import BackgroundExecution
+from app.models.subscription_follow import (
+    SubscriptionFollow,
+    SubscriptionShareNamespace,
+)
+from app.models.subtask import Subtask
+from app.models.subtask_context import SubtaskContext
+from app.models.system_config import SystemConfig
+from app.models.task import TaskResource
+
+# Do NOT import Base here to avoid conflicts with app.db.base.Base
+# All models should import Base directly from app.db.base
+# Import User last as it may have relationships to other models
+from app.models.user import User
+from app.models.wework_notification import WeworkNotification
+from app.models.wework_transcript import (
+    WeworkTranscript,
+    WeworkTranscriptArchive,
+    WeworkTranscriptTurn,
+)
+from app.models.wiki import WikiContent, WikiGeneration, WikiProject
+from app.models.work_queue import (
+    QueueMessage,
+    QueueMessagePriority,
+    QueueMessageStatus,
+    QueueVisibility,
+    RecentContact,
+    TriggerMode,
+)
+from app.schemas.namespace import GroupRole
+
+__all__ = [
+    "WeworkNotification",
+    "DingtalkSyncedNode",
+    "CloudProject",
+    "CloudProjectFile",
+    "LoopItemTaskBinding",
+    "LoopItemExecution",
+    "LoopItem",
+    "LoopItemAttachment",
+    "LoopItemCollaborator",
+    "ProjectIncomingEvent",
+    "ProjectIncomingHook",
+    "WorkspaceCleanupIntent",
+    "ProjectAutomationRule",
+    "ProjectAutomationRun",
+    "Delivery",
+    "DeliveryAsset",
+    "User",
+    "WeworkTranscript",
+    "WeworkTranscriptArchive",
+    "WeworkTranscriptTurn",
+    "Kind",
+    "IMPrivateSession",
+    "IMSessionMode",
+    "IMSessionState",
+    "TaskResource",
+    "Subtask",
+    "SubtaskContext",
+    "SkillBinary",
+    "SystemConfig",
+    "Namespace",
+    "NamespaceMember",
+    "APIKey",
+    "OAuthRefreshToken",
+    "KnowledgeDocument",
+    "KnowledgeDocumentExternalSource",
+    "KnowledgeArtifactRecord",
+    "Project",
+    "ProjectChatMessage",
+    "Plugin",
+    "PluginRelease",
+    "PluginUpstream",
+    "PluginSubmission",
+    "PluginDeviceInstallation",
+    "PluginPublicationRequest",
+    "PluginPublicationRevision",
+    "PluginPublicationCheck",
+    "PluginPublicationEvent",
+    "PluginPublicationIdempotency",
+    "PluginReleaseIdempotency",
+    "SmartApp",
+    "SmartAppRelease",
+    "SmartAppSubmission",
+    "MarketplaceResource",
+    "SubscriptionFollow",
+    "SubscriptionShareNamespace",
+    "BackgroundExecution",
+    # Wiki models
+    "WikiProject",
+    "WikiGeneration",
+    "WikiContent",
+    # Unified share system
+    "ShareLink",
+    "ResourceMember",
+    "ResourceType",
+    "GroupRole",
+    "ResourceRole",
+    "MemberStatus",
+    # Work Queue models
+    "QueueMessage",
+    "RecentContact",
+    "QueueVisibility",
+    "QueueMessageStatus",
+    "QueueMessagePriority",
+    "TriggerMode",
+]

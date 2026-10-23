@@ -1,0 +1,423 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
+
+from chat_shell.tools.builtin import KnowledgeBaseTool, ScopedKnowledgeBaseTool
+from shared.models import SearchHints
+from shared.models.knowledge import KnowledgeBaseScope
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "body", "outcome"),
+    [
+        (500, {"detail": "Retrieval service failed"}, "error"),
+        (500, "Internal Server Error", "error"),
+        (401, {"detail": "Unauthorized"}, "error"),
+        (422, {"detail": "Invalid retrieval configuration"}, "error"),
+        (200, {"mode": "rag_retrieval", "records": [], "total": 0}, "no_hit"),
+        (
+            403,
+            {
+                "detail": {
+                    "error_code": "document_scope_violation",
+                    "message": "Requested documents are outside the allowed scope.",
+                }
+            },
+            "scope_violation",
+        ),
+    ],
+)
+async def test_arun_preserves_http_retrieval_outcome(
+    status_code: int, body: dict | str, outcome: str
+) -> None:
+    tool = KnowledgeBaseTool(knowledge_base_ids=[1], user_id=7)
+    tool._kb_info_cache = {"items": [{"id": 1, "rag_enabled": True}]}
+    request = httpx.Request("POST", "http://backend/api/internal/rag/retrieve")
+    response = (
+        httpx.Response(status_code, json=body, request=request)
+        if isinstance(body, dict)
+        else httpx.Response(status_code, text=body, request=request)
+    )
+
+    with patch("httpx.AsyncClient") as mock_client:
+        post = AsyncMock(return_value=response)
+        mock_client.return_value.__aenter__.return_value.post = post
+        result = json.loads(await tool._arun(query="release checklist"))
+
+    post.assert_awaited_once()
+    if outcome == "error":
+        assert result["error"].startswith("Knowledge base search failed:")
+        assert str(status_code) in result["error"]
+        assert "results" not in result
+        assert "retrieval_summary" not in result
+    elif outcome == "scope_violation":
+        assert result["status"] == "error"
+        assert result["error_code"] == "document_scope_violation"
+        assert result["message"] == body["detail"]["message"]
+        assert "retrieval_summary" not in result
+    else:
+        assert "error" not in result
+        assert result["results"] == []
+        assert result["count"] == 0
+        assert result["retrieval_summary"]["source_statuses"][0]["status"] == "no_hit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("Backend unavailable"),
+        httpx.ReadTimeout("Retrieval timed out"),
+        httpx.InvalidURL("Invalid Backend URL"),
+    ],
+)
+async def test_arun_returns_query_error_on_http_request_failure(
+    error: Exception,
+) -> None:
+    tool = KnowledgeBaseTool(knowledge_base_ids=[1], user_id=7)
+    tool._kb_info_cache = {"items": [{"id": 1, "rag_enabled": True}]}
+
+    with patch("httpx.AsyncClient") as mock_client:
+        post = AsyncMock(side_effect=error)
+        mock_client.return_value.__aenter__.return_value.post = post
+        result = json.loads(await tool._arun(query="release checklist"))
+
+    post.assert_awaited_once()
+    assert result["error"] == f"Knowledge base search failed: {error}"
+    assert "results" not in result
+    assert "retrieval_summary" not in result
+
+
+def test_knowledge_base_input_supports_document_names():
+    from chat_shell.tools.builtin.knowledge_base import KnowledgeBaseInput
+
+    payload = KnowledgeBaseInput(
+        query="checklist",
+        max_results=5,
+        document_names=["release.md"],
+    )
+
+    assert payload.document_names == ["release.md"]
+
+
+def test_knowledge_base_input_supports_search_hints() -> None:
+    from chat_shell.tools.builtin.knowledge_base import KnowledgeBaseInput
+
+    payload = KnowledgeBaseInput(
+        query="release checklist",
+        search_hints=SearchHints(
+            semantic_query="deployment release checklist",
+            keywords=["release"],
+            phrases=["release checklist"],
+        ),
+    )
+
+    assert payload.search_hints is not None
+    assert payload.search_hints.keywords == ["release"]
+
+
+@pytest.mark.asyncio
+async def test_http_mode_forwards_document_names_and_ids():
+    tool = KnowledgeBaseTool(
+        knowledge_base_ids=[1, 2],
+        user_id=7,
+    )
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "mode": "rag_retrieval",
+        "records": [],
+        "total": 0,
+        "total_estimated_tokens": 0,
+    }
+
+    with (
+        patch("httpx.AsyncClient") as mock_client,
+        patch.object(
+            tool,
+            "_get_kb_info",
+            AsyncMock(
+                return_value={
+                    "items": [
+                        {
+                            "id": 1,
+                            "name": "Test KB",
+                            "rag_enabled": True,
+                            "max_calls_per_conversation": 10,
+                            "exempt_calls_before_check": 5,
+                        }
+                    ]
+                }
+            ),
+        ),
+    ):
+        post = AsyncMock(return_value=mock_response)
+        mock_client.return_value.__aenter__.return_value.post = post
+
+        await tool._arun(
+            query="release checklist",
+            max_results=8,
+            document_ids=[101],
+            document_names=["release.md"],
+        )
+
+    payload = post.call_args.kwargs["json"]
+    assert payload["document_ids"] == [101]
+    assert payload["document_names"] == ["release.md"]
+
+
+@pytest.mark.asyncio
+async def test_http_mode_forwards_search_hints() -> None:
+    tool = KnowledgeBaseTool(knowledge_base_ids=[1], user_id=7)
+    mock_response = MagicMock(status_code=200)
+    mock_response.json.return_value = {
+        "mode": "rag_retrieval",
+        "records": [],
+        "total": 0,
+        "total_estimated_tokens": 0,
+    }
+
+    with patch("httpx.AsyncClient") as mock_client:
+        post = AsyncMock(return_value=mock_response)
+        mock_client.return_value.__aenter__.return_value.post = post
+        await tool._retrieve_with_strategy_via_http(
+            "release checklist",
+            8,
+            search_hints=SearchHints(keywords=["release"]),
+        )
+
+    assert post.call_args.kwargs["json"]["search_hints"] == {"keywords": ["release"]}
+
+
+@pytest.mark.asyncio
+async def test_arun_preserves_backend_scoped_search_error_message():
+    tool = KnowledgeBaseTool(
+        knowledge_base_ids=[1],
+        user_id=7,
+    )
+
+    with (
+        patch.object(
+            tool,
+            "_get_kb_info",
+            AsyncMock(
+                return_value={
+                    "items": [
+                        {
+                            "id": 1,
+                            "name": "Test KB",
+                            "rag_enabled": True,
+                            "max_calls_per_conversation": 10,
+                            "exempt_calls_before_check": 5,
+                        }
+                    ]
+                }
+            ),
+        ),
+        patch.object(
+            tool,
+            "_retrieve_with_strategy_from_all_kbs",
+            AsyncMock(
+                return_value=(
+                    "rag_retrieval",
+                    {
+                        "mode": "rag_retrieval",
+                        "records": [],
+                        "total": 0,
+                        "message": "Document names not found in the selected knowledge bases. Use kb_ls to inspect available documents first.",
+                    },
+                )
+            ),
+        ),
+    ):
+        result = json.loads(await tool._arun(query="release checklist"))
+
+    assert result["message"].startswith("Document names not found")
+
+
+@pytest.mark.asyncio
+async def test_arun_unscoped_passes_call_filters_without_mutating_tool_defaults():
+    tool = KnowledgeBaseTool(
+        knowledge_base_ids=[1],
+        user_id=7,
+        document_ids=[999],
+        document_names=["default.md"],
+    )
+
+    async def _fake_retrieve(**kwargs):
+        assert kwargs["document_ids"] == [101]
+        assert kwargs["document_names"] == ["release.md"]
+        assert tool.document_ids == [999]
+        assert tool.document_names == ["default.md"]
+        return (
+            "rag_retrieval",
+            {
+                "mode": "rag_retrieval",
+                "records": [],
+                "total": 0,
+                "total_estimated_tokens": 0,
+            },
+        )
+
+    with (
+        patch.object(
+            tool,
+            "_get_kb_info",
+            AsyncMock(
+                return_value={
+                    "items": [
+                        {
+                            "id": 1,
+                            "name": "Test KB",
+                            "rag_enabled": True,
+                            "max_calls_per_conversation": 10,
+                            "exempt_calls_before_check": 5,
+                        }
+                    ]
+                }
+            ),
+        ),
+        patch.object(
+            tool,
+            "_retrieve_with_strategy_from_all_kbs",
+            AsyncMock(side_effect=_fake_retrieve),
+        ),
+    ):
+        await tool._arun(
+            query="release checklist",
+            document_ids=[101],
+            document_names=["release.md"],
+        )
+
+    assert tool.document_ids == [999]
+    assert tool.document_names == ["default.md"]
+
+
+@pytest.mark.asyncio
+async def test_unrestricted_scopes_do_not_block_per_call_document_filters():
+    """Unrestricted per-KB scopes keep forwarding legacy per-call document filters."""
+    tool = KnowledgeBaseTool(
+        knowledge_base_ids=[1],
+        knowledge_base_scopes=[
+            KnowledgeBaseScope(knowledge_base_id=1, scope_restricted=False)
+        ],
+        db_session=MagicMock(),
+    )
+
+    with patch.object(
+        tool,
+        "_retrieve_with_strategy_via_http",
+        AsyncMock(
+            return_value={
+                "mode": "rag_retrieval",
+                "records": [],
+                "total": 0,
+                "total_estimated_tokens": 0,
+            }
+        ),
+    ) as http_retrieve:
+        await tool._retrieve_with_strategy_from_all_kbs(
+            query="release checklist",
+            max_results=8,
+            document_ids=[101],
+            document_names=["release.md"],
+        )
+
+    http_retrieve.assert_awaited_once()
+    assert http_retrieve.await_args.kwargs["document_ids"] == [101]
+    assert http_retrieve.await_args.kwargs["document_names"] == ["release.md"]
+
+
+def test_scoped_tool_schema_hides_document_filters():
+    """Scoped search should not expose document override arguments to the model."""
+    schema = ScopedKnowledgeBaseTool().args_schema.model_json_schema()
+
+    assert "document_ids" not in schema["properties"]
+    assert "document_names" not in schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_scoped_arun_rejects_per_call_document_filters():
+    """Scoped search must reject attempts to override the configured scope."""
+    tool = ScopedKnowledgeBaseTool(
+        knowledge_base_ids=[1],
+        knowledge_base_scopes=[
+            KnowledgeBaseScope(
+                knowledge_base_id=1,
+                scope_restricted=True,
+                document_ids=[101],
+            )
+        ],
+        user_id=7,
+    )
+
+    result = json.loads(await tool._arun(query="release checklist", document_ids=[999]))
+
+    assert result["error_code"] == "document_scope_violation"
+
+
+@pytest.mark.asyncio
+async def test_scoped_arun_ignores_instance_legacy_document_filters():
+    """Configured scope documents must not be mistaken for per-call filters."""
+    tool = ScopedKnowledgeBaseTool(
+        knowledge_base_ids=[1],
+        document_ids=[101],
+        document_names=["legacy.md"],
+        knowledge_base_scopes=[
+            KnowledgeBaseScope(
+                knowledge_base_id=1,
+                scope_restricted=True,
+                document_ids=[101],
+            )
+        ],
+        user_id=7,
+    )
+
+    async def _fake_retrieve(**kwargs):
+        assert kwargs["document_ids"] == []
+        assert kwargs["document_names"] == []
+        return (
+            "rag_retrieval",
+            {
+                "mode": "rag_retrieval",
+                "records": [],
+                "total": 0,
+                "total_estimated_tokens": 0,
+            },
+        )
+
+    with (
+        patch.object(
+            tool,
+            "_get_kb_info",
+            AsyncMock(
+                return_value={
+                    "items": [
+                        {
+                            "id": 1,
+                            "name": "Scoped KB",
+                            "rag_enabled": True,
+                            "max_calls_per_conversation": 10,
+                            "exempt_calls_before_check": 5,
+                        }
+                    ]
+                }
+            ),
+        ),
+        patch.object(
+            tool,
+            "_retrieve_with_strategy_from_all_kbs",
+            AsyncMock(side_effect=_fake_retrieve),
+        ),
+    ):
+        result = json.loads(await tool._arun(query="release checklist"))
+
+    assert result["count"] == 0
+    assert "error" not in result

@@ -1,0 +1,171 @@
+import { defineConfig, devices } from '@playwright/test'
+
+const EXECUTOR_REGRESSION_SPEC =
+  /(tasks\/(agent-conversation-regression|provider-native-claudecode)|collaboration\/(collaboration-agent-execution|issue-dispatch-executor))\.spec\.ts/
+// Specs that share the mock provider MCP server and must run serially.
+const PROVIDER_NATIVE_CHAT_SPEC =
+  /(tasks\/provider-native-(chat|dingtalk|state-and-contract)|knowledge\/dingtalk-import)\.spec\.ts/
+
+/**
+ * Playwright configuration for Wegent E2E testing
+ * Optimized for faster execution while maintaining test reliability
+ * @see https://playwright.dev/docs/test-configuration
+ */
+export default defineConfig({
+  testDir: './e2e/tests',
+
+  /* Enable full parallelization for faster execution */
+  fullyParallel: true,
+  /* Increase workers: CI uses more workers per shard, local uses available CPUs */
+  workers: process.env.CI ? 4 : '50%',
+
+  /* Fail the build on CI if you accidentally left test.only in the source code */
+  forbidOnly: !!process.env.CI,
+
+  /* Do not retry E2E tests. Flaky tests should fail so they can be fixed. */
+  retries: 0,
+
+  /* Reporter to use - use blob reporter for sharded runs */
+  reporter: process.env.CI
+    ? [
+        ['./e2e/utils/process-diagnostics-reporter.ts'],
+        ['list'],
+        ['blob', { outputDir: 'blob-report' }],
+        ['html', { open: 'never' }],
+      ]
+    : [['html', { open: 'never' }], ['list']],
+
+  /* Output directory for test artifacts */
+  outputDir: 'test-results',
+
+  /* Shared settings for all the projects below */
+  use: {
+    /* Base URL to use in actions like `await page.goto('/')` */
+    baseURL: process.env.E2E_BASE_URL || 'http://localhost:3000',
+
+    /* Collect trace for failed CI runs without requiring retries. */
+    trace: process.env.CI ? 'retain-on-failure' : 'on-first-retry',
+
+    /* Capture screenshot only on failure */
+    screenshot: 'only-on-failure',
+
+    /* Disable video recording for speed (enable only when debugging) */
+    video: 'off',
+
+    /* Test ID attribute for locators */
+    testIdAttribute: 'data-testid',
+
+    /* Viewport size */
+    viewport: { width: 1280, height: 720 },
+
+    /* Action timeout - keep at 15s for API calls that may take longer */
+    actionTimeout: 15000,
+
+    /* Navigation timeout */
+    navigationTimeout: 30000,
+  },
+
+  /* Configure projects for major browsers */
+  projects: [
+    /* Setup project - runs once to authenticate */
+    {
+      name: 'setup',
+      testMatch: /global-setup\.ts/,
+      teardown: 'cleanup',
+    },
+    {
+      name: 'cleanup',
+      testMatch: /global-teardown\.ts/,
+    },
+    {
+      name: 'chromium',
+      testIgnore: [
+        /api\/.*\.spec\.ts/,
+        EXECUTOR_REGRESSION_SPEC, // Run executor-heavy coverage in a dedicated CI job.
+        PROVIDER_NATIVE_CHAT_SPEC, // Shared provider configuration requires serial execution.
+      ],
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: './e2e/.auth/user.json',
+      },
+      dependencies: ['setup'],
+    },
+    /* API tests - no browser needed, but setup provisions isolated E2E users */
+    {
+      name: 'api',
+      testMatch: /api\/.*\.spec\.ts/,
+      use: {
+        // API tests don't need a browser
+        baseURL: process.env.E2E_API_URL || 'http://localhost:8000',
+      },
+      dependencies: ['setup'],
+    },
+    {
+      name: 'provider-native-chromium',
+      testMatch: PROVIDER_NATIVE_CHAT_SPEC,
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: './e2e/.auth/user.json',
+      },
+      dependencies: ['setup'],
+    },
+    {
+      name: 'executor-chromium',
+      testMatch: EXECUTOR_REGRESSION_SPEC,
+      // Executor regression specs share administrator DingTalk configuration and
+      // the provider mock's global MCP call state, so files must not overlap.
+      workers: 1,
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: './e2e/.auth/user.json',
+      },
+      dependencies: ['setup'],
+    },
+    /* Performance tests */
+    {
+      name: 'performance',
+      testMatch: /performance\/.*\.spec\.ts/,
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: './e2e/.auth/user.json',
+      },
+      dependencies: ['setup'],
+    },
+    /* Visual regression tests */
+    {
+      name: 'visual',
+      testMatch: /visual\/.*\.spec\.ts/,
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: './e2e/.auth/user.json',
+      },
+      dependencies: ['setup'],
+    },
+  ],
+
+  /* Test timeout - keep at 60s for complex tests */
+  timeout: 60000,
+
+  /* Timeout for each expect assertion */
+  expect: {
+    timeout: 10000,
+    /* Visual comparison options */
+    toHaveScreenshot: {
+      maxDiffPixels: 100,
+      threshold: 0.2,
+    },
+    toMatchSnapshot: {
+      maxDiffPixelRatio: 0.1,
+    },
+  },
+
+  /* Snapshot path template */
+  snapshotPathTemplate: '{testDir}/__snapshots__/{testFilePath}/{arg}{ext}',
+
+  /* Run local dev server before starting the tests (optional for CI) */
+  // webServer: {
+  //   command: 'pnpm run dev',
+  //   url: 'http://localhost:3000',
+  //   reuseExistingServer: !process.env.CI,
+  // },
+})

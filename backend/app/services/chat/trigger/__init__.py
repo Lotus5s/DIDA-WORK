@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Chat Trigger - AI Response Triggering.
+
+This module is responsible for triggering AI responses:
+- Extract data from ORM objects
+- Start background streaming tasks
+- Prepare ChatEvent and send to Chat Shell
+
+This is Backend's responsibility, not Chat Shell's.
+
+Note: Tool preparation functions have been moved to their appropriate locations:
+- Knowledge base tools: app.chat_shell.tools.knowledge_factory
+- Skill tools: app.chat_shell.tools.skill_factory
+- Attachment processing: app.services.chat.preprocessing
+
+The main entry point is trigger_ai_response_unified which uses ExecutionDispatcher
+to automatically select the communication mode based on shell_type.
+"""
+
+from .group_chat import (
+    is_task_group_chat,
+    notify_group_members_task_updated,
+    should_trigger_ai_response,
+)
+from .lifecycle import (
+    collect_completed_result,
+    persist_completed_result,
+    prepare_execution_session,
+)
+from .unified import trigger_ai_response_unified
+
+__all__ = [
+    # Core
+    "trigger_ai_response_unified",
+    "prepare_execution_session",
+    "collect_completed_result",
+    "persist_completed_result",
+    # Group chat
+    "should_trigger_ai_response",
+    "notify_group_members_task_updated",
+    "is_task_group_chat",
+]

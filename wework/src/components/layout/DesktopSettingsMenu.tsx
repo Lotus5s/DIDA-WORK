@@ -1,0 +1,538 @@
+import { formatAppUpdateProgress } from '@/features/app-update/app-update-progress-copy'
+import {
+  ChevronDown,
+  Download,
+  Gauge,
+  Info,
+  KeyRound,
+  Loader2,
+  LogIn,
+  LogOut,
+  Settings,
+  TriangleAlert,
+} from 'lucide-react'
+import { useEffect, useState } from 'react'
+import type { ReactNode } from 'react'
+import {
+  emptyCodexUsageDisplay,
+  formatCodexUsageResetTime,
+  getLocalCodexUsageDisplay,
+  type CodexUsageDisplay,
+  type CodexUsageWindowDisplay,
+} from '@/api/local/codexUsage'
+import {
+  emptyWegentUsageDisplay,
+  getWegentUsageDisplay,
+  type WegentUsageDisplay,
+} from '@/api/wegentUsage'
+import { KeyboardShortcut } from '@/components/common/KeyboardShortcut'
+import { useOptionalAppUpdate } from '@/features/app-update/app-update-context'
+import { useLocalCodexSubscriptionEnabled } from '@/features/app-preferences/useLocalCodexSubscriptionEnabled'
+import {
+  calculateAppUpdateDownloadPercent,
+  formatAppUpdateVersion,
+} from '@/features/app-update/app-update-format'
+import { AppUpdateErrorDetailsDialog } from '@/features/app-update/AppUpdateErrorDetailsDialog'
+import type { AppUpdateError } from '@/features/app-update/app-update-error'
+import { formatAppUpdateErrorSummary } from '@/features/app-update/app-update-error-copy'
+import { useOptionalCloudConnection } from '@/features/cloud-connection/useCloudConnection'
+import { useTranslation } from '@/hooks/useTranslation'
+import { isLocalFirstAppRuntime } from '@/lib/runtime-mode'
+import type { User as UserProfile } from '@/types/api'
+
+function UpdateDownloadProgressIcon({ progress }: { progress: number }) {
+  return (
+    <span
+      data-testid="app-update-download-icon-progress"
+      aria-label={`${progress}%`}
+      className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full"
+      style={{
+        background: `conic-gradient(rgb(var(--color-primary)) ${progress}%, rgb(var(--color-border)) 0)`,
+      }}
+    >
+      <span className="h-2 w-2 rounded-full bg-popover" />
+    </span>
+  )
+}
+
+interface DesktopSettingsMenuProps {
+  user: UserProfile | null
+  onOpenSettings: () => void
+  onOpenAbout: () => void
+  onLogout: () => void
+  onLogin?: () => void
+  onSwitchDidaKey?: () => void
+  onSignOutDida?: () => void
+  showLogout?: boolean
+  placement?: 'above' | 'below-right'
+}
+
+export function DesktopSettingsMenu({
+  onOpenSettings,
+  onOpenAbout,
+  onLogout,
+  onLogin,
+  onSwitchDidaKey,
+  onSignOutDida,
+  showLogout,
+  placement = 'above',
+}: DesktopSettingsMenuProps) {
+  const { t } = useTranslation('common')
+  const shouldShowLogout = showLogout ?? !isLocalFirstAppRuntime()
+  const cloudConnection = useOptionalCloudConnection()
+  const { enabled: codexSubscriptionEnabled } = useLocalCodexSubscriptionEnabled()
+  const [isCodexUsageExpanded, setIsCodexUsageExpanded] = useState(false)
+  const [isWegentUsageExpanded, setIsWegentUsageExpanded] = useState(false)
+  const [codexUsage, setCodexUsage] = useState<CodexUsageDisplay>(() => emptyCodexUsageDisplay())
+  const [wegentUsage, setWegentUsage] = useState<WegentUsageDisplay>(() =>
+    emptyWegentUsageDisplay()
+  )
+  const [codexQuotaLoading, setCodexQuotaLoading] = useState(false)
+  const [wegentQuotaLoading, setWegentQuotaLoading] = useState(false)
+  const [codexQuotaError, setCodexQuotaError] = useState<string | null>(null)
+  const [wegentQuotaError, setWegentQuotaError] = useState<string | null>(null)
+  const [selectedUpdateError, setSelectedUpdateError] = useState<AppUpdateError | null>(null)
+  const appUpdate = useOptionalAppUpdate()
+  const availableUpdate = appUpdate?.availableUpdate ?? null
+  const updateStatus = appUpdate?.status ?? 'idle'
+  const downloadProgress = appUpdate?.downloadProgress ?? null
+  const updateError = appUpdate?.error ?? null
+  const updateErrorSummary = updateError ? formatAppUpdateErrorSummary(updateError, t) : null
+  const checkNow = appUpdate?.checkNow
+  const installUpdate = appUpdate?.installUpdate
+
+  const loadCodexUsage = () => {
+    if (codexQuotaLoading) {
+      return
+    }
+
+    setCodexQuotaLoading(true)
+    setCodexQuotaError(null)
+    getLocalCodexUsageDisplay()
+      .then(data => {
+        setCodexUsage(data)
+      })
+      .catch(() => {
+        setCodexQuotaError(t('workbench.quota_load_failed', '额度信息获取失败'))
+      })
+      .finally(() => {
+        setCodexQuotaLoading(false)
+      })
+  }
+
+  const loadWegentUsage = () => {
+    if (wegentQuotaLoading) {
+      return
+    }
+
+    setWegentQuotaLoading(true)
+    setWegentQuotaError(null)
+    getWegentUsageDisplay(cloudConnection)
+      .then(data => {
+        setWegentUsage(data)
+      })
+      .catch(() => {
+        setWegentQuotaError(t('workbench.quota_load_failed', '额度信息获取失败'))
+      })
+      .finally(() => {
+        setWegentQuotaLoading(false)
+      })
+  }
+
+  const handleCodexUsageClick = () => {
+    const shouldExpand = !isCodexUsageExpanded
+    setIsCodexUsageExpanded(shouldExpand)
+
+    if (shouldExpand) {
+      loadCodexUsage()
+    }
+  }
+
+  const handleWegentUsageClick = () => {
+    const shouldExpand = !isWegentUsageExpanded
+    setIsWegentUsageExpanded(shouldExpand)
+
+    if (shouldExpand) {
+      loadWegentUsage()
+    }
+  }
+
+  useEffect(() => {
+    if (!cloudConnection.isConnected) return
+
+    let cancelled = false
+    getWegentUsageDisplay({
+      isConnected: cloudConnection.isConnected,
+      apiBaseUrl: cloudConnection.apiBaseUrl,
+      token: cloudConnection.token,
+    })
+      .then(data => {
+        if (!cancelled) setWegentUsage(data)
+      })
+      .catch(() => undefined)
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    cloudConnection.apiBaseUrl,
+    cloudConnection.isConnected,
+    cloudConnection.serviceKey,
+    cloudConnection.token,
+  ])
+
+  const handleUpdateClick = async () => {
+    if (availableUpdate && installUpdate) {
+      await installUpdate()
+      return
+    }
+
+    await checkNow?.()
+  }
+
+  const updateButtonLabel = availableUpdate
+    ? formatAppUpdateVersion(
+        t('workbench.app_update_install', {
+          defaultValue: '更新到 {{version}}',
+          version: availableUpdate.version,
+        }),
+        availableUpdate.version
+      )
+    : t('workbench.app_update_check', { defaultValue: '检查更新' })
+  const isUpdateBusy =
+    updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing'
+  const downloadPercent = downloadProgress
+    ? calculateAppUpdateDownloadPercent(
+        downloadProgress.downloadedBytes,
+        downloadProgress.totalBytes
+      )
+    : null
+  const updateMessage =
+    updateStatus === 'downloading' || updateStatus === 'installing'
+      ? null
+      : availableUpdate
+        ? formatAppUpdateVersion(
+            t('workbench.app_update_available', {
+              defaultValue: '发现新版本 {{version}}',
+              version: availableUpdate.version,
+            }),
+            availableUpdate.version
+          )
+        : updateStatus === 'upToDate'
+          ? t('workbench.app_update_up_to_date', {
+              defaultValue: '已是最新版本',
+            })
+          : null
+  const downloadMessage =
+    updateStatus === 'downloading' ? formatAppUpdateProgress(downloadProgress, t) : null
+
+  return (
+    <div
+      data-testid="settings-menu"
+      className={
+        placement === 'below-right'
+          ? 'absolute right-0 top-9 z-30 w-72 overflow-hidden rounded-xl border border-border/70 bg-popover/95 p-1 text-text-primary shadow-[0_8px_16px_-4px_rgba(0,0,0,0.18)] ring-1 ring-border/30 backdrop-blur-xl'
+          : 'absolute bottom-[72px] left-1.5 right-1.5 z-30 overflow-hidden rounded-xl border border-border/70 bg-popover/95 p-1 text-text-primary shadow-[0_8px_16px_-4px_rgba(0,0,0,0.18)] ring-1 ring-border/30 backdrop-blur-xl'
+      }
+    >
+      {onLogin ? (
+        <>
+          <SettingsMenuItem
+            testId="login-menu-button"
+            icon={<LogIn className="h-4 w-4 shrink-0 text-text-secondary" />}
+            label={t('workbench.account_cloud_login', '登录 Wegent')}
+            description={t('workbench.account_cloud_login_description', '连接云端模型、设备和同步')}
+            onClick={onLogin}
+          />
+          <div className="mx-2 my-1 border-t border-border/70" />
+        </>
+      ) : null}
+      <SettingsMenuItem
+        testId="settings-menu-button"
+        icon={<Settings className="h-4 w-4 shrink-0 text-text-secondary" />}
+        label={t('workbench.settings', '设置')}
+        shortcut="Command+,"
+        onClick={onOpenSettings}
+      />
+      <SettingsMenuItem
+        testId="check-app-update-button"
+        icon={
+          updateStatus === 'downloading' && downloadPercent !== null ? (
+            <UpdateDownloadProgressIcon progress={downloadPercent} />
+          ) : isUpdateBusy ? (
+            <Loader2 className="h-4 w-4 shrink-0 animate-spin text-text-secondary" />
+          ) : (
+            <Download className="h-4 w-4 shrink-0 text-text-secondary" />
+          )
+        }
+        label={updateButtonLabel}
+        onClick={handleUpdateClick}
+        disabled={isUpdateBusy}
+        active={Boolean(updateError)}
+      />
+      {downloadMessage ? (
+        <div
+          data-testid="app-update-download-progress"
+          className="space-y-1.5 pb-2 pl-8 pr-3 text-xs font-medium leading-[18px] text-text-secondary"
+        >
+          <div className="h-1 overflow-hidden rounded-full bg-muted">
+            <div
+              className={
+                downloadPercent === null
+                  ? 'h-full w-1/3 animate-pulse rounded-full bg-primary'
+                  : 'h-full rounded-full bg-primary transition-[width] duration-200'
+              }
+              style={downloadPercent === null ? undefined : { width: `${downloadPercent}%` }}
+            />
+          </div>
+          <span>{downloadMessage}</span>
+        </div>
+      ) : null}
+      {updateMessage || updateErrorSummary ? (
+        <div
+          data-testid="app-update-status"
+          role={updateErrorSummary ? 'status' : undefined}
+          className="pb-2 pl-8 pr-3 text-xs font-medium leading-[18px] text-text-secondary"
+        >
+          {updateError && updateErrorSummary ? (
+            <div className="flex items-start gap-2">
+              <TriangleAlert
+                className="mt-0.5 h-3.5 w-3.5 shrink-0 text-orange-600 dark:text-orange-400"
+                aria-hidden="true"
+              />
+              <span className="min-w-0 flex-1">{updateErrorSummary}</span>
+              <button
+                type="button"
+                data-testid="app-update-error-details-button"
+                onClick={() => setSelectedUpdateError(updateError)}
+                className="shrink-0 rounded-sm text-blue-600 underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 dark:text-blue-300"
+              >
+                {t('workbench.app_update_error_details', '查看错误详情')}
+              </button>
+            </div>
+          ) : (
+            updateMessage
+          )}
+        </div>
+      ) : null}
+      {onSwitchDidaKey ? (
+        <SettingsMenuItem
+          testId="dida-key-menu-button"
+          icon={<KeyRound className="h-4 w-4 shrink-0 text-text-secondary" />}
+          label={t('workbench.dida_switch_api_key', '切换 DIDA API Key')}
+          onClick={onSwitchDidaKey}
+        />
+      ) : null}
+      {onSignOutDida ? (
+        <SettingsMenuItem
+          testId="dida-sign-out-menu-button"
+          icon={<LogOut className="h-4 w-4 shrink-0 text-text-secondary" />}
+          label={t('workbench.dida_sign_out', '退出 DIDA 账号')}
+          onClick={onSignOutDida}
+        />
+      ) : null}
+      <SettingsMenuItem
+        testId="about-menu-button"
+        icon={<Info className="h-4 w-4 shrink-0 text-text-secondary" />}
+        label={t('workbench.settings_nav_about', '关于')}
+        onClick={onOpenAbout}
+      />
+      <div className="mx-2 my-1 border-t border-border/70" />
+      {codexSubscriptionEnabled ? (
+        <SettingsMenuItem
+          testId="usage-menu-button"
+          icon={<Gauge className="h-4 w-4 shrink-0 text-text-secondary" />}
+          label={t('workbench.remaining_usage', 'Codex 剩余额度')}
+          onClick={handleCodexUsageClick}
+          ariaExpanded={isCodexUsageExpanded}
+          ariaControls="codex-remaining-usage-panel"
+          trailing={
+            <ChevronDown
+              className={`h-4 w-4 shrink-0 text-text-secondary transition-transform ${
+                isCodexUsageExpanded ? 'rotate-180' : ''
+              }`}
+            />
+          }
+        />
+      ) : null}
+      {codexSubscriptionEnabled && isCodexUsageExpanded ? (
+        <div
+          id="codex-remaining-usage-panel"
+          data-testid="usage-detail-panel"
+          className="pb-2 pl-8 pr-3 pt-1"
+        >
+          {codexQuotaLoading ? (
+            <div className="py-1 text-sm leading-[18px] text-text-secondary">
+              {t('common.loading', '加载中...')}
+            </div>
+          ) : null}
+          {codexQuotaError ? (
+            <div className="py-1 text-sm leading-[18px] text-text-secondary">{codexQuotaError}</div>
+          ) : null}
+          {!codexQuotaLoading && !codexQuotaError ? (
+            <div className="space-y-1.5 text-xs leading-5 text-text-secondary">
+              {codexUsage.fiveHour.percent !== null ? (
+                <UsageWindowRow window={codexUsage.fiveHour} />
+              ) : null}
+              <UsageWindowRow window={codexUsage.sevenDay} />
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      <SettingsMenuItem
+        testId="wegent-usage-menu-button"
+        icon={<Gauge className="h-4 w-4 shrink-0 text-text-secondary" />}
+        label={
+          wegentUsage.status === 'available'
+            ? wegentUsage.sourceText
+            : t('workbench.wegent_remaining_usage', '云端额度')
+        }
+        onClick={handleWegentUsageClick}
+        ariaExpanded={isWegentUsageExpanded}
+        ariaControls="wegent-remaining-usage-panel"
+        trailing={
+          <ChevronDown
+            className={`h-4 w-4 shrink-0 text-text-secondary transition-transform ${
+              isWegentUsageExpanded ? 'rotate-180' : ''
+            }`}
+          />
+        }
+      />
+      {isWegentUsageExpanded ? (
+        <div
+          id="wegent-remaining-usage-panel"
+          data-testid="wegent-usage-detail-panel"
+          className="pb-2 pl-8 pr-3 pt-1"
+        >
+          {wegentQuotaLoading ? (
+            <div className="py-1 text-sm leading-[18px] text-text-secondary">
+              {t('common.loading', '加载中...')}
+            </div>
+          ) : null}
+          {wegentQuotaError ? (
+            <div className="py-1 text-sm leading-[18px] text-text-secondary">
+              {wegentQuotaError}
+            </div>
+          ) : null}
+          {!wegentQuotaLoading && !wegentQuotaError ? (
+            wegentUsage.status === 'available' ? (
+              <div className="space-y-1 text-xs leading-5 text-text-secondary">
+                <div className="min-w-0">
+                  <div>{wegentUsage.sourceText}</div>
+                  <div className="break-words font-semibold text-text-primary">
+                    {wegentUsage.value}
+                  </div>
+                </div>
+                <div className="break-words text-text-muted">{wegentUsage.detail}</div>
+              </div>
+            ) : (
+              <div className="py-1 text-sm leading-[18px] text-text-secondary">
+                {cloudConnection.isConnected
+                  ? t('workbench.quota_load_failed', '额度信息获取失败')
+                  : t('workbench.account_cloud_login', '登录 Wegent')}
+              </div>
+            )
+          ) : null}
+        </div>
+      ) : null}
+      {shouldShowLogout ? (
+        <SettingsMenuItem
+          testId="logout-menu-button"
+          icon={<LogOut className="h-4 w-4 shrink-0 text-text-secondary" />}
+          label={t('workbench.logout', '退出登录')}
+          onClick={onLogout}
+        />
+      ) : null}
+      {selectedUpdateError ? (
+        <AppUpdateErrorDetailsDialog
+          key={`${selectedUpdateError.code}:${selectedUpdateError.occurredAt}`}
+          open
+          error={selectedUpdateError}
+          onClose={() => setSelectedUpdateError(null)}
+          onRetry={async () => {
+            setSelectedUpdateError(null)
+            await handleUpdateClick()
+          }}
+        />
+      ) : null}
+    </div>
+  )
+}
+
+function UsageWindowRow({ window }: { window: CodexUsageWindowDisplay }) {
+  const resetTime = formatCodexUsageResetTime(window.resetsAt)
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="min-w-0">
+        <div className="whitespace-nowrap">{window.title}</div>
+        {resetTime ? (
+          <div className="mt-0.5 whitespace-nowrap text-xs leading-4 text-text-muted">
+            {resetTime} 重置
+          </div>
+        ) : null}
+      </div>
+      <span className="shrink-0 whitespace-nowrap font-semibold text-text-primary">
+        {window.value}
+      </span>
+    </div>
+  )
+}
+
+interface SettingsMenuItemProps {
+  testId: string
+  icon: ReactNode
+  label: string
+  description?: string
+  shortcut?: string
+  trailing?: ReactNode
+  active?: boolean
+  disabled?: boolean
+  ariaExpanded?: boolean
+  ariaControls?: string
+  onClick?: () => void | Promise<void>
+}
+
+function SettingsMenuItem({
+  testId,
+  icon,
+  label,
+  description,
+  shortcut,
+  trailing,
+  active = false,
+  disabled = false,
+  ariaExpanded,
+  ariaControls,
+  onClick,
+}: SettingsMenuItemProps) {
+  return (
+    <button
+      type="button"
+      data-testid={testId}
+      onClick={onClick}
+      disabled={disabled}
+      aria-expanded={ariaExpanded}
+      aria-controls={ariaControls}
+      className={`flex w-full items-center gap-2 rounded-lg px-2 text-left text-sm font-normal leading-[18px] text-text-primary transition-colors hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60 ${
+        description ? 'min-h-12 py-2' : 'h-8'
+      } ${active ? 'bg-hover' : ''}`}
+    >
+      {icon}
+      <span className="min-w-0 flex-1">
+        <span className="block truncate">{label}</span>
+        {description ? (
+          <span className="block truncate text-xs font-normal leading-4 text-text-muted">
+            {description}
+          </span>
+        ) : null}
+      </span>
+      {shortcut ? (
+        <KeyboardShortcut
+          value={shortcut}
+          className="h-6 bg-muted px-2 text-sm text-text-secondary"
+        />
+      ) : null}
+      {trailing}
+    </button>
+  )
+}

@@ -1,0 +1,205 @@
+import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import test from 'node:test'
+import vm from 'node:vm'
+
+const packages = [
+  'conversation-export',
+  'ui-core-apps',
+  'ui-core-settings',
+  'ui-plugin-center',
+  'ui-applications',
+  'ui-automations',
+  'ui-cloud-work',
+  'ui-home-focus',
+  'ui-home-developer',
+  'ui-git',
+  'ui-outputs',
+]
+
+async function loadPlugin(packageName) {
+  const source = await readFile(new URL(`./${packageName}/client.js`, import.meta.url), 'utf8')
+  let handoff
+  const window = {
+    __ModuleLoader__: {
+      load(value) {
+        handoff = value
+      },
+    },
+  }
+  vm.runInNewContext(source, { window })
+  assert.ok(handoff)
+  return { plugin: handoff.factory(() => {}), window }
+}
+
+async function registrationsOf(packageName) {
+  const { plugin } = await loadPlugin(packageName)
+  const registrations = []
+  const injections = []
+  const ctx = {
+    slots: {
+      inject(slot, factory) {
+        injections.push(slot)
+        const result = factory()
+        if (result?.next) {
+          for (const disposer of result) assert.equal(typeof disposer, 'function')
+        }
+      },
+      register(options, component) {
+        registrations.push({ options, component })
+        return () => {}
+      },
+    },
+    wework: {
+      contributions: {
+        register(_owner, slotName, descriptor) {
+          registrations.push({
+            descriptor,
+            options: { name: slotName, id: descriptor.id },
+          })
+          return () => {}
+        },
+      },
+    },
+  }
+  plugin.apply(ctx)
+  return { injections, plugin, registrations }
+}
+
+test('all Wework UI packages are standard DSH client plugins', async () => {
+  for (const packageName of packages) {
+    const { plugin } = await loadPlugin(packageName)
+    assert.deepEqual(Array.from(plugin.inject), ['slots', 'wework'])
+    assert.equal(typeof plugin.apply, 'function')
+  }
+})
+
+test('core apps are contributed through wework.app', async () => {
+  const { injections, registrations } = await registrationsOf('ui-core-apps')
+  assert.deepEqual(injections, ['wework.app'])
+  assert.deepEqual(
+    registrations.map(entry => entry.options.id),
+    ['wework', 'todo', 'wegent']
+  )
+  assert.equal(registrations[0].descriptor.module, 'plugins/wework-ui-core-apps.js')
+  assert.equal(registrations[1].descriptor.module, 'plugins/wework-ui-core-apps.js')
+  assert.equal(registrations[2].descriptor.urlSource, 'cloud-web')
+})
+
+test('core settings are metadata-driven DSH pages', async () => {
+  const { injections, registrations } = await registrationsOf('ui-core-settings')
+  assert.deepEqual(injections, ['wework.settings.page'])
+  assert.equal(registrations.length, 18)
+  assert.equal(registrations[0].descriptor.path, '/settings')
+  assert.equal(registrations[0].descriptor.module, 'plugins/wework-ui-core-settings.js')
+  assert.equal(registrations.at(-1).descriptor.module, 'plugins/wework-ui-core-settings.js')
+  assert.equal('path' in registrations[0].options, false)
+  assert.equal('module' in registrations[0].options, false)
+})
+
+test('first-party route packages own their routes and sidebar navigation', async () => {
+  const registrations = []
+  const injections = []
+  for (const packageName of [
+    'ui-plugin-center',
+    'ui-applications',
+    'ui-automations',
+    'ui-cloud-work',
+  ]) {
+    const result = await registrationsOf(packageName)
+    registrations.push(...result.registrations)
+    injections.push(...result.injections)
+  }
+  const routes = registrations.filter(entry => entry.options.name === 'wework.route')
+  const navigation = registrations.filter(
+    entry => entry.options.name === 'wework.sidebar.navigation'
+  )
+  const actions = registrations.filter(entry => entry.options.name === 'wework.action')
+  assert.deepEqual(
+    routes.map(entry => entry.descriptor.path),
+    ['/plugins', '/plugins/create', '/plugins/manage', '/sites', '/automations', '/cloud-work']
+  )
+  assert.deepEqual(
+    navigation.map(entry => entry.descriptor.path),
+    ['/plugins', '/sites', '/automations', '/cloud-work']
+  )
+  assert.equal(injections.filter(slot => slot === 'wework.sidebar.navigation').length, 4)
+  assert.ok(actions.some(entry => entry.descriptor.id === 'plugin-center.open'))
+  assert.ok(
+    routes
+      .filter(entry => entry.descriptor.path.startsWith('/plugins'))
+      .every(entry => entry.descriptor.workspaceTabKind === 'task')
+  )
+  assert.ok(routes.every(entry => /^plugins\/wework-ui-[a-z-]+\.js$/.test(entry.descriptor.module)))
+  assert.ok(routes.every(entry => typeof entry.descriptor.icon === 'string'))
+  assert.ok(routes.every(entry => entry.descriptor.restorePolicy === 'session'))
+  assert.ok(routes.every(entry => typeof entry.descriptor.title === 'string'))
+  assert.ok(routes.every(entry => !('component' in entry.descriptor)))
+  assert.ok(registrations.every(entry => !('path' in entry.options)))
+})
+
+test('Git contributes UI only through generic positional extension points', async () => {
+  const { injections, registrations } = await registrationsOf('ui-git')
+  assert.deepEqual(injections, [
+    'wework.workspace.menu.section',
+    'wework.project.create.section',
+    'wework.project.work.section',
+    'wework.runtime-profile.workspace-policy',
+    'wework.task.status',
+    'wework.conversation.summary',
+    'wework.board.card.status',
+    'wework.settings.page',
+  ])
+  assert.equal(registrations.length, 9)
+  assert.deepEqual(
+    registrations.slice(0, 7).map(entry => entry.options.name),
+    [
+      'wework.workspace.menu.section',
+      'wework.project.create.section',
+      'wework.project.work.section',
+      'wework.runtime-profile.workspace-policy',
+      'wework.task.status',
+      'wework.conversation.summary',
+      'wework.board.card.status',
+    ]
+  )
+  assert.deepEqual(
+    registrations.slice(4, 7).map(entry => entry.options.name),
+    ['wework.task.status', 'wework.conversation.summary', 'wework.board.card.status']
+  )
+  assert.deepEqual(
+    registrations.slice(7).map(entry => entry.options.id),
+    ['git-hosting', 'worktrees']
+  )
+  assert.deepEqual(JSON.parse(JSON.stringify(registrations[5].descriptor.requiredHostServices)), [
+    'wework.environment',
+  ])
+})
+
+test('outputs contributes the non-Git conversation summary', async () => {
+  const { injections, registrations } = await registrationsOf('ui-outputs')
+  assert.deepEqual(injections, ['wework.conversation.summary'])
+  assert.equal(registrations.length, 1)
+  assert.equal(registrations[0].options.name, 'wework.conversation.summary')
+  assert.equal(
+    registrations[0].descriptor.module,
+    'plugins/wework-ui-outputs-conversation-summary.js'
+  )
+  assert.deepEqual(JSON.parse(JSON.stringify(registrations[0].descriptor.requiredHostServices)), [
+    'wework.conversation.outputs',
+  ])
+  assert.deepEqual(JSON.parse(JSON.stringify(registrations[0].descriptor.when)), {
+    key: 'workspace.isGitRepository',
+    equals: false,
+  })
+})
+
+test('workbench modes contribute mutually exclusive home implementations', async () => {
+  const focus = await registrationsOf('ui-home-focus')
+  const developer = await registrationsOf('ui-home-developer')
+
+  assert.deepEqual(focus.injections, ['wework.home'])
+  assert.deepEqual(developer.injections, ['wework.home'])
+  assert.equal(focus.registrations[0].descriptor.id, 'focus-home')
+  assert.equal(developer.registrations[0].descriptor.id, 'developer-home')
+})

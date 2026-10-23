@@ -1,0 +1,405 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * User module: encapsulates login/logout/getCurrentUser/updateUser and token management.
+ * All types and logic are self-contained for cohesion.
+ */
+
+import type {
+  GitInfo,
+  QuickLaunchPreparePresetRequest,
+  QuickLaunchPreparePresetResponse,
+  QuickAccessResponse,
+  QuickAccessTeam,
+  QuickLaunchResponse,
+  User,
+  UserPreferences,
+  DefaultTeamsResponse,
+  WelcomeConfigResponse,
+  TaskType,
+} from '@/types/api'
+import type { NotificationChannelInfo } from '@/types/subscription'
+
+// Type definitions
+export interface LoginRequest {
+  user_name: string
+  password: string
+}
+
+export interface LoginResponse {
+  access_token: string
+  token_type: string
+}
+
+export interface WeworkAuthSessionActionResponse {
+  status: string
+}
+
+export interface UpdateUserRequest {
+  user_name?: string
+  email?: string
+  is_active?: boolean
+  git_info?: GitInfo[]
+  preferences?: UserPreferences
+}
+
+export interface SearchUsersResponse {
+  users: Array<{
+    id: number
+    user_name: string
+    email?: string
+  }>
+  total: number
+}
+
+export interface RecentTeamsOptions {
+  includeFallback?: boolean
+  mode?: TaskType
+  signal?: AbortSignal
+}
+
+/**
+ * System-level feature flags from backend configuration
+ */
+export interface FeatureFlags {
+  /** Whether long-term memory service (mem0) is available */
+  memory_enabled: boolean
+}
+
+export interface McpProviderServiceConfig {
+  provider_id: string
+  service_id: string
+  server_name: string
+  detail_url: string
+  enabled: boolean
+  url: string
+  auth_mode: 'url' | 'oauth'
+  oauth_supported: boolean
+  oauth_connected: boolean
+  oauth_expires_at: number | null
+  oauth_account: string | null
+}
+
+export interface McpProviderOAuthSession {
+  session_id: string
+  poll_token: string
+  authorize_url: string
+  expires_at: number
+  poll_interval_seconds: number
+}
+
+export interface McpProviderOAuthPoll {
+  status: 'pending' | 'success' | 'declined' | 'failed'
+  error?: string | null
+  account?: string | null
+  expires_at?: number | null
+}
+
+const TOKEN_KEY = 'auth_token'
+const TOKEN_EXPIRE_KEY = 'auth_token_expire'
+const TOKEN_COOKIE_NAME = 'auth_token'
+
+function getJwtExp(token: string): number | null {
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1]))
+    return typeof payload.exp === 'number' ? payload.exp * 1000 : null // convert to milliseconds
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Set cookie for Nginx routing (user-based load balancing)
+ * Cookie is readable by Nginx to extract user_id from JWT for routing
+ */
+function setTokenCookie(token: string, expMs: number | null) {
+  if (typeof document !== 'undefined') {
+    const expires = expMs ? new Date(expMs).toUTCString() : ''
+    const cookieValue = `${TOKEN_COOKIE_NAME}=${encodeURIComponent(token)}; path=/; SameSite=Lax${expires ? `; expires=${expires}` : ''}`
+    document.cookie = cookieValue
+  }
+}
+
+function hasTokenCookie(token: string): boolean {
+  if (typeof document === 'undefined') return false
+
+  const expectedCookie = `${TOKEN_COOKIE_NAME}=${encodeURIComponent(token)}`
+  return document.cookie.split(';').some(cookie => cookie.trim() === expectedCookie)
+}
+
+/**
+ * Remove token cookie
+ */
+function removeTokenCookie() {
+  if (typeof document !== 'undefined') {
+    document.cookie = `${TOKEN_COOKIE_NAME}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT`
+  }
+}
+
+export function setToken(token: string) {
+  clearQuickAccess()
+  if (typeof window !== 'undefined') {
+    localStorage.setItem(TOKEN_KEY, token)
+    const exp = getJwtExp(token)
+    if (exp) {
+      localStorage.setItem(TOKEN_EXPIRE_KEY, String(exp))
+    } else {
+      localStorage.removeItem(TOKEN_EXPIRE_KEY)
+    }
+    // Also set cookie for Nginx routing
+    setTokenCookie(token, exp)
+  }
+}
+
+export function getToken(): string | null {
+  if (typeof window !== 'undefined') {
+    const token = localStorage.getItem(TOKEN_KEY)
+
+    // Native media requests cannot add the Authorization header used by
+    // apiClient, so restore the cookie for sessions created before cookie sync.
+    if (token && !hasTokenCookie(token)) {
+      setTokenCookie(token, getJwtExp(token))
+    }
+
+    return token
+  }
+  return null
+}
+
+export function getTokenExpire(): number | null {
+  if (typeof window !== 'undefined') {
+    const exp = localStorage.getItem(TOKEN_EXPIRE_KEY)
+    return exp ? Number(exp) : null
+  }
+  return null
+}
+
+export function removeToken() {
+  clearQuickAccess()
+  if (typeof window !== 'undefined') {
+    localStorage.removeItem(TOKEN_KEY)
+    localStorage.removeItem(TOKEN_EXPIRE_KEY)
+    // Also remove cookie for Nginx routing
+    removeTokenCookie()
+  }
+}
+
+/**
+ * Check if token exists and is not expired
+ */
+function isAuthenticated(): boolean {
+  const token = getToken()
+  const exp = getTokenExpire()
+  if (!token || !exp) return false
+  return Date.now() < exp
+}
+
+// API Client
+import { apiClient } from './client'
+import { paths } from '@/config/paths'
+
+// Share startup data across components that mount at different times.
+let quickAccessCache: {
+  token: string | null
+  request: Promise<QuickAccessResponse>
+  expiresAt: number
+} | null = null
+
+function clearQuickAccess() {
+  quickAccessCache = null
+}
+
+export const userApis = {
+  async login(data: LoginRequest): Promise<User> {
+    const res: LoginResponse = await apiClient.post('/auth/login', data)
+    setToken(res.access_token)
+    // Get user information after login
+    return await apiClient.get('/users/me')
+  },
+
+  async setupAdminPassword(password: string): Promise<User> {
+    const res: LoginResponse = await apiClient.post('/auth/admin-password/setup', { password })
+    setToken(res.access_token)
+    return await apiClient.get('/users/me')
+  },
+
+  logout() {
+    removeToken()
+    if (typeof window !== 'undefined') {
+      window.location.href = paths.home.getHref()
+    }
+  },
+
+  async getCurrentUser(): Promise<User> {
+    return apiClient.get('/users/me')
+  },
+
+  async getCurrentUserWithoutAuthRedirect(): Promise<User> {
+    return apiClient.get('/users/me', { redirectOnUnauthorized: false })
+  },
+
+  async approveWeworkAuthSession(sessionId: string): Promise<WeworkAuthSessionActionResponse> {
+    return apiClient.post(`/auth/wework/sessions/${encodeURIComponent(sessionId)}/approve`)
+  },
+
+  async declineWeworkAuthSession(sessionId: string): Promise<WeworkAuthSessionActionResponse> {
+    return apiClient.post(`/auth/wework/sessions/${encodeURIComponent(sessionId)}/decline`)
+  },
+
+  async updateUser(data: UpdateUserRequest): Promise<User> {
+    clearQuickAccess()
+    try {
+      return await apiClient.put('/users/me', data)
+    } finally {
+      clearQuickAccess()
+    }
+  },
+
+  async deleteGitToken(gitDomain: string, gitInfoId?: string): Promise<User> {
+    const params = gitInfoId ? `?git_info_id=${encodeURIComponent(gitInfoId)}` : ''
+    return apiClient.delete(`/users/me/git-token/${encodeURIComponent(gitDomain)}${params}`)
+  },
+
+  async reorderGitTokens(orderedKeys: string[]): Promise<User> {
+    return apiClient.put('/users/me/git-token-order', { ordered_keys: orderedKeys })
+  },
+
+  async getQuickAccess(): Promise<QuickAccessResponse> {
+    const token = getToken()
+    if (quickAccessCache?.token === token && quickAccessCache.expiresAt > Date.now()) {
+      return quickAccessCache.request
+    }
+
+    const request = apiClient.get<QuickAccessResponse>('/users/quick-access').then(
+      response => {
+        if (quickAccessCache?.request === request) {
+          quickAccessCache.expiresAt = Date.now() + 30_000
+        }
+        return response
+      },
+      error => {
+        if (quickAccessCache?.request === request) clearQuickAccess()
+        throw error
+      }
+    )
+    quickAccessCache = { token, request, expiresAt: Infinity }
+
+    return request
+  },
+
+  async getRecentTeams(
+    isCode = false,
+    options: RecentTeamsOptions = {}
+  ): Promise<QuickAccessTeam[]> {
+    const params = new URLSearchParams({ is_code: String(isCode) })
+    if (options.includeFallback !== undefined) {
+      params.set('include_fallback', String(options.includeFallback))
+    }
+    if (options.mode) params.set('mode', options.mode)
+    return apiClient.get(`/users/recent-teams?${params}`, { signal: options.signal })
+  },
+
+  async getQuickLaunch(): Promise<QuickLaunchResponse> {
+    return apiClient.get('/users/quick-launch')
+  },
+
+  async prepareQuickLaunchPreset(
+    data: QuickLaunchPreparePresetRequest
+  ): Promise<QuickLaunchPreparePresetResponse> {
+    return apiClient.post('/users/quick-launch/prepare-preset', data)
+  },
+
+  async getWelcomeConfig(): Promise<WelcomeConfigResponse> {
+    return apiClient.get('/users/welcome-config')
+  },
+
+  async getDefaultTeams(): Promise<DefaultTeamsResponse> {
+    return apiClient.get('/users/default-teams')
+  },
+
+  async searchUsers(query: string): Promise<SearchUsersResponse> {
+    return apiClient.get(`/users/search?q=${encodeURIComponent(query)}`)
+  },
+
+  async getUsersByIds(userIds: number[]): Promise<SearchUsersResponse> {
+    const params = new URLSearchParams()
+    userIds.forEach(userId => params.append('ids', String(userId)))
+    return apiClient.get(`/users/by-ids?${params.toString()}`)
+  },
+
+  async getMcpProviderServices(providerId: string): Promise<McpProviderServiceConfig[]> {
+    return apiClient.get(`/users/me/mcps/providers/${encodeURIComponent(providerId)}/services`)
+  },
+
+  async getMcpProviderService(
+    providerId: string,
+    serviceId: string
+  ): Promise<McpProviderServiceConfig> {
+    return apiClient.get(
+      `/users/me/mcps/providers/${encodeURIComponent(providerId)}/services/${encodeURIComponent(serviceId)}`
+    )
+  },
+
+  async updateMcpProviderService(
+    providerId: string,
+    serviceId: string,
+    data: Pick<McpProviderServiceConfig, 'enabled' | 'url' | 'auth_mode'>
+  ): Promise<McpProviderServiceConfig> {
+    return apiClient.put(
+      `/users/me/mcps/providers/${encodeURIComponent(providerId)}/services/${encodeURIComponent(serviceId)}`,
+      data
+    )
+  },
+
+  async createMcpProviderOAuthSession(
+    providerId: string,
+    serviceId: string
+  ): Promise<McpProviderOAuthSession> {
+    return apiClient.post(
+      `/users/me/mcps/providers/${encodeURIComponent(providerId)}/services/${encodeURIComponent(serviceId)}/oauth/sessions`
+    )
+  },
+
+  async pollMcpProviderOAuthSession(
+    providerId: string,
+    serviceId: string,
+    session: Pick<McpProviderOAuthSession, 'session_id' | 'poll_token'>
+  ): Promise<McpProviderOAuthPoll> {
+    const params = new URLSearchParams({ poll_token: session.poll_token })
+    return apiClient.get(
+      `/users/me/mcps/providers/${encodeURIComponent(providerId)}/services/${encodeURIComponent(serviceId)}/oauth/sessions/${encodeURIComponent(session.session_id)}/poll?${params.toString()}`
+    )
+  },
+
+  async disconnectMcpProviderOAuth(providerId: string, serviceId: string): Promise<void> {
+    return apiClient.delete(
+      `/users/me/mcps/providers/${encodeURIComponent(providerId)}/services/${encodeURIComponent(serviceId)}/oauth/connection`
+    )
+  },
+
+  /**
+   * Get system-level feature flags
+   * These flags indicate which features are available based on backend configuration
+   */
+  async getFeatureFlags(): Promise<FeatureFlags> {
+    return apiClient.get('/users/features')
+  },
+
+  /**
+   * Get available Messager channels for the current user
+   * This does not require an existing subscription
+   */
+  async getAvailableChannels(): Promise<NotificationChannelInfo[]> {
+    return apiClient.get('/users/me/available-channels')
+  },
+
+  isAuthenticated(): boolean {
+    return isAuthenticated()
+  },
+}
+
+export async function loginWithOidcToken(accessToken: string): Promise<void> {
+  setToken(accessToken)
+}

@@ -1,0 +1,170 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { useState, useEffect } from 'react'
+import { ChevronDown, ChevronRight } from 'lucide-react'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { useTranslation } from '@/hooks/useTranslation'
+import { updateDocument } from '@/apis/knowledge'
+import {
+  DEFAULT_FLAT_CHUNK_CONFIG,
+  DEFAULT_SPLITTER_CONFIG,
+  normalizeSplitterConfigForDisplay,
+  type KnowledgeDocument,
+  type SplitterConfig,
+} from '@/types/knowledge'
+import { SplitterSettingsSection } from './SplitterSettingsSection'
+
+function buildDefaultSplitterConfig(): Partial<SplitterConfig> {
+  return {
+    ...DEFAULT_SPLITTER_CONFIG,
+    flat_config: {
+      ...DEFAULT_FLAT_CHUNK_CONFIG,
+    },
+  }
+}
+
+interface EditDocumentDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  document: KnowledgeDocument | null
+  onSuccess: () => void
+}
+
+export function EditDocumentDialog({
+  open,
+  onOpenChange,
+  document,
+  onSuccess,
+}: EditDocumentDialogProps) {
+  const { t } = useTranslation()
+  const [name, setName] = useState('')
+  const [splitterConfig, setSplitterConfig] = useState<Partial<SplitterConfig>>(
+    buildDefaultSplitterConfig
+  )
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [showAdvanced, setShowAdvanced] = useState(false)
+
+  // Reset form when document changes
+  // Reset form when document changes
+  useEffect(() => {
+    if (document) {
+      setName(document.name)
+      setSplitterConfig(normalizeSplitterConfigForDisplay(document.splitter_config))
+      setError('')
+      setShowAdvanced(false) // Reset to collapsed state
+    } else {
+      setSplitterConfig(buildDefaultSplitterConfig())
+    }
+  }, [document])
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+
+    if (!document) return
+
+    const trimmedName = name.trim()
+    if (!trimmedName) {
+      setError(t('knowledge:document.document.nameRequired'))
+      return
+    }
+
+    setLoading(true)
+    setError('')
+
+    try {
+      // Only update name, splitter_config is read-only
+      await updateDocument(document.id, {
+        name: trimmedName,
+      })
+      onSuccess()
+    } catch (err) {
+      setError(t('knowledge:document.document.updateFailed'))
+      console.error('Failed to update document:', err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>{t('knowledge:document.document.edit')}</DialogTitle>
+        </DialogHeader>
+        <form onSubmit={handleSubmit}>
+          <div className="py-4 space-y-6">
+            {/* Document Name */}
+            <div>
+              <label className="block text-sm font-medium text-text-primary mb-1.5">
+                {t('knowledge:document.document.columns.name')}
+              </label>
+              <input
+                type="text"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                className="w-full h-9 px-3 text-sm bg-surface border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary"
+                placeholder={t('knowledge:document.document.namePlaceholder')}
+                autoFocus
+              />
+            </div>
+
+            {/* Advanced Settings - Splitter Configuration (Collapsible, Read-only) */}
+            <div className="border-t border-border pt-4">
+              <button
+                type="button"
+                onClick={() => setShowAdvanced(!showAdvanced)}
+                className="flex items-center gap-2 text-sm font-medium text-text-primary hover:text-primary transition-colors w-full"
+              >
+                {showAdvanced ? (
+                  <ChevronDown className="w-4 h-4" />
+                ) : (
+                  <ChevronRight className="w-4 h-4" />
+                )}
+                {t('knowledge:document.splitter.title')}
+                <span className="text-xs text-text-muted font-normal ml-auto">
+                  {t('knowledge:document.advancedSettings.readOnly')}
+                </span>
+              </button>
+
+              {showAdvanced && (
+                <div className="mt-4">
+                  <SplitterSettingsSection
+                    config={splitterConfig}
+                    onChange={() => {}} // No-op since it's read-only
+                    readOnly={true}
+                  />
+                </div>
+              )}
+            </div>
+
+            {error && <p className="text-xs text-error">{error}</p>}
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={loading}
+            >
+              {t('common:actions.cancel')}
+            </Button>
+            <Button type="submit" variant="primary" disabled={loading || !name.trim()}>
+              {loading ? t('common:actions.saving') : t('common:actions.save')}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}

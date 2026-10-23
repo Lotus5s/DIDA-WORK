@@ -1,0 +1,1600 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Kubernetes-style API schemas for cloud-native agent management
+"""
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Literal, Mapping, Optional
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
+
+from app.schemas.external_knowledge import ExternalKnowledgeRef
+from app.schemas.quick_launch import QuickPhraseMixin
+from app.utils.workspace_archive_time import normalize_workspace_archive_datetime
+from shared.utils.decision_model import validate_decision_model_spec
+from shared.utils.model_category import resolve_model_category
+
+
+# API Format Enum for OpenAI-compatible models
+class ApiFormat(str, Enum):
+    """
+    API format for OpenAI-compatible models.
+
+    - CHAT_COMPLETIONS: Traditional /v1/chat/completions API (default)
+    - RESPONSES: New /v1/responses API (recommended for agent scenarios)
+    """
+
+    CHAT_COMPLETIONS = "chat/completions"
+    RESPONSES = "responses"
+
+
+# Model Category Type Enum (different from resource type public/user/group)
+class ModelCategoryType(str, Enum):
+    """
+    Model category type enumeration for distinguishing model capabilities.
+
+    - LLM: Large Language Models for chat/code (default, backward compatible)
+    - TTS: Text-to-Speech models
+    - STT: Speech-to-Text models
+    - EMBEDDING: Vector embedding models
+    - RERANK: Reranking models
+    - VIDEO: Video generation models
+    - IMAGE: Image generation models
+    """
+
+    LLM = "llm"
+    TTS = "tts"
+    STT = "stt"
+    EMBEDDING = "embedding"
+    RERANK = "rerank"
+    VIDEO = "video"
+    IMAGE = "image"
+    DECISION = "decision"
+
+
+# Type-specific configurations
+class TTSConfig(BaseModel):
+    """TTS-specific configuration"""
+
+    model_config = ConfigDict(extra="allow", hide_input_in_errors=True)
+
+    voice: Optional[str] = Field(
+        None, description="Voice ID (e.g., 'alloy', 'echo' for OpenAI)"
+    )
+    speed: Optional[float] = Field(
+        1.0, ge=0.25, le=4.0, description="Speech speed (0.25-4.0)"
+    )
+    output_format: Optional[str] = Field("mp3", description="Output format (mp3, wav)")
+
+
+from app.schemas.runner_routing import ExecutionPolicy, ModelPolicy, RunnerSelection
+
+
+class STTConfig(BaseModel):
+    """STT-specific configuration"""
+
+    model_config = ConfigDict(extra="allow")
+
+    language: Optional[str] = Field(
+        None, description="Language code (e.g., 'en', 'zh')"
+    )
+    transcription_format: Optional[str] = Field(
+        "text", description="Response format (text, srt, vtt)"
+    )
+
+
+class EmbeddingConfig(BaseModel):
+    """Embedding-specific configuration"""
+
+    model_config = ConfigDict(extra="allow")
+
+    dimensions: Optional[int] = Field(
+        None, description="Output dimensions (e.g., 1536)"
+    )
+    encoding_format: Optional[str] = Field(
+        "float", description="Encoding format (float, base64)"
+    )
+    additional_input_modalities: Optional[List[str]] = Field(
+        None,
+        description="Additional supported input modalities beyond the implicit "
+        "text default (e.g., ['image']). Do not include 'text' in this list.",
+    )
+
+
+class RerankConfig(BaseModel):
+    """Rerank-specific configuration"""
+
+    model_config = ConfigDict(extra="allow")
+
+    top_n: Optional[int] = Field(None, description="Number of top results to return")
+    return_documents: Optional[bool] = Field(
+        True, description="Whether to return document texts"
+    )
+
+
+class ModelCapabilities(BaseModel):
+    """Declared multimodal capabilities for LLM-style models.
+
+    Consumed by both the chat attachment pipeline (media understanding) and the
+    knowledge-base multimodal analysis selector. The knowledge multimodal
+    capability gate treats a ``supportsVideo=true`` Gemini model as also
+    covering image analysis (no separate ``supportsImage`` toggle on such
+    models).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    supportsImage: Optional[bool] = Field(
+        None,
+        description="Whether the model supports image understanding in chat attachments.",
+    )
+    supportsVideo: Optional[bool] = Field(
+        None,
+        description="Whether the model supports video understanding in chat attachments.",
+    )
+
+
+# Import generation configs from separate module
+from .generation import ImageGenerationConfig, VideoGenerationConfig
+
+
+class ObjectMeta(BaseModel):
+    """Standard Kubernetes object metadata"""
+
+    name: str
+    namespace: str = "default"
+    displayName: Optional[str] = None  # Human-readable display name
+    labels: Optional[Dict[str, str]] = None
+    # annotations: Optional[Dict[str, str]] = None
+
+
+class Status(BaseModel):
+    """Standard status object"""
+
+    state: str
+    message: Optional[str] = None
+    # conditions: Optional[List[Dict[str, Any]]] = None
+
+
+# Skill reference metadata for precise skill identification
+class SkillRefMeta(BaseModel):
+    """Skill reference metadata for precise skill identification.
+
+    Used in Ghost.spec.skill_refs to avoid ambiguity when multiple skills
+    have the same name in different namespaces.
+    """
+
+    skill_id: int = Field(..., description="Unique skill ID (Kind.id)")
+    namespace: str = Field("default", description="Skill namespace")
+    is_public: bool = Field(False, description="Whether this is a public skill")
+    content_hash: Optional[str] = Field(
+        None,
+        description="SHA256 content hash of the skill ZIP package, prefixed with sha256:",
+    )
+
+
+class KnowledgeBaseDefaultRef(BaseModel):
+    """Knowledge base binding used for Ghost-level defaults."""
+
+    id: int
+    name: str
+
+
+class BaseGhostRef(BaseModel):
+    """Reference to a system Ghost used as the capability baseline."""
+
+    name: str
+    namespace: str = "default"
+    user_id: int = 0
+
+
+# Ghost CRD schemas
+class GhostSpec(BaseModel):
+    """Ghost specification"""
+
+    systemPrompt: str
+    baseGhostRef: Optional[BaseGhostRef] = None
+    mcpServers: Optional[Dict[str, Any]] = None
+    plugins: Optional[List[Dict[str, Any]]] = None
+    defaultKnowledgeBaseRefs: Optional[List[KnowledgeBaseDefaultRef]] = None
+    skills: Optional[List[str]] = None  # Skill names list
+    preload_skills: Optional[List[str]] = Field(
+        None,
+        description="List of skill names to preload into system prompt. "
+        "Must be a subset of skills. When specified, these skills' prompts "
+        "will be automatically injected into the system message.",
+    )
+    skill_refs: Optional[Dict[str, SkillRefMeta]] = Field(
+        None,
+        description="Mapping from skill name to skill metadata for precise identification. "
+        "Used to avoid ambiguity when multiple skills have the same name. "
+        "Keys must match the skills list. "
+        "Example: {'excel-helper': {'skill_id': 101, 'namespace': 'default', 'is_public': false}}",
+    )
+    preload_skill_refs: Optional[Dict[str, SkillRefMeta]] = Field(
+        None,
+        description="Mapping from preload skill name to skill metadata. "
+        "Keys must match the preload_skills list. "
+        "Used for precise skill identification during preloading.",
+    )
+
+
+class GhostStatus(Status):
+    """Ghost status"""
+
+    state: str = "Available"  # Available, Unavailable
+
+
+class Ghost(BaseModel):
+    """Ghost CRD"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "Ghost"
+    metadata: ObjectMeta
+    spec: GhostSpec
+    status: Optional[GhostStatus] = None
+
+
+class GhostList(BaseModel):
+    """Ghost list"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "GhostList"
+    items: List[Ghost]
+
+
+# Model CRD schemas
+_UNSAFE_MODEL_SPEC_KEYS = frozenset({"__proto__", "constructor", "prototype"})
+
+
+def _unsafe_model_spec_paths(value: Any, path: str = "spec") -> List[str]:
+    """Return unsafe key paths without exposing configuration values."""
+    if isinstance(value, dict):
+        paths: List[str] = []
+        for key, nested_value in value.items():
+            key_path = f"{path}.{key}"
+            if key in _UNSAFE_MODEL_SPEC_KEYS:
+                paths.append(key_path)
+            paths.extend(_unsafe_model_spec_paths(nested_value, key_path))
+        return paths
+    if isinstance(value, list):
+        paths = []
+        for index, nested_value in enumerate(value):
+            paths.extend(_unsafe_model_spec_paths(nested_value, f"{path}[{index}]"))
+        return paths
+    return []
+
+
+class ModelSpec(BaseModel):
+    """Model specification"""
+
+    model_config = ConfigDict(extra="allow", hide_input_in_errors=True)
+
+    @model_validator(mode="after")
+    def _validate_decision_model(self) -> "ModelSpec":
+        validate_decision_model_spec(self.model_dump(mode="json"))
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_unsafe_keys(cls, value: Any) -> Any:
+        unsafe_paths = _unsafe_model_spec_paths(value)
+        if unsafe_paths:
+            raise ValueError(
+                "Model spec contains unsafe key names: " + ", ".join(unsafe_paths)
+            )
+        return value
+
+    modelConfig: Dict[str, Any]
+    isCustomConfig: Optional[bool] = (
+        None  # True if user customized the config, False/None if using predefined model
+    )
+    protocol: Optional[str] = (
+        None  # Model protocol type: 'openai', 'claude', etc. Required for custom configs
+    )
+
+    # API format for OpenAI-compatible models
+    apiFormat: Optional[ApiFormat] = Field(
+        None,
+        description="API format for OpenAI-compatible models. "
+        "'chat/completions' for traditional API (default), "
+        "'responses' for new Responses API (recommended for agent scenarios). "
+        "Only applies when protocol is 'openai'.",
+    )
+
+    costIndex: Optional[str] = Field(
+        None,
+        coerce_numbers_to_str=True,
+        description="Relative model usage cost. A value of 1 represents the baseline cost.",
+    )
+    capability: Optional[str | Dict[str, Any]] = Field(
+        None,
+        description="Human-readable model summary, or publication metadata with "
+        "the summary in its description field.",
+    )
+
+    # Legacy top-level token limits. New configurations should use the
+    # snake_case fields in modelConfig.
+    contextWindow: Optional[int] = Field(
+        None,
+        description="Legacy maximum context window size in tokens.",
+    )
+    maxOutputTokens: Optional[int] = Field(
+        None,
+        description="Legacy maximum output tokens per response.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _adopt_legacy_model_type(cls, data: Any) -> Any:
+        """Adopt a nested ``modelConfig.modelType`` when the field is absent.
+
+        Legacy payloads put the category inside ``modelConfig``. Without this,
+        the ``llm`` default hides the nested category from every consumer that
+        reads the parsed resource.
+        """
+        if not isinstance(data, Mapping) or data.get("modelType") is not None:
+            return data
+        model_config = data.get("modelConfig") or {}
+        if (
+            isinstance(model_config, Mapping)
+            and model_config.get("modelType") is not None
+        ):
+            return {**data, "modelType": model_config["modelType"]}
+        return data
+
+    @staticmethod
+    def _model_config_token_limit(value: Any) -> Optional[int]:
+        """Return a numeric token limit from the runtime model config."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
+    @field_validator("contextWindow", "maxOutputTokens", mode="before")
+    @classmethod
+    def _normalize_legacy_token_limit(cls, value: Any) -> Optional[int]:
+        """Normalize legacy token limits without Pydantic type coercion."""
+        return cls._model_config_token_limit(value)
+
+    @property
+    def context_window(self) -> Optional[int]:
+        """Return the context window, preferring the runtime model config."""
+        if "context_window" in self.modelConfig:
+            return self._model_config_token_limit(
+                self.modelConfig.get("context_window")
+            )
+        return self._model_config_token_limit(self.contextWindow)
+
+    @property
+    def max_output_tokens(self) -> Optional[int]:
+        """Return the output limit, preferring the runtime model config."""
+        if "max_output_tokens" in self.modelConfig:
+            return self._model_config_token_limit(
+                self.modelConfig.get("max_output_tokens")
+            )
+        return self._model_config_token_limit(self.maxOutputTokens)
+
+    # New fields for multi-type model support
+    modelType: Optional[ModelCategoryType] = Field(
+        ModelCategoryType.LLM,
+        description="Model category type (llm, tts, stt, embedding, rerank). "
+        "Defaults to 'llm' for backward compatibility, unless the payload nests "
+        "the category in modelConfig.modelType.",
+    )
+    modelGroup: Optional[str] = Field(
+        None,
+        description="Primary user-defined group used when displaying model selectors.",
+    )
+    modelSubGroup: Optional[str] = Field(
+        None,
+        description="Secondary user-defined group used within the primary model group.",
+    )
+    ttsConfig: Optional[TTSConfig] = Field(
+        None, description="TTS-specific configuration (when modelType='tts')"
+    )
+    sttConfig: Optional[STTConfig] = Field(
+        None, description="STT-specific configuration (when modelType='stt')"
+    )
+    embeddingConfig: Optional[EmbeddingConfig] = Field(
+        None,
+        description="Embedding-specific configuration (when modelType='embedding')",
+    )
+    rerankConfig: Optional[RerankConfig] = Field(
+        None, description="Rerank-specific configuration (when modelType='rerank')"
+    )
+    videoConfig: Optional[VideoGenerationConfig] = Field(
+        None, description="Video generation configuration (when modelType='video')"
+    )
+    imageConfig: Optional[ImageGenerationConfig] = Field(
+        None, description="Image generation configuration (when modelType='image')"
+    )
+    isAdvanced: Optional[bool] = Field(
+        None,
+        description="Whether this is an advanced model. Advanced models are hidden by default in chat model selector.",
+    )
+    isWeworkAvailable: Optional[bool] = Field(
+        None,
+        description="Whether this model is available in the wework desktop client. "
+        "Only models with this field set to True are returned to wework.",
+    )
+    isVisible: bool = Field(
+        True,
+        description="Whether this public model is visible in user model selectors. "
+        "Hidden models remain available to existing bindings.",
+    )
+    allowedUsers: Optional[List[str]] = Field(
+        None,
+        description="User-name whitelist for a public model. Only enforced when "
+        "allowedUsersEnabled is True. The list is preserved even when the switch "
+        "is off, but then does not restrict access.",
+    )
+    allowedUsersEnabled: Optional[bool] = Field(
+        None,
+        description="Explicit switch for whitelist-only mode. When True, only "
+        "users listed in allowedUsers can see and use the model, and an empty "
+        "allowedUsers list denies everyone. When absent/False, the model is a "
+        "normal public model available to everyone and allowedUsers is ignored.",
+    )
+    modelCapabilities: Optional[ModelCapabilities] = Field(
+        None,
+        description="Declared multimodal capabilities (supportsImage / supportsVideo). "
+        "Used by the chat attachment media-understanding path and the knowledge-base "
+        "multimodal analysis selector/capability gate.",
+    )
+
+
+class ModelStatus(Status):
+    """Model status"""
+
+    state: str = "Available"  # Available, Unavailable
+
+
+class Model(BaseModel):
+    """Model CRD"""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "Model"
+    metadata: ObjectMeta
+    spec: ModelSpec
+    status: Optional[ModelStatus] = None
+
+
+class ModelList(BaseModel):
+    """Model list"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "ModelList"
+    items: List[Model]
+
+
+# Shell CRD schemas
+class ModelRef(BaseModel):
+    """Reference to a Model"""
+
+    name: str
+    namespace: str = "default"
+
+
+class ShellSpec(BaseModel):
+    """Shell specification"""
+
+    shellType: str = Field(
+        ..., validation_alias=AliasChoices("shellType", "runtime")
+    )  # Agent type: 'Codex', 'ClaudeCode', 'Agno', 'Dify', etc.
+    supportModel: Optional[List[str]] = None
+    baseImage: Optional[str] = None  # Custom base image address for user-defined shells
+    baseShellRef: Optional[str] = (
+        None  # Reference to base public shell (e.g., "ClaudeCode")
+    )
+    requiresWorkspace: Optional[bool] = Field(
+        default=None,
+        description="Whether this shell requires a workspace/repository. Defaults to True for local_engine types (Codex, ClaudeCode, Agno), False for external_api types (Dify, Chat).",
+    )
+
+
+class ShellStatus(Status):
+    """Shell status"""
+
+    state: str = "Available"  # Available, Unavailable
+
+
+class Shell(BaseModel):
+    """Shell CRD"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "Shell"
+    metadata: ObjectMeta
+    spec: ShellSpec
+    status: Optional[ShellStatus] = None
+
+
+class ShellList(BaseModel):
+    """Shell list"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "ShellList"
+    items: List[Shell]
+
+
+# Bot CRD schemas
+class GhostRef(BaseModel):
+    """Reference to a Ghost"""
+
+    name: str
+    namespace: str = "default"
+
+
+class ShellRef(BaseModel):
+    """Reference to a Shell"""
+
+    name: str
+    namespace: str = "default"
+
+
+class TeamDisplayConfig(BaseModel):
+    """Team display configuration."""
+
+    show_final_answer_only: Optional[bool] = None
+
+
+def dump_team_display_config(
+    config: Optional[TeamDisplayConfig | Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Convert team display config to a compact JSON dictionary."""
+    if not config:
+        return {}
+    if isinstance(config, TeamDisplayConfig):
+        return config.model_dump(exclude_none=True)
+    return {key: value for key, value in config.items() if value is not None}
+
+
+class BotSpec(BaseModel):
+    """Bot specification"""
+
+    ghostRef: GhostRef
+    shellRef: ShellRef
+    modelRef: Optional[ModelRef] = None
+    # Legacy Bots without this field keep their configured Ghost capabilities.
+    capability_mode: str = "manual"
+    routing_configuration_required: bool = False
+    execution_policy: ExecutionPolicy | None = None
+    model_policy: ModelPolicy | None = None
+    secondaryModelRef: Optional[ModelRef] = Field(
+        None,
+        description="Secondary LLM model for auxiliary tasks. "
+        "Effective when primary modelRef.modelType is 'video'. "
+        "Used for intent recognition and prompt merging.",
+    )
+
+
+class BotStatus(Status):
+    """Bot status"""
+
+    state: str = "Available"  # Available, Unavailable
+
+
+class Bot(BaseModel):
+    """Bot CRD"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "Bot"
+    metadata: ObjectMeta
+    spec: BotSpec
+    status: Optional[BotStatus] = None
+
+
+class BotList(BaseModel):
+    """Bot list"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "BotList"
+    items: List[Bot]
+
+
+# Team CRD schemas
+class BotTeamRef(BaseModel):
+    """Reference to a Bot in Team"""
+
+    name: str
+    namespace: str = "default"
+
+
+class TeamMember(BaseModel):
+    """Team member specification"""
+
+    botRef: BotTeamRef
+    prompt: Optional[str] = None
+    role: Optional[str] = None
+    requireConfirmation: Optional[bool] = (
+        False  # Whether this stage requires user confirmation before proceeding to next stage (Pipeline mode only)
+    )
+    contextPassing: Optional[str] = Field(
+        default="none",
+        description=(
+            "Pipeline mode only. Controls which message from this stage is passed "
+            "to the next stage: none, original_user, previous_bot, original_and_previous."
+        ),
+    )
+
+
+class LocalizedInputPlaceholder(BaseModel):
+    """Localized input placeholder text."""
+
+    en: Optional[str] = None
+    zh: Optional[str] = None
+
+
+class TeamInputPlaceholder(LocalizedInputPlaceholder):
+    """Team input placeholder text with device-specific overrides."""
+
+    mobile: Optional[LocalizedInputPlaceholder] = None
+    desktop: Optional[LocalizedInputPlaceholder] = None
+
+
+class ModeSpec(BaseModel):
+    """Model selectors exposed for specialized task modes."""
+
+    allowedModelCategories: List[ModelCategoryType] = Field(
+        default_factory=list,
+        description="Model categories available for user selection.",
+    )
+    hiddenVideoParams: Optional[List[str]] = Field(
+        default=None,
+        description="Video parameters owned by the workflow and hidden from users.",
+    )
+
+
+class TeamSpec(QuickPhraseMixin):
+    """Team specification"""
+
+    members: List[TeamMember]
+    collaborationModel: str  # solo、pipeline、route、coordinate、collaborate
+    bind_mode: Optional[List[str]] = None  # ['chat', 'code'] or empty list for none
+    modeSpec: Optional[ModeSpec] = Field(
+        default=None,
+        description="Optional media selectors exposed while retaining chat execution.",
+    )
+    description: Optional[str] = None  # Team description
+    icon: Optional[str] = None  # Icon ID from preset icon library
+    requiresWorkspace: Optional[bool] = Field(
+        default=None,
+        description="Whether this team requires a workspace/repository. "
+        "If not set (None), it will be inferred from the underlying shell types. "
+        "Set to True to always require workspace, False to never require workspace.",
+    )
+    capability: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Capability Center publication metadata.",
+    )
+    inputPlaceholder: Optional[TeamInputPlaceholder] = None
+
+
+class TeamStatus(Status):
+    """Team status"""
+
+    state: str = "Available"  # Available, Unavailable
+
+
+class Team(BaseModel):
+    """Team CRD"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "Team"
+    metadata: ObjectMeta
+    spec: TeamSpec
+    status: Optional[TeamStatus] = None
+
+
+class TeamList(BaseModel):
+    """Team list"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "TeamList"
+    items: List[Team]
+
+
+# Workspace CRD schemas
+class Repository(BaseModel):
+    """Repository configuration"""
+
+    gitUrl: str
+    gitRepo: str
+    gitRepoId: Optional[int] = None
+    branchName: str
+    gitDomain: str
+
+
+class WorkspaceSpec(BaseModel):
+    """Workspace specification"""
+
+    repository: Repository
+
+
+class WorkspaceStatus(Status):
+    """Workspace status"""
+
+    state: str = "Available"  # Available, Unavailable
+
+
+class Workspace(BaseModel):
+    """Workspace CRD"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "Workspace"
+    metadata: ObjectMeta
+    spec: WorkspaceSpec
+    status: Optional[WorkspaceStatus] = None
+
+
+class WorkspaceList(BaseModel):
+    """Workspace list"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "WorkspaceList"
+    items: List[Workspace]
+
+
+# Task CRD schemas
+class TeamTaskRef(BaseModel):
+    """Reference to a Team"""
+
+    name: str
+    namespace: str = "default"
+    user_id: Optional[int] = Field(
+        None,
+        description="Team owner's user ID. Used for skill lookup in shared team scenarios. "
+        "When set, allows downloading skills owned by the team owner without additional DB queries.",
+    )
+
+
+class WorkspaceTaskRef(BaseModel):
+    """Reference to a Workspace"""
+
+    name: str
+    namespace: str = "default"
+
+
+class KnowledgeBaseTaskRef(BaseModel):
+    """Reference to a KnowledgeBase bound to a Task (group chat)
+
+    Note: The 'id' field stores Kind.id for stable references.
+    The 'name' field stores the display name (spec.name) for display purposes.
+    When looking up a knowledge base:
+    1. Query by Kind.id directly (id is the unique identifier)
+    2. Legacy data with namespace field will be ignored during lookup
+
+    The namespace field was removed because:
+    - Knowledge base ID is globally unique and sufficient for lookup
+    - When KB migrates from personal to group namespace, we don't need to update all task refs
+    """
+
+    id: Optional[int] = None  # Knowledge base Kind.id (primary reference)
+    name: str  # Display name (spec.name), kept for display purposes
+    # Note: namespace field removed - use id for lookup, existing data with namespace is ignored
+    boundBy: Optional[str] = None  # Username of the person who bound this KB
+    boundAt: Optional[str] = None  # Binding timestamp in ISO format
+
+
+class KnowledgeBaseTaskScopeRef(BaseModel):
+    """Task-level knowledge base scope for API follow-up inheritance."""
+
+    id: Optional[int] = None
+    namespace: str = "default"
+    name: str
+    scopeRestricted: bool = False
+    folderIds: Optional[List[int]] = None
+    explicitDocumentIds: Optional[List[int]] = None
+    includeSubfolders: bool = True
+    boundBy: Optional[str] = None
+    boundAt: Optional[str] = None
+
+
+class TaskExecutionWorkspace(BaseModel):
+    """Task-specific execution workspace override."""
+
+    source: str = Field(..., description="Workspace source, such as git_worktree")
+    path: Optional[str] = Field(
+        None, min_length=1, description="Execution workspace path"
+    )
+
+
+class TaskExecutionSpec(BaseModel):
+    """Task execution runtime metadata."""
+
+    workspace: Optional[TaskExecutionWorkspace] = None
+
+
+class TaskForkSpec(BaseModel):
+    """Task-level fork metadata.
+
+    Forks inherit parent history up to afterMessageId without copying subtasks.
+    """
+
+    sourceTaskId: int = Field(..., ge=1, description="Direct source task ID")
+    afterMessageId: int = Field(
+        ..., ge=0, description="Maximum parent message_id inherited by this fork"
+    )
+    rootTaskId: int = Field(..., ge=1, description="Root task ID for the fork chain")
+    runtime: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Runtime migration metadata for workspace and executor sessions",
+    )
+
+
+class TaskSpec(BaseModel):
+    """Task specification"""
+
+    title: str
+    prompt: str
+    teamRef: TeamTaskRef
+    workspaceRef: WorkspaceTaskRef
+    is_group_chat: bool = False  # Whether this task is a group chat
+    knowledgeBaseRefs: Optional[List[KnowledgeBaseTaskRef]] = (
+        None  # Bound knowledge bases for group chat
+    )
+    knowledgeBaseScopes: Optional[List[KnowledgeBaseTaskScopeRef]] = (
+        None  # Per-KB scope refs for OpenAPI follow-up inheritance
+    )
+    externalKnowledgeRefs: List[ExternalKnowledgeRef] = Field(default_factory=list)
+    device_id: Optional[str] = None  # Device ID used for execution (for task history)
+    execution: Optional[TaskExecutionSpec] = None
+    fork: Optional[TaskForkSpec] = None
+    # Pipeline mode: current stage index (0-based)
+    # Updated when user confirms to proceed to next stage
+    # Used to determine which bot to use for follow-up questions
+    currentStage: Optional[int] = Field(
+        None,
+        description="Current pipeline stage index (0-based). "
+        "Only set for pipeline collaboration mode. "
+        "Updated when user confirms to proceed to next stage.",
+    )
+
+
+class TaskApp(BaseModel):
+    """App preview information (set by expose_service tool when service starts)"""
+
+    name: str
+    address: str
+    previewUrl: str
+
+
+class ArchiveInfo(BaseModel):
+    """Workspace archive information for Pod recovery after deletion.
+
+    Stores metadata about archived workspace files that can be restored
+    when a user sends a message after the executor Pod has been deleted.
+    """
+
+    storageKey: Optional[str] = Field(
+        None,
+        description="MinIO storage key (e.g., 'workspace-archives/12345/archive.tar.gz')",
+    )
+    archivedAt: Optional[datetime] = Field(
+        None, description="Timestamp when the workspace was archived"
+    )
+    expiresAt: Optional[datetime] = Field(
+        None, description="Timestamp when the archive expires (30 days after archiving)"
+    )
+    sizeBytes: Optional[int] = Field(None, description="Archive file size in bytes")
+    sessionFileIncluded: bool = Field(
+        False, description="Whether .claude_session_id file is included in the archive"
+    )
+    gitIncluded: bool = Field(
+        False, description="Whether .git directory is included in the archive"
+    )
+
+    @field_serializer("archivedAt", "expiresAt")
+    def serialize_archive_datetimes(self, value: Optional[datetime]) -> Optional[str]:
+        """Serialize archive timestamps in the configured display timezone."""
+        if value is None:
+            return None
+        return normalize_workspace_archive_datetime(value).isoformat()
+
+
+class TaskStatus(Status):
+    """Task status"""
+
+    state: str = "Available"  # Available, Unavailable
+    status: str = "PENDING"  # PENDING, RUNNING, COMPLETED, FAILED, CANCELLED, DELETE
+    progress: int = 0
+    result: Optional[Dict[str, Any]] = None
+    errorMessage: Optional[str] = None
+    createdAt: Optional[datetime] = None
+    updatedAt: Optional[datetime] = None
+    completedAt: Optional[datetime] = None
+    subTasks: Optional[List[Dict[str, Any]]] = None
+    app: Optional[TaskApp] = None  # App preview information
+    archive: Optional[ArchiveInfo] = Field(
+        None,
+        description="Workspace archive information for Pod recovery after deletion. "
+        "Set when executor Pod is deleted after task completion.",
+    )
+
+
+class Task(BaseModel):
+    """Task CRD"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "Task"
+    metadata: ObjectMeta
+    spec: TaskSpec
+    status: Optional[TaskStatus] = None
+
+
+class TaskList(BaseModel):
+    """Task list"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "TaskList"
+    items: List[Task]
+
+
+class BatchResponse(BaseModel):
+    """Batch operation response"""
+
+    success: bool
+    message: str
+    results: List[Dict[str, Any]]
+
+
+# Skill CRD schemas
+class SkillSource(BaseModel):
+    """Source information for skills imported from Git repositories"""
+
+    type: str = Field(
+        "upload",
+        description="Source type: 'upload' (manual upload) or 'git' (imported from Git repository)",
+    )
+    repo_url: Optional[str] = Field(
+        None, description="Git repository URL (for git source type)"
+    )
+    skill_path: Optional[str] = Field(
+        None, description="Path to skill in the repository (for git source type)"
+    )
+    imported_at: Optional[str] = Field(
+        None, description="Timestamp when the skill was imported (ISO format)"
+    )
+
+
+class SkillToolDeclaration(BaseModel):
+    """Tool declaration in skill configuration.
+
+    Defines a tool that should be dynamically loaded when the skill is active.
+    """
+
+    name: str = Field(..., description="Tool name")
+    provider: str = Field(..., description="Provider name")
+    config: Optional[Dict[str, Any]] = Field(
+        None, description="Tool-specific configuration"
+    )
+
+
+class SkillProviderConfig(BaseModel):
+    """Provider configuration for dynamic loading from skill
+
+    Specifies the module and class to load as the SkillToolProvider.
+    The provider.py file should be included in the skill ZIP package.
+    """
+
+    module: str = Field(
+        "provider",
+        description="Module name (without .py extension), e.g., 'provider'",
+    )
+    class_name: str = Field(
+        ...,
+        alias="class",
+        description="Provider class name",
+    )
+
+
+class SkillRuntimeConfig(BaseModel):
+    """Optional execution policies declared by a Skill."""
+
+    returnDirectTools: List[str] = Field(
+        default_factory=list,
+        description="Tool names whose successful result should end the current turn.",
+    )
+
+
+class SkillSpec(BaseModel):
+    """Skill specification"""
+
+    description: str  # Trigger condition description (from SKILL.md YAML frontmatter)
+    displayName: Optional[str] = (
+        None  # Friendly display name shown when tool is being used (e.g., "正在渲染图表")
+    )
+    prompt: Optional[str] = None  # Full prompt content (from SKILL.md body)
+    version: Optional[str] = None  # Skill version
+    author: Optional[str] = None  # Author
+    tags: Optional[List[str]] = None  # Tags
+    bindShells: Optional[List[str]] = Field(
+        None,
+        description="List of shell types this skill is compatible with. "
+        "Valid values: 'Codex', 'ClaudeCode', 'Agno', 'Dify', 'Chat'. "
+        "REQUIRED: Skills must explicitly specify bindShells to be available. "
+        "If not specified or empty, the skill will NOT be available for any shell type.",
+    )
+    config: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Skill-level configuration shared by all tools. "
+        "Tool-specific configs override these values.",
+    )
+    tools: Optional[List[SkillToolDeclaration]] = Field(
+        None,
+        description="Tool declarations for skill-tool binding. "
+        "Each tool is dynamically loaded via SkillToolRegistry.",
+    )
+    provider: Optional[SkillProviderConfig] = Field(
+        None,
+        description="Provider configuration for dynamic loading. "
+        "If specified, the provider will be loaded from the skill .",
+    )
+    runtime: Optional[SkillRuntimeConfig] = Field(
+        None,
+        description="Optional Chat runtime policies for this Skill.",
+    )
+    mcpServers: Optional[Dict[str, Any]] = Field(
+        None,
+        description="MCP servers configuration for this skill. "
+        "When the skill is loaded, these MCP servers will be connected "
+        "and their tools will be available to the AI. "
+        "Format follows the standard MCP server configuration schema.",
+    )
+    visible: Optional[bool] = Field(
+        True,
+        description="Whether this skill is visible in user-facing skill lists. "
+        "Hidden skills can still be used by agents that already have them bound.",
+    )
+    source: Optional[SkillSource] = Field(
+        None,
+        description="Source information for the skill. "
+        "Tracks where the skill was imported from (upload or git repository). "
+        "Used to enable updating skills from their original Git source.",
+    )
+    capability: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Capability Center publication metadata.",
+    )
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version(cls, v):
+        """Convert float/int version to string to handle YAML parsing."""
+        if v is None:
+            return v
+        return str(v)
+
+
+class SkillStatus(Status):
+    """Skill status"""
+
+    state: str = "Available"  # Available, Unavailable
+    fileSize: Optional[int] = None  # ZIP package size in bytes
+    fileHash: Optional[str] = None  # SHA256 hash
+
+
+class Skill(BaseModel):
+    """Skill CRD"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "Skill"
+    metadata: ObjectMeta
+    spec: SkillSpec
+    status: Optional[SkillStatus] = None
+
+
+class SkillList(BaseModel):
+    """Skill list"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "SkillList"
+    items: List[Skill]
+
+
+# KnowledgeBase CRD schemas
+class EmbeddingModelRef(BaseModel):
+    """Reference to an Embedding Model"""
+
+    model_name: Optional[str] = Field(None, description="Embedding model name")
+    model_namespace: str = Field("default", description="Embedding model namespace")
+
+
+class CompleteEmbeddingModelRef(BaseModel):
+    """Complete reference to an Embedding Model."""
+
+    model_name: str = Field(..., min_length=1, description="Embedding model name")
+    model_namespace: str = Field("default", description="Embedding model namespace")
+
+
+class RetrieverRef(BaseModel):
+    """Reference to a Retriever"""
+
+    name: str
+    namespace: str = "default"
+
+
+class HybridWeights(BaseModel):
+    """Hybrid search weights configuration"""
+
+    vector_weight: float = Field(
+        0.7, ge=0.0, le=1.0, description="Weight for vector search (0.0-1.0)"
+    )
+    keyword_weight: float = Field(
+        0.3, ge=0.0, le=1.0, description="Weight for keyword search (0.0-1.0)"
+    )
+
+    def model_post_init(self, __context):
+        """Validate that weights sum to 1.0"""
+        total = self.vector_weight + self.keyword_weight
+        if not (0.99 <= total <= 1.01):  # Allow small floating point errors
+            raise ValueError(f"Weights must sum to 1.0, got {total}")
+
+
+class RetrievalConfig(BaseModel):
+    """Complete retrieval configuration for a RAG-enabled knowledge base."""
+
+    retriever_name: str = Field(..., min_length=1, description="Retriever name")
+    retriever_namespace: str = Field("default", description="Retriever namespace")
+    embedding_config: CompleteEmbeddingModelRef = Field(
+        ..., description="Embedding model configuration"
+    )
+    retrieval_mode: str = Field(
+        "vector", description="Retrieval mode: 'vector', 'keyword', or 'hybrid'"
+    )
+    top_k: int = Field(5, ge=1, le=10, description="Number of results to return")
+    score_threshold: float = Field(
+        0.5, ge=0.0, le=1.0, description="Minimum score threshold"
+    )
+    hybrid_weights: Optional[HybridWeights] = Field(
+        None, description="Hybrid search weights"
+    )
+
+
+class SummaryModelRef(BaseModel):
+    """Reference to a Model for summary generation"""
+
+    name: str = Field(..., description="Model name")
+    namespace: str = Field("default", description="Model namespace")
+    type: str = Field(
+        "public",
+        description="Model type: 'public' (system public model), 'user' (personal model), or 'group' (group model)",
+    )
+
+
+class KnowledgeBaseSpec(BaseModel):
+    """KnowledgeBase specification"""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
+    directAccessRequirement: Literal["read", "edit"] = Field(
+        default="read",
+        description="Minimum capability required for direct knowledge base access",
+    )
+    allowDocumentDownload: Optional[bool] = Field(
+        default=None,
+        description="Whether readers may download original knowledge documents",
+    )
+    kbType: Optional[str] = Field(
+        "notebook",
+        description=(
+            "What this knowledge base is: 'notebook' or 'classic' select the default "
+            "opening view and may be switched freely; 'code_wiki' binds the knowledge "
+            "base to a source repository and is fixed at creation."
+        ),
+    )
+    source: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Source repository a code wiki is generated from",
+    )
+    language: Optional[str] = Field(
+        None,
+        max_length=10,
+        description=(
+            "Language a code wiki's pages are generated in. Absent falls back to the "
+            "deployment default rather than meaning English, so changing that default "
+            "does not strand wikis created before this field existed."
+        ),
+    )
+    showGenerationTask: bool = Field(
+        False,
+        description=(
+            "Whether this code wiki's generation runs appear in the owner's "
+            "conversation list. Hidden by default: a wiki regenerates on its own, so "
+            "its runs would otherwise fill the list with conversations nobody "
+            "started. A hidden task stays openable by id, and the wiki's own run "
+            "history links to it, so nothing becomes unreachable."
+        ),
+    )
+    generationStrategy: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_]*$",
+        description="Default orchestration strategy for this code wiki",
+    )
+    publishedGenerationId: int = Field(
+        0,
+        description=(
+            "Generation whose content is currently projected into this knowledge base; "
+            "0 means nothing has been published yet. Sole authority for which version "
+            "is live — never infer it from the latest completed generation, because a "
+            "generation that finished but failed its publish gate is not published."
+        ),
+    )
+    document_count: Optional[int] = Field(
+        default=0, description="Cached document count"
+    )
+    retrievalConfig: Optional[RetrievalConfig] = Field(
+        None, description="Retrieval configuration"
+    )
+    dingtalkAutoSyncEnabled: bool = Field(default=False)
+    summaryEnabled: bool = Field(
+        default=False,
+        description="Enable automatic summary generation for documents",
+    )
+    executionModelRef: Optional[SummaryModelRef] = Field(
+        None,
+        description=(
+            "Model this knowledge base's own generation runs on. Only a code wiki "
+            "generates; absent means the run inherits the model bound by its team's "
+            "bot, which is what wikis created before this field existed do."
+        ),
+    )
+    summaryModelRef: Optional[SummaryModelRef] = Field(
+        None,
+        description="Model reference for summary generation. Required when summaryEnabled=True",
+    )
+
+    # Knowledge base tool call limit configuration
+    maxCallsPerConversation: Optional[int] = Field(
+        default=10,
+        ge=2,
+        le=50,
+        description="Maximum number of knowledge base tool calls allowed per conversation. "
+        "Default: 10. For backward compatibility, if not set, defaults to 10 in code.",
+    )
+    exemptCallsBeforeCheck: Optional[int] = Field(
+        default=5,
+        ge=1,
+        description="Number of calls that are exempt from token checking. "
+        "Must be less than maxCallsPerConversation. Default: 5.",
+    )
+
+    @model_validator(mode="after")
+    def validate_call_limits(self):
+        """Validate that exemptCallsBeforeCheck < maxCallsPerConversation"""
+        if (
+            self.exemptCallsBeforeCheck is not None
+            and self.maxCallsPerConversation is not None
+        ):
+            if self.exemptCallsBeforeCheck >= self.maxCallsPerConversation:
+                raise ValueError(
+                    f"exemptCallsBeforeCheck ({self.exemptCallsBeforeCheck}) must be less than "
+                    f"maxCallsPerConversation ({self.maxCallsPerConversation})"
+                )
+        return self
+
+
+class KnowledgeBaseStatus(Status):
+    """KnowledgeBase status"""
+
+    state: str = "Available"  # Available, Unavailable
+
+
+class KnowledgeBase(BaseModel):
+    """KnowledgeBase CRD"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "KnowledgeBase"
+    metadata: ObjectMeta
+    spec: KnowledgeBaseSpec
+    status: Optional[KnowledgeBaseStatus] = None
+
+
+class KnowledgeBaseList(BaseModel):
+    """KnowledgeBase list"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "KnowledgeBaseList"
+    items: List[KnowledgeBase]
+
+
+# Retriever CRD schemas
+class IndexStrategy(BaseModel):
+    """Index naming strategy configuration"""
+
+    mode: str  # 'fixed', 'rolling', 'per_dataset', 'per_user'
+    fixedName: Optional[str] = None  # For 'fixed' mode: single index name
+    rollingStep: Optional[int] = None  # For 'rolling' mode: step size (e.g., 5000)
+    prefix: Optional[str] = None  # For 'per_dataset'/'per_user' mode: index prefix
+
+
+class StorageConfig(BaseModel):
+    """Storage backend configuration"""
+
+    type: str  # 'elasticsearch' or 'qdrant'
+    url: str  # Connection URL
+    username: Optional[str] = None  # Username for authentication
+    password: Optional[str] = None  # Password for authentication
+    apiKey: Optional[str] = (
+        None  # API key for authentication (alternative to username/password)
+    )
+    indexStrategy: IndexStrategy  # Index naming strategy
+    ext: Optional[Dict[str, Any]] = None  # Additional provider-specific config
+
+
+class RetrievalMethod(BaseModel):
+    """Retrieval method configuration"""
+
+    enabled: bool = True
+    defaultWeight: Optional[float] = None  # Default weight for hybrid search
+
+
+class RetrieverSpec(BaseModel):
+    """Retriever specification"""
+
+    storageConfig: StorageConfig
+    retrievalMethods: Dict[str, RetrievalMethod] = Field(
+        default_factory=lambda: {
+            "vector": RetrievalMethod(enabled=True, defaultWeight=0.7),
+            "keyword": RetrievalMethod(enabled=True, defaultWeight=0.3),
+            "hybrid": RetrievalMethod(enabled=True),
+        }
+    )
+    description: Optional[str] = None
+
+
+class Retriever(BaseModel):
+    """Retriever CRD"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "Retriever"
+    metadata: ObjectMeta
+    spec: RetrieverSpec
+
+
+class RetrieverList(BaseModel):
+    """Retriever list"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "RetrieverList"
+    items: List[Retriever]
+
+
+# Device CRD schemas
+class DeviceSpec(BaseModel):
+    """Device specification for local device registration"""
+
+    deviceId: str = Field(
+        ...,
+        description="Device unique identifier (self-generated, e.g., MAC/UUID)",
+    )
+    displayName: Optional[str] = Field(
+        None,
+        description="Human-readable device name",
+    )
+    isDefault: bool = Field(
+        default=False,
+        description="Whether this is the default device for the user",
+    )
+    capabilities: Optional[List[str]] = Field(
+        None,
+        description="Device capabilities/tags (e.g., 'gpu', 'high-memory')",
+    )
+
+
+class DeviceStatus(Status):
+    """Device status"""
+
+    state: str = "Available"  # Available, Unavailable
+    online: bool = False  # Derived from Redis at query time
+    deviceStatus: str = "offline"  # online, offline, busy (from Redis)
+    lastHeartbeat: Optional[datetime] = None
+
+
+class Device(BaseModel):
+    """Device CRD for local device management"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "Device"
+    metadata: ObjectMeta
+    spec: DeviceSpec
+    status: Optional[DeviceStatus] = None
+
+
+class DeviceList(BaseModel):
+    """Device list"""
+
+    apiVersion: str = "agent.wecode.io/v1"
+    kind: str = "DeviceList"
+    items: List[Device]
+
+
+# Git Skill Import schemas
+class GitSkillInfo(BaseModel):
+    """Information about a skill found in a Git repository"""
+
+    path: str = Field(
+        ..., description="Path in the repository (e.g., 'skills/pdf-reader')"
+    )
+    name: str = Field(
+        ..., description="Skill name extracted from path (directory name)"
+    )
+    description: str = Field(..., description="Description from SKILL.md frontmatter")
+    version: Optional[str] = Field(
+        None, description="Version from SKILL.md frontmatter"
+    )
+    author: Optional[str] = Field(None, description="Author from SKILL.md frontmatter")
+    display_name: Optional[str] = Field(
+        None, description="Display name from SKILL.md frontmatter"
+    )
+    tags: Optional[List[str]] = Field(
+        None, description="Tags from SKILL.md frontmatter"
+    )
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version(cls, v):
+        """Convert float/int version to string to handle YAML parsing."""
+        if v is None:
+            return v
+        return str(v)
+
+
+class GitScanResponse(BaseModel):
+    """Response from scanning a Git repository for skills"""
+
+    repo_url: str = Field(..., description="The scanned repository URL")
+    skills: List[GitSkillInfo] = Field(
+        default_factory=list, description="List of skills found in the repository"
+    )
+    total_count: int = Field(0, description="Total number of skills found")
+
+
+class GitImportRequest(BaseModel):
+    """Request to import skills from a Git repository"""
+
+    repo_url: str = Field(..., description="Git repository URL")
+    skill_paths: List[str] = Field(
+        ..., description="List of skill paths to import (e.g., ['skills/pdf-reader'])"
+    )
+    namespace: str = Field("default", description="Namespace for the imported skills")
+    overwrite_names: Optional[List[str]] = Field(
+        None,
+        description="List of skill names that can be overwritten if they already exist",
+    )
+    marketplace_tags: Optional[List[str]] = Field(
+        None,
+        description="Marketplace tags required when importing public skills",
+    )
+
+
+class GitSkillUpdateRequest(BaseModel):
+    """Update an existing skill from a selected Git repository path."""
+
+    repo_url: str = Field(..., description="Git repository URL")
+    skill_path: str = Field(..., description="Path to the skill in the repository")
+
+
+class GitImportSuccessItem(BaseModel):
+    """Successfully imported skill information"""
+
+    name: str = Field(..., description="Skill name")
+    path: str = Field(..., description="Skill path in repository")
+    id: int = Field(..., description="Created/updated skill ID")
+    action: str = Field(..., description="Action taken: 'created' or 'updated'")
+
+
+class GitImportSkippedItem(BaseModel):
+    """Skipped skill information (due to name conflict)"""
+
+    name: str = Field(..., description="Skill name")
+    path: str = Field(..., description="Skill path in repository")
+    reason: str = Field(..., description="Reason for skipping")
+
+
+class GitImportFailedItem(BaseModel):
+    """Failed skill import information"""
+
+    name: str = Field(..., description="Skill name")
+    path: str = Field(..., description="Skill path in repository")
+    error: str = Field(..., description="Error message")
+
+
+class GitImportResponse(BaseModel):
+    """Response from importing skills from a Git repository"""
+
+    success: List[GitImportSuccessItem] = Field(
+        default_factory=list, description="Successfully imported skills"
+    )
+    skipped: List[GitImportSkippedItem] = Field(
+        default_factory=list, description="Skipped skills (due to name conflict)"
+    )
+    failed: List[GitImportFailedItem] = Field(
+        default_factory=list, description="Failed skill imports"
+    )
+    total_success: int = Field(
+        0, description="Total number of successfully imported skills"
+    )
+    total_skipped: int = Field(0, description="Total number of skipped skills")
+    total_failed: int = Field(0, description="Total number of failed imports")
+
+
+# Git Skill Batch Update schemas
+class GitBatchUpdateRequest(BaseModel):
+    """Request to batch update skills from their Git repository sources"""
+
+    skill_ids: List[int] = Field(
+        ...,
+        description="List of skill IDs to update from their Git sources. "
+        "Skills from the same repository will be updated together with a single download.",
+    )
+
+
+class GitBatchUpdateSuccessItem(BaseModel):
+    """Successfully updated skill information"""
+
+    id: int = Field(..., description="Skill ID")
+    name: str = Field(..., description="Skill name")
+    version: Optional[str] = Field(None, description="Updated skill version")
+    source: Optional[Dict[str, Any]] = Field(
+        None, description="Updated source information"
+    )
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version(cls, v):
+        """Convert float/int version to string to handle YAML parsing."""
+        if v is None:
+            return v
+        return str(v)
+
+
+class GitBatchUpdateSkippedItem(BaseModel):
+    """Skipped skill information (not found, not from git, etc.)"""
+
+    id: int = Field(..., description="Skill ID")
+    name: Optional[str] = Field(None, description="Skill name (if found)")
+    reason: str = Field(..., description="Reason for skipping")
+
+
+class GitBatchUpdateFailedItem(BaseModel):
+    """Failed skill update information"""
+
+    id: int = Field(..., description="Skill ID")
+    name: Optional[str] = Field(None, description="Skill name (if found)")
+    error: str = Field(..., description="Error message")
+
+
+class GitBatchUpdateResponse(BaseModel):
+    """Response from batch updating skills from Git repositories"""
+
+    success: List[GitBatchUpdateSuccessItem] = Field(
+        default_factory=list, description="Successfully updated skills"
+    )
+    skipped: List[GitBatchUpdateSkippedItem] = Field(
+        default_factory=list,
+        description="Skipped skills (not found, not from git, etc.)",
+    )
+    failed: List[GitBatchUpdateFailedItem] = Field(
+        default_factory=list, description="Failed skill updates"
+    )
+    total_success: int = Field(
+        0, description="Total number of successfully updated skills"
+    )
+    total_skipped: int = Field(0, description="Total number of skipped skills")
+    total_failed: int = Field(0, description="Total number of failed updates")

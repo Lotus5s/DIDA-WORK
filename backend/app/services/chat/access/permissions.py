@@ -1,0 +1,196 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Task access permission utilities for Chat Service.
+
+This module provides utilities for checking task access permissions,
+including ownership and group membership checks.
+Uses the unified ResourceMember model for access control.
+
+Note: Async functions use with_session_in_executor decorator to run
+database operations in a thread pool without blocking the event loop.
+"""
+
+import logging
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from sqlalchemy.orm import Session
+
+from app.db.timezone import database_datetime_timezone
+from app.models.subtask import SubtaskStatus
+from app.services.chat.storage.db import with_session_in_executor
+from app.stores.tasks import subtask_store, task_access_store
+
+logger = logging.getLogger(__name__)
+
+_ACTIVE_STREAMING_SUBTASK_STATUSES = {
+    SubtaskStatus.PENDING,
+    SubtaskStatus.RUNNING,
+}
+_ACTIVE_STREAMING_STATUS_VALUES = {
+    status.value for status in _ACTIVE_STREAMING_SUBTASK_STATUSES
+}
+
+
+def _serialize_database_datetime(value: datetime | None) -> str | None:
+    """Serialize a database datetime with an explicit timezone offset."""
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.isoformat()
+
+    return value.replace(tzinfo=database_datetime_timezone()).isoformat()
+
+
+@with_session_in_executor
+def can_access_task(db: Session, user_id: int, task_id: int) -> bool:
+    """
+    Check if user can access a task.
+
+    This function is decorated with @with_session_in_executor, so when called
+    it runs in a thread pool and returns a coroutine. The db session is
+    automatically created and managed by the decorator.
+
+    Supports:
+    - Task ownership
+    - Resource membership (via ResourceMember with status=approved)
+
+    Args:
+        db: Database session (injected by decorator)
+        user_id: User ID
+        task_id: Task ID
+
+    Returns:
+        True if user can access the task
+
+    Usage:
+        # Call as async function (db is injected automatically):
+        result = await can_access_task(user_id, task_id)
+    """
+    return task_access_store.is_member(db, task_id=task_id, user_id=user_id)
+
+
+async def get_active_streaming(task_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Check if there's an active streaming session for a task.
+
+    Priority:
+    1. Check Redis task_streaming_status (real-time, set when stream starts)
+    2. Fall back to database query (delayed, updated every 5 seconds)
+
+    Args:
+        task_id: Task ID
+
+    Returns:
+        Streaming info dict if active, None otherwise
+    """
+    from app.services.chat.storage import session_manager
+
+    logger.info(
+        f"[get_active_streaming] Checking streaming status for task_id={task_id}"
+    )
+
+    # First, check Redis for real-time streaming status
+    # This is set immediately when streaming starts, before DB update
+    redis_status = await session_manager.get_task_streaming_status(task_id)
+    logger.info(
+        f"[get_active_streaming] Redis task_streaming_status for task_id={task_id}: {redis_status}"
+    )
+
+    if redis_status:
+        subtask_id = redis_status.get("subtask_id")
+        try:
+            subtask_id = int(subtask_id)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[get_active_streaming] Invalid Redis streaming status for task %s: %s",
+                task_id,
+                redis_status,
+            )
+            await session_manager.clear_task_streaming_status(task_id)
+            return await _get_active_streaming_from_db(task_id)
+
+        if not await _is_streaming_subtask_active(task_id, subtask_id):
+            logger.info(
+                "[get_active_streaming] Ignoring stale Redis streaming status for "
+                "task_id=%s subtask_id=%s",
+                task_id,
+                subtask_id,
+            )
+            await session_manager.cleanup_streaming_state(
+                subtask_id,
+                task_id=task_id,
+            )
+            return await _get_active_streaming_from_db(task_id)
+
+        redis_status["subtask_id"] = subtask_id
+        # Also get cached content to verify stream is active
+        cached_content = await session_manager.get_streaming_content(subtask_id)
+        logger.info(
+            f"[get_active_streaming] Found Redis streaming status for task {task_id}: "
+            f"subtask_id={subtask_id}, cached_content_len={len(cached_content) if cached_content else 0}"
+        )
+        return redis_status
+
+    # Fall back to database query if Redis doesn't have the status
+    # This handles the case where Redis data expired or was cleared
+    # Use run_sync_in_executor to avoid blocking the event loop
+    logger.info(
+        f"[get_active_streaming] No Redis status, falling back to DB query for task_id={task_id}"
+    )
+    return await _get_active_streaming_from_db(task_id)
+
+
+@with_session_in_executor
+def _is_streaming_subtask_active(db: Session, task_id: int, subtask_id: int) -> bool:
+    """Return True only when the cached streaming subtask is still active."""
+    subtask = subtask_store.get_basic_by_id(db, subtask_id=subtask_id)
+    if not subtask or subtask.task_id != task_id:
+        return False
+
+    if isinstance(subtask.status, str):
+        return subtask.status.upper() in _ACTIVE_STREAMING_STATUS_VALUES
+
+    return subtask.status in _ACTIVE_STREAMING_SUBTASK_STATUSES
+
+
+@with_session_in_executor
+def _get_active_streaming_from_db(
+    db: Session, task_id: int
+) -> Optional[Dict[str, Any]]:
+    """
+    Query database for active streaming subtask.
+
+    This is the database fallback for get_active_streaming when Redis
+    doesn't have the status.
+
+    Args:
+        db: Database session (injected by decorator)
+        task_id: Task ID
+
+    Returns:
+        Streaming info dict if active, None otherwise
+    """
+    # Find running assistant subtask
+    subtask = subtask_store.get_latest_running_assistant_by_task(
+        db,
+        task_id=task_id,
+    )
+
+    if subtask:
+        logger.info(
+            f"[get_active_streaming] Found DB streaming subtask for task {task_id}: "
+            f"subtask_id={subtask.id}, status={subtask.status}"
+        )
+        return {
+            "subtask_id": subtask.id,
+            "user_id": subtask.user_id,
+            "started_at": _serialize_database_datetime(subtask.created_at),
+        }
+
+    logger.info(
+        f"[get_active_streaming] No active streaming found for task_id={task_id}"
+    )
+    return None

@@ -1,0 +1,713 @@
+import { useCallback, useEffect, useRef } from 'react'
+import type { Dispatch } from 'react'
+import type { ExecutorClient } from '@/api/executorAccess'
+import { stripAppBasePath } from '@/config/runtime'
+import { useTranslation } from '@/hooks/useTranslation'
+import { track } from '@/telemetry/client'
+import { buildRuntimeTaskRoute, navigateTo, parseRuntimeTaskRoute } from '@/lib/navigation'
+import { runtimeProjectToProject, runtimeProjectUiId } from '@/lib/runtime-project'
+import type {
+  RuntimeTaskSummary,
+  ProjectWithTasks,
+  RuntimeGoalSetRequest,
+  RuntimeDeviceWorkspace,
+  RuntimeTaskAddress,
+  RuntimeTaskForkTarget,
+  RuntimeTranscriptRequest,
+  RuntimeWorkSearchRequest,
+  ModelSelectionConfig,
+  User,
+} from '@/types/api'
+import type {
+  RuntimePaneTranscript,
+  RuntimePaneTranscriptLoadOptions,
+  WorkbenchState,
+} from '@/types/workbench'
+import {
+  createRuntimeTaskStreamHandlers,
+  runtimeAddressDebug,
+  runtimeTranscriptDebug,
+  type RuntimeTaskStreamHandlers,
+} from './runtimePaneMessages'
+import type { WorkbenchAction } from './workbenchReducer'
+import {
+  findRuntimeTask,
+  findRuntimeTaskProjectWork,
+  findRuntimeTaskWorkspace,
+  getRuntimeTaskRouteKey,
+  getRuntimeTaskWorkspacePath,
+  isSameRuntimeTaskAddress,
+  isSameRuntimeTaskIdentity,
+  mergeRuntimeTaskAddresses,
+  projectTaskAddresses,
+  writeLastProjectId,
+} from './workbenchRuntimeHelpers'
+import { modelSelectionFromRuntimeHandle } from './runtimeContextUsage'
+import { getRuntimeTaskChatScopeKey } from './workbenchProviderHelpers'
+import type { WorkbenchServices } from './workbenchServices'
+import type {
+  ArchiveRuntimeTaskOptions,
+  ArchiveRuntimeTaskResult,
+  ArchiveRuntimeConversationsResult,
+  RefreshWorkLists,
+} from './workbenchContextTypes'
+import {
+  beginRuntimeConversationHydration,
+  completeRuntimeConversationHydration,
+  evictRuntimeConversation,
+} from './runtimeConversationCache'
+import { archiveRuntimeTaskAddresses, findFailedRuntimeTaskArchive } from './runtimeTaskArchive'
+import { logRuntimeQueueStage } from './runtimeQueueDiagnostics'
+import type { RuntimeTaskLifecycleStore } from './runtimeTaskLifecycle'
+import { projectRuntimePaneTranscript } from './runtimeTaskLifecycle/projection'
+
+interface UseWorkbenchRuntimeTasksOptions {
+  user: User
+  state: WorkbenchState
+  dispatch: Dispatch<WorkbenchAction>
+  executorClient: ExecutorClient
+  services: WorkbenchServices
+  lifecycleStore: RuntimeTaskLifecycleStore
+  markRuntimeTasksArchived: (addresses: RuntimeTaskAddress[]) => void
+  refreshWorkLists: RefreshWorkLists
+  setComposerErrorForScope: (scopeKey: string, error: string | null) => void
+  canNavigate?: () => boolean
+}
+
+const runtimeTranscriptRequests = new Map<string, Promise<RuntimePaneTranscript>>()
+
+export function useWorkbenchRuntimeTasks({
+  user,
+  state,
+  dispatch,
+  executorClient,
+  services,
+  lifecycleStore,
+  markRuntimeTasksArchived,
+  refreshWorkLists,
+  setComposerErrorForScope,
+  canNavigate = () => true,
+}: UseWorkbenchRuntimeTasksOptions) {
+  const { t } = useTranslation('common')
+  const openedRuntimeTaskKeysRef = useRef<Set<string>>(new Set())
+  const currentRuntimeTaskRef = useRef<RuntimeTaskAddress | null>(null)
+
+  useEffect(() => {
+    currentRuntimeTaskRef.current = state.currentRuntimeTask
+  }, [state.currentRuntimeTask])
+
+  const openRuntimeTaskView = useCallback(
+    (
+      address: RuntimeTaskAddress,
+      project: ProjectWithTasks | null,
+      options?: { markOpened?: boolean; navigate?: boolean }
+    ) => {
+      const reopeningCurrentTask = isSameRuntimeTaskIdentity(currentRuntimeTaskRef.current, address)
+      const openedAddress = mergeRuntimeTaskAddresses(currentRuntimeTaskRef.current, address)
+      currentRuntimeTaskRef.current = openedAddress
+      if (options?.markOpened !== false) {
+        openedRuntimeTaskKeysRef.current.add(getRuntimeTaskRouteKey(openedAddress))
+      }
+      dispatch({
+        type: 'runtime_task_opened',
+        address: openedAddress,
+        project,
+      })
+      console.info('[DIDA] Runtime task view opened', {
+        address: runtimeAddressDebug(openedAddress),
+        reopeningCurrentTask,
+        navigate: options?.navigate === true,
+      })
+      if (options?.navigate && canNavigate()) {
+        navigateTo(buildRuntimeTaskRoute(openedAddress))
+      }
+    },
+    [canNavigate, dispatch]
+  )
+
+  const isCurrentRuntimeTask = useCallback(
+    (address: RuntimeTaskAddress) =>
+      isSameRuntimeTaskIdentity(currentRuntimeTaskRef.current, address),
+    []
+  )
+
+  const reconcileCurrentRuntimeTaskAddress = useCallback(
+    (previousAddress: RuntimeTaskAddress, address: RuntimeTaskAddress) => {
+      currentRuntimeTaskRef.current = mergeRuntimeTaskAddresses(
+        currentRuntimeTaskRef.current,
+        address
+      )
+      dispatch({
+        type: 'runtime_task_address_reconciled',
+        previousAddress,
+        address,
+      })
+    },
+    [dispatch]
+  )
+
+  const clearCurrentRuntimeTaskView = useCallback(
+    (navigate = true) => {
+      currentRuntimeTaskRef.current = null
+      dispatch({ type: 'current_task_cleared' })
+      if (navigate) navigateTo('/')
+    },
+    [dispatch]
+  )
+
+  const loadRuntimeTranscriptForPane = useCallback(
+    async (
+      address: RuntimeTaskAddress,
+      options: RuntimePaneTranscriptLoadOptions = {}
+    ): Promise<RuntimePaneTranscript> => {
+      const transcriptRequest: RuntimeTranscriptRequest = { ...address, ...options }
+      const transcriptKey = runtimeTranscriptRequestKey(address, options)
+      const inFlightTranscript = runtimeTranscriptRequests.get(transcriptKey)
+      if (inFlightTranscript) {
+        return inFlightTranscript
+      }
+
+      const request = executorClient.runtime
+        .getRuntimeTranscript(transcriptRequest)
+        .then(transcript => {
+          if (!Array.isArray(transcript.turns)) {
+            console.error('[DIDA] Runtime pane transcript response missing canonical turns', {
+              address: runtimeAddressDebug(address),
+              response: runtimeTranscriptDebug(transcript),
+              transcriptKey,
+            })
+            throw new Error('Runtime transcript response is missing canonical turns')
+          }
+
+          return projectRuntimePaneTranscript(transcript)
+        })
+        .finally(() => {
+          if (runtimeTranscriptRequests.get(transcriptKey) === request) {
+            runtimeTranscriptRequests.delete(transcriptKey)
+          }
+        })
+      runtimeTranscriptRequests.set(transcriptKey, request)
+      return request
+    },
+    [executorClient]
+  )
+
+  const subscribeRuntimeTaskStream = useCallback(
+    (address: RuntimeTaskAddress, handlers: RuntimeTaskStreamHandlers) =>
+      services.chatStream.subscribe(createRuntimeTaskStreamHandlers(address, handlers)),
+    [services.chatStream]
+  )
+
+  const openRuntimeTask = useCallback(
+    async (
+      address: RuntimeTaskAddress,
+      options?: { fallbackProject?: ProjectWithTasks | null }
+    ) => {
+      const runtimeProjectWork = findRuntimeTaskProjectWork(state.runtimeWork, address)
+      const project = runtimeProjectWork
+        ? (state.projects.find(
+            item => item.id === runtimeProjectUiId(runtimeProjectWork.project)
+          ) ?? runtimeProjectToProject(runtimeProjectWork))
+        : (options?.fallbackProject ?? null)
+
+      writeLastProjectId(user.id, project?.id ?? null)
+      openRuntimeTaskView(address, project, {
+        markOpened: !openedRuntimeTaskKeysRef.current.has(getRuntimeTaskRouteKey(address)),
+        navigate: true,
+      })
+    },
+    [openRuntimeTaskView, state.projects, state.runtimeWork, user.id]
+  )
+
+  const clearCurrentRuntimeTaskIfArchived = useCallback(
+    (addresses: RuntimeTaskAddress[]) => {
+      if (
+        !addresses.some(address => isSameRuntimeTaskAddress(currentRuntimeTaskRef.current, address))
+      ) {
+        return
+      }
+      const activeRoute = parseRuntimeTaskRoute(
+        stripAppBasePath(window.location.pathname),
+        window.location.search
+      )
+      const shouldNavigateHome = addresses.some(address =>
+        isSameRuntimeTaskAddress(activeRoute, address)
+      )
+      clearCurrentRuntimeTaskView(shouldNavigateHome)
+    },
+    [clearCurrentRuntimeTaskView]
+  )
+
+  const removeArchivedWorktrees = useCallback(
+    async (worktreeTargets: RuntimeTaskWorktreeTarget[]) => {
+      let succeeded = true
+      for (const target of uniqueRuntimeTaskWorktreeTargets(worktreeTargets)) {
+        try {
+          if (!services.runtimeWorkApi) throw new Error('Runtime work API is unavailable')
+          await services.runtimeWorkApi.deleteWorktree({
+            deviceId: target.deviceId,
+            path: target.path,
+            preserveSnapshot: true,
+          })
+        } catch (error) {
+          succeeded = false
+          dispatch({
+            type: 'error_set',
+            error:
+              error instanceof Error
+                ? t('workbench.archive_runtime_task_remove_failed_detail', {
+                    message: error.message,
+                  })
+                : t('workbench.archive_runtime_task_remove_failed'),
+          })
+        }
+      }
+      return succeeded
+    },
+    [dispatch, services.runtimeWorkApi, t]
+  )
+
+  const archiveRuntimeConversations = useCallback(
+    async (
+      addresses: RuntimeTaskAddress[],
+      fallbackError: string
+    ): Promise<ArchiveRuntimeConversationsResult> => {
+      const archiveTargets = uniqueRuntimeTaskAddresses(addresses)
+      if (archiveTargets.length === 0) return { status: 'archived' }
+      const localFailedTargets = archiveTargets.filter(address => {
+        const task = findRuntimeTask(state.runtimeWork, address)
+        return task?.status === 'failed' && task.optimistic === true
+      })
+      const persistedTargets = archiveTargets.filter(
+        address =>
+          !localFailedTargets.some(localAddress => isSameRuntimeTaskAddress(localAddress, address))
+      )
+      localFailedTargets.forEach(address =>
+        logRuntimeQueueStage(address, 'queue-archive-requested', { localOnly: true })
+      )
+      persistedTargets.forEach(address =>
+        logRuntimeQueueStage(address, 'queue-archive-requested', { localOnly: false })
+      )
+      const archiveResults = await archiveRuntimeTaskAddresses(persistedTargets, address =>
+        executorClient.runtime.archiveConversation(address)
+      )
+      localFailedTargets.forEach(address =>
+        logRuntimeQueueStage(address, 'queue-archive-result', {
+          localOnly: true,
+          accepted: true,
+          failed: false,
+        })
+      )
+      archiveResults.forEach(result =>
+        logRuntimeQueueStage(result.address, 'queue-archive-result', {
+          localOnly: false,
+          accepted: result.response?.accepted ?? false,
+          failed: !result.response,
+        })
+      )
+      const archivedAddresses = [
+        ...localFailedTargets,
+        ...archiveResults.flatMap(result => (result.response?.accepted ? [result.address] : [])),
+      ]
+      if (archivedAddresses.length > 0) {
+        archivedAddresses.forEach(evictRuntimeConversation)
+        archivedAddresses.forEach(address => lifecycleStore.remove(address))
+        archivedAddresses.forEach(address => logRuntimeQueueStage(address, 'queue-archive-evicted'))
+        markRuntimeTasksArchived(archivedAddresses)
+        const worktreeCleanupSucceeded = await removeArchivedWorktrees(
+          findRuntimeTaskWorktrees(state.runtimeWork, archivedAddresses)
+        )
+        clearCurrentRuntimeTaskIfArchived(archivedAddresses)
+        await refreshWorkLists({ syncCloud: false })
+        if (!worktreeCleanupSucceeded) {
+          track('operation_failed', { operation: 'worktree_archive_cleanup' })
+        }
+      }
+      const failedResult = findFailedRuntimeTaskArchive(archiveResults)
+      if (!failedResult) {
+        track('feature_action_completed', { domain: 'conversation', action: 'archive' })
+        return { status: 'archived' }
+      }
+      track('operation_failed', { operation: 'conversation_archive' })
+      dispatch({
+        type: 'error_set',
+        error:
+          failedResult.response?.error ||
+          (failedResult.error instanceof Error ? failedResult.error.message : fallbackError),
+      })
+      return { status: 'failed' }
+    },
+    [
+      clearCurrentRuntimeTaskIfArchived,
+      dispatch,
+      executorClient,
+      lifecycleStore,
+      markRuntimeTasksArchived,
+      refreshWorkLists,
+      removeArchivedWorktrees,
+      state.runtimeWork,
+    ]
+  )
+
+  const archiveRuntimeTask = useCallback(
+    async (
+      address: RuntimeTaskAddress,
+      options: ArchiveRuntimeTaskOptions = {}
+    ): Promise<ArchiveRuntimeTaskResult> => {
+      console.debug('[DIDA] Runtime archive task start', {
+        address: runtimeAddressDebug(address),
+        force: Boolean(options.force),
+      })
+      const result = await archiveRuntimeConversations([address], 'Failed to archive runtime task')
+      console.debug('[DIDA] Runtime archive task finished', {
+        address: runtimeAddressDebug(address),
+        status: result.status,
+      })
+      return result
+    },
+    [archiveRuntimeConversations]
+  )
+
+  const renameRuntimeTask = useCallback(
+    async (address: RuntimeTaskAddress, title: string) => {
+      const response = await executorClient.runtime.renameRuntimeTask({ address, title })
+      if (!response.accepted) {
+        throw new Error(response.error || 'Failed to rename runtime task')
+      }
+      await refreshWorkLists()
+    },
+    [executorClient, refreshWorkLists]
+  )
+
+  const archiveProjectConversations = useCallback(
+    async (
+      runtimeProjectKey: string,
+      options: ArchiveRuntimeTaskOptions = {}
+    ): Promise<ArchiveRuntimeConversationsResult> => {
+      const addresses = projectTaskAddresses(state.runtimeWork, [runtimeProjectKey])
+      console.debug('[DIDA] Runtime archive project start', {
+        runtimeProjectKey,
+        addresses: addresses.map(runtimeAddressDebug),
+        force: Boolean(options.force),
+      })
+      const result = await archiveRuntimeConversations(addresses, 'Failed to archive project')
+      console.debug('[DIDA] Runtime archive project finished', {
+        runtimeProjectKey,
+        status: result.status,
+        archivedAddresses: addresses.length,
+      })
+      return result
+    },
+    [archiveRuntimeConversations, state.runtimeWork]
+  )
+
+  const archiveProjectsConversations = useCallback(
+    async (
+      runtimeProjectKeys: string[],
+      options: ArchiveRuntimeTaskOptions = {}
+    ): Promise<ArchiveRuntimeConversationsResult> => {
+      const uniqueProjectKeys = [...new Set(runtimeProjectKeys.filter(Boolean))]
+      if (uniqueProjectKeys.length === 0) return { status: 'archived' }
+
+      const archivedAddresses = projectTaskAddresses(state.runtimeWork, uniqueProjectKeys)
+      console.debug('[DIDA] Runtime archive projects start', {
+        runtimeProjectKeys: uniqueProjectKeys,
+        addresses: archivedAddresses.map(runtimeAddressDebug),
+        force: Boolean(options.force),
+      })
+      const result = await archiveRuntimeConversations(
+        archivedAddresses,
+        'Failed to archive project conversations'
+      )
+      console.debug('[DIDA] Runtime archive projects finished', {
+        runtimeProjectKeys: uniqueProjectKeys,
+        status: result.status,
+        archivedAddresses: archivedAddresses.length,
+      })
+      return result
+    },
+    [archiveRuntimeConversations, state.runtimeWork]
+  )
+
+  const archiveChatConversations = useCallback(
+    async (
+      addresses: RuntimeTaskAddress[],
+      options: ArchiveRuntimeTaskOptions = {}
+    ): Promise<ArchiveRuntimeConversationsResult> => {
+      if (addresses.length === 0) return { status: 'archived' }
+
+      console.debug('[DIDA] Runtime archive chats start', {
+        addresses: addresses.map(runtimeAddressDebug),
+        force: Boolean(options.force),
+      })
+      const result = await archiveRuntimeConversations(
+        addresses,
+        'Failed to archive chat conversations'
+      )
+      console.debug('[DIDA] Runtime archive chats finished', {
+        status: result.status,
+        archivedAddresses: addresses.length,
+      })
+      return result
+    },
+    [archiveRuntimeConversations]
+  )
+
+  const searchRuntimeWork = useCallback(
+    async (request: RuntimeWorkSearchRequest) => executorClient.runtime.searchRuntimeWork(request),
+    [executorClient]
+  )
+
+  const forkCurrentRuntimeTask = useCallback(
+    async (
+      target: RuntimeTaskForkTarget,
+      options: {
+        source?: RuntimeTaskAddress
+        lastTurnId?: string
+        title?: string
+        modelSelection?: ModelSelectionConfig | null
+      } = {}
+    ) => {
+      const source = options.source ?? state.currentRuntimeTask
+      if (!source) {
+        throw new Error('No runtime task is selected')
+      }
+
+      const sourceTask = findRuntimeTask(state.runtimeWork, source)
+      const sourceWorkspace = findRuntimeTaskWorkspace(state.runtimeWork, source)
+      const requestOptions = { ...options }
+      delete requestOptions.source
+      const response = await executorClient.runtime.forkRuntimeTask({
+        source,
+        target,
+        ...requestOptions,
+      })
+      if (!response.accepted) {
+        throw new Error(response.error || t('workbench.task_fork_failed'))
+      }
+
+      if (sourceTask && sourceWorkspace) {
+        const now = new Date().toISOString()
+        const workspacePath =
+          response.target.workspacePath || getRuntimeTaskWorkspacePath(sourceWorkspace, sourceTask)
+        const modelSelection =
+          options.modelSelection ??
+          sourceTask.modelSelection ??
+          modelSelectionFromRuntimeHandle(source.runtimeHandle)
+        dispatch({
+          type: 'runtime_task_optimistic_upserted',
+          project: state.currentProject,
+          workspace: {
+            ...sourceWorkspace,
+            deviceId: response.target.deviceId,
+            workspacePath,
+            tasks: [],
+          },
+          task: {
+            taskId: response.target.taskId,
+            workspacePath,
+            title: options.title ?? sourceTask.title,
+            runtime: response.runtime ?? sourceTask.runtime,
+            status: 'active',
+            running: false,
+            optimistic: true,
+            createdAt: now,
+            updatedAt: now,
+            modelSelection,
+          },
+        })
+      }
+
+      // Creation is committed; subsequent setup errors must not invite another fork.
+      const reportSetupError = (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        console.warn('[DIDA] Runtime task fork setup failed', {
+          taskId: response.target.taskId,
+          error: message,
+        })
+        setComposerErrorForScope(
+          getRuntimeTaskChatScopeKey(response.target),
+          t('workbench.task_fork_setup_failed', {
+            taskId: response.target.taskId,
+            error: message,
+          })
+        )
+      }
+      if (response.setupError) reportSetupError(response.setupError)
+      try {
+        if (response.transcript) {
+          const forkedTranscript = projectRuntimePaneTranscript(response.transcript)
+          const hydrationToken = beginRuntimeConversationHydration(response.target)
+          completeRuntimeConversationHydration(
+            response.target,
+            hydrationToken,
+            forkedTranscript.turns
+          )
+          lifecycleStore.syncTranscript(response.target, forkedTranscript)
+        }
+      } catch (error) {
+        reportSetupError(error)
+      }
+      try {
+        await openRuntimeTask(response.target, { fallbackProject: state.currentProject })
+        await refreshWorkLists()
+      } catch (error) {
+        reportSetupError(error)
+      }
+    },
+    [
+      dispatch,
+      executorClient,
+      lifecycleStore,
+      openRuntimeTask,
+      refreshWorkLists,
+      setComposerErrorForScope,
+      state.currentProject,
+      state.currentRuntimeTask,
+      state.runtimeWork,
+      t,
+    ]
+  )
+
+  const getRuntimeGoal = useCallback(
+    async (address: RuntimeTaskAddress) => executorClient.runtime.getRuntimeGoal({ address }),
+    [executorClient]
+  )
+
+  const setRuntimeGoal = useCallback(
+    async (request: RuntimeGoalSetRequest) => {
+      const response = await executorClient.runtime.setRuntimeGoal(request)
+      if (!response.accepted) {
+        dispatch({
+          type: 'error_set',
+          error: response.error || t('workbench.goal_set_failed', 'Failed to set goal'),
+        })
+      }
+      return response
+    },
+    [dispatch, executorClient, t]
+  )
+
+  const clearRuntimeGoal = useCallback(
+    async (address: RuntimeTaskAddress) => {
+      const response = await executorClient.runtime.clearRuntimeGoal({ address })
+      if (!response.accepted) {
+        dispatch({
+          type: 'error_set',
+          error: response.error || t('workbench.goal_clear_failed', 'Failed to delete goal'),
+        })
+      }
+      return response
+    },
+    [dispatch, executorClient, t]
+  )
+
+  return {
+    openRuntimeTaskView,
+    isCurrentRuntimeTask,
+    reconcileCurrentRuntimeTaskAddress,
+    clearCurrentRuntimeTaskView,
+    loadRuntimeTranscriptForPane,
+    subscribeRuntimeTaskStream,
+    openRuntimeTask,
+    renameRuntimeTask,
+    archiveRuntimeTask,
+    archiveProjectConversations,
+    archiveProjectsConversations,
+    archiveChatConversations,
+    searchRuntimeWork,
+    forkCurrentRuntimeTask,
+    getRuntimeGoal,
+    setRuntimeGoal,
+    clearRuntimeGoal,
+  }
+}
+
+type RuntimeTaskWorktreeTarget = { deviceId: string; path: string }
+
+function uniqueRuntimeTaskAddresses(addresses: RuntimeTaskAddress[]): RuntimeTaskAddress[] {
+  const uniqueAddresses = new Map(
+    addresses.map(address => [getRuntimeTaskRouteKey(address), address])
+  )
+  return [...uniqueAddresses.values()]
+}
+
+function findRuntimeTaskWorktree(
+  runtimeWork: WorkbenchState['runtimeWork'],
+  address: RuntimeTaskAddress
+): RuntimeTaskWorktreeTarget | null {
+  if (!runtimeWork) return null
+  const workspaces = [
+    ...runtimeWork.chats,
+    ...runtimeWork.projects.flatMap(project => project.deviceWorkspaces),
+  ]
+
+  for (const workspace of workspaces) {
+    if (workspace.deviceId !== address.deviceId) continue
+    const task = workspace.tasks.find(item => item.taskId === address.taskId)
+    if (!task || !isRuntimeTaskWorktree(workspace, task)) continue
+    const path = getRuntimeTaskWorkspacePath(workspace, task)
+    if (address.workspacePath?.trim() && path !== address.workspacePath.trim()) continue
+    return {
+      deviceId: workspace.deviceId,
+      path,
+    }
+  }
+
+  return null
+}
+
+function findRuntimeTaskWorktrees(
+  runtimeWork: WorkbenchState['runtimeWork'],
+  addresses: RuntimeTaskAddress[]
+): RuntimeTaskWorktreeTarget[] {
+  return addresses
+    .map(address => findRuntimeTaskWorktree(runtimeWork, address))
+    .filter((target): target is RuntimeTaskWorktreeTarget => Boolean(target))
+}
+
+function uniqueRuntimeTaskWorktreeTargets(
+  targets: RuntimeTaskWorktreeTarget[]
+): RuntimeTaskWorktreeTarget[] {
+  const seen = new Set<string>()
+  const uniqueTargets: RuntimeTaskWorktreeTarget[] = []
+  for (const target of targets) {
+    const key = `${target.deviceId}:${target.path}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    uniqueTargets.push(target)
+  }
+  return uniqueTargets
+}
+
+function isRuntimeTaskWorktree(
+  workspace: RuntimeDeviceWorkspace,
+  task: RuntimeTaskSummary
+): boolean {
+  return (
+    workspace.workspaceKind === 'worktree' ||
+    Boolean(workspace.worktreeId) ||
+    task.workspaceKind === 'worktree' ||
+    Boolean(task.worktreeId)
+  )
+}
+
+function runtimeTranscriptRequestKey(
+  address: RuntimeTaskAddress,
+  options: RuntimePaneTranscriptLoadOptions
+): string {
+  return JSON.stringify({
+    address: getRuntimeTaskRouteKey(address),
+    projectSession: address.projectSession ?? null,
+    threadId: address.threadId ?? null,
+    limit: options.limit ?? null,
+    beforeCursor: options.beforeCursor ?? null,
+    afterCursor: options.afterCursor ?? null,
+    refresh: options.refresh ?? null,
+    includeFullContent: options.includeFullContent ?? null,
+    conversationContextOnly: options.conversationContextOnly ?? null,
+    navigationOnly: options.navigationOnly ?? null,
+  })
+}
+
+export type WorkbenchRuntimeTasks = ReturnType<typeof useWorkbenchRuntimeTasks>

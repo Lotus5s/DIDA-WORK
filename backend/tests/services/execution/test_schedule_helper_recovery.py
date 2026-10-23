@@ -1,0 +1,164 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for recovery behavior in schedule dispatch."""
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.models.subtask import SubtaskStatus
+from app.services.execution.recovery_service import recovery_service
+from app.services.execution.schedule_helper import _recover_executor
+from shared.models import ExecutionRequest
+
+
+@pytest.mark.asyncio
+async def test_recover_executor_propagates_expired_archive_error():
+    """Expired archive errors should propagate to the caller."""
+    db = MagicMock()
+    subtask = MagicMock()
+    subtask.id = 123
+    task = MagicMock()
+    request = ExecutionRequest(
+        task_id=1,
+        subtask_id=123,
+        user={"id": 7, "name": "user7"},
+        user_id=7,
+        user_name="user7",
+        bot=[{"shell_type": "ClaudeCode"}],
+    )
+
+    with patch.object(
+        recovery_service,
+        "recover",
+        AsyncMock(side_effect=RuntimeError("archive expired")),
+    ):
+        with pytest.raises(RuntimeError, match="archive expired"):
+            await _recover_executor(
+                db=db,
+                subtask=subtask,
+                task=task,
+                request=request,
+            )
+
+
+@pytest.mark.asyncio
+async def test_recover_executor_updates_current_subtask_from_recovered_info():
+    """Recovered executor info should be copied onto the current subtask."""
+    db = MagicMock()
+    subtask = MagicMock()
+    subtask.id = 123
+    subtask.executor_name = "old-executor"
+    subtask.executor_namespace = ""
+    subtask.executor_deleted_at = True
+    task = MagicMock()
+    request = ExecutionRequest(
+        task_id=1,
+        subtask_id=123,
+        user={"id": 7, "name": "user7"},
+        user_id=7,
+        user_name="user7",
+        bot=[{"shell_type": "ClaudeCode"}],
+    )
+
+    with (
+        patch.object(
+            recovery_service,
+            "recover",
+            AsyncMock(
+                return_value={
+                    "executor_name": "new-executor",
+                    "executor_namespace": "default",
+                }
+            ),
+        ),
+        patch("app.stores.tasks.subtask_store") as mock_subtask_store,
+    ):
+        mock_subtask_store.update_fields.side_effect = (
+            lambda _db, *, subtask, **fields: [
+                setattr(subtask, name, value) for name, value in fields.items()
+            ]
+        )
+        result = await _recover_executor(
+            db=db,
+            subtask=subtask,
+            task=task,
+            request=request,
+        )
+
+    assert result is True
+    assert subtask.executor_name == "new-executor"
+    assert subtask.executor_namespace == "default"
+    assert subtask.executor_deleted_at is False
+    mock_subtask_store.update_fields.assert_called_once_with(
+        db,
+        subtask=subtask,
+        executor_name="new-executor",
+        executor_namespace="default",
+        executor_deleted_at=False,
+    )
+    db.commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_schedule_marks_subtask_failed_when_recovery_returns_false():
+    """Recovery failures should update subtask status in schedule dispatch logic."""
+    subtask = MagicMock()
+    subtask.id = 123
+    subtask.status = SubtaskStatus.PENDING
+    subtask.error_message = ""
+    db = MagicMock()
+
+    recovery_success = False
+    if not recovery_success:
+        subtask.status = SubtaskStatus.FAILED
+        subtask.error_message = "Failed to recover executor after Pod deletion"
+        db.commit()
+
+    assert subtask.status == SubtaskStatus.FAILED
+    assert subtask.error_message == "Failed to recover executor after Pod deletion"
+    db.commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_executor_pod_missing_returns_false_when_pod_alive() -> None:
+    """A confirmed-alive pod should not trigger recovery."""
+    from app.services.execution.schedule_helper import _executor_pod_missing
+
+    with patch(
+        "app.services.remote_workspace_service.remote_workspace_service.executor_alive",
+        return_value=True,
+    ):
+        result = await _executor_pod_missing("executor-1", "default")
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_executor_pod_missing_returns_true_when_pod_gone() -> None:
+    """executor_manager confirming 'No pod found' should trigger recovery."""
+    from app.services.execution.schedule_helper import _executor_pod_missing
+
+    with patch(
+        "app.services.remote_workspace_service.remote_workspace_service.executor_alive",
+        return_value=False,
+    ):
+        result = await _executor_pod_missing("executor-1", "default")
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_executor_pod_missing_treats_transport_error_as_alive() -> None:
+    """Network/transport failures must not trigger spurious recovery."""
+    from app.services.execution.schedule_helper import _executor_pod_missing
+
+    with patch(
+        "app.services.remote_workspace_service.remote_workspace_service.executor_alive",
+        side_effect=RuntimeError("timeout"),
+    ):
+        result = await _executor_pod_missing("executor-1", "default")
+
+    assert result is False

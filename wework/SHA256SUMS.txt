@@ -1,0 +1,1 @@
+0ca3293b84a1cb177c4a0b82b0e5d57f7bde3300cd22d6682a641fb41ddebce4  DIDAWork_0.5.20_windows_x64-setup.exe

@@ -1,0 +1,277 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Runtime Configuration Manager
+ *
+ * Fetches and caches runtime configuration from the server.
+ * This allows configuration to be changed without rebuilding the app.
+ *
+ * Configuration priority:
+ * 1. RUNTIME_* environment variables (read at server startup)
+ * 2. NEXT_PUBLIC_* environment variables (build-time fallback)
+ * 3. Default values (empty string = use proxy)
+ */
+
+export interface RuntimeConfig {
+  /** Backend API URL. Empty string means use '/api' proxy */
+  apiUrl: string
+  /** Public backend API URL used for generated examples such as curl commands */
+  publicApiUrl: string
+  /** Socket.IO direct URL. Empty string means use proxy */
+  socketDirectUrl: string
+  /** Enable chat context feature (knowledge base background) */
+  enableChatContext: boolean
+  /** Login mode: 'password', 'oidc', or 'all' */
+  loginMode: string
+  /** OIDC login button text */
+  oidcLoginText: string
+  /** Enable display quotas in frontend */
+  enableDisplayQuotas: boolean
+  /** Enable Wiki module */
+  enableWiki: boolean
+  /** Enable Code Knowledge add repository feature */
+  enableCodeKnowledgeAddRepo: boolean
+  /**
+   * Enable creating code wikis. Enabled by default; this gates creation only, so
+   * existing wikis stay readable and stay able to regenerate when it is disabled.
+   */
+  enableCodeWiki: boolean
+  /** Enable workspace project UI. Disabled by default for dark launch. */
+  enableProjectWorkspace: boolean
+  /** Comma-separated user_name whitelist for workspace projects. Empty means all users (when enabled). */
+  projectWorkspaceWhitelist: string
+  /** VSCode link template for deep linking */
+  vscodeLinkTemplate: string
+  /** Feedback URL for issue reporting */
+  feedbackUrl: string
+  /** Documentation URL */
+  docsUrl: string
+  /** Optional URL explaining how to choose a model */
+  modelSelectionGuideUrl: string
+  /** Enable OpenTelemetry tracing */
+  otelEnabled: boolean
+  /** OpenTelemetry service name */
+  otelServiceName: string
+  /** OpenTelemetry collector endpoint */
+  otelCollectorEndpoint: string
+  /** Bind group description text (supports multiple paragraphs separated by |) */
+  bindGroupDesc: string
+  /** Bind group steps configuration (JSON string with array of {title, hint}) */
+  bindGroupSteps: string
+  /** Application version (e.g. "0.1.5"), "dev" in local development */
+  appVersion: string
+  /** External Wework URL for coding entry points. Empty means use in-app chat code-agent mode. */
+  weworkCodeUrl: string
+}
+
+/** Default bind group steps configuration */
+export const DEFAULT_BIND_GROUP_STEPS = JSON.stringify({
+  variables: { botName: '机器人' },
+  steps: [
+    {
+      title: '添加{{botName}}到群聊',
+      hint: '打开“群设置” → 选择“机器人” → 选择“添加机器人” → 搜索并添加{{botName}}',
+    },
+    { title: '点击开始绑定', hint: '' },
+    { title: '在群聊中 @{{botName}} 发送消息', hint: '' },
+  ],
+})
+
+// Cache for runtime config to avoid repeated API calls
+let runtimeConfigCache: RuntimeConfig | null = null
+let runtimeConfigPromise: Promise<RuntimeConfig> | null = null
+
+/**
+ * Fetch runtime configuration from the server
+ * Results are cached to avoid repeated API calls
+ */
+export const fetchRuntimeConfig = async (): Promise<RuntimeConfig> => {
+  // Return cached config if available
+  if (runtimeConfigCache) {
+    return runtimeConfigCache
+  }
+
+  // Return existing promise if fetch is in progress
+  if (runtimeConfigPromise) {
+    return runtimeConfigPromise
+  }
+
+  // Fetch config from API
+  runtimeConfigPromise = fetch('/runtime-config', {
+    ...(process.env.NODE_ENV === 'development' && { cache: 'no-store' as RequestCache }),
+  })
+    .then(res => {
+      if (!res.ok) {
+        throw new Error('Failed to fetch runtime config')
+      }
+      return res.json()
+    })
+    .then((config: RuntimeConfig) => {
+      runtimeConfigCache = config
+      return config
+    })
+    .catch(err => {
+      console.warn('[RuntimeConfig] Failed to fetch, using build-time config:', err)
+      // Fallback to build-time env vars
+      const fallback: RuntimeConfig = {
+        apiUrl: process.env.NEXT_PUBLIC_API_URL || '',
+        publicApiUrl: process.env.NEXT_PUBLIC_API_URL || '',
+        socketDirectUrl: process.env.NEXT_PUBLIC_SOCKET_DIRECT_URL || '',
+        enableChatContext: process.env.NEXT_PUBLIC_ENABLE_CHAT_CONTEXT === 'true',
+        loginMode: process.env.NEXT_PUBLIC_LOGIN_MODE || 'all',
+        oidcLoginText: process.env.NEXT_PUBLIC_OIDC_LOGIN_TEXT || '',
+        enableDisplayQuotas: process.env.NEXT_PUBLIC_FRONTEND_ENABLE_DISPLAY_QUOTAS === 'enable',
+        enableWiki: process.env.NEXT_PUBLIC_ENABLE_WIKI !== 'false',
+        enableCodeKnowledgeAddRepo:
+          process.env.NEXT_PUBLIC_ENABLE_CODE_KNOWLEDGE_ADD_REPO !== 'false',
+        // Keep the client usable if the runtime-config endpoint is unavailable.
+        // A deployment opts out explicitly through RUNTIME_ENABLE_CODE_WIKI=false.
+        enableCodeWiki: true,
+        enableProjectWorkspace: process.env.NEXT_PUBLIC_ENABLE_PROJECT_WORKSPACE === 'true',
+        projectWorkspaceWhitelist: process.env.NEXT_PUBLIC_PROJECT_WORKSPACE_WHITELIST || '',
+        vscodeLinkTemplate: process.env.NEXT_PUBLIC_VSCODE_LINK_TEMPLATE || '',
+        feedbackUrl:
+          process.env.NEXT_PUBLIC_FEEDBACK_URL || 'https://github.com/wecode-ai/wegent/issues/new',
+        docsUrl: process.env.NEXT_PUBLIC_DOCS_URL || 'https://wecode-ai.github.io/wegent-docs',
+        otelEnabled: process.env.NEXT_PUBLIC_OTEL_ENABLED === 'true',
+        otelServiceName: process.env.NEXT_PUBLIC_OTEL_SERVICE_NAME || 'wegent-frontend',
+        otelCollectorEndpoint:
+          process.env.NEXT_PUBLIC_OTEL_COLLECTOR_ENDPOINT || 'http://localhost:4318',
+        bindGroupDesc: process.env.NEXT_PUBLIC_BIND_GROUP_DESC || '',
+        bindGroupSteps: process.env.NEXT_PUBLIC_BIND_GROUP_STEPS || DEFAULT_BIND_GROUP_STEPS,
+        appVersion: process.env.NEXT_PUBLIC_APP_VERSION || 'dev',
+        weworkCodeUrl: '',
+        modelSelectionGuideUrl: '',
+      }
+      runtimeConfigCache = fallback
+      return fallback
+    })
+    .finally(() => {
+      runtimeConfigPromise = null
+    })
+
+  return runtimeConfigPromise
+}
+
+/**
+ * Get runtime config synchronously (uses cached value or build-time fallback)
+ * Use this when you need config immediately and can't await
+ */
+export const getRuntimeConfigSync = (): RuntimeConfig => {
+  if (runtimeConfigCache) {
+    return runtimeConfigCache
+  }
+  // Fallback to build-time env vars
+  return {
+    apiUrl: process.env.NEXT_PUBLIC_API_URL || '',
+    publicApiUrl: process.env.NEXT_PUBLIC_API_URL || '',
+    socketDirectUrl: process.env.NEXT_PUBLIC_SOCKET_DIRECT_URL || '',
+    enableChatContext: process.env.NEXT_PUBLIC_ENABLE_CHAT_CONTEXT === 'true',
+    loginMode: process.env.NEXT_PUBLIC_LOGIN_MODE || 'all',
+    oidcLoginText: process.env.NEXT_PUBLIC_OIDC_LOGIN_TEXT || '',
+    enableDisplayQuotas: process.env.NEXT_PUBLIC_FRONTEND_ENABLE_DISPLAY_QUOTAS === 'enable',
+    enableWiki: process.env.NEXT_PUBLIC_ENABLE_WIKI !== 'false',
+    enableCodeKnowledgeAddRepo: process.env.NEXT_PUBLIC_ENABLE_CODE_KNOWLEDGE_ADD_REPO !== 'false',
+    enableCodeWiki: true,
+    enableProjectWorkspace: process.env.NEXT_PUBLIC_ENABLE_PROJECT_WORKSPACE === 'true',
+    projectWorkspaceWhitelist: process.env.NEXT_PUBLIC_PROJECT_WORKSPACE_WHITELIST || '',
+    vscodeLinkTemplate: process.env.NEXT_PUBLIC_VSCODE_LINK_TEMPLATE || '',
+    feedbackUrl:
+      process.env.NEXT_PUBLIC_FEEDBACK_URL || 'https://github.com/wecode-ai/wegent/issues/new',
+    docsUrl: process.env.NEXT_PUBLIC_DOCS_URL || 'https://wecode-ai.github.io/wegent-docs',
+    otelEnabled: process.env.NEXT_PUBLIC_OTEL_ENABLED === 'true',
+    otelServiceName: process.env.NEXT_PUBLIC_OTEL_SERVICE_NAME || 'wegent-frontend',
+    otelCollectorEndpoint:
+      process.env.NEXT_PUBLIC_OTEL_COLLECTOR_ENDPOINT || 'http://localhost:4318',
+    bindGroupDesc: process.env.NEXT_PUBLIC_BIND_GROUP_DESC || '',
+    bindGroupSteps: process.env.NEXT_PUBLIC_BIND_GROUP_STEPS || DEFAULT_BIND_GROUP_STEPS,
+    appVersion: process.env.NEXT_PUBLIC_APP_VERSION || 'dev',
+    weworkCodeUrl: '',
+    modelSelectionGuideUrl: '',
+  }
+}
+
+/**
+ * Get API base URL
+ * Returns the configured API URL with /api suffix, or '/api' for proxy mode
+ *
+ * Examples:
+ * - '' (empty) -> '/api' (proxy mode)
+ * - 'http://localhost:8000' -> 'http://localhost:8000/api'
+ * - 'http://localhost:8000/api' -> 'http://localhost:8000/api' (unchanged)
+ * - '/api' -> '/api' (unchanged)
+ */
+function normalizeApiBaseUrl(apiUrl: string, fallback: string): string {
+  if (!apiUrl || apiUrl.trim() === '') {
+    return fallback
+  }
+
+  const trimmedApiUrl = apiUrl.trim()
+
+  if (trimmedApiUrl === '/api' || trimmedApiUrl.endsWith('/api')) {
+    return trimmedApiUrl
+  }
+
+  if (trimmedApiUrl.startsWith('http://') || trimmedApiUrl.startsWith('https://')) {
+    return trimmedApiUrl.replace(/\/+$/, '') + '/api'
+  }
+
+  return trimmedApiUrl
+}
+
+export const getApiBaseUrl = (): string => {
+  const config = getRuntimeConfigSync()
+
+  // If apiUrl is not set or empty, use '/api' proxy mode
+  return normalizeApiBaseUrl(config.apiUrl, '/api')
+}
+
+/**
+ * Get the public API base URL for generated examples.
+ * Falls back to regular browser API base URL when no public URL is configured.
+ */
+export function getPublicApiBaseUrl(): string {
+  const config = getRuntimeConfigSync()
+
+  if (!config.publicApiUrl || config.publicApiUrl.trim() === '') {
+    return getApiBaseUrl()
+  }
+
+  return normalizeApiBaseUrl(config.publicApiUrl, '/api')
+}
+
+/**
+ * Get Socket.IO URL
+ * Returns the configured socket URL or empty string for proxy mode
+ */
+export const getSocketUrl = (): string => {
+  const config = getRuntimeConfigSync()
+  return config.socketDirectUrl
+}
+
+/**
+ * Check if chat context feature is enabled
+ * Returns true if the feature is enabled, false otherwise
+ */
+export const isChatContextEnabled = (): boolean => {
+  const config = getRuntimeConfigSync()
+  return config.enableChatContext
+}
+
+/**
+ * Clear the config cache (useful for testing or forcing refresh)
+ */
+export const clearRuntimeConfigCache = (): void => {
+  runtimeConfigCache = null
+  runtimeConfigPromise = null
+}
+
+/**
+ * Initialize runtime config
+ * Call this early in app initialization to pre-fetch config
+ */
+export const initRuntimeConfig = async (): Promise<RuntimeConfig> => {
+  return fetchRuntimeConfig()
+}

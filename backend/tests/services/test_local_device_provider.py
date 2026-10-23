@@ -1,0 +1,153 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for local device provider filtering."""
+
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from app.models.kind import Kind
+from app.schemas.device import DeviceType
+from app.services.device.local_provider import AppDeviceProvider, LocalDeviceProvider
+
+
+def _local_device(device_id: str, device_type: str) -> Kind:
+    return Kind(
+        user_id=7,
+        kind="Device",
+        name=device_id,
+        namespace="default",
+        is_active=True,
+        json={
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Device",
+            "metadata": {
+                "name": device_id,
+                "namespace": "default",
+            },
+            "spec": {
+                "deviceId": device_id,
+                "deviceType": device_type,
+                "connectionMode": "websocket",
+                "bindShell": "claudecode",
+                "displayName": device_id,
+                "runtimeInstanceId": f"runtime-{device_id}",
+                "isDefault": False,
+            },
+        },
+    )
+
+
+async def test_list_devices_excludes_remote_devices(test_db):
+    """Remote devices are listed by RemoteDeviceProvider, not LocalDeviceProvider."""
+    test_db.add(_local_device("remote-device", DeviceType.REMOTE.value))
+    test_db.commit()
+
+    devices = await LocalDeviceProvider().list_devices(test_db, user_id=7)
+
+    assert devices == []
+
+
+async def test_app_provider_lists_app_devices_separately(test_db, monkeypatch):
+    """Desktop app registrations keep their explicit app device type."""
+    test_db.add(_local_device("app-device", DeviceType.APP.value))
+    test_db.add(_local_device("local-device", DeviceType.LOCAL.value))
+    test_db.commit()
+    monkeypatch.setattr(
+        "app.services.device.local_provider.cache_manager.mget_or_raise",
+        AsyncMock(return_value={}),
+    )
+
+    app_devices = await AppDeviceProvider().list_devices(test_db, user_id=7)
+    local_devices = await LocalDeviceProvider().list_devices(test_db, user_id=7)
+
+    assert [device["device_id"] for device in app_devices] == ["app-device"]
+    assert app_devices[0]["device_type"] == DeviceType.APP.value
+    assert app_devices[0]["runtime_instance_id"] == "runtime-app-device"
+    assert [device["device_id"] for device in local_devices] == ["local-device"]
+    assert local_devices[0]["runtime_instance_id"] == "runtime-local-device"
+
+
+@pytest.mark.parametrize(
+    "observed_runtime", [None, "runtime-other", "runtime-app-device"]
+)
+async def test_app_status_only_uses_matching_runtime_heartbeat(
+    test_db, observed_runtime
+):
+    record = _local_device("app-device", DeviceType.APP.value)
+    test_db.add(record)
+    test_db.commit()
+    online = {
+        "runtime_instance_id": observed_runtime,
+        "status": "online",
+        "runtime_features": {"schemaVersion": 2},
+        "executor_version": "1.8.6",
+        "runtime_capacity": {"limit": 4, "active": 1, "active_task_ids": ["task-1"]},
+    }
+    with (
+        patch(
+            "app.services.device.local_provider.cache_manager.get_or_raise",
+            AsyncMock(return_value=online),
+        ),
+        patch(
+            "app.services.device.local_provider.cache_manager.mget_or_raise",
+            AsyncMock(
+                return_value={
+                    f"device:online:7:app-record-{record.id}": online,
+                }
+            ),
+        ),
+    ):
+        provider = AppDeviceProvider()
+        status = await provider.get_status(test_db, 7, "app-device")
+        listed = (await provider.list_devices(test_db, 7))[0]
+    expected_online = observed_runtime == "runtime-app-device"
+    for device in [status, listed]:
+        assert device["status"] == ("online" if expected_online else "offline")
+        assert device["slot_used"] == (1 if expected_online else 0)
+        assert device["slot_max"] == (4 if expected_online else 0)
+        assert device["runtime_features"] == (
+            online["runtime_features"] if expected_online else None
+        )
+
+
+async def test_heartbeat_without_capacity_clears_previous_observation():
+    previous = {
+        "status": "online",
+        "runtime_instance_id": "runtime-1",
+        "runtime_features": {
+            "schemaVersion": 1,
+            "worktrees": {"version": 1, "managed": True},
+        },
+        "runtime_capacity": {
+            "limit": 4,
+            "active": 1,
+            "active_task_ids": ["task-1"],
+            "queued": 0,
+        },
+    }
+    cache_set = AsyncMock(return_value=True)
+    with (
+        patch(
+            "app.services.device.local_provider.cache_manager.get_or_raise",
+            AsyncMock(return_value=previous),
+        ),
+        patch(
+            "app.services.device.local_provider.cache_manager.set_or_raise",
+            cache_set,
+        ),
+    ):
+        refreshed = await LocalDeviceProvider().refresh_heartbeat(
+            user_id=7,
+            device_id="local-device",
+            runtime_instance_id=None,
+            runtime_capacity=None,
+        )
+
+    assert refreshed is True
+    stored = cache_set.await_args.args[1]
+    assert stored["runtime_instance_id"] is None
+    assert stored["runtime_capacity"] is None
+    assert stored["runtime_features"] is None

@@ -1,0 +1,319 @@
+import { describe, expect, test, vi } from 'vitest'
+import { navigateTo } from '@/lib/navigation'
+import type { InstalledPlugin, PluginMarketplaceItem } from '@/types/api'
+import type { InstalledPluginItem } from '../PluginManagementRows'
+import {
+  keepRicherMarketplacePluginDetail,
+  marketplacePluginDetailSelectionKey,
+  marketplacePluginDetailSource,
+  pluginDetailActionErrorMessage,
+  pluginUsesWegentConnectorOAuth,
+  queueMarketplacePluginTrial,
+  requiredConnectionNames,
+  resolveCloudMarketplaceRevalidateIntervalMs,
+  resolveMarketplaceUninstallId,
+} from './marketplaceWorkspaceHelpers'
+
+vi.mock('@/lib/navigation', () => ({
+  navigateTo: vi.fn(),
+}))
+
+test('keeps production marketplace polling at sixty seconds while accelerating E2E', () => {
+  expect(resolveCloudMarketplaceRevalidateIntervalMs(false)).toBe(60_000)
+  expect(resolveCloudMarketplaceRevalidateIntervalMs(true)).toBe(5_000)
+})
+
+const emptyComponents = {
+  skills: [],
+  commands: [],
+  agents: [],
+  hooks: [],
+  mcps: [],
+  lsps: [],
+  monitors: [],
+  bins: [],
+  connectors: [],
+}
+
+test('detail source preserves the shared inventory local path for an official marketplace', () => {
+  const item = githubMarketplaceItem()
+  item.manifest = { marketplaceId: 'openai-official' }
+  expect(
+    marketplacePluginDetailSource(item, [
+      {
+        key: 'local:openai-official',
+        id: 'openai-official',
+        name: 'OpenAI',
+        kind: 'local',
+        path: '/tmp/github-marketplace',
+      },
+    ])
+  ).toEqual({ id: 'openai-official', name: 'OpenAI', path: '/tmp/github-marketplace' })
+})
+
+test('only a declared remote catalog can resolve without a local path', () => {
+  const item = githubMarketplaceItem()
+  expect(marketplacePluginDetailSource(item, []).path).toBe('openai-curated-remote')
+  item.manifest = { marketplaceId: 'enterprise' }
+  expect(() => marketplacePluginDetailSource(item, [])).toThrow(
+    'Local plugin marketplace path is unavailable'
+  )
+})
+
+test('account connections do not require legacy login during plugin installation', () => {
+  const item = githubMarketplaceItem()
+  item.components = {
+    ...emptyComponents,
+    connectors: [
+      {
+        slug: 'github',
+        authPolicy: 'on_install',
+        accountAuth: { protocolVersion: 1, credentialType: 'oauth2', adapter: 'scripts/auth.py' },
+      },
+    ],
+  }
+  expect(requiredConnectionNames(item)).toEqual([])
+  delete item.components.connectors![0].accountAuth
+  expect(requiredConnectionNames(item)).toEqual(['GitHub'])
+})
+
+function githubMarketplaceItem(): PluginMarketplaceItem {
+  return {
+    id: 'github@openai-curated-remote',
+    remotePluginId: 'plugin_connector_1p_github',
+    name: 'github',
+    displayName: 'GitHub',
+    description: 'Connect GitHub',
+    version: '0.1.8',
+    visibility: 'public',
+    featured: false,
+    installed: true,
+    installedPluginId: 'github@openai-curated-remote',
+    installedLocally: true,
+    enabled: true,
+    sourceType: 'marketplace',
+    sourceProvider: 'codex',
+    sourceLabel: 'OpenAI 官方',
+    components: emptyComponents,
+    manifest: { marketplaceId: 'openai-curated-remote' },
+    ownerUserId: 0,
+    latestReleaseId: null,
+    interface: {
+      displayName: 'GitHub',
+      shortDescription: 'Connect GitHub',
+      category: 'Developer Tools',
+      defaultPrompt: ['Inspect pull requests and failing checks'],
+    },
+  }
+}
+
+function githubInstalledItem(): InstalledPluginItem {
+  const raw: InstalledPlugin = {
+    apiVersion: 'agent.wecode.io/v1',
+    kind: 'InstalledPlugin',
+    metadata: {
+      name: 'github',
+      namespace: 'openai-curated-remote',
+      labels: { id: 'github@openai-curated-remote' },
+    },
+    spec: {
+      source: {
+        type: 'marketplace',
+        providerKey: 'openai-curated-remote',
+        pluginKey: 'github',
+        marketplace: 'openai-curated-remote',
+      },
+      origin: 'market',
+      displayName: 'GitHub',
+      description: 'Connect GitHub',
+      version: '0.1.8',
+      installState: 'installed',
+      enabled: true,
+      componentStates: {},
+      components: emptyComponents,
+      interface: {
+        displayName: 'GitHub',
+        defaultPrompt: ['Inspect pull requests and failing checks'],
+      },
+      packageRef: null,
+      sourcePayload: { marketplaceName: 'openai-curated-remote', pluginName: 'github' },
+    },
+    status: { state: 'enabled' },
+  }
+  return {
+    id: 'github@openai-curated-remote',
+    name: 'GitHub',
+    description: 'Connect GitHub',
+    enabled: true,
+    version: '0.1.8',
+    origin: 'market',
+    sourceLabel: 'OpenAI 官方',
+    distribution: 'official',
+    updateAvailable: false,
+    componentCounts: {},
+    raw,
+  }
+}
+
+describe('queueMarketplacePluginTrial', () => {
+  test('queues an OpenAI official plugin from in-memory detail without extra Codex reads', () => {
+    const rememberMarketplaceSelection = vi.fn()
+    vi.mocked(navigateTo).mockClear()
+    window.sessionStorage.clear()
+
+    expect(
+      queueMarketplacePluginTrial({
+        item: githubMarketplaceItem(),
+        installed: githubInstalledItem(),
+        rememberMarketplaceSelection,
+      })
+    ).toBe(true)
+
+    expect(rememberMarketplaceSelection).toHaveBeenCalledWith('openai-curated-remote')
+    expect(navigateTo).toHaveBeenCalledWith('/')
+    expect(
+      JSON.parse(window.sessionStorage.getItem('wework:pending-plugin-trial') ?? '{}')
+    ).toEqual(
+      expect.objectContaining({
+        input:
+          '[$GitHub](plugin://github@openai-curated-remote) Inspect pull requests and failing checks',
+        pluginName: 'GitHub',
+        openInNewChat: true,
+      })
+    )
+  })
+})
+
+describe('pluginUsesWegentConnectorOAuth', () => {
+  test('skips Wegent OAuth for OpenAI official marketplace and installed plugins', () => {
+    expect(pluginUsesWegentConnectorOAuth(githubMarketplaceItem())).toBe(false)
+    expect(pluginUsesWegentConnectorOAuth(githubInstalledItem())).toBe(false)
+  })
+
+  test('uses Wegent OAuth for cloud marketplace plugins', () => {
+    const item: PluginMarketplaceItem = {
+      ...githubMarketplaceItem(),
+      id: 101,
+      remotePluginId: 'wegent-github',
+      latestReleaseId: 1001,
+      sourceProvider: 'wegent',
+      sourceLabel: 'Wegent 官方',
+      manifest: { marketplaceId: 'default' },
+    }
+    expect(pluginUsesWegentConnectorOAuth(item)).toBe(true)
+  })
+})
+
+describe('resolveMarketplaceUninstallId', () => {
+  test('prefers the actual installed inventory record over a stale marketplace id', () => {
+    const item: PluginMarketplaceItem = {
+      ...githubMarketplaceItem(),
+      id: 54,
+      installedPluginId: 54,
+      name: 'documents',
+      displayName: '文档',
+      sourceProvider: 'wegent',
+      sourceLabel: 'Wegent 官方',
+      manifest: { marketplaceId: 'wegent' },
+    }
+    const installed = githubInstalledItem()
+    installed.id = '269646-wegent-documents-0.1.3'
+    installed.name = '文档'
+    installed.raw.metadata = {
+      name: 'documents',
+      namespace: 'wegent',
+      labels: { id: '269646-wegent-documents-0.1.3' },
+    }
+    installed.raw.spec.source = {
+      type: 'marketplace',
+      providerKey: 'wegent',
+      pluginKey: 'documents',
+      marketplace: 'wegent',
+    }
+    installed.raw.spec.sourcePayload = {
+      managedByWegent: true,
+      cloudInstalledPluginId: 269646,
+      marketplaceName: 'wegent',
+    }
+
+    expect(resolveMarketplaceUninstallId(item, [installed])).toBe('269646-wegent-documents-0.1.3')
+  })
+})
+
+describe('pluginDetailActionErrorMessage', () => {
+  test('only returns the message for the plugin that produced the error', () => {
+    const error = {
+      pluginId: 'github@openai-curated-remote',
+      message: 'Connector app not found',
+    }
+    expect(pluginDetailActionErrorMessage(error, 'github@openai-curated-remote')).toBe(
+      'Connector app not found'
+    )
+    expect(pluginDetailActionErrorMessage(error, 'gmail@openai-curated-remote')).toBeNull()
+    expect(pluginDetailActionErrorMessage(null, 'github@openai-curated-remote')).toBeNull()
+  })
+})
+
+describe('keepRicherMarketplacePluginDetail', () => {
+  test('keeps previously loaded skills when a later catalog row has empty components', () => {
+    const empty = githubInstalledItem()
+    const rich: InstalledPluginItem = {
+      ...empty,
+      raw: {
+        ...empty.raw,
+        spec: {
+          ...empty.raw.spec,
+          components: {
+            ...emptyComponents,
+            skills: [{ name: 'ci-debug', description: 'Debug failing checks', path: 'ci-debug' }],
+            apps: [
+              {
+                name: 'GitHub',
+                path: 'github',
+                description: 'Access repositories, issues, and pull requests.',
+              },
+            ],
+          },
+        },
+      },
+    }
+
+    const kept = keepRicherMarketplacePluginDetail(rich, empty)
+    expect(kept.raw.spec.components.skills).toEqual([
+      { name: 'ci-debug', description: 'Debug failing checks', path: 'ci-debug' },
+    ])
+    expect(kept.raw.spec.components.apps).toEqual([
+      {
+        name: 'GitHub',
+        path: 'github',
+        description: 'Access repositories, issues, and pull requests.',
+      },
+    ])
+  })
+})
+
+describe('marketplacePluginDetailSelectionKey', () => {
+  test('separates same-name personal and enterprise cloud listings', () => {
+    const enterprise = githubMarketplaceItem()
+    enterprise.id = 22
+    enterprise.name = 'ip-location'
+    enterprise.version = '0.3.0'
+    enterprise.visibility = 'workspace'
+    enterprise.accessRole = 'catalog'
+    enterprise.sourceProvider = 'wegent'
+    enterprise.manifest = {}
+
+    const personal = {
+      ...enterprise,
+      id: 21,
+      version: '0.1.0',
+      visibility: 'personal' as const,
+      accessRole: 'owner' as const,
+      sourceProvider: 'user' as const,
+    }
+
+    expect(marketplacePluginDetailSelectionKey(enterprise)).not.toBe(
+      marketplacePluginDetailSelectionKey(personal)
+    )
+  })
+})

@@ -1,0 +1,1045 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Knowledge base and document related types
+ */
+
+// Import BaseRole and related utilities from base-role module
+import type { BaseRole } from './base-role'
+
+// Re-export MemberRole as backward compatible alias
+export type MemberRole = BaseRole
+
+export type DocumentStatus = 'enabled' | 'disabled'
+
+export type DocumentSourceType = 'file' | 'text' | 'web' | 'external'
+
+export type DocumentIndexStatus =
+  | 'not_indexed'
+  | 'queued'
+  | 'pending_conversion'
+  | 'converting'
+  | 'indexing'
+  | 'success'
+  | 'failed'
+
+export interface DocumentProcessingError {
+  stage: 'dispatch' | 'conversion' | 'indexing' | 'system'
+  code: string
+  message: string
+  retryable: boolean
+  generation: number
+  occurred_at: string
+  provider?: string | null
+  model?: string | null
+  request_id?: string | null
+}
+
+export type KnowledgeResourceScope = 'personal' | 'organization' | 'group' | 'all'
+
+// Retrieval Config types
+export interface RetrievalConfig {
+  retriever_name: string
+  retriever_namespace?: string
+  embedding_config: {
+    model_name: string
+    model_namespace?: string
+  }
+  retrieval_mode?: 'vector' | 'keyword' | 'hybrid'
+  top_k?: number
+  score_threshold?: number
+  hybrid_weights?: {
+    vector_weight: number
+    keyword_weight: number
+  }
+}
+
+export interface RetrievalConfigDraft {
+  retriever_name?: string
+  retriever_namespace?: string
+  embedding_config?: {
+    model_name?: string
+    model_namespace?: string
+  }
+  retrieval_mode?: 'vector' | 'keyword' | 'hybrid'
+  top_k?: number
+  score_threshold?: number
+  hybrid_weights?: {
+    vector_weight: number
+    keyword_weight: number
+  }
+}
+
+export interface KnowledgeBaseRetrievalProfileHealth {
+  status: 'missing' | 'valid' | 'invalid'
+  fallback_reason: string | null
+}
+
+export interface KnowledgeBaseRetrievalProfile {
+  version: number
+  retrieval_config: RetrievalConfigDraft | null
+  health: KnowledgeBaseRetrievalProfileHealth
+}
+
+// Splitter Config types
+export type ChunkStrategy = 'flat' | 'hierarchical' | 'semantic'
+export type FormatEnhancement = 'none' | 'file_aware'
+export type LegacySplitterType = 'sentence' | 'semantic' | 'smart'
+export type SplitterType = ChunkStrategy | LegacySplitterType
+
+export interface FlatChunkConfig {
+  separator?: string
+  chunk_size?: number
+  chunk_overlap?: number
+}
+
+export interface HierarchicalChunkConfig {
+  parent_chunk_size?: number
+  child_chunk_size?: number
+  child_chunk_overlap?: number
+  parent_separator?: string
+  child_separator?: string
+}
+
+export interface SemanticChunkConfig {
+  buffer_size?: number
+  breakpoint_percentile_threshold?: number
+}
+
+export interface MarkdownEnhancementConfig {
+  enabled?: boolean
+}
+
+export interface NormalizedSplitterConfig {
+  chunk_strategy: ChunkStrategy
+  format_enhancement?: FormatEnhancement
+  flat_config?: FlatChunkConfig
+  hierarchical_config?: HierarchicalChunkConfig
+  semantic_config?: SemanticChunkConfig
+  markdown_enhancement?: MarkdownEnhancementConfig
+}
+
+// Base splitter config
+export interface BaseLegacySplitterConfig {
+  type: LegacySplitterType
+}
+
+// Sentence splitter config
+export interface SentenceSplitterConfig extends BaseLegacySplitterConfig {
+  type: 'sentence'
+  separator?: string
+  chunk_size?: number
+  chunk_overlap?: number
+}
+
+// Semantic splitter config
+export interface LegacySemanticSplitterConfig extends BaseLegacySplitterConfig {
+  type: 'semantic'
+  buffer_size?: number // 1-10, default 1
+  breakpoint_percentile_threshold?: number // 50-100, default 95
+}
+
+// Smart splitter config (file-type aware)
+export interface SmartSplitterConfig extends BaseLegacySplitterConfig {
+  type: 'smart'
+  chunk_size?: number // 128-8192, default 1024
+  chunk_overlap?: number // 0-2048, default 50
+  file_extension?: string // .md, .txt, .pdf, .doc, .docx
+  subtype?: string // markdown_sentence, sentence, recursive_character
+}
+
+export type LegacySplitterConfig =
+  | SentenceSplitterConfig
+  | LegacySemanticSplitterConfig
+  | SmartSplitterConfig
+
+// Union type for splitter config
+export type SplitterConfig = NormalizedSplitterConfig | LegacySplitterConfig
+
+export const DEFAULT_FLAT_CHUNK_CONFIG: FlatChunkConfig = {
+  separator: '\n\n',
+  chunk_size: 1024,
+  chunk_overlap: 50,
+}
+
+export const DEFAULT_HIERARCHICAL_CHUNK_CONFIG: HierarchicalChunkConfig = {
+  parent_chunk_size: 2048,
+  child_chunk_size: 512,
+  child_chunk_overlap: 64,
+  parent_separator: '\n\n',
+  child_separator: '\n',
+}
+
+export const DEFAULT_SEMANTIC_CHUNK_CONFIG: SemanticChunkConfig = {
+  buffer_size: 1,
+  breakpoint_percentile_threshold: 95,
+}
+
+export const DEFAULT_SPLITTER_CONFIG: NormalizedSplitterConfig = {
+  chunk_strategy: 'flat',
+  format_enhancement: 'file_aware',
+  flat_config: { ...DEFAULT_FLAT_CHUNK_CONFIG },
+  markdown_enhancement: {
+    enabled: true,
+  },
+}
+
+function isNormalizedSplitterConfig(
+  config: Partial<SplitterConfig>
+): config is Partial<NormalizedSplitterConfig> {
+  return 'chunk_strategy' in config
+}
+
+function isLegacySplitterConfig(
+  config: Partial<SplitterConfig>
+): config is Partial<LegacySplitterConfig> {
+  return 'type' in config
+}
+
+export function normalizeSplitterConfigForDisplay(
+  config?: Partial<SplitterConfig> | null
+): NormalizedSplitterConfig {
+  if (!config) {
+    return {
+      ...DEFAULT_SPLITTER_CONFIG,
+      flat_config: { ...DEFAULT_FLAT_CHUNK_CONFIG },
+      markdown_enhancement: {
+        enabled: DEFAULT_SPLITTER_CONFIG.markdown_enhancement?.enabled ?? true,
+      },
+    }
+  }
+
+  if (isNormalizedSplitterConfig(config) && config.chunk_strategy) {
+    const formatEnhancement =
+      config.format_enhancement ?? DEFAULT_SPLITTER_CONFIG.format_enhancement ?? 'file_aware'
+    const markdownEnhancementEnabled =
+      formatEnhancement === 'file_aware' ? (config.markdown_enhancement?.enabled ?? true) : false
+
+    const normalizedBase = {
+      chunk_strategy: config.chunk_strategy,
+      format_enhancement: formatEnhancement,
+      markdown_enhancement: {
+        enabled: markdownEnhancementEnabled,
+      },
+    }
+
+    if (config.chunk_strategy === 'hierarchical') {
+      return {
+        ...normalizedBase,
+        chunk_strategy: 'hierarchical',
+        hierarchical_config: {
+          ...DEFAULT_HIERARCHICAL_CHUNK_CONFIG,
+          ...config.hierarchical_config,
+        },
+      }
+    }
+
+    if (config.chunk_strategy === 'semantic') {
+      return {
+        ...normalizedBase,
+        chunk_strategy: 'semantic',
+        semantic_config: {
+          ...DEFAULT_SEMANTIC_CHUNK_CONFIG,
+          ...config.semantic_config,
+        },
+      }
+    }
+
+    return {
+      ...normalizedBase,
+      chunk_strategy: 'flat',
+      flat_config: {
+        ...DEFAULT_FLAT_CHUNK_CONFIG,
+        ...config.flat_config,
+      },
+    }
+  }
+
+  if (isLegacySplitterConfig(config) && config.type === 'semantic') {
+    return {
+      chunk_strategy: 'semantic',
+      format_enhancement: 'none',
+      semantic_config: {
+        ...DEFAULT_SEMANTIC_CHUNK_CONFIG,
+        buffer_size: config.buffer_size ?? DEFAULT_SEMANTIC_CHUNK_CONFIG.buffer_size,
+        breakpoint_percentile_threshold:
+          config.breakpoint_percentile_threshold ??
+          DEFAULT_SEMANTIC_CHUNK_CONFIG.breakpoint_percentile_threshold,
+      },
+      markdown_enhancement: {
+        enabled: false,
+      },
+    }
+  }
+
+  if (isLegacySplitterConfig(config) && config.type === 'smart') {
+    return {
+      chunk_strategy: 'flat',
+      format_enhancement: 'file_aware',
+      flat_config: {
+        ...DEFAULT_FLAT_CHUNK_CONFIG,
+        chunk_size: config.chunk_size ?? DEFAULT_FLAT_CHUNK_CONFIG.chunk_size,
+        chunk_overlap: config.chunk_overlap ?? DEFAULT_FLAT_CHUNK_CONFIG.chunk_overlap,
+      },
+      markdown_enhancement: {
+        enabled: true,
+      },
+    }
+  }
+
+  if (isLegacySplitterConfig(config) && config.type === 'sentence') {
+    return {
+      chunk_strategy: 'flat',
+      format_enhancement: 'none',
+      flat_config: {
+        ...DEFAULT_FLAT_CHUNK_CONFIG,
+        separator: config.separator ?? DEFAULT_FLAT_CHUNK_CONFIG.separator,
+        chunk_size: config.chunk_size ?? DEFAULT_FLAT_CHUNK_CONFIG.chunk_size,
+        chunk_overlap: config.chunk_overlap ?? DEFAULT_FLAT_CHUNK_CONFIG.chunk_overlap,
+      },
+      markdown_enhancement: {
+        enabled: false,
+      },
+    }
+  }
+
+  return {
+    ...DEFAULT_SPLITTER_CONFIG,
+    flat_config: { ...DEFAULT_FLAT_CHUNK_CONFIG },
+    markdown_enhancement: {
+      enabled: DEFAULT_SPLITTER_CONFIG.markdown_enhancement?.enabled ?? true,
+    },
+  }
+}
+
+// Summary Model Reference types
+export interface SummaryModelRef {
+  name: string
+  namespace: string
+  type: 'public' | 'user' | 'group' | 'runtime'
+}
+
+// Knowledge Base Type.
+// This field is persisted as spec.kbType and now represents the default
+// opening view, not a resource capability boundary.
+// - notebook: default to Notebook workspace view
+// - classic: default to document management view
+/**
+ * How a knowledge base is filled and read.
+ *
+ * `code_wiki` is generated from a repository by an agent rather than filled by hand,
+ * and is read through its own three-pane reader. It is otherwise an ordinary
+ * knowledge base: same ownership, same ACL, same listing.
+ */
+export type KnowledgeBaseType = 'notebook' | 'classic' | 'code_wiki'
+
+/**
+ * The two views a document knowledge base can open in.
+ *
+ * Deliberately narrower than `KnowledgeBaseType`: a code wiki has neither view, it
+ * has a reader of its own. Components that render one or the other take this type so
+ * that a code wiki cannot be handed to them without the conversion being visible.
+ */
+export type DocumentViewType = 'notebook' | 'classic'
+
+/** The view to open a knowledge base in, or `null` when it is not a document one. */
+export function documentViewOf(kbType?: KnowledgeBaseType | null): DocumentViewType | null {
+  return kbType === 'notebook' || kbType === 'classic' ? kbType : null
+}
+export type KnowledgeView = 'documents' | 'notebook'
+export type CodeWikiView = 'wiki' | 'documents'
+export type RagConfigMode = 'auto' | 'disabled'
+export type DirectAccessRequirement = 'read' | 'edit'
+
+// Knowledge Base types
+export interface KnowledgeBase {
+  id: number
+  name: string
+  description: string | null
+  user_id: number
+  namespace: string
+  direct_access_requirement?: DirectAccessRequirement
+  /** Whether readers may download original documents from this knowledge base. */
+  allow_document_download?: boolean
+  document_count: number
+  is_active: boolean
+  retrieval_config?: RetrievalConfig
+  /** Repository a code wiki documents. Absent for every other kind. */
+  source?: {
+    sourceType?: string
+    sourceUrl?: string
+    sourceDomain?: string
+    projectName?: string
+  }
+  /** Language a code wiki's pages are generated in. */
+  language?: string
+  /** Whether a code wiki's generation runs appear in the conversation list. */
+  show_generation_task?: boolean
+  /** Default generation strategy for this code wiki. */
+  generation_strategy?: string | null
+  dingtalk_auto_sync_enabled?: boolean
+  summary_enabled: boolean
+  summary_model_ref?: SummaryModelRef | null
+  /** Which model this knowledge base's own generation runs on. */
+  execution_model_ref?: SummaryModelRef | null
+  summary?: KnowledgeBaseSummary | null
+  /** Default opening view: 'notebook' or 'classic' (documents) */
+  kb_type?: KnowledgeBaseType
+  /** Guided questions list (max 3) for notebook mode quick user interaction */
+  guided_questions?: string[]
+  /** Maximum number of knowledge base tool calls allowed per conversation */
+  max_calls_per_conversation: number
+  /** Number of calls exempt from token checking (must be < max_calls_per_conversation) */
+  exempt_calls_before_check: number
+  /** Whether multimodal (video/image) uploads + Gemini analysis are enabled for this KB */
+  multimodal_analysis_enabled?: boolean
+  /** Model reference for multimodal analysis (must support multimodal analysis) */
+  multimodal_analysis_model_ref?: SummaryModelRef | null
+  /** Custom video analysis prompt; null/undefined = use system default */
+  multimodal_analysis_video_prompt?: string | null
+  /** Custom image analysis prompt; null/undefined = use system default */
+  multimodal_analysis_image_prompt?: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** Initial member to add when creating a knowledge base */
+export interface InitialMember {
+  entity_type: string
+  entity_id: string
+  role: MemberRole
+  entity_display_name?: string
+}
+
+export interface KnowledgeBaseCreate {
+  name: string
+  description?: string
+  namespace?: string
+  direct_access_requirement?: DirectAccessRequirement
+  /** Defaults to true for a new knowledge base. */
+  allow_document_download?: boolean
+  retrieval_config?: RetrievalConfigDraft
+  rag_config_mode?: RagConfigMode
+  dingtalk_auto_sync_enabled?: boolean
+  summary_enabled?: boolean
+  summary_model_ref?: SummaryModelRef | null
+  /** Default opening view: 'notebook' or 'classic' (documents) */
+  kb_type?: KnowledgeBaseType
+  /** Only for `kb_type: 'code_wiki'` — which platform hosts the repository. */
+  source_type?: 'github' | 'gitlab' | 'gitea'
+  /** Only for `kb_type: 'code_wiki'` — the repository to document. */
+  source_url?: string
+  /** Only for `kb_type: 'code_wiki'` — what language to generate the pages in. */
+  language?: string
+  /** What the provider calls the repository, used when the name is left blank. */
+  resolved_name?: string
+  /** What the provider says the repository is, used when no description is given. */
+  resolved_description?: string
+  /**
+   * Only for `kb_type: 'code_wiki'` — which model the generation agent runs on.
+   * Required by the server there: a wiki reads a whole repository, so which model
+   * sees it is the creator's choice rather than the team bot's default.
+   */
+  execution_model_ref?: SummaryModelRef | null
+  /** Only for `kb_type: 'code_wiki'` — leave unset to use the deployment default. */
+  generation_strategy?: string
+  /** Optional future updates; the first generation always starts after creation. */
+  scheduled_update?: {
+    enabled: boolean
+    cadence: 'daily' | 'weekly' | 'biweekly' | 'four_weeks' | 'custom'
+    interval_days: number
+    weekday: number
+    hour: number
+    minute: number
+    timezone: string
+    execution_principal_user_id?: number | null
+  } | null
+  /** Guided questions list (max 3) for notebook mode quick user interaction */
+  guided_questions?: string[]
+  /** Maximum number of knowledge base tool calls allowed per conversation */
+  max_calls_per_conversation?: number
+  /** Number of calls exempt from token checking (must be < max_calls_per_conversation) */
+  exempt_calls_before_check?: number
+  /** Initial members (users and groups) to add after creation */
+  members?: InitialMember[]
+  /** Enable multimodal (video/image) uploads + Gemini analysis */
+  multimodal_analysis_enabled?: boolean
+  /** Model reference for multimodal analysis (must support multimodal analysis) */
+  multimodal_analysis_model_ref?: SummaryModelRef | null
+  /** Custom video analysis prompt; null/empty = use system default */
+  multimodal_analysis_video_prompt?: string | null
+  /** Custom image analysis prompt; null/empty = use system default */
+  multimodal_analysis_image_prompt?: string | null
+}
+
+export interface RetrievalConfigUpdate {
+  retrieval_mode?: 'vector' | 'keyword' | 'hybrid'
+  top_k?: number
+  score_threshold?: number
+  hybrid_weights?: {
+    vector_weight: number
+    keyword_weight: number
+  }
+}
+
+export interface KnowledgeBaseUpdate {
+  name?: string
+  description?: string
+  direct_access_requirement?: DirectAccessRequirement
+  allow_document_download?: boolean
+  retrieval_config?: RetrievalConfigUpdate
+  dingtalk_auto_sync_enabled?: boolean
+  summary_enabled?: boolean
+  summary_model_ref?: SummaryModelRef | null
+  /** Editable: applies to the next run, not one already going. */
+  execution_model_ref?: SummaryModelRef | null
+  /** Guided questions list (max 3) for notebook mode quick user interaction */
+  /** Only for a code wiki: whether its generation runs are listed as conversations. */
+  show_generation_task?: boolean
+  /** Only for a code wiki: applies to future runs. */
+  generation_strategy?: string
+  guided_questions?: string[]
+  /** Maximum number of knowledge base tool calls allowed per conversation */
+  max_calls_per_conversation?: number
+  /** Number of calls exempt from token checking (must be < max_calls_per_conversation) */
+  exempt_calls_before_check?: number
+  /** Enable multimodal (video/image) uploads + Gemini analysis */
+  multimodal_analysis_enabled?: boolean
+  /** Model reference for multimodal analysis (must support multimodal analysis) */
+  multimodal_analysis_model_ref?: SummaryModelRef | null
+  /** Custom video analysis prompt; null/empty = use system default */
+  multimodal_analysis_video_prompt?: string | null
+  /** Custom image analysis prompt; null/empty = use system default */
+  multimodal_analysis_image_prompt?: string | null
+}
+
+export interface DocumentProtection {
+  original_download_allowed: boolean
+  watermark_text?: string | null
+}
+
+export interface KnowledgeBaseListResponse {
+  total: number
+  items: KnowledgeBase[]
+}
+
+// Knowledge Document types
+export type KnowledgeContentOrigin = 'generated' | 'user'
+
+export interface KnowledgeDocument {
+  id: number
+  kind_id: number
+  attachment_id: number | null
+  name: string
+  file_extension: string
+  file_size: number
+  status: DocumentStatus
+  user_id: number
+  created_by?: string | null
+  is_active: boolean
+  index_status: DocumentIndexStatus
+  index_generation: number
+  processing_error?: DocumentProcessingError | null
+  splitter_config?: SplitterConfig
+  source_type: DocumentSourceType
+  source_config: Record<string, unknown>
+  /** Content ownership is present on current API responses. */
+  origin?: KnowledgeContentOrigin
+  /** External provider identity when the document was imported (e.g. 'dingtalk'). */
+  external_provider?: string | null
+  /** Provider-scoped external document ID when the document was imported. */
+  external_resource_id?: string | null
+  folder_id: number // 0 = root level
+  created_at: string
+  updated_at: string
+}
+
+export interface KnowledgeDocumentCreate {
+  attachment_id?: number
+  name: string
+  file_extension: string
+  file_size: number
+  folder_id?: number // 0 = root level
+  splitter_config?: Partial<SplitterConfig>
+  source_type?: DocumentSourceType
+  source_config?: Record<string, unknown>
+  /** Per-document multimodal analysis prompt override; null/undefined = inherit KB default */
+  multimodal_analysis_prompt?: string | null
+}
+
+export interface KnowledgeDocumentUpdate {
+  name?: string
+  status?: DocumentStatus
+  splitter_config?: Partial<SplitterConfig>
+}
+
+export interface KnowledgeDocumentListResponse {
+  total: number
+  returned_count: number
+  limit: number | null
+  offset: number
+  has_more: boolean
+  items: KnowledgeDocument[]
+}
+
+export interface DocumentContentReadResponse {
+  document_id: number
+  name: string
+  content: string
+  total_length: number
+  offset: number
+  returned_length: number
+  has_more: boolean
+  kb_id: number
+  index_status: DocumentIndexStatus
+}
+
+// Accessible Knowledge types (for AI integration)
+export interface AccessibleKnowledgeBase {
+  id: number
+  name: string
+  description: string | null
+  document_count: number
+  updated_at: string
+}
+
+export interface TeamKnowledgeGroup {
+  group_name: string
+  group_display_name: string | null
+  knowledge_bases: AccessibleKnowledgeBase[]
+}
+
+export interface AccessibleKnowledgeResponse {
+  personal: AccessibleKnowledgeBase[]
+  team: TeamKnowledgeGroup[]
+}
+
+// Document Summary types
+export interface DocumentSummary {
+  short_summary?: string
+  long_summary?: string
+  topics?: string[]
+  meta_info?: {
+    author?: string
+    source?: string
+    type?: string
+  }
+  status?: 'pending' | 'generating' | 'completed' | 'failed'
+  task_id?: number
+  error?: string
+  updated_at?: string
+}
+
+// Knowledge Base Summary types
+export interface KnowledgeBaseSummary {
+  short_summary?: string
+  long_summary?: string
+  manual_long_summary?: string | null
+  topics?: string[]
+  meta_info?: {
+    document_count?: number
+    last_updated?: string
+  }
+  status?: 'pending' | 'generating' | 'completed' | 'failed'
+  task_id?: number
+  error?: string
+  updated_at?: string
+  last_summary_doc_count?: number
+  manual_updated_at?: string | null
+  manual_updated_by?: {
+    id: number
+    name: string
+  } | null
+}
+
+export interface KnowledgeBaseSummaryResponse {
+  kb_id: number
+  summary: KnowledgeBaseSummary | null
+}
+
+// Document Detail types
+export interface DocumentDetailResponse {
+  document_id: number
+  content?: string
+  content_length?: number
+  truncated?: boolean
+  summary?: DocumentSummary | null
+}
+
+// Web Scraper types
+export interface WebScrapeRequest {
+  url: string
+}
+
+export interface WebScrapeResponse {
+  title?: string
+  content: string
+  url: string
+  scraped_at: string
+  content_length: number
+  description?: string
+  success: boolean
+  error_code?:
+    | 'INVALID_URL_FORMAT'
+    | 'FETCH_FAILED'
+    | 'FETCH_TIMEOUT'
+    | 'PARSE_FAILED'
+    | 'EMPTY_CONTENT'
+    | 'AUTH_REQUIRED'
+    | 'SSRF_BLOCKED'
+    | 'CONTENT_TOO_LARGE'
+    | 'NOT_HTML'
+  error_message?: string
+}
+
+// Chunk types
+export interface ChunkItem {
+  index: number
+  content: string
+  token_count: number
+  start_position: number
+  end_position: number
+}
+
+export interface ChunkResponse {
+  index: number
+  content: string
+  token_count: number
+  document_name: string
+  document_id: number
+  kb_id: number
+}
+
+export interface ChunkListResponse {
+  total: number
+  page: number
+  page_size: number
+  items: ChunkItem[]
+  splitter_type?: string
+  splitter_subtype?: string
+  qa_pair_count: number
+}
+
+// ============== Permission Types ==============
+
+export type PermissionStatus = 'pending' | 'approved' | 'rejected'
+export type ReviewAction = 'approve' | 'reject'
+
+// Note: ROLE_DISPLAY_NAMES, ROLE_DISPLAY_NAMES_EN, and ROLE_HIERARCHY
+// are now defined in ./base-role.ts and should be imported from there
+
+// Permission Apply types
+export interface PermissionApplyRequest {
+  role: MemberRole
+}
+
+export interface PermissionApplyResponse {
+  id: number
+  knowledge_base_id: number
+  role: MemberRole
+  status: PermissionStatus
+  requested_at: string
+  message: string
+}
+
+// Permission Review types
+export interface PermissionReviewRequest {
+  action: ReviewAction
+  role?: MemberRole
+}
+
+export interface PermissionReviewResponse {
+  id: number
+  user_id: number
+  role: MemberRole | null
+  status: PermissionStatus
+  reviewed_at: string
+  message: string
+}
+
+// Permission Add/Update types
+export interface PermissionAddRequest {
+  user_name: string
+  role: MemberRole
+}
+
+export interface PermissionUpdateRequest {
+  role: MemberRole
+}
+
+// Batch permission add types
+export interface BatchPermissionMember {
+  user_id: number
+  role: MemberRole
+  entity_type?: string
+  entity_id?: string
+  entity_display_name?: string
+}
+
+export interface BatchPermissionAddRequest {
+  members: BatchPermissionMember[]
+}
+
+export interface BatchPermissionAddResponse {
+  succeeded: PermissionResponse[]
+  failed: { user_id: number; error: string }[]
+}
+
+// Permission User Info types
+export interface PermissionUserInfo {
+  id: number
+  user_id?: number | null
+  display_name: string
+  email?: string
+  role: MemberRole
+  requested_at: string
+  reviewed_at?: string
+  reviewed_by?: number
+  /** Entity type: 'user' (default), 'namespace' */
+  entity_type?: string
+  /** Entity identifier */
+  entity_id?: string
+  /** Permission source: 'direct', 'entity_permission', 'share_link' */
+  source_type?: string
+}
+
+export interface PendingPermissionInfo {
+  id: number
+  user_id: number
+  username: string
+  email?: string
+  role: MemberRole
+  requested_at: string
+}
+
+// Approved permissions grouped by role
+export interface ApprovedPermissionsByRole {
+  Owner: PermissionUserInfo[]
+  Maintainer: PermissionUserInfo[]
+  Developer: PermissionUserInfo[]
+  Reporter: PermissionUserInfo[]
+  RestrictedAnalyst: PermissionUserInfo[]
+}
+
+export interface PermissionListResponse {
+  pending: PendingPermissionInfo[]
+  approved: ApprovedPermissionsByRole
+}
+
+// Current User Permission types
+export interface PendingRequestInfo {
+  id: number
+  role: MemberRole
+  requested_at: string
+}
+
+export interface MyPermissionResponse {
+  has_access: boolean
+  role: MemberRole | null
+  is_creator: boolean
+  pending_request: PendingRequestInfo | null
+}
+
+// Permission Response (for CRUD operations)
+export interface PermissionResponse {
+  id: number
+  knowledge_base_id: number
+  user_id: number
+  role: MemberRole
+  status: PermissionStatus
+  requested_at: string
+  reviewed_at?: string
+  reviewed_by?: number
+  created_at: string
+  updated_at: string
+}
+
+// KB Share Info for share page
+export interface KBShareInfo {
+  id: number
+  name: string
+  description?: string
+  namespace: string
+  creator_id: number
+  creator_name: string
+  created_at?: string
+  my_permission: MyPermissionResponse
+}
+
+// Public Knowledge Base Response (for anonymous access via share token)
+export interface PublicKnowledgeBaseResponse {
+  id: number
+  name: string
+  namespace: string
+  description?: string
+  creator_id: number
+  creator_name: string
+  require_approval: boolean
+  default_role: MemberRole
+  is_expired: boolean
+}
+
+// Share Link types
+export interface ShareLinkConfig {
+  require_approval?: boolean
+  default_role?: MemberRole
+  expires_in_hours?: number
+}
+
+export interface ShareLinkResponse {
+  id: number
+  resource_type: string
+  resource_id: number
+  share_url: string
+  share_token: string
+  require_approval: boolean
+  default_role: MemberRole
+  expires_at?: string
+  is_active: boolean
+  created_by_user_id: number
+  created_at: string
+  updated_at: string
+}
+
+// Join by link types
+export interface JoinByLinkRequest {
+  share_token: string
+  requested_role?: MemberRole
+}
+
+export interface JoinByLinkResponse {
+  message: string
+  status: 'pending' | 'approved' | 'rejected'
+  member_id: number
+  resource_type: string
+  resource_id: number
+  copied_resource_id?: number
+}
+
+// Personal Knowledge Base Group (for grouped display)
+export interface PersonalKnowledgeBaseGroup {
+  created_by_me: KnowledgeBase[]
+  shared_with_me: KnowledgeBase[]
+}
+
+// ============== All Grouped Knowledge Types ==============
+
+/** Group type for knowledge base categorization */
+export type KnowledgeGroupType = 'personal' | 'personal-shared' | 'group' | 'organization'
+
+/** Group info for a knowledge base (for display purposes) */
+export interface KbGroupInfo {
+  groupId: string
+  groupName: string
+  groupType: KnowledgeGroupType
+}
+
+/** Knowledge base with group info for all-grouped response */
+export interface KnowledgeBaseWithGroupInfo {
+  id: number
+  name: string
+  description: string | null
+  kb_type: KnowledgeBaseType
+  namespace: string
+  document_count: number
+  updated_at: string
+  created_at: string
+  user_id: number
+  /** Group identifier (namespace or 'default') */
+  group_id: string
+  /** Display name for the group */
+  group_name: string
+  /** Type of group */
+  group_type: KnowledgeGroupType
+  /** Current user's role for this KB: 'Owner' | 'Maintainer' | 'Developer' | 'Reporter' | 'RestrictedAnalyst' | null */
+  my_role?: MemberRole | null
+  /** Source group name for entity-authorized shared KBs */
+  source_group?: string | null
+  /** Share source user name for shared KBs */
+  shared_from?: string | null
+  /** Multiple share source user names for multi-source shared KBs in All mode */
+  shared_from_users?: string[]
+  /** Share via entity type: 'user', 'namespace', or other registered types */
+  shared_via?: string
+  /** Knowledge base creator's user name for display fallback */
+  owner_name?: string
+}
+
+/** Personal knowledge bases in all-grouped response */
+export interface AllGroupedPersonal {
+  created_by_me: KnowledgeBaseWithGroupInfo[]
+  shared_with_me: KnowledgeBaseWithGroupInfo[]
+}
+
+/** Team group in all-grouped response */
+export interface AllGroupedTeamGroup {
+  group_name: string
+  group_display_name: string
+  kb_count: number
+  knowledge_bases: KnowledgeBaseWithGroupInfo[]
+}
+
+/** Organization knowledge bases in all-grouped response */
+export interface AllGroupedOrganization {
+  namespace: string | null
+  display_name: string | null
+  kb_count: number
+  knowledge_bases: KnowledgeBaseWithGroupInfo[]
+}
+
+/** Summary counts in all-grouped response */
+export interface AllGroupedSummary {
+  total_count: number
+  personal_count: number
+  group_count: number
+  organization_count: number
+}
+
+/**
+ * Response for GET /api/v1/knowledge-bases/all-grouped
+ * Returns all knowledge bases accessible to the user in a single request,
+ * solving the N+1 query problem.
+ */
+export interface AllGroupedKnowledgeResponse {
+  personal: AllGroupedPersonal
+  groups: AllGroupedTeamGroup[]
+  organization: AllGroupedOrganization
+  summary: AllGroupedSummary
+}
+
+// ============== Knowledge Folder Types ==============
+
+/** Knowledge folder node in the folder tree */
+export interface KnowledgeFolder {
+  id: number
+  kind_id: number
+  parent_id: number // 0 = root level
+  name: string
+  /** Content ownership is present on current API responses. */
+  origin?: KnowledgeContentOrigin
+  children: KnowledgeFolder[]
+  document_count: number
+  direct_document_count?: number
+  total_document_count?: number
+  created_at: string
+  updated_at: string
+}
+
+/** Request to create a new folder */
+export interface KnowledgeFolderCreate {
+  name: string
+  parent_id?: number // 0 = root level
+}
+
+/** Request to update a folder */
+export interface KnowledgeFolderUpdate {
+  name?: string
+  parent_id?: number // 0 = root level, undefined = no change
+}
+
+/** Request to move a document to a folder */
+export interface DocumentMoveRequest {
+  folder_id: number // 0 = root level
+}

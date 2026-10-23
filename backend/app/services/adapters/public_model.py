@@ -1,0 +1,832 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+from typing import Any, Dict, List, Optional
+
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from app.core.exceptions import ValidationException
+from app.models.kind import Kind
+from app.models.user import User
+from app.schemas.kind import Model, ModelSpec, Shell
+from app.schemas.model import ModelBulkCreateItem, ModelCreate, ModelUpdate
+from app.services.adapters.shell_utils import find_shell_json
+from app.services.base import BaseService
+from app.services.model_capabilities import normalize_model_capabilities
+from app.services.model_embedding_dimension import (
+    validate_embedding_dimension_declaration,
+)
+from app.services.wework_model_config import wework_model_catalog_config
+from app.utils.model_capability import get_model_capability_description
+from shared.codex_model_catalog import codex_catalog_model_id_from_config
+
+
+def is_public_model_visible(json_data: Optional[Dict[str, Any]]) -> bool:
+    """Return whether a public model should appear in user model selectors."""
+    if not isinstance(json_data, dict):
+        return True
+    spec = json_data.get("spec")
+    if not isinstance(spec, dict):
+        return True
+    value = spec.get("isVisible")
+    return value if isinstance(value, bool) else True
+
+
+def get_public_model_allowed_users(
+    json_data: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Return the user-name whitelist of a public model (empty = everyone)."""
+    if not isinstance(json_data, dict):
+        return []
+    spec = json_data.get("spec")
+    if not isinstance(spec, dict):
+        return []
+    raw = spec.get("allowedUsers")
+    if not isinstance(raw, list):
+        return []
+    return [name.strip() for name in raw if isinstance(name, str) and name.strip()]
+
+
+def is_public_model_whitelist_enabled(json_data: Optional[Dict[str, Any]]) -> bool:
+    """Return whether whitelist-only mode is active for a public model.
+
+    Active only when ``spec.allowedUsersEnabled`` is True. A non-empty
+    ``spec.allowedUsers`` list without the switch is preserved for later use
+    but does not restrict access.
+    """
+    if not isinstance(json_data, dict):
+        return False
+    spec = json_data.get("spec")
+    if not isinstance(spec, dict):
+        return False
+    return spec.get("allowedUsersEnabled") is True
+
+
+def is_public_model_allowed_for_user(
+    json_data: Optional[Dict[str, Any]], user_name: Optional[str]
+) -> bool:
+    """Return whether the user may see and use the public model.
+
+    A model without whitelist-only mode is available to everyone. When the
+    mode is active, only users whose ``user_name`` appears in
+    ``allowedUsers`` qualify; an empty list then denies everyone.
+    """
+    if not is_public_model_whitelist_enabled(json_data):
+        return True
+    allowed_users = get_public_model_allowed_users(json_data)
+    return bool(user_name) and user_name in allowed_users
+
+
+def is_public_model_allowed_for_user_id(
+    db: Session, json_data: Optional[Dict[str, Any]], user_id: Optional[int]
+) -> bool:
+    """Return whether the given user id may see and use the public model."""
+    if user_id is None:
+        return is_public_model_allowed_for_user(json_data, None)
+    user = db.query(User).filter(User.id == user_id).first()
+    return is_public_model_allowed_for_user(json_data, user.user_name if user else None)
+
+
+def explicit_public_model_visibility(
+    json_data: Optional[Dict[str, Any]],
+) -> Optional[bool]:
+    """Return an explicitly configured visibility value, if present."""
+    if not isinstance(json_data, dict):
+        return None
+    spec = json_data.get("spec")
+    if not isinstance(spec, dict):
+        return None
+    value = spec.get("isVisible")
+    return value if isinstance(value, bool) else None
+
+
+def with_public_model_visibility(
+    json_data: Optional[Dict[str, Any]], is_visible: bool
+) -> Dict[str, Any]:
+    """Return a model CRD payload with an explicit selector visibility flag."""
+    updated_json = dict(json_data) if isinstance(json_data, dict) else {}
+    current_spec = updated_json.get("spec")
+    if "spec" in updated_json and not isinstance(current_spec, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="Public model JSON spec must be an object",
+        )
+    spec = dict(current_spec) if isinstance(current_spec, dict) else {}
+    spec["isVisible"] = is_visible
+    updated_json["spec"] = spec
+    return updated_json
+
+
+SPEC_LEVEL_KEYS = ("protocol", "apiFormat", "modelType", "embeddingConfig")
+
+
+def _merge_declaration(spec: Dict[str, Any], declaration: Dict[str, Any]) -> None:
+    """Apply the CRD-level keys a bulk item declares onto a Model spec."""
+    spec.update(declaration)
+
+
+def _hoist_spec_keys(
+    config: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Move CRD-level keys from modelConfig to spec level if present.
+
+    Older clients and bulk-import payloads may place protocol, apiFormat,
+    modelType or embeddingConfig inside the modelConfig dict. The Model CRD
+    schema keeps them at spec level, so normalize them here to keep
+    adapter-created models consistent with CRD models created by the frontend.
+    """
+    spec_keys: Dict[str, Any] = {}
+    if isinstance(config, dict):
+        for key in SPEC_LEVEL_KEYS:
+            value = config.pop(key, None)
+            if value:
+                spec_keys[key] = value
+    return config, spec_keys
+
+
+class ModelAdapter:
+    """
+    Adapter to convert Kind (Model) to Model-like object for API compatibility
+    """
+
+    @staticmethod
+    def to_model_dict(kind: Kind) -> Dict[str, Any]:
+        """
+        Convert Kind (Model) to Model-like dictionary
+        """
+        # Extract config and displayName from json
+        config = {}
+        display_name = None
+        is_advanced = False
+        is_wework_available = False
+        model_category_type = "llm"
+        model_group = None
+        model_sub_group = None
+        context_window = None
+        max_output_tokens = None
+        cost_index = None
+        capability = None
+        model_capabilities = None
+        allowed_users = get_public_model_allowed_users(kind.json)
+        if isinstance(kind.json, dict):
+            # Check if json has proper CRD structure (metadata and spec)
+            if "metadata" in kind.json and "spec" in kind.json:
+                try:
+                    model_crd = Model.model_validate(kind.json)
+                    legacy_model_capabilities = model_crd.spec.modelConfig.get(
+                        "modelCapabilities"
+                    )
+                    config = {
+                        key: value
+                        for key, value in model_crd.spec.modelConfig.items()
+                        if key != "modelCapabilities"
+                    }
+                    display_name = model_crd.metadata.displayName
+                    is_advanced = (
+                        bool(model_crd.spec.isAdvanced)
+                        if model_crd.spec.isAdvanced
+                        else False
+                    )
+                    is_wework_available = (
+                        bool(model_crd.spec.isWeworkAvailable) or False
+                    )
+                    if model_crd.spec.modelType:
+                        model_category_type = model_crd.spec.modelType.value
+                    model_group = model_crd.spec.modelGroup
+                    model_sub_group = model_crd.spec.modelSubGroup
+                    context_window = model_crd.spec.context_window
+                    max_output_tokens = model_crd.spec.max_output_tokens
+                    cost_index = model_crd.spec.costIndex
+                    capability = get_model_capability_description(
+                        model_crd.spec.capability
+                    )
+                    if model_crd.spec.protocol:
+                        config = {**config, "protocol": model_crd.spec.protocol}
+                    if model_crd.spec.apiFormat:
+                        config = {
+                            **config,
+                            "apiFormat": model_crd.spec.apiFormat.value,
+                        }
+                    if model_crd.spec.modelCapabilities:
+                        model_capabilities = (
+                            model_crd.spec.modelCapabilities.model_dump(
+                                exclude_none=True
+                            )
+                        )
+                    elif legacy_model_capabilities is not None:
+                        model_capabilities = normalize_model_capabilities(
+                            legacy_model_capabilities
+                        )
+                    # Include type-specific config for non-LLM models
+                    if model_category_type == "video":
+                        if model_crd.spec.videoConfig:
+                            config = {
+                                **config,
+                                "videoConfig": model_crd.spec.videoConfig.model_dump(
+                                    exclude_none=True
+                                ),
+                            }
+                    if model_crd.spec.embeddingConfig:
+                        config = {
+                            **config,
+                            "embeddingConfig": model_crd.spec.embeddingConfig.model_dump(
+                                exclude_none=True
+                            ),
+                        }
+                except Exception:
+                    # Fallback for invalid CRD structure
+                    config = kind.json
+            else:
+                # Legacy format: json contains config directly
+                config = kind.json
+                spec = kind.json.get("spec")
+                if isinstance(spec, dict):
+                    model_group = spec.get("modelGroup")
+                    model_sub_group = spec.get("modelSubGroup")
+                    cost_index = spec.get("costIndex")
+                    capability = get_model_capability_description(
+                        spec.get("capability")
+                    )
+                    model_config = spec.get("modelConfig")
+                    if isinstance(model_config, dict):
+                        context_window = ModelSpec._model_config_token_limit(
+                            model_config.get("context_window")
+                        )
+                        max_output_tokens = ModelSpec._model_config_token_limit(
+                            model_config.get("max_output_tokens")
+                        )
+                    capabilities = normalize_model_capabilities(
+                        spec.get("modelCapabilities")
+                    )
+                    if capabilities:
+                        model_capabilities = capabilities
+
+        if model_capabilities is None and isinstance(config, dict):
+            model_capabilities = normalize_model_capabilities(
+                config.get("modelCapabilities")
+            )
+
+        # Extract provider and model_id from env before stripping
+        env = config.get("env", {}) if isinstance(config, dict) else {}
+        provider = env.get("model") if isinstance(env, dict) else None
+        model_id_value = env.get("model_id") if isinstance(env, dict) else None
+        codex_catalog_model_id = codex_catalog_model_id_from_config(env)
+
+        if isinstance(config, dict):
+            config = wework_model_catalog_config(config)
+
+        # Strip sensitive env from public model config
+        if isinstance(config, dict) and "env" in config:
+            config = {**config, "env": {}}
+        if isinstance(config, dict) and "modelCapabilities" in config:
+            config = {k: v for k, v in config.items() if k != "modelCapabilities"}
+        if model_capabilities:
+            config = {**config, "modelCapabilities": model_capabilities}
+        if codex_catalog_model_id:
+            config = {**config, "codex_catalog_model_id": codex_catalog_model_id}
+
+        return {
+            "id": kind.id,
+            "name": kind.name,
+            "displayName": display_name,
+            "config": config,
+            "provider": provider,
+            "model_id": model_id_value,
+            "is_active": kind.is_active,
+            "is_advanced": is_advanced,
+            "is_wework_available": is_wework_available,
+            "modelGroup": model_group,
+            "modelSubGroup": model_sub_group,
+            "contextWindow": context_window,
+            "maxOutputTokens": max_output_tokens,
+            "costIndex": cost_index,
+            "capability": capability,
+            "modelCapabilities": model_capabilities,
+            "allowedUsers": allowed_users,
+            "allowedUsersEnabled": is_public_model_whitelist_enabled(kind.json),
+            "model_category_type": model_category_type,
+            "created_at": kind.created_at,
+            "updated_at": kind.updated_at,
+        }
+
+
+class MockModel:
+    """
+    Mock Model class that behaves like the original Model for API compatibility
+    """
+
+    def __init__(self, data: Dict[str, Any]):
+        for key, value in data.items():
+            setattr(self, key, value)
+
+
+class PublicModelService(BaseService[Kind, ModelCreate, ModelUpdate]):
+    """
+    Public Model service class - queries kinds table with user_id=0
+    """
+
+    def create_model(
+        self, db: Session, *, obj_in: ModelCreate, current_user: User
+    ) -> Dict[str, Any]:
+        """
+        Create a Public Model entry in kinds table
+        """
+        # Ensure unique name in default namespace
+        existed = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Model",
+                Kind.name == obj_in.name,
+                Kind.namespace == "default",
+            )
+            .first()
+        )
+        if existed:
+            raise HTTPException(status_code=400, detail="Model name already exists")
+
+        # Convert config to JSON format matching kinds table structure.
+        # Pull protocol/apiFormat up to spec level if the caller nested them
+        # inside the config dict.
+        model_config, spec_keys = _hoist_spec_keys(
+            dict(obj_in.config) if obj_in.config else {}
+        )
+        spec: Dict[str, Any] = {"modelConfig": model_config, **spec_keys}
+        validate_embedding_dimension_declaration(
+            spec=spec,
+            stored_spec=None,
+            name=obj_in.name,
+        )
+        json_data = {
+            "kind": "Model",
+            "spec": spec,
+            "status": {"state": "Available"},
+            "metadata": {"name": obj_in.name, "namespace": "default"},
+            "apiVersion": "agent.wecode.io/v1",
+        }
+
+        db_obj = Kind(
+            user_id=0,
+            kind="Model",
+            name=obj_in.name,
+            namespace="default",
+            json=json_data,
+            is_active=obj_in.is_active if obj_in.is_active is not None else True,
+        )
+        db.add(db_obj)
+        db.commit()
+        db.refresh(db_obj)
+        return ModelAdapter.to_model_dict(db_obj)
+
+    def bulk_create_models(
+        self, db: Session, *, items: List[ModelBulkCreateItem], current_user: User
+    ) -> Dict[str, Any]:
+        """
+        Bulk upsert public models in kinds table.
+        """
+        created: List[Kind] = []
+        updated: List[Kind] = []
+        skipped: List[Dict[str, Any]] = []
+
+        for it in items:
+            try:
+                # Declarations a bulk item may carry for an embedding model
+                declaration: Dict[str, Any] = {}
+                if it.model_type:
+                    declaration["modelType"] = it.model_type
+                if it.embedding_config:
+                    declaration["embeddingConfig"] = it.embedding_config
+
+                existed = (
+                    db.query(Kind)
+                    .filter(
+                        Kind.user_id == 0,
+                        Kind.kind == "Model",
+                        Kind.name == it.name,
+                        Kind.namespace == "default",
+                    )
+                    .first()
+                )
+                if existed:
+                    # Update existing model
+                    stored_spec = (
+                        existed.json.get("spec")
+                        if isinstance(existed.json, dict)
+                        else None
+                    )
+                    if isinstance(existed.json, dict):
+                        model_crd = Model.model_validate(existed.json)
+                        # Update env section
+                        model_crd.spec.modelConfig["env"] = (
+                            dict(it.env) if isinstance(it.env, dict) else {}
+                        )
+                        if it.wework_available is not None:
+                            model_crd.spec.isWeworkAvailable = it.wework_available
+                        if it.protocol is not None:
+                            model_crd.spec.protocol = it.protocol
+                        if it.api_format is not None:
+                            model_crd.spec.apiFormat = it.api_format
+                        json_data = model_crd.model_dump(exclude_none=True)
+                        _merge_declaration(json_data["spec"], declaration)
+                        existed.json = json_data
+                    else:
+                        # Fallback for invalid JSON
+                        spec: Dict[str, Any] = {
+                            "modelConfig": {
+                                "env": (
+                                    dict(it.env) if isinstance(it.env, dict) else {}
+                                )
+                            }
+                        }
+                        if it.wework_available is not None:
+                            spec["isWeworkAvailable"] = it.wework_available
+                        if it.protocol is not None:
+                            spec["protocol"] = it.protocol
+                        if it.api_format is not None:
+                            spec["apiFormat"] = it.api_format
+                        _merge_declaration(spec, declaration)
+                        json_data = {
+                            "kind": "Model",
+                            "spec": spec,
+                            "status": {"state": "Available"},
+                            "metadata": {"name": it.name, "namespace": "default"},
+                            "apiVersion": "agent.wecode.io/v1",
+                        }
+                        existed.json = json_data
+                    # Update is_active only if explicitly provided
+                    if getattr(it, "is_active", None) is not None:
+                        existed.is_active = it.is_active  # type: ignore[attr-defined]
+
+                    validate_embedding_dimension_declaration(
+                        spec=(existed.json or {}).get("spec") or {},
+                        stored_spec=stored_spec,
+                        name=it.name,
+                    )
+                    db.add(existed)
+                    db.commit()
+                    db.refresh(existed)
+                    updated.append(existed)
+                else:
+                    # Create new
+                    spec: Dict[str, Any] = {"modelConfig": {"env": it.env}}
+                    if it.wework_available is not None:
+                        spec["isWeworkAvailable"] = it.wework_available
+                    if it.protocol is not None:
+                        spec["protocol"] = it.protocol
+                    if it.api_format is not None:
+                        spec["apiFormat"] = it.api_format
+                    _merge_declaration(spec, declaration)
+                    json_data = {
+                        "kind": "Model",
+                        "spec": spec,
+                        "status": {"state": "Available"},
+                        "metadata": {"name": it.name, "namespace": "default"},
+                        "apiVersion": "agent.wecode.io/v1",
+                    }
+
+                    validate_embedding_dimension_declaration(
+                        spec=spec,
+                        stored_spec=None,
+                        name=it.name,
+                    )
+                    db_obj = Kind(
+                        user_id=0,
+                        kind="Model",
+                        name=it.name,
+                        namespace="default",
+                        json=json_data,
+                        is_active=getattr(it, "is_active", True),  # type: ignore[attr-defined]
+                    )
+                    db.add(db_obj)
+                    db.commit()
+                    db.refresh(db_obj)
+                    created.append(db_obj)
+            except ValidationException as e:
+                db.rollback()
+                skipped.append({"name": it.name, "reason": str(e)})
+            except Exception as e:
+                db.rollback()
+                skipped.append({"name": it.name, "reason": f"DB error: {str(e)}"})
+
+        return {"created": created, "updated": updated, "skipped": skipped}
+
+    def get_models(
+        self,
+        db: Session,
+        *,
+        skip: int = 0,
+        limit: int = 100,
+        current_user: User,
+        include_hidden: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get active public models from kinds table (paginated).
+        """
+        public_models = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Model",
+                Kind.namespace == "default",
+                Kind.is_active == True,  # noqa: E712
+            )
+            .order_by(Kind.created_at.desc())
+            .all()
+        )
+        user_name = current_user.user_name if current_user else None
+        selected_models = [
+            model
+            for model in public_models
+            if (include_hidden or is_public_model_visible(model.json))
+            and is_public_model_allowed_for_user(model.json, user_name)
+        ]
+        return [
+            ModelAdapter.to_model_dict(model)
+            for model in selected_models[skip : skip + limit]
+        ]
+
+    def get_model_by_name(
+        self,
+        db: Session,
+        *,
+        name: str,
+        namespace: str = "default",
+        include_hidden: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Get an active public model directly by its complete resource identity."""
+        model = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Model",
+                Kind.namespace == namespace,
+                Kind.name == name,
+                Kind.is_active == True,  # noqa: E712
+            )
+            .first()
+        )
+        if model is None:
+            return None
+        if not include_hidden and not is_public_model_visible(model.json):
+            return None
+        return ModelAdapter.to_model_dict(model)
+
+    def count_active_models(self, db: Session, *, current_user: User) -> int:
+        """
+        Count visible, active public models in kinds table.
+        """
+        public_models = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Model",
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )
+            .all()
+        )  # noqa: E712
+        return sum(
+            1
+            for model in public_models
+            if is_public_model_visible(model.json)
+            and is_public_model_allowed_for_user(model.json, current_user.user_name)
+        )
+
+    def list_model_names(
+        self, db: Session, *, current_user: User, shell_type: str
+    ) -> List[Dict[str, str]]:
+        """
+        List available model names based on shell type and shell supportModel filter.
+        Queries both user's own models and public models from kinds table.
+
+        Logic:
+        - If supportModel is empty, all models are supported
+        - If supportModel is not empty, only models matching the specified providers are supported
+
+        Returns list of dicts with 'name' and 'displayName' fields.
+        """
+        shell_json = find_shell_json(db, shell_type, current_user.id)
+        if not shell_json:
+            raise HTTPException(status_code=400, detail="Shell type not found")
+
+        supportModel: List[str] = []
+        if isinstance(shell_json, dict):
+            shell_crd = Shell.model_validate(shell_json)
+            supportModel = shell_crd.spec.supportModel or []
+            supportModel = [str(x) for x in supportModel if x]
+
+        # If supportModel is empty, all models are supported
+        # If supportModel is not empty, only filter by specified providers
+        use_support_model_filter = len(supportModel) > 0
+        allowed = set(supportModel)
+
+        def get_model_provider(json_data: Optional[Dict]) -> Optional[str]:
+            if not isinstance(json_data, dict):
+                return None
+            try:
+                model_crd = Model.model_validate(json_data)
+                env = model_crd.spec.modelConfig.get("env", {})
+                if not isinstance(env, dict):
+                    return None
+                return env.get("model")
+            except:
+                return None
+
+        def get_model_display_name(json_data: Optional[Dict]) -> Optional[str]:
+            """Extract displayName from model metadata"""
+            if not isinstance(json_data, dict):
+                return None
+            try:
+                model_crd = Model.model_validate(json_data)
+                return model_crd.metadata.displayName
+            except:
+                return None
+
+        def is_model_compatible(json_data: Optional[Dict]) -> bool:
+            provider = get_model_provider(json_data)
+            if use_support_model_filter:
+                # Use supportModel filter from shell spec
+                return provider in allowed
+            else:
+                # supportModel is empty, all models are supported
+                return True
+
+        # Use dict to store name -> displayName mapping (to handle duplicates)
+        result_models: Dict[str, Optional[str]] = {}
+
+        # Query user's own models from kinds table
+        user_models = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == current_user.id,
+                Kind.kind == "Model",
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )
+            .all()
+        )
+
+        for m in user_models:
+            if is_model_compatible(m.json):
+                display_name = get_model_display_name(m.json)
+                result_models[m.name] = display_name
+
+        # Query public models from kinds table
+        public_models = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Model",
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )
+            .all()
+        )
+
+        for m in public_models:
+            if is_public_model_visible(m.json) and is_model_compatible(m.json):
+                if not is_public_model_allowed_for_user(m.json, current_user.user_name):
+                    continue
+                # Only add if not already present (user models take precedence)
+                if m.name not in result_models:
+                    display_name = get_model_display_name(m.json)
+                    result_models[m.name] = display_name
+
+        return [
+            {"name": name, "displayName": display_name}
+            for name, display_name in sorted(result_models.items())
+        ]
+
+    def get_by_id(
+        self, db: Session, *, model_id: int, current_user: User
+    ) -> Dict[str, Any]:
+        """
+        Get public model by ID from kinds table (only active)
+        """
+        model = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Model",
+                Kind.id == model_id,
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )  # noqa: E712
+            .first()
+        )
+        if not model:
+            raise HTTPException(status_code=404, detail="Model not found")
+        if not is_public_model_allowed_for_user(
+            model.json, current_user.user_name if current_user else None
+        ):
+            raise HTTPException(status_code=404, detail="Model not found")
+        return ModelAdapter.to_model_dict(model)
+
+    def update_model(
+        self, db: Session, *, model_id: int, obj_in: ModelUpdate, current_user: User
+    ) -> Dict[str, Any]:
+        """
+        Update public model by ID in kinds table
+        """
+        # Get the actual Kind object for update
+        model = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Model",
+                Kind.id == model_id,
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )  # noqa: E712
+            .first()
+        )
+        if not model:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        update_data = obj_in.model_dump(exclude_unset=True)
+        stored_spec = (
+            dict(model.json.get("spec") or {}) if isinstance(model.json, dict) else {}
+        )
+
+        # If updating name, ensure uniqueness
+        if "name" in update_data and update_data["name"] != model.name:
+            existed = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == 0,
+                    Kind.kind == "Model",
+                    Kind.name == update_data["name"],
+                    Kind.namespace == "default",
+                )
+                .first()
+            )
+            if existed:
+                raise HTTPException(status_code=400, detail="Model name already exists")
+
+        # Update fields
+        for field, value in update_data.items():
+            if field == "name":
+                setattr(model, field, value)
+                # Also update metadata in json
+                if isinstance(model.json, dict):
+                    model_crd = Model.model_validate(model.json)
+                    model_crd.metadata.name = value
+                    model.json = model_crd.model_dump()
+            elif field == "config":
+                # Update modelConfig in json and pull CRD-level keys up to spec
+                # level if the caller nested them inside the config dict.
+                if isinstance(model.json, dict):
+                    model_crd = Model.model_validate(model.json)
+                    model_config, spec_keys = _hoist_spec_keys(
+                        dict(value) if value else {}
+                    )
+                    spec = model_crd.spec.model_dump()
+                    spec["modelConfig"] = model_config
+                    # CRD-level keys the payload omits keep their stored value,
+                    # so an update cannot silently drop the model category.
+                    for key in SPEC_LEVEL_KEYS:
+                        if key not in spec_keys and stored_spec.get(key):
+                            spec_keys[key] = stored_spec[key]
+                    spec.update(spec_keys)
+                    model.json = {**model_crd.model_dump(), "spec": spec}
+            else:
+                setattr(model, field, value)
+
+        if "config" in update_data and isinstance(model.json, dict):
+            validate_embedding_dimension_declaration(
+                spec=model.json.get("spec") or {},
+                stored_spec=stored_spec,
+                name=model.name,
+            )
+
+        db.add(model)
+        db.commit()
+        db.refresh(model)
+        return ModelAdapter.to_model_dict(model)
+
+    def delete_model(self, db: Session, *, model_id: int, current_user: User) -> None:
+        """
+        Delete public model from kinds table
+        """
+        # Get the actual Kind object for deletion
+        model = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Model",
+                Kind.id == model_id,
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )  # noqa: E712
+            .first()
+        )
+        if not model:
+            raise HTTPException(status_code=404, detail="Model not found")
+        db.delete(model)
+        db.commit()
+
+
+public_model_service = PublicModelService(Kind)

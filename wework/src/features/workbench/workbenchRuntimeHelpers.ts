@@ -1,0 +1,616 @@
+import { isDeviceRuntimeProject } from '@/lib/runtime-project-state'
+import { normalizeProjectPluginNames } from '@wegent/chat-core/composer-plugin-scope'
+import { findRuntimeTask, findRuntimeTaskWorkspace } from '@wegent/chat-core/runtime-task-lookup'
+export { findRuntimeTask, findRuntimeTaskWorkspace } from '@wegent/chat-core/runtime-task-lookup'
+import { getPreferredStandaloneDeviceId } from '@/lib/device-selection'
+import { buildConversationWorkspacePath } from '@/lib/runtime-conversation-workspace'
+import {
+  normalizeRuntimeWorkspacePath,
+  runtimeProjectToProject,
+  runtimeProjectUiId,
+} from '@/lib/runtime-project'
+import type {
+  DeviceInfo,
+  RuntimeTaskSummary,
+  ProjectWithTasks,
+  RuntimeDeviceWorkspace,
+  RuntimeProjectWork,
+  RuntimeTaskAddress,
+  RuntimeTaskPinRequest,
+  RuntimeWorkListResponse,
+  User,
+} from '@/types/api'
+import type { RuntimeTaskRoute } from '@/lib/navigation'
+import { normalizeRuntimeTaskSummary } from './runtimeTaskLifecycle/projection'
+
+export const STANDALONE_PROJECT_ID = 0
+export const EMPTY_MESSAGE_TASK_TITLE = '新对话'
+import { truncateRuntimeTaskTitle } from '@wegent/chat-core/runtime-task-title'
+export {
+  truncateRuntimeTaskTitle,
+  MAX_RUNTIME_TASK_TITLE_LENGTH,
+} from '@wegent/chat-core/runtime-task-title'
+
+export function findRuntimeTaskProjectWork(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  address: RuntimeTaskAddress | null | undefined
+): RuntimeProjectWork | null {
+  if (!address) return null
+  return (
+    runtimeWork?.projects.find(project =>
+      project.deviceWorkspaces.some(
+        workspace =>
+          (workspace.deviceId === address.deviceId ||
+            workspace.remoteHostId === address.deviceId) &&
+          workspace.tasks.some(task => task.taskId === address.taskId)
+      )
+    ) ?? null
+  )
+}
+
+export async function createConversationWorkspace(
+  deviceApi: {
+    createDirectory: (deviceId: string, path: string) => Promise<void>
+    getHomeDirectory: (deviceId: string) => Promise<string>
+  },
+  deviceId: string,
+  message: string,
+  taskId: string
+): Promise<string> {
+  const homeDirectory = await deviceApi.getHomeDirectory(deviceId)
+  const workspacePath = buildConversationWorkspacePath(homeDirectory, message, taskId)
+  await deviceApi.createDirectory(deviceId, workspacePath)
+  return workspacePath
+}
+
+export function getRuntimeTaskRouteKey(route: RuntimeTaskRoute): string {
+  return `${route.deviceId}:${route.taskId}:${route.workspacePath ?? ''}`
+}
+
+function matchesRequestedWorkspacePath(
+  currentPath?: string | null,
+  requestedPath?: string | null
+): boolean {
+  const normalizedRequestedPath = requestedPath?.trim()
+  if (!normalizedRequestedPath) return true
+  return currentPath?.trim() === normalizedRequestedPath
+}
+
+export function isSameRuntimeTaskIdentity(
+  address: RuntimeTaskAddress | null,
+  route: RuntimeTaskRoute
+): boolean {
+  return Boolean(
+    address &&
+    address.deviceId === route.deviceId &&
+    address.taskId === route.taskId &&
+    matchesRequestedWorkspacePath(address.workspacePath, route.workspacePath)
+  )
+}
+
+export function isSameRuntimeTaskAddress(
+  left: RuntimeTaskAddress | null | undefined,
+  right: RuntimeTaskAddress
+): boolean {
+  if (
+    !left ||
+    left.deviceId !== right.deviceId ||
+    left.taskId !== right.taskId ||
+    !matchesRequestedWorkspacePath(left.workspacePath, right.workspacePath)
+  ) {
+    return false
+  }
+  if (
+    right.issueExecution &&
+    (left.issueExecution?.projectId !== right.issueExecution.projectId ||
+      left.issueExecution?.issueId !== right.issueExecution.issueId)
+  ) {
+    return false
+  }
+  if (
+    right.projectSession &&
+    (left.projectSession?.projectId !== right.projectSession.projectId ||
+      left.projectSession?.issueId !== right.projectSession.issueId)
+  ) {
+    return false
+  }
+  return true
+}
+
+export function mergeRuntimeTaskHandles(
+  base?: Record<string, unknown> | null,
+  override?: Record<string, unknown> | null
+): Record<string, unknown> | undefined {
+  if (!base && !override) return undefined
+  return {
+    ...(base ?? {}),
+    ...(override ?? {}),
+  }
+}
+
+export function mergeRuntimeTaskAddresses(
+  base: RuntimeTaskAddress | null | undefined,
+  override: RuntimeTaskAddress
+): RuntimeTaskAddress {
+  if (
+    !base ||
+    (!base.issueExecution && !base.projectSession) ||
+    base.deviceId !== override.deviceId ||
+    base.taskId !== override.taskId
+  ) {
+    return override
+  }
+  const runtimeHandle = mergeRuntimeTaskHandles(base.runtimeHandle, override.runtimeHandle)
+  return {
+    ...base,
+    ...override,
+    ...(runtimeHandle ? { runtimeHandle } : {}),
+  }
+}
+
+function workspaceTaskAddresses(workspaces: RuntimeDeviceWorkspace[]): RuntimeTaskAddress[] {
+  return workspaces.flatMap(workspace =>
+    workspace.tasks.map(task => runtimeTaskAddressFromWorkspace(workspace, task))
+  )
+}
+
+export function getRuntimeTaskWorkspacePath(
+  workspace: RuntimeDeviceWorkspace,
+  task: { workspacePath?: string | null }
+): string {
+  return task.workspacePath || workspace.workspacePath
+}
+
+function runtimeTaskAddressFromWorkspace(
+  workspace: RuntimeDeviceWorkspace,
+  task: RuntimeTaskSummary
+): RuntimeTaskAddress {
+  return {
+    deviceId: workspace.deviceId,
+    taskId: task.taskId,
+    ...(task.runtime !== 'codex' ? { runtime: task.runtime } : {}),
+    workspacePath: getRuntimeTaskWorkspacePath(workspace, task),
+    ...(task.taskId ? { taskId: task.taskId } : {}),
+    ...(task.threadId ? { threadId: task.threadId } : {}),
+    ...(task.runtimeHandle ? { runtimeHandle: task.runtimeHandle } : {}),
+  }
+}
+
+export function projectTaskAddresses(
+  runtimeWork: RuntimeWorkListResponse | null,
+  runtimeProjectKeys: string[]
+): RuntimeTaskAddress[] {
+  if (!runtimeWork || runtimeProjectKeys.length === 0) return []
+
+  const keySet = new Set(runtimeProjectKeys)
+  return runtimeWork.projects.flatMap(projectWork =>
+    keySet.has(projectWork.project.key) ? workspaceTaskAddresses(projectWork.deviceWorkspaces) : []
+  )
+}
+
+export function removeRuntimeTasks(
+  runtimeWork: RuntimeWorkListResponse,
+  addresses: RuntimeTaskAddress[]
+): RuntimeWorkListResponse {
+  if (addresses.length === 0) return runtimeWork
+
+  const removeFromWorkspace = (workspace: RuntimeDeviceWorkspace): RuntimeDeviceWorkspace => ({
+    ...workspace,
+    tasks: workspace.tasks.filter(task => {
+      const taskAddress = runtimeTaskAddressFromWorkspace(workspace, task)
+      return !addresses.some(address => runtimeTaskMatchesArchivedAddress(taskAddress, address))
+    }),
+  })
+  const projects = runtimeWork.projects.map(project => {
+    const deviceWorkspaces = project.deviceWorkspaces.map(removeFromWorkspace)
+    return {
+      ...project,
+      deviceWorkspaces,
+      totalTasks: deviceWorkspaces.reduce((total, workspace) => total + workspace.tasks.length, 0),
+    }
+  })
+  const chats = runtimeWork.chats.map(removeFromWorkspace)
+
+  return {
+    ...runtimeWork,
+    projects,
+    chats,
+    totalTasks:
+      projects.reduce((total, project) => total + (project.totalTasks ?? 0), 0) +
+      chats.reduce((total, workspace) => total + workspace.tasks.length, 0),
+  }
+}
+
+export function updateRuntimeWorkTask(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  address: RuntimeTaskAddress,
+  updates: Partial<RuntimeTaskSummary>
+): RuntimeWorkListResponse | null {
+  if (!runtimeWork) return null
+
+  const updateWorkspace = (workspace: RuntimeDeviceWorkspace): RuntimeDeviceWorkspace => {
+    if (workspace.deviceId !== address.deviceId && workspace.remoteHostId !== address.deviceId) {
+      return workspace
+    }
+
+    const tasks = workspace.tasks.map(task =>
+      task.taskId === address.taskId ? normalizeRuntimeTaskSummary({ ...task, ...updates }) : task
+    )
+    if (tasks.every((task, index) => task === workspace.tasks[index])) return workspace
+    return { ...workspace, tasks }
+  }
+
+  return {
+    ...runtimeWork,
+    projects: runtimeWork.projects.map(project => ({
+      ...project,
+      deviceWorkspaces: project.deviceWorkspaces.map(updateWorkspace),
+    })),
+    chats: runtimeWork.chats.map(updateWorkspace),
+  }
+}
+
+export function getRuntimeTaskThreadId(task: RuntimeTaskSummary): string | null {
+  const explicitThreadId = task.threadId?.trim()
+  if (explicitThreadId) return explicitThreadId
+
+  const runtimeHandleThreadId = [task.runtimeHandle?.threadId, task.runtimeHandle?.thread_id].find(
+    value => typeof value === 'string' && value.trim()
+  )
+  if (typeof runtimeHandleThreadId === 'string') return runtimeHandleThreadId.trim()
+
+  const taskId = task.taskId.trim()
+  return task.runtime === 'codex' && !task.optimistic && taskId ? taskId : null
+}
+
+function runtimeWorkspaceMatchesTaskPinRequest(
+  workspace: RuntimeDeviceWorkspace,
+  request: RuntimeTaskPinRequest,
+  stateDeviceId?: string | null
+): boolean {
+  return [stateDeviceId, workspace.deviceId, workspace.remoteHostId].some(
+    deviceId => deviceId === request.deviceId
+  )
+}
+
+export function findRuntimeTaskForPinRequest(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  request: RuntimeTaskPinRequest
+): RuntimeTaskSummary | null {
+  if (!runtimeWork) return null
+
+  for (const projectWork of runtimeWork.projects) {
+    for (const workspace of projectWork.deviceWorkspaces) {
+      if (
+        !runtimeWorkspaceMatchesTaskPinRequest(
+          workspace,
+          request,
+          projectWork.project.stateDeviceId
+        )
+      ) {
+        continue
+      }
+      const task = workspace.tasks.find(item => getRuntimeTaskThreadId(item) === request.threadId)
+      if (task) return task
+    }
+  }
+
+  for (const workspace of runtimeWork.chats) {
+    if (!runtimeWorkspaceMatchesTaskPinRequest(workspace, request)) continue
+    const task = workspace.tasks.find(item => getRuntimeTaskThreadId(item) === request.threadId)
+    if (task) return task
+  }
+
+  return null
+}
+
+export function updateRuntimeWorkTaskPinned(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  request: RuntimeTaskPinRequest
+): RuntimeWorkListResponse | null {
+  if (!runtimeWork) return null
+
+  const updateWorkspace = (
+    workspace: RuntimeDeviceWorkspace,
+    stateDeviceId?: string | null
+  ): RuntimeDeviceWorkspace => {
+    if (!runtimeWorkspaceMatchesTaskPinRequest(workspace, request, stateDeviceId)) {
+      return workspace
+    }
+
+    const tasks = workspace.tasks.map(task => {
+      if (getRuntimeTaskThreadId(task) !== request.threadId) return task
+      return normalizeRuntimeTaskSummary({
+        ...task,
+        pinned: request.pinned,
+        ...(!request.pinned ? { pinnedOrder: undefined } : {}),
+      })
+    })
+    if (tasks.every((task, index) => task === workspace.tasks[index])) return workspace
+    return { ...workspace, tasks }
+  }
+
+  return {
+    ...runtimeWork,
+    projects: runtimeWork.projects.map(projectWork => ({
+      ...projectWork,
+      deviceWorkspaces: projectWork.deviceWorkspaces.map(workspace =>
+        updateWorkspace(workspace, projectWork.project.stateDeviceId)
+      ),
+    })),
+    chats: runtimeWork.chats.map(workspace => updateWorkspace(workspace)),
+  }
+}
+
+export function updateRuntimeWorkTaskTitle(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  address: RuntimeTaskAddress,
+  title: string
+): RuntimeWorkListResponse | null {
+  return updateRuntimeWorkTask(runtimeWork, address, { title })
+}
+
+export function runtimeWorkContainsTask(
+  runtimeWork: RuntimeWorkListResponse,
+  address: RuntimeTaskAddress
+): boolean {
+  const workspaces = [
+    ...runtimeWork.projects.flatMap(project => project.deviceWorkspaces),
+    ...runtimeWork.chats,
+  ]
+  return workspaces.some(workspace =>
+    workspace.tasks.some(task =>
+      runtimeTaskMatchesArchivedAddress(runtimeTaskAddressFromWorkspace(workspace, task), address)
+    )
+  )
+}
+
+function runtimeTaskMatchesArchivedAddress(
+  taskAddress: RuntimeTaskAddress,
+  archivedAddress: RuntimeTaskAddress
+): boolean {
+  if (taskAddress.taskId !== archivedAddress.taskId) return false
+  return taskAddress.deviceId === archivedAddress.deviceId
+}
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+export function isDeviceStatus(value: unknown): value is DeviceInfo['status'] {
+  return value === 'online' || value === 'offline' || value === 'busy'
+}
+
+export function getDeviceEventId(payload: unknown): string | null {
+  if (!isRecord(payload) || typeof payload.device_id !== 'string') return null
+  const deviceId = payload.device_id.trim()
+  return deviceId || null
+}
+
+export function getDeviceEventName(payload: unknown): string | null {
+  if (!isRecord(payload) || typeof payload.name !== 'string') return null
+  const name = payload.name.trim()
+  return name || null
+}
+
+export function getCommandStdoutObject(stdout: unknown): Record<string, unknown> | null {
+  return isRecord(stdout) ? stdout : null
+}
+
+function getLastProjectStorageKey(userId: number) {
+  return `wework.lastProjectId.${userId}`
+}
+
+export function writeLastProjectId(userId: number, projectId: number | null) {
+  try {
+    window.localStorage.setItem(
+      getLastProjectStorageKey(userId),
+      projectId === null ? 'none' : String(projectId)
+    )
+  } catch {
+    // Ignore storage failures; project selection still works for the current session.
+  }
+}
+
+export function readLastProjectId(userId: number): number | null | undefined {
+  try {
+    const storedValue = window.localStorage.getItem(getLastProjectStorageKey(userId))
+    if (storedValue === null) return undefined
+    if (storedValue === 'none') return null
+    const value = Number(storedValue)
+    return Number.isSafeInteger(value) && value > 0 ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function resolveComposerProjectPluginNames(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  currentProjectId: number | null | undefined,
+  currentRuntimeTask: RuntimeTaskAddress | null | undefined
+): string[] | null {
+  const task = findRuntimeTask(runtimeWork, currentRuntimeTask)
+  if (task?.projectPluginIds !== undefined) {
+    return normalizeProjectPluginNames(task.projectPluginIds)
+  }
+
+  if (!runtimeWork) return null
+  const taskProject = currentRuntimeTask
+    ? runtimeWork.projects.find(project =>
+        project.deviceWorkspaces.some(
+          workspace =>
+            (workspace.deviceId === currentRuntimeTask.deviceId ||
+              workspace.remoteHostId === currentRuntimeTask.deviceId) &&
+            workspace.tasks.some(item => item.taskId === currentRuntimeTask.taskId)
+        )
+      )
+    : null
+  const project =
+    taskProject ??
+    (currentProjectId == null
+      ? null
+      : runtimeWork.projects.find(item => runtimeProjectUiId(item.project) === currentProjectId))
+  if (!project || !isDeviceRuntimeProject(project.project)) return null
+  return normalizeProjectPluginNames(
+    (project.project.aiSettings?.plugins ?? []).map(plugin => plugin.pluginName)
+  )
+}
+
+export function hydrateRuntimeTaskAddress(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  address: RuntimeTaskAddress
+): RuntimeTaskAddress {
+  const workspace = findRuntimeTaskWorkspace(runtimeWork, address)
+  const task = workspace?.tasks.find(item => item.taskId === address.taskId)
+  if (!workspace || !task) return address
+  return {
+    ...address,
+    runtime: task.runtime,
+    workspacePath: getRuntimeTaskWorkspacePath(workspace, task),
+    ...(task.threadId ? { threadId: task.threadId } : {}),
+    ...(task.runtimeHandle ? { runtimeHandle: task.runtimeHandle } : {}),
+  }
+}
+
+export function getRememberedStandaloneDeviceId(
+  user: User,
+  devices: DeviceInfo[],
+  fallbackDeviceId?: string | null
+) {
+  return getPreferredStandaloneDeviceId(
+    devices,
+    user.preferences?.default_execution_target ?? fallbackDeviceId
+  )
+}
+
+function getSelectableProjectDeviceWorkspaces(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  projectId: number | null | undefined
+): RuntimeDeviceWorkspace[] {
+  return getProjectDeviceWorkspaces(runtimeWork, projectId).filter(workspace => workspace.available)
+}
+
+function getProjectDeviceWorkspaces(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  projectId: number | null | undefined
+): RuntimeDeviceWorkspace[] {
+  if (!projectId) return []
+  const projectWork = runtimeWork?.projects.find(
+    item => runtimeProjectUiId(item.project) === projectId
+  )
+  return projectWork?.deviceWorkspaces ?? []
+}
+
+export function getDefaultProjectDeviceWorkspace(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  projectId: number | null | undefined
+): RuntimeDeviceWorkspace | null {
+  const workspaces = getSelectableProjectDeviceWorkspaces(runtimeWork, projectId)
+  if (workspaces.length === 1) return workspaces[0]
+
+  const projectWork = runtimeWork?.projects.find(
+    item => runtimeProjectUiId(item.project) === projectId
+  )
+  if (!projectWork || !isDeviceRuntimeProject(projectWork.project)) return null
+
+  const primaryRoot = projectWork.project.roots?.[0]?.path
+  if (primaryRoot) {
+    const normalizedPrimaryRoot = normalizeRuntimeWorkspacePath(primaryRoot)
+    const primaryWorkspace = workspaces.find(
+      workspace => normalizeRuntimeWorkspacePath(workspace.workspacePath) === normalizedPrimaryRoot
+    )
+    if (primaryWorkspace) return primaryWorkspace
+  }
+  return new Set(workspaces.map(workspace => workspace.remoteHostId || workspace.deviceId)).size <=
+    1
+    ? (workspaces[0] ?? null)
+    : null
+}
+
+export function getDefaultProjectDeviceWorkspaceId(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  projectId: number | null | undefined
+): number | null {
+  return getDefaultProjectDeviceWorkspace(runtimeWork, projectId)?.id ?? null
+}
+
+export function findSelectableProject(
+  projects: ProjectWithTasks[],
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  projectId: number
+): ProjectWithTasks | null {
+  const project = projects.find(item => item.id === projectId)
+  if (project) return project
+  const runtimeProject = runtimeWork?.projects.find(
+    item => runtimeProjectUiId(item.project) === projectId
+  )
+  return runtimeProject ? runtimeProjectToProject(runtimeProject) : null
+}
+
+export function findProjectDeviceWorkspace(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  projectId: number | null | undefined,
+  deviceWorkspaceId: number | null | undefined
+): RuntimeDeviceWorkspace | null {
+  const workspaces = getSelectableProjectDeviceWorkspaces(runtimeWork, projectId)
+  if (deviceWorkspaceId) {
+    return workspaces.find(workspace => workspace.id === deviceWorkspaceId) ?? null
+  }
+  return getDefaultProjectDeviceWorkspace(runtimeWork, projectId)
+}
+
+export function findProjectMetadataDeviceWorkspace(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  projectId: number | null | undefined,
+  deviceWorkspaceId: number | null | undefined
+): RuntimeDeviceWorkspace | null {
+  const workspaces = getProjectDeviceWorkspaces(runtimeWork, projectId)
+  if (deviceWorkspaceId) {
+    return workspaces.find(workspace => workspace.id === deviceWorkspaceId) ?? null
+  }
+  if (workspaces.length === 1) return workspaces[0]
+
+  const projectWork = runtimeWork?.projects.find(
+    item => runtimeProjectUiId(item.project) === projectId
+  )
+  if (!projectWork || !isDeviceRuntimeProject(projectWork.project)) return null
+
+  const primaryRoot = projectWork.project.roots?.[0]?.path
+  if (primaryRoot) {
+    const normalizedPrimaryRoot = normalizeRuntimeWorkspacePath(primaryRoot)
+    const primaryWorkspace = workspaces.find(
+      workspace => normalizeRuntimeWorkspacePath(workspace.workspacePath) === normalizedPrimaryRoot
+    )
+    if (primaryWorkspace) return primaryWorkspace
+  }
+  return new Set(workspaces.map(workspace => workspace.remoteHostId || workspace.deviceId)).size <=
+    1
+    ? (workspaces[0] ?? null)
+    : null
+}
+
+const MARKDOWN_MENTION_PATTERN = /\[([^\]]+)]\(([^)]+)\)/g
+const LEADING_TOOL_MENTION_PATTERN =
+  /^(?:\[(?:\$|@)[^\]]+]\((?:(?:skill|app|plugin):\/\/[^)\n]+|\/[^)\n]*SKILL\.md)\)\s*)+/
+
+function runtimeTitleText(value: string): string {
+  const normalizedValue = value.trim()
+  const withoutLeadingToolMentions = normalizedValue
+    .replace(LEADING_TOOL_MENTION_PATTERN, '')
+    .trim()
+
+  return (withoutLeadingToolMentions || normalizedValue)
+    .replace(MARKDOWN_MENTION_PATTERN, (_match, label: string) => label)
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+export function buildRuntimeTaskTitle(message: string, fallback?: string): string {
+  const title = runtimeTitleText(fallback || message)
+  return truncateRuntimeTaskTitle(title) ?? EMPTY_MESSAGE_TASK_TITLE
+}
+
+export {
+  createRuntimeTaskId,
+  createRuntimeTaskIdFromSeed,
+} from '@wegent/chat-core/runtime-task-identity'

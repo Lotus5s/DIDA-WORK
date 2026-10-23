@@ -1,0 +1,1130 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Resolve and dispatch global capability sync requests to local executors."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+from typing import Any, Iterable, Optional
+
+from sqlalchemy import and_, or_
+from sqlalchemy.orm import Session
+
+from app.core.socketio import get_sio
+from app.db.session import get_db_session
+from app.models.kind import Kind
+from app.models.plugin_marketplace import PluginRelease
+from app.models.user import User
+from app.schemas.device import (
+    DeviceCapabilityItemResult,
+    DeviceCapabilitySyncResponse,
+    DeviceCapabilitySyncResult,
+)
+from app.services.device.runtime_route import RuntimeRouteError, runtime_route_resolver
+from app.services.device_service import device_service
+from app.services.plugin_device_identity import plugin_device_rows
+from app.services.plugin_device_installation_service import (
+    plugin_device_installation_service,
+)
+from app.services.plugin_package_storage import plugin_package_storage
+
+logger = logging.getLogger(__name__)
+
+SYNC_EVENT = "device:sync_capabilities"
+SYNC_NAMESPACE = "/local-executor"
+SYNC_TIMEOUT_SECONDS = 180
+DESIRED_STATE_SYNC_ATTEMPTS = 3
+
+
+def capability_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the stable desired state represented by a sync payload."""
+
+    def normalized_items(field: str, identity_fields: tuple[str, ...]) -> list[dict]:
+        items = []
+        for raw in payload.get(field) or []:
+            if not isinstance(raw, dict):
+                continue
+            item = {
+                key: value
+                for key, value in raw.items()
+                if key not in {"download_path", "download_url_expires_at"}
+            }
+            items.append(item)
+        return sorted(
+            items,
+            key=lambda item: tuple(
+                str(item.get(field) or "") for field in identity_fields
+            ),
+        )
+
+    return {
+        "mode": payload.get("mode"),
+        "scope": payload.get("scope"),
+        "skills": normalized_items(
+            "skills", ("installed_skill_id", "skill_id", "name")
+        ),
+        "plugins": normalized_items(
+            "plugins", ("installed_plugin_id", "name", "marketplace")
+        ),
+        "mcps": normalized_items("mcps", ("installed_mcp_id", "name")),
+    }
+
+
+class DeviceCapabilityResolutionError(RuntimeError):
+    """Raised when requested capabilities cannot be resolved for sync."""
+
+    def __init__(self, message: str, status_code: int = 400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class DeviceCapabilitySyncError(RuntimeError):
+    """Raised when capability sync cannot be dispatched to a device."""
+
+
+class DeviceCapabilitySyncService:
+    """Backend-side resolver and dispatcher for local executor capabilities."""
+
+    def __init__(
+        self,
+        session_factory: Callable[[], AbstractContextManager[Session]] | None = None,
+    ) -> None:
+        self._session_factory = session_factory or get_db_session
+
+    def build_desired_capabilities(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        mode: str = "replace",
+        device_id: str | None = None,
+        include_plugins: bool = True,
+    ) -> dict[str, Any]:
+        """Build desired state, merging Skills/MCP only when plugins are deferred."""
+        self._validate_mode(mode)
+        skills = self._load_enabled_installed_skills(db, user_id=user_id)
+        plugins = (
+            self._load_installed_plugins(db, user_id=user_id, device_id=device_id)
+            if include_plugins
+            else []
+        )
+        mcps = self._load_enabled_installed_mcps(db, user_id=user_id)
+        # Replace treats an absent plugins array as empty on existing clients.
+        # Merge preserves local plugins until their preparation can succeed.
+        effective_mode = mode if include_plugins else "merge"
+        logger.info(
+            "Built desired capabilities: user_id=%s mode=%s skill_names=%s plugin_names=%s mcp_names=%s",
+            user_id,
+            effective_mode,
+            [item.get("name") for item in skills],
+            [item.get("name") for item in plugins],
+            [item.get("name") for item in mcps],
+        )
+        payload: dict[str, Any] = {
+            "mode": effective_mode,
+            "skills": skills,
+            "mcps": mcps,
+        }
+        if include_plugins:
+            payload["plugins"] = plugins
+        return payload
+
+    def build_desired_plugins(
+        self, db: Session, *, user_id: int, device_id: str
+    ) -> dict[str, Any]:
+        return {
+            "mode": "merge",
+            "scope": "plugins",
+            "plugins": self._load_installed_plugins(
+                db, user_id=user_id, device_id=device_id
+            ),
+        }
+
+    def resolve_payload(
+        self,
+        db: Session,
+        *,
+        user: User,
+        skill_ids: list[int],
+        installed_skill_ids: Optional[list[int]] = None,
+        installed_plugin_ids: Optional[list[int]] = None,
+        installed_mcp_ids: Optional[list[int]] = None,
+        mcp_ids: Optional[list[str]] = None,
+        mode: str = "merge",
+    ) -> dict[str, Any]:
+        """Resolve user-selected capability IDs into an executor payload."""
+        self._validate_mode(mode)
+        if mcp_ids:
+            raise DeviceCapabilityResolutionError(
+                "MCP capability sync is temporarily disabled for server-key IDs; use InstalledMCP IDs",
+                422,
+            )
+
+        payload: dict[str, Any] = {
+            "mode": mode,
+            "skills": self._resolve_skill_payloads(
+                db,
+                user_id=user.id,
+                skill_ids=skill_ids,
+                installed_skill_ids=installed_skill_ids or [],
+                strict=True,
+            ),
+        }
+        plugins = self._resolve_plugin_payloads(
+            db,
+            user_id=user.id,
+            installed_plugin_ids=installed_plugin_ids or [],
+            strict=True,
+        )
+        if plugins:
+            payload["plugins"] = plugins
+        mcps = self._resolve_mcp_payloads(
+            db,
+            user_id=user.id,
+            installed_mcp_ids=installed_mcp_ids or [],
+            strict=True,
+        )
+        if mcps:
+            payload["mcps"] = mcps
+        return payload
+
+    async def sync_user_global_capabilities(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        mode: str = "replace",
+    ) -> DeviceCapabilitySyncResponse:
+        """Sync the user's full desired capability set to all online devices."""
+        devices = await device_service.get_online_devices(db, user_id)
+        logger.info(
+            "Syncing global capabilities: user_id=%s mode=%s online_devices=%s",
+            user_id,
+            mode,
+            len(devices),
+        )
+        results: list[DeviceCapabilitySyncResult] = []
+        skipped = 0
+
+        for device in devices:
+            device_id = self._extract_device_id(device)
+            if not device_id:
+                skipped += 1
+                logger.warning(
+                    "Skipping capability sync for device without runtime id: user_id=%s device=%s",
+                    user_id,
+                    device,
+                )
+                continue
+            results.append(
+                await self.sync_current_device_capabilities(
+                    user_id=user_id,
+                    device_id=device_id,
+                    mode=mode,
+                )
+            )
+
+        return self._aggregate_response(results, skipped=skipped, mode=mode)
+
+    async def sync_current_device_capabilities(
+        self,
+        *,
+        user_id: int,
+        device_id: str,
+        mode: str = "replace",
+        timeout_seconds: int = SYNC_TIMEOUT_SECONDS,
+        include_plugins: bool = True,
+    ) -> DeviceCapabilitySyncResult:
+        """Sync a fresh snapshot and correct changes made during the round trip."""
+
+        def load_payload() -> dict[str, Any]:
+            with self._session_factory() as snapshot_db:
+                return self.build_desired_capabilities(
+                    snapshot_db,
+                    user_id=user_id,
+                    mode=mode,
+                    device_id=device_id,
+                    include_plugins=include_plugins,
+                )
+
+        return await self.sync_latest_device_capabilities(
+            user_id=user_id,
+            device_id=device_id,
+            load_payload=load_payload,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def sync_latest_device_capabilities(
+        self,
+        *,
+        user_id: int,
+        device_id: str,
+        load_payload: Callable[[], dict[str, Any]],
+        timeout_seconds: int = SYNC_TIMEOUT_SECONDS,
+    ) -> DeviceCapabilitySyncResult:
+        """Dispatch desired state until the acknowledged snapshot is still current."""
+        payload = load_payload()
+        result: DeviceCapabilitySyncResult | None = None
+        for attempt in range(1, DESIRED_STATE_SYNC_ATTEMPTS + 1):
+            result = await self.sync_device_payload(
+                user_id=user_id,
+                device_id=device_id,
+                payload=payload,
+                timeout_seconds=timeout_seconds,
+            )
+            if not result.acknowledged:
+                return result
+
+            latest = load_payload()
+            if capability_snapshot(latest) == capability_snapshot(payload):
+                return result
+            logger.warning(
+                "Capability desired state changed during sync; retrying latest snapshot: "
+                "user_id=%s device_id=%s attempt=%s",
+                user_id,
+                device_id,
+                attempt,
+            )
+            payload = latest
+
+        error = "Capability desired state kept changing during synchronization"
+        logger.warning(
+            "%s: user_id=%s device_id=%s attempts=%s",
+            error,
+            user_id,
+            device_id,
+            DESIRED_STATE_SYNC_ATTEMPTS,
+        )
+        return DeviceCapabilitySyncResult(
+            device_id=device_id,
+            success=False,
+            acknowledged=True,
+            error=error,
+            scope=result.scope if result else None,
+            skills=result.skills if result else [],
+            plugins=result.plugins if result else [],
+            mcps=result.mcps if result else [],
+            errors=result.errors if result else [],
+        )
+
+    async def sync_device_capabilities(
+        self,
+        db: Session,
+        *,
+        user: User,
+        device_id: str,
+        skill_ids: list[int],
+        installed_skill_ids: Optional[Iterable[int]] = None,
+        installed_plugin_ids: Optional[Iterable[int]] = None,
+        installed_mcp_ids: Optional[Iterable[int]] = None,
+        mcp_ids: Optional[list[str]] = None,
+        mode: str = "merge",
+    ) -> DeviceCapabilitySyncResponse:
+        """Resolve selected capabilities and send them to one online device."""
+        payload = self.resolve_payload(
+            db,
+            user=user,
+            skill_ids=skill_ids,
+            installed_skill_ids=list(installed_skill_ids or []),
+            installed_plugin_ids=list(installed_plugin_ids or []),
+            installed_mcp_ids=list(installed_mcp_ids or []),
+            mcp_ids=mcp_ids,
+            mode=mode,
+        )
+        result = await self._dispatch_payload_or_raise(
+            user_id=user.id,
+            device_id=device_id,
+            payload=payload,
+        )
+        return self._aggregate_response([result], skipped=0, mode=mode)
+
+    async def sync_device_selected_capabilities(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        device_id: str,
+        skill_ids: Optional[Iterable[int]] = None,
+        installed_skill_ids: Optional[Iterable[int]] = None,
+        installed_plugin_ids: Optional[Iterable[int]] = None,
+        installed_mcp_ids: Optional[Iterable[int]] = None,
+        mode: str = "replace",
+    ) -> DeviceCapabilitySyncResponse:
+        """Sync explicitly selected capability IDs to one device."""
+        user = User(id=user_id)
+        return await self.sync_device_capabilities(
+            db,
+            user=user,
+            device_id=device_id,
+            skill_ids=list(skill_ids or []),
+            installed_skill_ids=list(installed_skill_ids or []),
+            installed_plugin_ids=list(installed_plugin_ids or []),
+            installed_mcp_ids=list(installed_mcp_ids or []),
+            mode=mode,
+        )
+
+    async def sync_installed_plugin_to_device(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        device_id: str,
+        installed_plugin_id: int,
+    ) -> DeviceCapabilitySyncResponse:
+        """Merge one installed plugin and require its explicit acknowledgement."""
+        response = await self.sync_installed_plugin_to_device_result(
+            db,
+            user_id=user_id,
+            device_id=device_id,
+            installed_plugin_id=installed_plugin_id,
+        )
+        plugin_result = next(
+            (
+                item
+                for item in response.plugins
+                if str(item.id) == str(installed_plugin_id)
+            ),
+            None,
+        )
+        if not plugin_result or plugin_result.status != "synced":
+            detail = self._item_failure_message(plugin_result)
+            raise DeviceCapabilitySyncError(
+                detail
+                or f"InstalledPlugin was not acknowledged by the device: {installed_plugin_id}"
+            )
+        return response
+
+    async def sync_installed_plugin_to_device_result(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        device_id: str,
+        installed_plugin_id: int,
+    ) -> DeviceCapabilitySyncResponse:
+        """Merge one plugin and preserve its item-level failure in the response."""
+        payload = self.resolve_payload(
+            db,
+            user=User(id=user_id),
+            skill_ids=[],
+            installed_plugin_ids=[installed_plugin_id],
+            mode="merge",
+        )
+        result = await self.sync_device_payload(
+            user_id=user_id,
+            device_id=device_id,
+            payload=payload,
+        )
+        return self._aggregate_response([result], skipped=0, mode="merge")
+
+    async def sync_device_payload(
+        self,
+        *,
+        user_id: int,
+        device_id: str,
+        payload: dict[str, Any],
+        timeout_seconds: int = SYNC_TIMEOUT_SECONDS,
+    ) -> DeviceCapabilitySyncResult:
+        """Push an already-built desired payload to one online device."""
+        try:
+            route = await runtime_route_resolver.resolve(
+                user_id=user_id,
+                submitted_device_id=device_id,
+            )
+        except RuntimeRouteError as exc:
+            logger.info(
+                "Skipping capability sync without Runtime route: user_id=%s "
+                "device_id=%s code=%s",
+                user_id,
+                device_id,
+                exc.code,
+            )
+            return DeviceCapabilitySyncResult(
+                device_id=device_id,
+                success=False,
+                error=(
+                    "device not found or access denied"
+                    if exc.code == "device_not_found"
+                    else "device is offline"
+                ),
+            )
+
+        dispatch_payload = {**payload, "device_id": route.runtime_device_id}
+        try:
+            logger.info(
+                "Sending capability sync: user_id=%s logical_device_id=%s "
+                "runtime_device_id=%s socket_id=%s mode=%s skill_names=%s "
+                "plugin_names=%s mcp_names=%s",
+                user_id,
+                device_id,
+                route.runtime_device_id,
+                route.socket_id,
+                dispatch_payload.get("mode"),
+                [item.get("name") for item in dispatch_payload.get("skills") or []],
+                [item.get("name") for item in dispatch_payload.get("plugins") or []],
+                [item.get("name") for item in dispatch_payload.get("mcps") or []],
+            )
+            response = await get_sio().call(
+                SYNC_EVENT,
+                dispatch_payload,
+                to=route.socket_id,
+                namespace=SYNC_NAMESPACE,
+                timeout=timeout_seconds,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Capability sync failed: user_id=%s device_id=%s error=%s",
+                user_id,
+                device_id,
+                exc,
+            )
+            return DeviceCapabilitySyncResult(
+                device_id=device_id,
+                success=False,
+                error=str(exc),
+            )
+
+        if not isinstance(response, dict):
+            logger.warning(
+                "Capability sync returned invalid data: user_id=%s device_id=%s response=%s",
+                user_id,
+                device_id,
+                response,
+            )
+            return DeviceCapabilitySyncResult(
+                device_id=device_id,
+                success=False,
+                error="Capability sync RPC returned invalid data",
+            )
+        if response.get("success") is False:
+            logger.warning(
+                "Capability sync rejected by device: user_id=%s device_id=%s response=%s",
+                user_id,
+                device_id,
+                response,
+            )
+            return DeviceCapabilitySyncResult(
+                device_id=device_id,
+                success=False,
+                acknowledged=True,
+                error=str(
+                    response.get("error")
+                    or self._raw_item_failure_message(response)
+                    or "device rejected sync"
+                ),
+                skills=response.get("skills", []),
+                plugins=response.get("plugins", []),
+                mcps=response.get("mcps", []),
+                errors=response.get("errors", []),
+            )
+        logger.info(
+            "Capability sync delivered: user_id=%s device_id=%s skills=%s plugins=%s mcps=%s",
+            user_id,
+            device_id,
+            len(response.get("skills") or []),
+            len(response.get("plugins") or []),
+            len(response.get("mcps") or []),
+        )
+        return DeviceCapabilitySyncResult(
+            device_id=device_id,
+            success=True,
+            acknowledged=True,
+            scope=response.get("scope"),
+            skills=response.get("skills", []),
+            plugins=response.get("plugins", []),
+            mcps=response.get("mcps", []),
+            errors=response.get("errors", []),
+        )
+
+    async def _dispatch_payload_or_raise(
+        self,
+        *,
+        user_id: int,
+        device_id: str,
+        payload: dict[str, Any],
+    ) -> DeviceCapabilitySyncResult:
+        result = await self.sync_device_payload(
+            user_id=user_id,
+            device_id=device_id,
+            payload=payload,
+        )
+        if result.error == "device is offline":
+            raise DeviceCapabilityResolutionError(
+                "Device is offline. Start the local executor and retry.", 409
+            )
+        if result.error == "device not found or access denied":
+            raise DeviceCapabilityResolutionError(
+                "Device not found or access denied", 404
+            )
+        if not result.success:
+            raise DeviceCapabilitySyncError(result.error or "Capability sync failed")
+        return result
+
+    def _load_enabled_installed_skills(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+    ) -> list[dict[str, Any]]:
+        rows = (
+            db.query(Kind)
+            .filter(
+                and_(
+                    Kind.user_id == user_id,
+                    Kind.kind == "InstalledSkill",
+                    Kind.namespace == "default",
+                )
+            )
+            .all()
+        )
+        enabled_ids = [
+            row.id for row in rows if self._should_include_installed_skill(user_id, row)
+        ]
+        return self._resolve_skill_payloads(
+            db,
+            user_id=user_id,
+            installed_skill_ids=enabled_ids,
+        )
+
+    def _load_installed_plugins(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        device_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = (
+            db.query(Kind)
+            .filter(
+                and_(
+                    Kind.user_id == user_id,
+                    Kind.kind == "InstalledPlugin",
+                    Kind.namespace == "default",
+                )
+            )
+            .all()
+        )
+        installed_ids = [
+            row.id for row in rows if self._should_sync_installed_plugin(user_id, row)
+        ]
+        release_overrides = self._device_release_overrides(
+            db,
+            user_id=user_id,
+            device_id=device_id,
+            installed_rows=rows,
+        )
+        return self._resolve_plugin_payloads(
+            db,
+            user_id=user_id,
+            installed_plugin_ids=installed_ids,
+            release_overrides=release_overrides,
+            strict=True,
+        )
+
+    def _load_enabled_installed_mcps(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+    ) -> list[dict[str, Any]]:
+        rows = (
+            db.query(Kind)
+            .filter(
+                and_(
+                    Kind.user_id == user_id,
+                    Kind.kind == "InstalledMCP",
+                    Kind.namespace == "default",
+                )
+            )
+            .all()
+        )
+        enabled_ids = [
+            row.id for row in rows if self._should_include_installed_mcp(user_id, row)
+        ]
+        return self._resolve_mcp_payloads(
+            db,
+            user_id=user_id,
+            installed_mcp_ids=enabled_ids,
+        )
+
+    def _resolve_skill_payloads(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        skill_ids: Optional[list[int]] = None,
+        installed_skill_ids: Optional[list[int]] = None,
+        strict: bool = False,
+    ) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        seen_skill_ids: set[int] = set()
+
+        for skill_id in skill_ids or []:
+            skill = self._get_skill_by_id(db, user_id=user_id, skill_id=skill_id)
+            if not skill:
+                if strict:
+                    raise DeviceCapabilityResolutionError(
+                        f"Skill not found or access denied: {skill_id}", 404
+                    )
+                continue
+            if skill.id not in seen_skill_ids:
+                payloads.append(self._skill_payload(skill, installed_skill_id=None))
+                seen_skill_ids.add(skill.id)
+
+        for installed_id in installed_skill_ids or []:
+            installed = self._get_user_kind(
+                db,
+                user_id=user_id,
+                kind="InstalledSkill",
+                kind_id=installed_id,
+            )
+            if not installed:
+                logger.warning(
+                    "InstalledSkill id not found while resolving sync payload: user_id=%s installed_id=%s",
+                    user_id,
+                    installed_id,
+                )
+                if strict:
+                    raise DeviceCapabilityResolutionError(
+                        f"InstalledSkill not found or access denied: {installed_id}",
+                        404,
+                    )
+                continue
+            skill = self._resolve_installed_skill_ref(db, installed)
+            if not skill:
+                logger.warning(
+                    "InstalledSkill has no resolvable Skill ref: user_id=%s installed_id=%s name=%s skill_ref=%s",
+                    user_id,
+                    installed.id,
+                    installed.name,
+                    installed.json.get("spec", {}).get("skillRef"),
+                )
+                if strict:
+                    raise DeviceCapabilityResolutionError(
+                        f"InstalledSkill has no resolvable Skill ref: {installed_id}",
+                        404,
+                    )
+                continue
+            if skill.id not in seen_skill_ids:
+                payloads.append(
+                    self._skill_payload(skill, installed_skill_id=installed.id)
+                )
+                seen_skill_ids.add(skill.id)
+
+        return payloads
+
+    def _resolve_plugin_payloads(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        installed_plugin_ids: Optional[list[int]] = None,
+        strict: bool = False,
+        release_overrides: Optional[dict[int, int]] = None,
+    ) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        for installed_id in installed_plugin_ids or []:
+            installed = self._get_user_kind(
+                db,
+                user_id=user_id,
+                kind="InstalledPlugin",
+                kind_id=installed_id,
+            )
+            if not installed:
+                logger.warning(
+                    "InstalledPlugin id not found while resolving sync payload: user_id=%s installed_id=%s",
+                    user_id,
+                    installed_id,
+                )
+                if strict:
+                    raise DeviceCapabilityResolutionError(
+                        f"InstalledPlugin not found or access denied: {installed_id}",
+                        404,
+                    )
+                continue
+            if installed.id in seen_ids:
+                continue
+            payloads.append(
+                self._plugin_payload(
+                    db,
+                    installed,
+                    release_id_override=(release_overrides or {}).get(installed.id),
+                )
+            )
+            seen_ids.add(installed.id)
+        return payloads
+
+    def _resolve_mcp_payloads(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        installed_mcp_ids: Optional[list[int]] = None,
+        strict: bool = False,
+    ) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        for installed_id in installed_mcp_ids or []:
+            installed = self._get_user_kind(
+                db,
+                user_id=user_id,
+                kind="InstalledMCP",
+                kind_id=installed_id,
+            )
+            if not installed:
+                logger.warning(
+                    "InstalledMCP id not found while resolving sync payload: user_id=%s installed_id=%s",
+                    user_id,
+                    installed_id,
+                )
+                if strict:
+                    raise DeviceCapabilityResolutionError(
+                        f"InstalledMCP not found or access denied: {installed_id}",
+                        404,
+                    )
+                continue
+            spec = installed.json.get("spec", {})
+            payloads.append(
+                {
+                    "installed_mcp_id": installed.id,
+                    "name": installed.name,
+                    "display_name": spec.get("displayName") or installed.name,
+                    "description": spec.get("description", ""),
+                    "source": spec.get("source") or {},
+                    "server": spec.get("server") or {},
+                }
+            )
+        return payloads
+
+    def _get_skill_by_id(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        skill_id: int,
+    ) -> Optional[Kind]:
+        return (
+            db.query(Kind)
+            .filter(
+                and_(
+                    Kind.id == skill_id,
+                    Kind.kind == "Skill",
+                    Kind.is_active == True,
+                    or_(Kind.user_id == user_id, Kind.user_id == 0),
+                )
+            )
+            .first()
+        )
+
+    def _get_user_kind(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        kind: str,
+        kind_id: int,
+    ) -> Optional[Kind]:
+        return (
+            db.query(Kind)
+            .filter(
+                Kind.id == kind_id,
+                Kind.user_id == user_id,
+                Kind.kind == kind,
+                Kind.is_active == True,
+            )
+            .first()
+        )
+
+    def _resolve_installed_skill_ref(
+        self, db: Session, installed: Kind
+    ) -> Optional[Kind]:
+        ref = installed.json.get("spec", {}).get("skillRef") or {}
+        if not ref:
+            return None
+        return (
+            db.query(Kind)
+            .filter(
+                Kind.kind == "Skill",
+                Kind.name == ref.get("name"),
+                Kind.namespace == ref.get("namespace", "default"),
+                Kind.user_id == ref.get("user_id", installed.user_id),
+                Kind.is_active == True,
+            )
+            .first()
+        )
+
+    def _skill_payload(
+        self,
+        skill: Kind,
+        *,
+        installed_skill_id: Optional[int],
+    ) -> dict[str, Any]:
+        name = skill.json.get("metadata", {}).get("name") or skill.name
+        namespace = skill.json.get("metadata", {}).get("namespace") or skill.namespace
+        file_hash = (skill.json or {}).get("status", {}).get("fileHash")
+        return {
+            "id": skill.id,
+            "skill_id": skill.id,
+            "installed_skill_id": installed_skill_id,
+            "name": name,
+            "namespace": namespace,
+            "is_public": skill.user_id == 0,
+            "content_hash": f"sha256:{file_hash}" if file_hash else None,
+            "download_path": (
+                f"/api/v1/kinds/skills/{skill.id}/download?namespace={namespace}"
+            ),
+        }
+
+    def _plugin_payload(
+        self,
+        db: Session,
+        installed: Kind,
+        *,
+        release_id_override: int | None = None,
+    ) -> dict[str, Any]:
+        spec = installed.json.get("spec", {})
+        source = spec.get("source") or {}
+        marketplace = spec.get("marketplace") or source.get("marketplace")
+        package_ref = spec.get("packageRef") or {}
+        payload = {
+            "installed_plugin_id": installed.id,
+            "name": self._plugin_payload_name(installed, spec, source),
+            "display_name": spec.get("displayName") or installed.name,
+            "description": spec.get("description", ""),
+            "enabled": spec.get("enabled", True),
+            "marketplace": marketplace,
+            "version": spec.get("version"),
+            "source": source,
+        }
+        catalog_item_id = spec.get("pluginId") or source.get("catalogItemId")
+        if isinstance(catalog_item_id, bool):
+            cloud_plugin_id = None
+        elif isinstance(catalog_item_id, int):
+            cloud_plugin_id = catalog_item_id
+        elif (
+            isinstance(catalog_item_id, str)
+            and catalog_item_id.isascii()
+            and catalog_item_id.isdecimal()
+        ):
+            cloud_plugin_id = int(catalog_item_id)
+        else:
+            cloud_plugin_id = None
+        if cloud_plugin_id is not None and cloud_plugin_id > 0:
+            payload["cloud_plugin_id"] = cloud_plugin_id
+        component_states = spec.get("componentStates") or {}
+        if component_states:
+            payload["component_states"] = component_states
+        components = spec.get("components") or {}
+        if components:
+            payload["components"] = components
+        if package_ref:
+            payload["checksum"] = package_ref.get("checksum")
+            release_id = release_id_override or spec.get("releaseId")
+            release = (
+                db.get(PluginRelease, release_id)
+                if isinstance(release_id, int)
+                else None
+            )
+            if (
+                release
+                and release.status == "ready"
+                and release.scan_status == "passed"
+            ):
+                if release_id_override is not None:
+                    payload["version"] = release.version
+                    payload["checksum"] = f"sha256:{release.sha256}"
+                    release_components = (release.scan_report_json or {}).get(
+                        "components"
+                    ) or {}
+                    if release_components:
+                        payload["components"] = release_components
+                download_url, expires_at = plugin_package_storage.presign_download(
+                    release.storage_key
+                )
+                payload["download_path"] = download_url
+                payload["download_url_expires_at"] = expires_at.isoformat()
+                payload["release_id"] = release.id
+            else:
+                payload["download_path"] = (
+                    f"/api/plugins/installed/{installed.id}/download"
+                )
+        return payload
+
+    def _device_release_overrides(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        device_id: str | None,
+        installed_rows: list[Kind],
+    ) -> dict[int, int]:
+        if not device_id or not installed_rows:
+            return {}
+        rows_by_installed_id = plugin_device_rows(db, user_id, device_id)
+        overrides: dict[int, int] = {}
+        for installed in installed_rows:
+            release_id = installed.json.get("spec", {}).get("releaseId")
+            if not isinstance(release_id, int):
+                continue
+            preserved_release_id = (
+                plugin_device_installation_service.auto_update_blocked_release_id(
+                    rows_by_installed_id.get(installed.id),
+                    desired_release_id=release_id,
+                )
+            )
+            if preserved_release_id:
+                overrides[installed.id] = preserved_release_id
+        return overrides
+
+    def _plugin_payload_name(
+        self,
+        installed: Kind,
+        spec: dict[str, Any],
+        source: dict[str, Any],
+    ) -> str:
+        manifest = spec.get("manifest") or {}
+        for candidate in (
+            source.get("pluginKey"),
+            source.get("plugin"),
+            manifest.get("name") if isinstance(manifest, dict) else None,
+            installed.json.get("metadata", {}).get("name"),
+            installed.name,
+        ):
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return installed.name
+
+    def _aggregate_response(
+        self,
+        results: list[DeviceCapabilitySyncResult],
+        *,
+        skipped: int,
+        mode: str,
+    ) -> DeviceCapabilitySyncResponse:
+        synced = sum(1 for item in results if item.success)
+        failed = sum(1 for item in results if not item.success)
+        first = results[0] if results else None
+        errors = []
+        for result in results:
+            errors.extend(result.errors or [])
+            if result.error:
+                errors.append({"device_id": result.device_id, "error": result.error})
+        return DeviceCapabilitySyncResponse(
+            success=failed == 0 and skipped == 0,
+            device_id=first.device_id if first else "",
+            mode=mode,
+            skills=first.skills if first else [],
+            plugins=first.plugins if first else [],
+            mcps=first.mcps if first else [],
+            errors=errors,
+            synced=synced,
+            failed=failed,
+            skipped=skipped,
+            results=results,
+        )
+
+    @staticmethod
+    def _item_failure_message(item: DeviceCapabilityItemResult | None) -> str | None:
+        if item is None:
+            return None
+        error = (item.error or "").strip()
+        if not error:
+            return None
+        name = (item.name or str(item.id or "plugin")).strip()
+        stage = (item.stage or "").strip()
+        location = f" during {stage}" if stage else ""
+        return f"Plugin {name} failed{location}: {error}"
+
+    @staticmethod
+    def _raw_item_failure_message(response: dict[str, Any]) -> str | None:
+        for field in ("plugins", "skills", "mcps"):
+            for item in response.get(field) or []:
+                if not isinstance(item, dict) or item.get("status") not in {
+                    "failed",
+                    "error",
+                }:
+                    continue
+                error = str(item.get("error") or "").strip()
+                if not error:
+                    continue
+                name = str(item.get("name") or item.get("id") or field[:-1])
+                stage = str(item.get("stage") or "").strip()
+                location = f" during {stage}" if stage else ""
+                return f"{field[:-1].title()} {name} failed{location}: {error}"
+        return None
+
+    def _extract_device_id(self, device: dict[str, Any]) -> Optional[str]:
+        value = (
+            device.get("socket_device_id")
+            or device.get("runtime_device_id")
+            or device.get("device_id")
+            or device.get("deviceId")
+            or device.get("name")
+        )
+        return str(value) if value else None
+
+    def _is_enabled_install(self, row: Kind) -> bool:
+        spec = row.json.get("spec", {})
+        return (
+            spec.get("enabled", True)
+            and spec.get("installState", "installed") == "installed"
+        )
+
+    def _should_include_installed_skill(self, user_id: int, row: Kind) -> bool:
+        spec = row.json.get("spec", {})
+        include = row.is_active and self._is_enabled_install(row)
+        logger.info(
+            "Desired-state InstalledSkill candidate: user_id=%s installed_id=%s name=%s active=%s enabled=%s state=%s skill_ref=%s include=%s",
+            user_id,
+            row.id,
+            row.name,
+            row.is_active,
+            spec.get("enabled", True),
+            spec.get("installState", "installed"),
+            spec.get("skillRef"),
+            include,
+        )
+        return include
+
+    def _should_sync_installed_plugin(self, user_id: int, row: Kind) -> bool:
+        spec = row.json.get("spec", {})
+        include = row.is_active and spec.get("installState", "installed") == "installed"
+        logger.info(
+            "Desired-state InstalledPlugin candidate: user_id=%s installed_id=%s name=%s active=%s enabled=%s state=%s source=%s include=%s",
+            user_id,
+            row.id,
+            row.name,
+            row.is_active,
+            spec.get("enabled", True),
+            spec.get("installState", "installed"),
+            spec.get("source"),
+            include,
+        )
+        return include
+
+    def _should_include_installed_mcp(self, user_id: int, row: Kind) -> bool:
+        spec = row.json.get("spec", {})
+        include = row.is_active and self._is_enabled_install(row)
+        logger.info(
+            "Desired-state InstalledMCP candidate: user_id=%s installed_id=%s name=%s active=%s enabled=%s state=%s source=%s include=%s",
+            user_id,
+            row.id,
+            row.name,
+            row.is_active,
+            spec.get("enabled", True),
+            spec.get("installState", "installed"),
+            spec.get("source"),
+            include,
+        )
+        return include
+
+    def _validate_mode(self, mode: str) -> None:
+        if mode not in {"merge", "replace"}:
+            raise DeviceCapabilityResolutionError("Invalid sync mode", 422)
+
+
+device_capability_sync_service = DeviceCapabilitySyncService()

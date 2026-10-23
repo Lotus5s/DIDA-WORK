@@ -1,0 +1,658 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Helper functions for Subscription service.
+
+This module contains utility functions for:
+- Building Subscription CRD structures
+- Trigger configuration handling
+- Next execution time calculation
+- Prompt template resolution
+- Result summary extraction
+"""
+
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, Optional
+
+from sqlalchemy.orm import Session
+
+from app.models.kind import Kind
+from app.models.task import TaskResource
+from app.schemas.kind import Workspace
+from app.schemas.subscription import (
+    CronTriggerConfig,
+    EventTriggerConfig,
+    GitPushEventConfig,
+    IntervalTriggerConfig,
+    OneTimeTriggerConfig,
+    Subscription,
+    SubscriptionCreate,
+    SubscriptionEventType,
+    SubscriptionExecutionTarget,
+    SubscriptionMetadata,
+    SubscriptionSpec,
+    SubscriptionStatus,
+    SubscriptionTeamRef,
+    SubscriptionTriggerConfig,
+    SubscriptionTriggerType,
+    SubscriptionWorkspaceRef,
+)
+from app.stores.tasks import task_store
+
+logger = logging.getLogger(__name__)
+
+
+# Supported prompt template variables
+TEMPLATE_VARIABLES = {
+    "date": lambda: datetime.now().strftime("%Y-%m-%d"),
+    "time": lambda: datetime.now().strftime("%H:%M:%S"),
+    "datetime": lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "timestamp": lambda: str(int(datetime.now().timestamp())),
+}
+
+
+def resolve_prompt_template(
+    template: str,
+    subscription_name: str,
+    extra_variables: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Resolve prompt template with variables.
+
+    Supported variables:
+    - {{date}}: Current date (YYYY-MM-DD)
+    - {{time}}: Current time (HH:MM:SS)
+    - {{datetime}}: Current datetime (YYYY-MM-DD HH:MM:SS)
+    - {{timestamp}}: Unix timestamp
+    - {{subscription_name}}: Subscription display name
+    - Custom variables from extra_variables dict
+
+    Args:
+        template: The prompt template string
+        subscription_name: The subscription's display name
+        extra_variables: Optional dict of additional variables
+
+    Returns:
+        Resolved prompt string
+    """
+    result = template
+
+    # Replace standard variables
+    for var_name, var_func in TEMPLATE_VARIABLES.items():
+        pattern = "{{" + var_name + "}}"
+        if pattern in result:
+            result = result.replace(pattern, var_func())
+
+    # Replace subscription_name
+    result = result.replace("{{subscription_name}}", subscription_name)
+
+    # Replace extra variables (like webhook_data)
+    if extra_variables:
+        for var_name, var_value in extra_variables.items():
+            pattern = "{{" + var_name + "}}"
+            if pattern in result:
+                if isinstance(var_value, (dict, list)):
+                    result = result.replace(
+                        pattern, json.dumps(var_value, ensure_ascii=False)
+                    )
+                else:
+                    result = result.replace(pattern, str(var_value))
+
+    return result
+
+
+def validate_subscription_for_read(subscription_json: Dict[str, Any]) -> Subscription:
+    """Validate subscription JSON for read paths with legacy trigger compatibility."""
+    try:
+        return Subscription.model_validate(subscription_json)
+    except Exception as e:
+        error_str = str(e)
+        if (
+            "Interval must be at least" in error_str
+            or "Cron interval must be at least" in error_str
+        ):
+            # Import here to avoid circular imports.
+            from app.services.subscription import subscription_service
+
+            fixed_json = subscription_service._fix_invalid_trigger_config_for_read(
+                subscription_json
+            )
+            return Subscription.model_validate(fixed_json)
+        raise
+
+
+def build_subscription_crd(
+    subscription_in: SubscriptionCreate,
+    team: Kind,
+    workspace: Optional[TaskResource],
+    webhook_token: Optional[str],
+) -> Subscription:
+    """
+    Build Subscription CRD JSON structure.
+
+    Args:
+        subscription_in: Subscription creation data
+        team: The Team (Kind) resource
+        workspace: Optional Workspace (TaskResource)
+        webhook_token: Optional webhook token for event triggers
+
+    Returns:
+        Subscription CRD object
+    """
+    from app.schemas.kind import ModelRef
+
+    # Build trigger config
+    trigger = build_trigger_config(
+        subscription_in.trigger_type, subscription_in.trigger_config
+    )
+
+    # Build modelRef from model_ref dict if provided
+    model_ref = None
+    if subscription_in.model_ref:
+        model_ref = ModelRef(
+            name=subscription_in.model_ref.get("name", ""),
+            namespace=subscription_in.model_ref.get("namespace", "default"),
+        )
+
+    spec = SubscriptionSpec(
+        displayName=subscription_in.display_name,
+        taskType=subscription_in.task_type,
+        visibility=subscription_in.visibility,
+        trigger=trigger,
+        teamRef=SubscriptionTeamRef(name=team.name, namespace=team.namespace),
+        workspaceRef=(
+            SubscriptionWorkspaceRef(name=workspace.name, namespace=workspace.namespace)
+            if workspace
+            else None
+        ),
+        modelRef=model_ref,
+        forceOverrideBotModel=subscription_in.force_override_bot_model,
+        promptTemplate=subscription_in.prompt_template,
+        retryCount=subscription_in.retry_count,
+        timeoutSeconds=subscription_in.timeout_seconds,
+        enabled=subscription_in.enabled,
+        executionTarget=SubscriptionExecutionTarget.model_validate(
+            subscription_in.execution_target.model_dump()
+        ),
+        description=subscription_in.description,
+        # History preservation settings
+        preserveHistory=subscription_in.preserve_history,
+        historyMessageCount=subscription_in.history_message_count,
+        # Knowledge base references
+        knowledgeBaseRefs=subscription_in.knowledge_base_refs,
+        # Notification webhooks
+        notificationWebhooks=subscription_in.notification_webhooks,
+        # Skill references
+        skillRefs=subscription_in.skill_refs,
+    )
+
+    status = SubscriptionStatus()
+    if webhook_token:
+        status.webhookUrl = f"/api/subscriptions/webhook/{webhook_token}"
+
+    return Subscription(
+        metadata=SubscriptionMetadata(
+            name=subscription_in.name,
+            namespace=subscription_in.namespace,
+            displayName=subscription_in.display_name,
+        ),
+        spec=spec,
+        status=status,
+    )
+
+
+def build_trigger_config(
+    trigger_type: SubscriptionTriggerType,
+    trigger_config: Dict[str, Any],
+) -> SubscriptionTriggerConfig:
+    """
+    Build SubscriptionTriggerConfig from trigger type and config dict.
+
+    Args:
+        trigger_type: The trigger type enum
+        trigger_config: Dict containing trigger-specific configuration
+
+    Returns:
+        SubscriptionTriggerConfig object
+    """
+    trigger_type_enum = (
+        trigger_type
+        if isinstance(trigger_type, SubscriptionTriggerType)
+        else SubscriptionTriggerType(trigger_type)
+    )
+
+    if trigger_type_enum == SubscriptionTriggerType.CRON:
+        return SubscriptionTriggerConfig(
+            type=trigger_type_enum,
+            cron=CronTriggerConfig(
+                expression=trigger_config.get("expression", "0 9 * * *"),
+                timezone=trigger_config.get("timezone", "UTC"),
+            ),
+        )
+    elif trigger_type_enum == SubscriptionTriggerType.INTERVAL:
+        from app.core.config import settings
+
+        value = trigger_config.get("value", 1)
+        unit = trigger_config.get("unit", "hours")
+        # Enforce minimum interval of SUBSCRIPTION_MIN_INTERVAL_MINUTES (default 15)
+        min_interval = settings.SUBSCRIPTION_MIN_INTERVAL_MINUTES
+        if unit == "minutes" and value < min_interval:
+            value = min_interval
+        return SubscriptionTriggerConfig(
+            type=trigger_type_enum,
+            interval=IntervalTriggerConfig(
+                value=value,
+                unit=unit,
+            ),
+        )
+    elif trigger_type_enum == SubscriptionTriggerType.ONE_TIME:
+        execute_at_str = trigger_config.get("execute_at")
+        if not execute_at_str:
+            raise ValueError("execute_at is required for ONE_TIME trigger type")
+        # Handle ISO format with 'Z' suffix (JavaScript's toISOString() format)
+        # Python's fromisoformat() doesn't support 'Z', need to replace with '+00:00'
+        execute_at_normalized = execute_at_str.replace("Z", "+00:00")
+        return SubscriptionTriggerConfig(
+            type=trigger_type_enum,
+            one_time=OneTimeTriggerConfig(
+                execute_at=datetime.fromisoformat(execute_at_normalized),
+            ),
+        )
+    elif trigger_type_enum == SubscriptionTriggerType.EVENT:
+        event_type = trigger_config.get("event_type", "webhook")
+        git_push_config = None
+
+        if event_type == "git_push":
+            git_push_data = trigger_config.get("git_push", {})
+            git_push_config = GitPushEventConfig(
+                repository=git_push_data.get("repository", ""),
+                branch=git_push_data.get("branch"),
+            )
+
+        return SubscriptionTriggerConfig(
+            type=trigger_type_enum,
+            event=EventTriggerConfig(
+                event_type=SubscriptionEventType(event_type),
+                git_push=git_push_config,
+            ),
+        )
+
+    raise ValueError(f"Unknown trigger type: {trigger_type}")
+
+
+def extract_trigger_config(trigger: SubscriptionTriggerConfig) -> Dict[str, Any]:
+    """
+    Extract trigger config dict from SubscriptionTriggerConfig.
+
+    Args:
+        trigger: The trigger configuration object
+
+    Returns:
+        Dict containing trigger-specific configuration
+    """
+    if trigger.type == SubscriptionTriggerType.CRON and trigger.cron:
+        return {
+            "expression": trigger.cron.expression,
+            "timezone": trigger.cron.timezone,
+        }
+    elif trigger.type == SubscriptionTriggerType.INTERVAL and trigger.interval:
+        return {
+            "value": trigger.interval.value,
+            "unit": trigger.interval.unit,
+        }
+    elif trigger.type == SubscriptionTriggerType.ONE_TIME and trigger.one_time:
+        return {
+            "execute_at": trigger.one_time.execute_at.isoformat(),
+        }
+    elif trigger.type == SubscriptionTriggerType.EVENT and trigger.event:
+        result = {"event_type": trigger.event.event_type.value}
+        if trigger.event.git_push:
+            result["git_push"] = {
+                "repository": trigger.event.git_push.repository,
+                "branch": trigger.event.git_push.branch,
+            }
+        return result
+
+    return {}
+
+
+def calculate_next_execution_time(
+    trigger_type: SubscriptionTriggerType,
+    trigger_config: Dict[str, Any],
+) -> Optional[datetime]:
+    """
+    Calculate the next execution time based on trigger configuration.
+
+    For cron triggers, the timezone from trigger_config is used to interpret
+    the cron expression. The returned datetime is always in UTC for storage.
+
+    For example, if cron is "0 9 * * *" with timezone "Asia/Shanghai",
+    it means 9:00 AM Shanghai time, which is 1:00 AM UTC.
+
+    All returned datetimes are naive UTC (no tzinfo) for database storage.
+
+    Args:
+        trigger_type: The trigger type
+        trigger_config: Dict containing trigger-specific configuration
+
+    Returns:
+        Next execution time as naive UTC datetime, or None for event triggers
+    """
+    from zoneinfo import ZoneInfo
+
+    trigger_type_enum = (
+        trigger_type
+        if isinstance(trigger_type, SubscriptionTriggerType)
+        else SubscriptionTriggerType(trigger_type)
+    )
+
+    # Use UTC as the reference time
+    utc_tz = ZoneInfo("UTC")
+    now_utc = datetime.now(utc_tz)
+
+    if trigger_type_enum == SubscriptionTriggerType.CRON:
+        # Use croniter to calculate next run with timezone support
+        try:
+            from croniter import croniter
+
+            cron_expr = trigger_config.get("expression", "0 9 * * *")
+            timezone_str = trigger_config.get("timezone", "UTC")
+
+            # Get the user's timezone
+            try:
+                user_tz = ZoneInfo(timezone_str)
+            except Exception:
+                logger.warning(
+                    f"Invalid timezone '{timezone_str}', falling back to UTC"
+                )
+                user_tz = utc_tz
+
+            # Convert current UTC time to user's timezone
+            now_user_tz = now_utc.astimezone(user_tz)
+
+            # Calculate next execution in user's timezone
+            iter = croniter(cron_expr, now_user_tz)
+            next_user_tz = iter.get_next(datetime)
+
+            # Ensure the result has timezone info
+            if next_user_tz.tzinfo is None:
+                next_user_tz = next_user_tz.replace(tzinfo=user_tz)
+
+            # Convert back to UTC
+            next_utc = next_user_tz.astimezone(utc_tz)
+
+            logger.debug(
+                f"Cron calculation: expr={cron_expr}, tz={timezone_str}, "
+                f"now_utc={now_utc}, now_user_tz={now_user_tz}, "
+                f"next_user_tz={next_user_tz}, next_utc={next_utc}"
+            )
+
+            # Return naive UTC datetime for database storage
+            return next_utc.replace(tzinfo=None)
+        except Exception as e:
+            logger.warning(f"Failed to parse cron expression: {e}")
+            return None
+
+    elif trigger_type_enum == SubscriptionTriggerType.INTERVAL:
+        value = trigger_config.get("value", 1)
+        unit = trigger_config.get("unit", "hours")
+
+        # Calculate interval from UTC now
+        now_naive_utc = now_utc.replace(tzinfo=None)
+        if unit == "minutes":
+            return now_naive_utc + timedelta(minutes=value)
+        elif unit == "hours":
+            return now_naive_utc + timedelta(hours=value)
+        elif unit == "days":
+            return now_naive_utc + timedelta(days=value)
+
+    elif trigger_type_enum == SubscriptionTriggerType.ONE_TIME:
+        execute_at = trigger_config.get("execute_at")
+        if execute_at:
+            if isinstance(execute_at, str):
+                # Parse ISO format, handle both timezone-aware and naive
+                parsed = datetime.fromisoformat(execute_at.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    # Convert to UTC and strip tzinfo
+                    return parsed.astimezone(utc_tz).replace(tzinfo=None)
+                # For naive datetime, check if timezone is provided in trigger_config
+                # If so, interpret the datetime in that timezone and convert to UTC
+                timezone_str = trigger_config.get("timezone")
+                if timezone_str:
+                    try:
+                        user_tz = ZoneInfo(timezone_str)
+                        # Interpret the naive datetime as being in user's timezone
+                        parsed_with_tz = parsed.replace(tzinfo=user_tz)
+                        # Convert to UTC and strip tzinfo
+                        return parsed_with_tz.astimezone(utc_tz).replace(tzinfo=None)
+                    except Exception:
+                        logger.warning(
+                            f"Invalid timezone '{timezone_str}' for one_time trigger, "
+                            "treating execute_at as UTC"
+                        )
+                # No timezone provided, assume naive datetime is already UTC
+                return parsed
+            elif hasattr(execute_at, "tzinfo") and execute_at.tzinfo is not None:
+                return execute_at.astimezone(utc_tz).replace(tzinfo=None)
+            return execute_at
+
+    # Event triggers don't have scheduled next execution
+    return None
+
+
+def create_or_get_workspace(
+    db: Session,
+    *,
+    user_id: int,
+    git_repo: str,
+    git_repo_id: Optional[int],
+    git_domain: str,
+    branch_name: str,
+) -> int:
+    """
+    Create or get a workspace for the given git repository.
+
+    This method checks if a workspace already exists for the given repo/branch,
+    and creates one if it doesn't exist.
+
+    Args:
+        db: Database session
+        user_id: User ID
+        git_repo: Git repository name (e.g., 'owner/repo')
+        git_repo_id: Git repository ID
+        git_domain: Git domain (e.g., 'github.com')
+        branch_name: Git branch name
+
+    Returns:
+        Workspace ID
+    """
+    # Generate a unique workspace name based on repo and branch
+    workspace_name = f"{git_repo.replace('/', '-')}-{branch_name}".lower()[:100]
+    namespace = "default"
+
+    # Check if workspace already exists
+    existing = task_store.get_workspace_by_ref(
+        db,
+        user_id=user_id,
+        name=workspace_name,
+        namespace=namespace,
+    )
+
+    if existing:
+        return existing.id
+
+    # Build git URL from domain and repo
+    git_url = f"https://{git_domain}/{git_repo}.git"
+
+    # Create workspace CRD JSON
+    workspace_json = {
+        "apiVersion": "wegent.io/v1",
+        "kind": "Workspace",
+        "metadata": {
+            "name": workspace_name,
+            "namespace": namespace,
+        },
+        "spec": {
+            "repository": {
+                "gitUrl": git_url,
+                "gitRepo": git_repo,
+                "gitRepoId": git_repo_id or 0,
+                "gitDomain": git_domain,
+                "branchName": branch_name,
+            }
+        },
+    }
+
+    workspace = task_store.create_workspace(
+        db,
+        user_id=user_id,
+        name=workspace_name,
+        namespace=namespace,
+        payload=workspace_json,
+        client_origin="frontend",
+    )
+    db.flush()  # Get the ID without committing
+
+    return workspace.id
+
+
+def extract_workspace_repo_fields(
+    workspace_json: Dict[str, Any],
+) -> Dict[str, Optional[Any]]:
+    """Extract repository fields from workspace JSON."""
+    try:
+        workspace_crd = Workspace.model_validate(workspace_json)
+        repo = workspace_crd.spec.repository
+        return {
+            "git_repo": repo.gitRepo,
+            "git_repo_id": repo.gitRepoId,
+            "git_domain": repo.gitDomain,
+            "branch_name": repo.branchName,
+        }
+    except Exception:
+        repo = workspace_json.get("spec", {}).get("repository", {})
+        return {
+            "git_repo": repo.get("gitRepo"),
+            "git_repo_id": repo.get("gitRepoId"),
+            "git_domain": repo.get("gitDomain"),
+            "branch_name": repo.get("branchName"),
+        }
+
+
+def build_workspace_repo_cache(
+    db: Session, workspace_ids: Iterable[int]
+) -> Dict[int, Dict[str, Optional[Any]]]:
+    """Batch load workspace repository fields by workspace IDs."""
+    workspace_id_list = [ws_id for ws_id in set(workspace_ids) if ws_id]
+    if not workspace_id_list:
+        return {}
+
+    workspaces = task_store.list_active_workspaces_by_ids(
+        db,
+        workspace_ids=workspace_id_list,
+    )
+    return {
+        workspace.id: extract_workspace_repo_fields(workspace.json)
+        for workspace in workspaces
+    }
+
+
+def resolve_workspace_repo_fields(
+    db: Session,
+    *,
+    user_id: int,
+    workspace_id: Optional[int],
+    workspace_ref: Optional[SubscriptionWorkspaceRef],
+    workspace_repo_cache: Optional[Dict[int, Dict[str, Optional[Any]]]] = None,
+) -> Dict[str, Optional[Any]]:
+    """Resolve repository fields from a workspace reference."""
+    empty = {
+        "git_repo": None,
+        "git_repo_id": None,
+        "git_domain": None,
+        "branch_name": None,
+    }
+
+    if workspace_id and workspace_repo_cache is not None:
+        cached = workspace_repo_cache.get(workspace_id)
+        if cached is not None:
+            return cached
+
+    workspace = None
+    if workspace_id:
+        workspace = task_store.get_active_workspace_by_id(db, workspace_id=workspace_id)
+    elif workspace_ref:
+        workspace = task_store.get_workspace_by_ref(
+            db,
+            user_id=user_id,
+            name=workspace_ref.name,
+            namespace=workspace_ref.namespace,
+        )
+
+    if not workspace:
+        return empty
+
+    fields = extract_workspace_repo_fields(workspace.json)
+    if workspace_id and workspace_repo_cache is not None:
+        workspace_repo_cache[workspace_id] = fields
+    return fields
+
+
+def extract_result_summary(result: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Extract a summary from the result dict.
+
+    This function extracts the model output from task result for display in
+    BackgroundExecution result_summary. It is used by both:
+    - SubscriptionEventEmitter (for Chat Shell type tasks)
+    - ExecutorKindsService (for Executor type tasks like Claude Code, Agno)
+
+    Args:
+        result: The result dictionary from task/chat completion.
+                Expected structure: {"value": "model output text", ...}
+
+    Returns:
+        A summary string (the model output), or None if no result or empty value
+    """
+    if not result:
+        return None
+
+    # Try to get the value from result
+    value = result.get("value", "")
+    if not value:
+        return None
+
+    # Return full content - database column is TEXT type which can store large content
+    return value
+
+
+def is_subscription_expired(
+    expires_at: Optional[datetime],
+    current_time: Optional[datetime] = None,
+) -> bool:
+    """Check if a subscription has expired.
+
+    Args:
+        expires_at: The expiration timestamp (stored in _internal.expires_at)
+        current_time: Optional current time (defaults to UTC now)
+
+    Returns:
+        True if expired, False otherwise
+    """
+    if not expires_at:
+        return False
+
+    if current_time is None:
+        current_time = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # Handle timezone-aware comparison
+    if expires_at.tzinfo and not current_time.tzinfo:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    elif not expires_at.tzinfo and current_time.tzinfo:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    return current_time >= expires_at

@@ -1,0 +1,947 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import type { InteractiveFormAnswerPayload, SkillRef, TaskType } from './api'
+import type { ArtifactNodeContext } from './knowledge-artifact'
+
+/**
+ * Socket.IO event types and payload definitions
+ */
+
+// ============================================================
+// Client -> Server Events
+// ============================================================
+
+export const ClientEvents = {
+  CHAT_SEND: 'chat:send',
+  CHAT_GUIDE: 'chat:guide',
+  CHAT_CANCEL: 'chat:cancel',
+  CHAT_RESUME: 'chat:resume',
+  CHAT_RETRY: 'chat:retry',
+  TASK_JOIN: 'task:join',
+  TASK_LEAVE: 'task:leave',
+  HISTORY_SYNC: 'history:sync',
+} as const
+
+// ============================================================
+// Server -> Client Events
+// ============================================================
+export const ServerEvents = {
+  // Authentication events
+  AUTH_ERROR: 'auth:error', // Token expired or invalid
+
+  // Chat streaming events (to task room)
+  CHAT_START: 'chat:start',
+  CHAT_CHUNK: 'chat:chunk',
+  CHAT_DONE: 'chat:done',
+  CHAT_ERROR: 'chat:error',
+  CHAT_CANCELLED: 'chat:cancelled',
+  CHAT_STATUS_UPDATED: 'chat:status_updated',
+  CHAT_GUIDANCE_QUEUED: 'chat:guidance_queued',
+  CHAT_GUIDANCE_APPLIED: 'chat:guidance_applied',
+  CHAT_GUIDANCE_EXPIRED: 'chat:guidance_expired',
+
+  // Block events for mixed content rendering (to task room)
+  CHAT_BLOCK_CREATED: 'chat:block_created',
+  CHAT_BLOCK_UPDATED: 'chat:block_updated',
+
+  // Non-streaming messages (to task room, exclude sender)
+  CHAT_MESSAGE: 'chat:message',
+  CHAT_BOT_COMPLETE: 'chat:bot_complete',
+  CHAT_SYSTEM: 'chat:system',
+
+  // Correction events (to task room)
+  CORRECTION_START: 'correction:start',
+  CORRECTION_PROGRESS: 'correction:progress',
+  CORRECTION_CHUNK: 'correction:chunk',
+  CORRECTION_DONE: 'correction:done',
+  CORRECTION_ERROR: 'correction:error',
+
+  // Task list events (to user room)
+  TASK_CREATED: 'task:created',
+  TASK_DELETED: 'task:deleted',
+  TASK_RENAMED: 'task:renamed',
+  TASK_STATUS: 'task:status',
+  TASK_SHARED: 'task:shared',
+  TASK_INVITED: 'task:invited', // User invited to group chat
+  TASK_APP_UPDATE: 'task:app_update', // App data updated (to task room)
+  UNREAD_COUNT: 'unread:count',
+
+  // Background execution events (to user room)
+  BACKGROUND_EXECUTION_UPDATE: 'background:execution_update',
+  SUBSCRIPTION_GROUP_BINDING_UPDATED: 'subscription:group_binding_updated',
+
+  // Generic Skill Events
+  SKILL_REQUEST: 'skill:request', // Server -> Client: generic skill request
+
+  // Mermaid rendering events (deprecated, use SKILL_REQUEST instead)
+  MERMAID_RENDER: 'mermaid:render',
+
+  // Device events (to user room)
+  DEVICE_ONLINE: 'device:online',
+  DEVICE_OFFLINE: 'device:offline',
+  DEVICE_STATUS: 'device:status',
+  DEVICE_SLOT_UPDATE: 'device:slot_update',
+  DEVICE_UPGRADE_STATUS: 'device:upgrade_status',
+} as const
+
+// Client -> Server Skill events
+export const ClientSkillEvents = {
+  SKILL_RESPONSE: 'skill:response', // Client -> Server: generic skill response
+} as const
+
+// Client -> Server Mermaid events (deprecated, use ClientSkillEvents instead)
+export const ClientMermaidEvents = {
+  MERMAID_RESULT: 'mermaid:result',
+} as const
+
+// ============================================================
+// Client -> Server Payloads
+// ============================================================
+
+export interface ChatSendPayload {
+  task_id?: number
+  team_id: number
+  message: string
+  title?: string
+  attachment_id?: number // Single attachment (deprecated, use attachment_ids)
+  attachment_ids?: number[] // Multiple attachments support
+  enable_deep_thinking?: boolean
+  enable_web_search?: boolean
+  search_engine?: string
+  enable_clarification?: boolean
+  force_override_bot_model?: string
+  force_override_bot_model_type?: string
+  is_group_chat?: boolean
+  contexts?: Array<{
+    type: string
+    data: Record<string, unknown>
+  }>
+  // Repository info for code tasks
+  git_url?: string
+  git_repo?: string
+  git_repo_id?: number
+  git_domain?: string
+  branch_name?: string
+  task_type?: TaskType
+  // Knowledge base ID for knowledge type tasks
+  knowledge_base_id?: number
+  artifact_context?: ArtifactNodeContext
+  // Local device execution
+  device_id?: string // Local device ID for task execution (if undefined, use cloud executor)
+  // Project association
+  project_id?: number // Project ID to associate this task with
+  // Skill selection
+  /** Skill names to preload (for Chat Shell - prompts injected into system message) */
+  preload_skill_names?: string[]
+  /** Additional skill names (for other shells - downloaded to executor) */
+  additional_skill_names?: string[]
+  /** Additional skills with their original resource identity. */
+  additional_skills?: SkillRef[]
+  /** Action type. 'pipeline:confirm' for pipeline stage confirmation */
+  action?: 'pipeline:confirm' | string
+  /** Generation parameters for video/image generation tasks */
+  generate_params?: {
+    /** Resolution for generation (e.g., '1080p', '720p', '480p') */
+    resolution?: string
+    /** Aspect ratio for generation (e.g., '16:9', '9:16', '1:1') */
+    ratio?: string
+    /** Duration in seconds for video generation */
+    duration?: number
+    /** Selected model-defined video generation mode */
+    generation_mode_id?: string
+    /** Image dimensions selected at generation time */
+    size?: string
+  }
+  interactive_form_answer?: InteractiveFormAnswerPayload
+}
+
+export interface ChatCancelPayload {
+  subtask_id: number
+  partial_content?: string
+}
+
+export interface ChatGuidePayload {
+  task_id: number
+  team_id?: number
+  message?: string
+  guidance: string
+  client_guidance_id: string
+  guidance_id?: string
+  subtask_id?: number
+}
+
+export interface ChatResumePayload {
+  task_id: number
+  subtask_id: number
+  offset: number
+}
+
+export interface ChatRetryPayload {
+  task_id: number
+  subtask_id: number
+}
+
+export interface TaskJoinPayload {
+  task_id: number
+  /** If provided, only return messages after this message_id (for incremental sync on reconnect) */
+  after_message_id?: number
+}
+
+export interface TaskLeavePayload {
+  task_id: number
+}
+
+export interface HistorySyncPayload {
+  task_id: number
+  after_message_id: number
+}
+
+// ============================================================
+// Server -> Client Payloads
+// ============================================================
+
+export interface AuthErrorPayload {
+  error: string
+  code: 'TOKEN_EXPIRED' | 'INVALID_TOKEN' | string
+}
+
+export interface SourceReference {
+  /** Source index number (e.g., 1, 2, 3) */
+  index: number
+  /** Document title/filename */
+  title: string
+  /** Knowledge base ID */
+  kb_id?: number | null
+  /** Provider-specific source ID */
+  source_id?: string
+  /** Provider source type */
+  source_type?: string
+  /** Provider source URI */
+  source_uri?: string
+  /** Provider source name */
+  source_name?: string
+}
+
+export interface RetrievalSummaryPayload {
+  searched_source_ids?: string[]
+  ignored_source_ids?: string[]
+  source_statuses?: RetrievalSourceStatus[]
+}
+
+export interface RetrievalSourceStatus {
+  provider: string
+  source_id: string
+  source_name?: string | null
+  status: 'hit' | 'no_hit' | 'ignored' | 'failed'
+  record_count: number
+  citation_count: number
+  mode?: 'rag_retrieval' | 'direct_injection' | string | null
+}
+
+/** Gemini Deep Research grounding annotation */
+export interface GeminiAnnotation {
+  /** Start index in the text where the citation appears */
+  start_index: number
+  /** End index in the text where the citation appears */
+  end_index: number
+  /** Source URL for the citation */
+  source: string
+}
+
+export type ChatBlockType =
+  | 'text'
+  | 'tool'
+  | 'subagent'
+  | 'thinking'
+  | 'error'
+  | 'guidance'
+  | 'card'
+
+export interface ChatBlock {
+  id: string
+  type: ChatBlockType
+  content?: string
+  tool_use_id?: string
+  tool_name?: string
+  tool_input?: Record<string, unknown>
+  tool_output?: unknown
+  parent_tool_use_id?: string
+  display_name?: string
+  agent_type?: string
+  title?: string
+  description?: string
+  output?: string
+  summary?: string
+  children?: ChatBlock[]
+  render_payload?: unknown
+  card_id?: string
+  card_type?: string
+  card_data?: Record<string, unknown>
+  card_status?: 'pending' | 'partial_ready' | 'populated' | 'error' | 'expired'
+  card_error?: string | null
+  card_preview_data?: Record<string, unknown>
+  guidance_id?: string
+  loop_index?: number
+  applied_at?: string
+  argument_status?: 'streaming' | 'done'
+  status?: 'generating_arguments' | 'pending' | 'streaming' | 'invoking' | 'done' | 'error'
+  timestamp?: number
+}
+
+export interface ChatStartPayload {
+  task_id: number
+  subtask_id: number
+  bot_name?: string
+  shell_type?: string // Shell type for frontend display (Chat, ClaudeCode, Agno, etc.)
+  /** Message ID for ordering (primary sort key) */
+  message_id?: number
+}
+
+export interface ChatChunkPayload {
+  subtask_id: number
+  content: string
+  offset: number
+  /** Task ID for page refresh recovery */
+  task_id?: number
+  /** Optional block ID for text block streaming (append content to specific block) */
+  block_id?: string
+  /** Optional block offset for offset-based content merging within a specific block */
+  block_offset?: number
+  /** Full result data for executor tasks (contains thinking, workbench) */
+  result?: {
+    value?: string
+    thinking?: unknown[]
+    workbench?: Record<string, unknown>
+    sources?: SourceReference[]
+    /** Shell type for frontend display (Chat, ClaudeCode, Agno, etc.) */
+    shell_type?: string
+    /** Reasoning content from models like DeepSeek R1 */
+    reasoning_content?: string
+    /** Incremental reasoning chunk for streaming */
+    reasoning_chunk?: string
+    /** Message blocks for mixed rendering (new format) */
+    blocks?: ChatBlock[]
+    /** Gemini Deep Research grounding annotations */
+    annotations?: GeminiAnnotation[]
+    /** Aggregated retrieval coverage summary */
+    retrieval_summary?: RetrievalSummaryPayload
+  }
+  /** Knowledge base source references (for RAG citations) */
+  sources?: SourceReference[]
+}
+
+export interface ChatDonePayload {
+  task_id?: number
+  subtask_id: number
+  offset: number
+  result: Record<string, unknown> & {
+    value?: string
+    thinking?: unknown[]
+    workbench?: Record<string, unknown>
+    sources?: SourceReference[]
+    shell_type?: string
+    reasoning_content?: string
+    /** Message blocks for mixed rendering (new format) */
+    blocks?: ChatBlock[]
+    error?: string // Error message if result represents error completion
+    termination_reason?: string
+    /** Gemini Deep Research grounding annotations */
+    annotations?: GeminiAnnotation[]
+    /** Aggregated retrieval coverage summary */
+    retrieval_summary?: RetrievalSummaryPayload
+  }
+  /** Message ID for ordering (primary sort key) */
+  message_id?: number
+  /** Knowledge base source references (for RAG citations) */
+  sources?: SourceReference[]
+  /** Aggregated retrieval coverage summary */
+  retrieval_summary?: RetrievalSummaryPayload
+}
+
+export interface ChatErrorPayload {
+  subtask_id: number
+  error: string
+  type?: string
+  /** Message ID for ordering (primary sort key) */
+  message_id?: number
+  /** Task ID for page refresh recovery */
+  task_id?: number
+}
+
+export interface ChatCancelledPayload {
+  task_id: number
+  subtask_id: number
+}
+
+/**
+ * Snapshot of the current model-visible context budget for a chat turn.
+ *
+ * All numeric budget fields use token units except the *_percent fields.
+ * `display_*` values are intended for UI display, while the raw remaining/limit
+ * values follow the stricter internal guard accounting.
+ */
+export interface ContextMetricsSnapshot {
+  /** Full context window size for the active model, in tokens. */
+  context_window: number
+  /** Output tokens reserved up front when computing the usable input budget. */
+  reserved_output_tokens: number
+  /** Effective input budget after reserving output tokens, in tokens. */
+  available_input_tokens: number
+  /** Current model-visible input usage, in tokens. */
+  used_input_tokens: number
+  /** Strict remaining input budget after internal guard reservation, in tokens. */
+  remaining_input_tokens: number
+  /** Strict remaining input budget expressed as a percentage. */
+  remaining_percent: number
+  /** UI-facing remaining budget based on the full context window, in tokens. */
+  display_remaining_tokens: number
+  /** UI-facing remaining budget percentage shown to users. */
+  display_remaining_percent: number
+  /** Threshold where request-level compaction should begin, in tokens. */
+  trigger_limit: number
+  /** Desired post-compaction target budget, in tokens. */
+  target_limit: number
+  /** Whether current usage has crossed the trigger limit. */
+  is_over_trigger: boolean
+}
+
+/**
+ * Socket payload for `chat:status_updated`.
+ *
+ * Emitted when the active chat/subtask advances through major runtime phases
+ * such as post-tool updates, finalization, or other context-budget checkpoints.
+ */
+export interface ChatStatusUpdatedPayload {
+  /** Parent task identifier. */
+  task_id: number
+  /** Active subtask identifier for this status snapshot. */
+  subtask_id: number
+  /** Backend-provided phase name for the status update. */
+  phase: string
+  /** Context budget snapshot associated with this phase transition. */
+  context_metrics: ContextMetricsSnapshot
+  /** Optional transient summary-compaction runtime event. */
+  context_compaction?: ChatContextCompactionPayload
+}
+
+export interface ChatContextCompactionPayload {
+  type: 'summary_compact'
+  status: 'started' | 'completed' | 'fallback'
+  before_tokens: number
+  trigger_limit: number
+  target_limit: number
+  used_legacy_fallback: boolean
+  created_at: string
+  after_tokens?: number
+  summary_message_id?: string
+  failure_reason?: string
+}
+
+/**
+ * Block event payloads for mixed content rendering
+ */
+export interface ChatBlockCreatedPayload {
+  task_id: number
+  subtask_id: number
+  block: ChatBlock
+}
+
+export interface ChatBlockUpdatedPayload {
+  task_id: number
+  subtask_id: number
+  block_id: string
+  content?: string
+  tool_output?: unknown
+  tool_input?: Record<string, unknown>
+  parent_tool_use_id?: string
+  render_payload?: unknown
+  card_id?: string
+  card_type?: string
+  card_data?: Record<string, unknown>
+  card_status?: 'pending' | 'partial_ready' | 'populated' | 'error' | 'expired'
+  card_error?: string | null
+  card_preview_data?: Record<string, unknown>
+  argument_status?: 'streaming' | 'done'
+  output?: string
+  summary?: string
+  children?: ChatBlock[]
+  guidance_id?: string
+  loop_index?: number
+  applied_at?: string
+  status?: ChatBlock['status'] | 'running'
+}
+
+export interface ChatGuidanceQueuedPayload {
+  task_id: number
+  guidance_id: string
+  client_guidance_id?: string
+  subtask_id?: number
+  content?: string
+  loop_index?: number
+  created_at?: string
+}
+
+export interface ChatGuidanceAppliedPayload {
+  task_id: number
+  guidance_id: string
+  client_guidance_id?: string
+  subtask_id?: number
+  loop_index?: number
+  applied_at: string
+}
+
+export interface ChatGuidanceExpiredPayload {
+  task_id: number
+  subtask_id?: number
+  guidance_ids: string[]
+}
+export interface ChatMessageAttachment {
+  id: number
+  original_filename: string
+  file_extension: string
+  file_size: number
+  mime_type: string
+  status?: string
+}
+
+export interface ChatMessageContext {
+  id: number
+  context_type: 'attachment' | 'knowledge_base'
+  name: string
+  status: string
+  file_extension?: string
+  file_size?: number
+  mime_type?: string
+  document_count?: number
+}
+
+export interface ChatMessagePayload {
+  subtask_id: number
+  task_id: number
+  /** Message ID for ordering (primary sort key) */
+  message_id: number
+  role: string
+  content: string
+  sender: {
+    user_id: number
+    user_name: string
+    avatar?: string
+  }
+  created_at: string
+  /** Single attachment (for backward compatibility) */
+  attachment?: ChatMessageAttachment
+  /** Multiple attachments */
+  attachments?: ChatMessageAttachment[]
+  /** Unified contexts (attachments, knowledge bases, etc.) */
+  contexts?: ChatMessageContext[]
+}
+
+export interface ChatBotCompletePayload {
+  subtask_id: number
+  task_id: number
+  content: string
+  result: Record<string, unknown>
+  created_at?: string
+}
+
+export interface ChatSystemPayload {
+  task_id: number
+  type: string
+  content: string
+  data?: Record<string, unknown>
+}
+
+export interface TaskCreatedPayload {
+  task_id: number
+  title: string
+  team_id: number
+  team_name: string
+  created_at: string
+  is_group_chat?: boolean
+  project_id?: number | null
+}
+
+export interface TaskDeletedPayload {
+  task_id: number
+}
+
+export interface TaskRenamedPayload {
+  task_id: number
+  title: string
+}
+
+export interface TaskStatusPayload {
+  task_id: number
+  status: string
+  progress?: number
+  updated_at?: string
+  completed_at?: string
+}
+
+export interface TaskSharedPayload {
+  task_id: number
+  title: string
+  shared_by: {
+    user_id: number
+    user_name: string
+  }
+}
+
+export interface TaskInvitedPayload {
+  task_id: number
+  title: string
+  team_id: number
+  team_name: string
+  invited_by: {
+    user_id: number
+    user_name: string
+  }
+  is_group_chat: boolean
+  created_at: string
+}
+
+export interface TaskAppUpdatePayload {
+  task_id: number
+  app: {
+    name: string
+    address: string
+    previewUrl: string
+    mysql?: string
+  }
+}
+
+export interface UnreadCountPayload {
+  count: number
+}
+
+// ============================================================
+// Background Execution Event Payloads
+// ============================================================
+
+export interface BackgroundExecutionUpdatePayload {
+  execution_id: number
+  subscription_id: number
+  subscription_name: string
+  subscription_display_name?: string
+  team_name?: string
+  status:
+    | 'PENDING'
+    | 'RUNNING'
+    | 'COMPLETED'
+    | 'COMPLETED_SILENT'
+    | 'FAILED'
+    | 'RETRYING'
+    | 'CANCELLED'
+  is_silent: boolean // Flag for silent executions
+  task_id?: number
+  task_type?: string
+  prompt?: string
+  result_summary?: string
+  error_message?: string
+  trigger_reason?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface SubscriptionGroupBindingUpdatedPayload {
+  subscription_id: number
+  channel_id: number
+  conversation_id?: string
+  private_bound: boolean
+  group_bound: boolean
+  completed: boolean
+  status: 'success' | 'partial'
+}
+
+// ============================================================
+// Correction Event Payloads
+// ============================================================
+
+/** Correction stage types */
+export type CorrectionStage = 'verifying_facts' | 'evaluating' | 'generating_improvement'
+
+/** Correction field types for streaming */
+export type CorrectionField = 'summary' | 'improved_answer'
+
+export interface CorrectionStartPayload {
+  task_id: number
+  subtask_id: number
+  correction_model: string
+}
+
+export interface CorrectionProgressPayload {
+  task_id: number
+  subtask_id: number
+  stage: CorrectionStage
+  tool_name?: string
+}
+
+export interface CorrectionChunkPayload {
+  task_id: number
+  subtask_id: number
+  field: CorrectionField
+  content: string
+  offset: number
+}
+
+export interface CorrectionDonePayload {
+  task_id: number
+  subtask_id: number
+  result: {
+    scores: {
+      accuracy: number
+      logic: number
+      completeness: number
+    }
+    corrections: Array<{
+      issue: string
+      category: string
+      suggestion: string
+    }>
+    summary: string
+    improved_answer: string
+    is_correct: boolean
+  }
+}
+
+export interface CorrectionErrorPayload {
+  task_id: number
+  subtask_id: number
+  error: string
+}
+
+// ============================================================
+// ACK Responses
+// ============================================================
+
+export interface ChatSendAck {
+  task_id?: number
+  subtask_id?: number
+  message_id?: number // Message ID for the user's subtask
+  error?: string
+  // Pipeline confirmation response fields
+  /** Current stage number (1-indexed) */
+  current_stage?: number
+  /** Total number of stages in the pipeline */
+  total_stages?: number
+  /** Name of the next stage (null if pipeline completed) */
+  next_stage_name?: string | null
+}
+
+export interface ChatGuideAck {
+  success?: boolean
+  task_id?: number
+  subtask_id?: number
+  guidance_id?: string
+  client_guidance_id?: string
+  error?: string
+}
+
+export interface TaskJoinAck {
+  streaming?: {
+    subtask_id: number
+    offset: number
+    cached_content: string
+    started_at?: string
+    last_activity_at?: string
+  }
+  /** Subtasks data for immediate message sync (same format as task detail API) */
+  subtasks?: Array<Record<string, unknown>>
+  /** Latest cached status snapshot for active streaming recovery. */
+  status_updated?: ChatStatusUpdatedPayload
+  error?: string
+}
+
+export interface HistorySyncAck {
+  messages: Array<{
+    subtask_id: number
+    message_id: number
+    role: string
+    content: string
+    status: string
+    created_at: string | null
+  }>
+  error?: string
+}
+
+export interface GenericAck {
+  success: boolean
+  error?: string
+}
+
+// ============================================================
+// Mermaid Rendering Payloads
+// ============================================================
+
+/**
+ * Payload for mermaid:render event - Server to Client
+ * Backend requests frontend to render a mermaid diagram
+ */
+export interface MermaidRenderPayload {
+  /** Task ID */
+  task_id: number
+  /** Subtask ID */
+  subtask_id: number
+  /** Unique request ID for correlation */
+  request_id: string
+  /** Mermaid diagram code to render */
+  code: string
+  /** Diagram type hint: flowchart, sequence, class, etc. */
+  diagram_type?: string
+  /** Optional title for the diagram */
+  title?: string
+  /** Render timeout in milliseconds */
+  timeout_ms?: number
+}
+
+/**
+ * Mermaid render error details
+ */
+export interface MermaidRenderError {
+  /** Error message */
+  message: string
+  /** Line number where error occurred */
+  line?: number
+  /** Column number where error occurred */
+  column?: number
+  /** Detailed error info from mermaid parser */
+  details?: string
+}
+
+/**
+ * Payload for mermaid:result event - Client to Server
+ * Frontend sends render result back to backend
+ */
+export interface MermaidResultPayload {
+  /** Task ID */
+  task_id: number
+  /** Subtask ID */
+  subtask_id: number
+  /** Request ID for correlation */
+  request_id: string
+  /** Whether render succeeded */
+  success: boolean
+  /** Rendered SVG content if success */
+  svg?: string
+  /** Error details if failed */
+  error?: MermaidRenderError
+}
+
+// ============================================================
+// Generic Skill Payloads
+// ============================================================
+
+/**
+ * Generic payload for skill:request event - Server to Client
+ * Backend requests frontend to perform a skill action
+ */
+export interface SkillRequestPayload {
+  /** Unique request ID for correlation */
+  request_id: string
+  /** Name of the skill (e.g., 'mermaid-diagram') */
+  skill_name: string
+  /** Action to perform (e.g., 'render') */
+  action: string
+  /** Skill-specific data payload */
+  data: Record<string, unknown>
+}
+
+/**
+ * Generic payload for skill:response event - Client to Server
+ * Frontend sends skill action result back to backend
+ */
+export interface SkillResponsePayload {
+  /** Request ID for correlation */
+  request_id: string
+  /** Name of the skill */
+  skill_name: string
+  /** Action that was performed */
+  action: string
+  /** Whether the action succeeded */
+  success: boolean
+  /** Success result data */
+  result?: unknown
+  /** Error message if failed */
+  error?: string | Record<string, unknown>
+}
+
+// ============================================================
+// Device Event Payloads
+// ============================================================
+
+/** Device status type */
+export type DeviceStatus = 'online' | 'offline' | 'busy'
+
+/** Payload for device:online event */
+export interface DeviceOnlinePayload {
+  device_id: string
+  name: string
+  status: DeviceStatus
+}
+
+/** Payload for device:offline event */
+export interface DeviceOfflinePayload {
+  device_id: string
+}
+
+/** Payload for device:status event */
+export interface DeviceStatusPayload {
+  device_id: string
+  status: DeviceStatus
+}
+
+/** Running task info for slot updates */
+export interface DeviceRunningTaskWs {
+  task_id: number
+  subtask_id: number
+  title: string
+  status: string
+  created_at?: string
+}
+
+/** Payload for device:slot_update event */
+export interface DeviceSlotUpdatePayload {
+  device_id: string
+  slot_used: number
+  slot_max: number
+  running_tasks: DeviceRunningTaskWs[]
+}
+
+/**
+ * Device info for WebSocket events.
+ * Note: For full device info including id and is_default, use DeviceInfo from @/apis/devices
+ */
+export interface DeviceInfoWs {
+  device_id: string
+  name: string
+  status: DeviceStatus
+  last_heartbeat?: string
+}
+
+// ============================================================
+// Device Upgrade Event Payloads
+// ============================================================
+
+/** Device upgrade status types */
+export type DeviceUpgradeStatus =
+  | 'checking'
+  | 'downloading'
+  | 'installing'
+  | 'restarting'
+  | 'success'
+  | 'error'
+  | 'skipped'
+  | 'busy'
+
+/** Payload for device:upgrade_status event */
+export interface DeviceUpgradeStatusPayload {
+  device_id: string
+  status: DeviceUpgradeStatus
+  message: string
+  old_version?: string
+  new_version?: string
+  progress?: number
+  error?: string
+}

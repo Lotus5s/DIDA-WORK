@@ -1,0 +1,382 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Task data conversion utilities.
+
+This module contains functions for converting Task and related Kind objects
+to dictionary format for API responses.
+"""
+
+import json
+import logging
+from typing import Any, Dict
+
+from sqlalchemy.orm import Session
+
+from app.models.kind import Kind
+from app.schemas.kind import Task, Team, Workspace
+from app.services.readers.kinds import KindType, kindReader
+from app.services.readers.users import userReader
+from app.stores.tasks import task_store
+
+logger = logging.getLogger(__name__)
+
+
+def _get_model_selection_labels(task_crd: Task) -> Dict[str, Any]:
+    """Extract model selection labels from a task CRD."""
+    labels = task_crd.metadata.labels if task_crd.metadata else {}
+    model_options = None
+    raw_model_options = labels.get("modelOptions") if labels else None
+    if raw_model_options:
+        try:
+            parsed = json.loads(raw_model_options)
+            if isinstance(parsed, dict):
+                model_options = {
+                    str(key): str(value)
+                    for key, value in parsed.items()
+                    if value is not None
+                }
+        except (TypeError, ValueError):
+            logger.warning(
+                "Failed to parse task modelOptions label: %s",
+                raw_model_options,
+            )
+
+    return {
+        "model_id": labels.get("modelId") if labels else None,
+        "force_override_bot_model_type": (
+            labels.get("forceOverrideBotModelType") if labels else None
+        ),
+        "model_options": model_options,
+    }
+
+
+def get_task_execution_workspace_source(task_crd: Task) -> str | None:
+    """Return the task execution workspace source used by list views."""
+
+    execution = getattr(task_crd.spec, "execution", None)
+    workspace = getattr(execution, "workspace", None) if execution else None
+    source = getattr(workspace, "source", None) if workspace else None
+    if isinstance(source, str) and source.strip():
+        return source.strip()
+    return None
+
+
+def get_task_execution_workspace_path(task_crd: Task) -> str | None:
+    """Return the task execution workspace path used by workspace tools."""
+
+    execution = getattr(task_crd.spec, "execution", None)
+    workspace = getattr(execution, "workspace", None) if execution else None
+    path = getattr(workspace, "path", None) if workspace else None
+    if isinstance(path, str) and path.strip():
+        return path.strip()
+    return None
+
+
+def resolve_task_ref_team(
+    db: Session, task_crd: Task, viewer_user_id: int
+) -> Kind | None:
+    team_ref = task_crd.spec.teamRef
+    team_ref_user_id = getattr(team_ref, "user_id", None)
+    if team_ref_user_id is not None:
+        team = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == team_ref_user_id,
+                Kind.kind == KindType.TEAM.value,
+                Kind.namespace == team_ref.namespace,
+                Kind.name == team_ref.name,
+                Kind.is_active == True,
+            )
+            .first()
+        )
+        return team
+
+    return kindReader.get_by_name_and_namespace(
+        db,
+        viewer_user_id,
+        KindType.TEAM,
+        team_ref.namespace,
+        team_ref.name,
+    )
+
+
+def convert_to_task_dict(task: Kind, db: Session, user_id: int) -> Dict[str, Any]:
+    """
+    Convert kinds Task to task-like dictionary.
+
+    Args:
+        task: Task Kind object
+        db: Database session
+        user_id: User ID for looking up related data
+
+    Returns:
+        Dictionary representation of the task
+    """
+    task_crd = Task.model_validate(task.json)
+
+    # Get workspace data
+    workspace = task_store.get_workspace_by_ref(
+        db,
+        user_id=user_id,
+        name=task_crd.spec.workspaceRef.name,
+        namespace=task_crd.spec.workspaceRef.namespace,
+    )
+
+    git_url = ""
+    git_repo = ""
+    git_repo_id = 0
+    git_domain = ""
+    branch_name = ""
+
+    if workspace and workspace.json:
+        try:
+            workspace_crd = Workspace.model_validate(workspace.json)
+            git_url = workspace_crd.spec.repository.gitUrl
+            git_repo = workspace_crd.spec.repository.gitRepo
+            git_repo_id = workspace_crd.spec.repository.gitRepoId or 0
+            git_domain = workspace_crd.spec.repository.gitDomain
+            branch_name = workspace_crd.spec.repository.branchName
+        except Exception:
+            # Handle workspaces with incomplete repository data
+            pass
+
+    team = resolve_task_ref_team(db, task_crd, user_id)
+    team_id = team.id if team else None
+
+    # Parse timestamps
+    created_at = None
+    updated_at = None
+    completed_at = None
+
+    if task_crd.status:
+        try:
+            if task_crd.status.createdAt:
+                created_at = task_crd.status.createdAt
+            if task_crd.status.updatedAt:
+                updated_at = task_crd.status.updatedAt
+            if task_crd.status.completedAt:
+                completed_at = task_crd.status.completedAt
+        except:
+            # Fallback to task timestamps
+            created_at = task.created_at
+            updated_at = task.updated_at
+
+    # Get user info
+    user = userReader.get_by_id(db, user_id)
+    user_name = user.user_name if user else ""
+
+    type_value = (
+        task_crd.metadata.labels and task_crd.metadata.labels.get("type") or "online"
+    )
+    task_type = (
+        task_crd.metadata.labels and task_crd.metadata.labels.get("taskType") or "chat"
+    )
+
+    model_selection = _get_model_selection_labels(task_crd)
+
+    # Extract preserve_executor flag from task labels
+    preserve_executor = (
+        task_crd.metadata.labels
+        and task_crd.metadata.labels.get("preserveExecutor") == "true"
+    )
+
+    # Extract is_group_chat from task spec
+    is_group_chat = (
+        task_crd.spec.is_group_chat
+        if hasattr(task_crd.spec, "is_group_chat")
+        else False
+    )
+
+    # Extract app from task status
+    app_data = None
+    if task_crd.status and task_crd.status.app:
+        app_data = task_crd.status.app.model_dump()
+        logger.info(f"[convert_to_task_dict] Found app data: {app_data}")
+    else:
+        # Build status dict without blocks for logging
+        status_info = None
+        if task_crd.status:
+            status_dict = task_crd.status.model_dump()
+            # Remove blocks field from result if it exists to avoid logging large data
+            if "result" in status_dict and isinstance(status_dict["result"], dict):
+                if "blocks" in status_dict["result"]:
+                    status_dict["result"].pop("blocks")
+                if "thinking" in status_dict["result"]:
+                    status_dict["result"].pop("thinking")
+            status_info = status_dict
+        logger.info(
+            f"[convert_to_task_dict] No app data found. status={status_info}, app={task_crd.status.app if task_crd.status else 'N/A'}"
+        )
+
+    # Extract device_id from task spec
+    device_id = task_crd.spec.device_id if hasattr(task_crd.spec, "device_id") else None
+    execution_workspace_source = get_task_execution_workspace_source(task_crd)
+    execution_workspace_path = get_task_execution_workspace_path(task_crd)
+    external_knowledge_refs = [
+        ref.model_dump(exclude_none=True)
+        for ref in (task_crd.spec.externalKnowledgeRefs or [])
+    ]
+
+    return {
+        "id": task.id,
+        "type": type_value,
+        "task_type": task_type,
+        "user_id": task.user_id,
+        "user_name": user_name,
+        "client_origin": task.client_origin,
+        "title": task_crd.spec.title,
+        "team_id": team_id,
+        "git_url": git_url,
+        "git_repo": git_repo,
+        "git_repo_id": git_repo_id,
+        "git_domain": git_domain,
+        "branch_name": branch_name,
+        "prompt": task_crd.spec.prompt,
+        "status": task_crd.status.status if task_crd.status else "PENDING",
+        "progress": task_crd.status.progress if task_crd.status else 0,
+        "result": task_crd.status.result if task_crd.status else None,
+        "error_message": task_crd.status.errorMessage if task_crd.status else None,
+        "created_at": created_at or task.created_at,
+        "updated_at": updated_at or task.updated_at,
+        "completed_at": completed_at,
+        "project_id": task.project_id or 0,
+        **model_selection,
+        "is_group_chat": is_group_chat,
+        "app": app_data,
+        "device_id": device_id,
+        "execution_workspace_source": execution_workspace_source,
+        "execution_workspace_path": execution_workspace_path,
+        "preserve_executor": preserve_executor,
+        "external_knowledge_refs": external_knowledge_refs,
+    }
+
+
+def convert_to_task_dict_optimized(
+    task: Kind, related_data: Dict[str, Any], task_crd: Task
+) -> Dict[str, Any]:
+    """
+    Optimized version of convert_to_task_dict that uses pre-fetched related data.
+
+    Args:
+        task: Task Kind object
+        related_data: Pre-fetched related data (workspace, team, user info)
+        task_crd: Pre-parsed Task CRD
+
+    Returns:
+        Dictionary representation of the task
+    """
+    workspace_data = related_data.get("workspace_data", {})
+
+    # Get task type from metadata labels
+    type_value = (
+        task_crd.metadata.labels and task_crd.metadata.labels.get("type") or "online"
+    )
+    task_type = (
+        task_crd.metadata.labels and task_crd.metadata.labels.get("taskType") or "chat"
+    )
+
+    # Extract device_id from task spec
+    device_id = task_crd.spec.device_id if hasattr(task_crd.spec, "device_id") else None
+    execution_workspace_source = get_task_execution_workspace_source(task_crd)
+    execution_workspace_path = get_task_execution_workspace_path(task_crd)
+
+    # Extract preserve_executor flag from task labels
+    preserve_executor = (
+        task_crd.metadata.labels
+        and task_crd.metadata.labels.get("preserveExecutor") == "true"
+    )
+    model_selection = _get_model_selection_labels(task_crd)
+    external_knowledge_refs = [
+        ref.model_dump(exclude_none=True)
+        for ref in (task_crd.spec.externalKnowledgeRefs or [])
+    ]
+
+    return {
+        "id": task.id,
+        "type": type_value,
+        "task_type": task_type,
+        "user_id": task.user_id,
+        "user_name": related_data.get("user_name", ""),
+        "client_origin": task.client_origin,
+        "title": task_crd.spec.title,
+        "team_id": related_data.get("team_id"),
+        "git_url": workspace_data.get("git_url", ""),
+        "git_repo": workspace_data.get("git_repo", ""),
+        "git_repo_id": workspace_data.get("git_repo_id", 0),
+        "git_domain": workspace_data.get("git_domain", ""),
+        "branch_name": workspace_data.get("branch_name", ""),
+        "prompt": task_crd.spec.prompt,
+        "status": task_crd.status.status if task_crd.status else "PENDING",
+        "progress": task_crd.status.progress if task_crd.status else 0,
+        "result": task_crd.status.result if task_crd.status else None,
+        "error_message": task_crd.status.errorMessage if task_crd.status else None,
+        "created_at": related_data.get("created_at", task.created_at),
+        "updated_at": related_data.get("updated_at", task.updated_at),
+        "completed_at": related_data.get("completed_at"),
+        "project_id": task.project_id or 0,
+        **model_selection,
+        "is_group_chat": related_data.get("is_group_chat", False),
+        "app": (
+            task_crd.status.app.model_dump()
+            if task_crd.status and task_crd.status.app
+            else None
+        ),
+        "device_id": device_id,
+        "execution_workspace_source": execution_workspace_source,
+        "execution_workspace_path": execution_workspace_path,
+        "preserve_executor": preserve_executor,
+        "external_knowledge_refs": external_knowledge_refs,
+    }
+
+
+def convert_team_to_dict(team: Kind, db: Session, user_id: int) -> Dict[str, Any]:
+    """
+    Convert kinds Team to team-like dictionary (simplified version).
+
+    Args:
+        team: Team Kind object
+        db: Database session
+        user_id: User ID for looking up related data
+
+    Returns:
+        Dictionary representation of the team
+    """
+    team_crd = Team.model_validate(team.json)
+
+    # Convert members to bots format
+    bots = []
+    for member in team_crd.spec.members:
+        # Find bot using kindReader
+        bot = kindReader.get_by_name_and_namespace(
+            db, user_id, KindType.BOT, member.botRef.namespace, member.botRef.name
+        )
+
+        if bot:
+            bot_info = {
+                "bot_id": bot.id,
+                "bot_prompt": member.prompt or "",
+                "role": member.role or "",
+            }
+            bots.append(bot_info)
+
+    # Convert collaboration model to workflow format
+    workflow = {"mode": team_crd.spec.collaborationModel}
+
+    # Get user info for user name
+    user = userReader.get_by_id(db, team.user_id)
+    user_name = user.user_name if user else ""
+
+    return {
+        "id": team.id,
+        "user_id": team.user_id,
+        "user_name": user_name,
+        "name": team.name,
+        "bots": bots,
+        "workflow": workflow,
+        "is_active": team.is_active,
+        "created_at": team.created_at,
+        "updated_at": team.updated_at,
+    }

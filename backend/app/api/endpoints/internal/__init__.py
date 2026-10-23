@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Internal API endpoints for service-to-service communication."""
+
+from app.core.config import settings
+
+from .attachments import router as attachments_router
+from .bots import router as bots_router
+from .callback import router as callback_router
+from .chat_storage import router as chat_storage_router
+from .conversion_callback import router as conversion_callback_router
+from .knowledge import router as knowledge_router
+from .model_config import router as model_config_router
+from .object_storage import router as object_storage_router
+from .plugin_publications import router as plugin_publications_router
+from .rag_content import router as rag_content_router
+from .services import router as services_router
+from .workspace_archives import router as workspace_archives_router
+
+# RAG router is conditionally imported based on STANDALONE_MODE
+# RAG module is heavy (llama_index, scipy, pandas, grpc) - skip in standalone mode
+if not settings.STANDALONE_MODE:
+    from .rag import router as rag_router  # noqa: F401
+
+__all__ = [
+    "attachments_router",
+    "bots_router",
+    "callback_router",
+    "chat_storage_router",
+    "conversion_callback_router",
+    "knowledge_router",
+    "model_config_router",
+    "object_storage_router",
+    "plugin_publications_router",
+    "rag_content_router",
+    "services_router",
+    "workspace_archives_router",
+]
+
+# Conditionally add rag_router to __all__
+if not settings.STANDALONE_MODE:
+    __all__.append("rag_router")

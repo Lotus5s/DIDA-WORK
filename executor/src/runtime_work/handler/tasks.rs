@@ -1,0 +1,2648 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#[cfg(test)]
+use super::context_compaction::context_compaction_outcome;
+use super::context_compaction::wait_for_context_compaction;
+use super::*;
+
+impl RuntimeWorkRpcHandler {
+    pub(super) async fn create_collaboration_dispatch(
+        &self,
+        payload: Value,
+    ) -> Result<Value, AppIpcError> {
+        if payload.get("dispatchKind").and_then(Value::as_str) != Some("collaboration_group") {
+            return Err(AppIpcError::new(
+                "bad_request",
+                "collaboration dispatch kind is required",
+            ));
+        }
+        let dispatch_task_id = string_field(&payload, "dispatchTaskId")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                AppIpcError::new(
+                    "bad_request",
+                    "collaboration dispatch task identity is required",
+                )
+            })?;
+        let mut manager_request = payload
+            .get("managerRuntimeRequest")
+            .cloned()
+            .filter(Value::is_object)
+            .ok_or_else(|| {
+                AppIpcError::new(
+                    "bad_request",
+                    "collaboration manager Runtime request is required",
+                )
+            })?;
+        let claimed_dispatch_task_id = id_field(&manager_request, "taskId")
+            .or_else(|| id_field(&manager_request, "localTaskId"))
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                AppIpcError::new(
+                    "bad_request",
+                    "collaboration manager task identity is required",
+                )
+            })?;
+        if claimed_dispatch_task_id != dispatch_task_id {
+            return Err(AppIpcError::new(
+                "bad_request",
+                "collaboration manager must run inside the claimed dispatch",
+            ));
+        }
+        let manager_task_id = format!("{dispatch_task_id}-manager-initial");
+        let member_profiles = payload
+            .get("memberRuntimeProfiles")
+            .and_then(Value::as_array)
+            .filter(|profiles| !profiles.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                AppIpcError::new(
+                    "bad_request",
+                    "collaboration member Runtime profiles are required",
+                )
+            })?;
+        detach_collaboration_manager_from_backend_execution(&mut manager_request, &manager_task_id);
+        let manager_context = string_field(&manager_request, "message")
+            .or_else(|| string_field(&manager_request, "content"))
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                AppIpcError::new("bad_request", "collaboration manager context is required")
+            })?;
+        {
+            let manager_request_object = manager_request
+                .as_object_mut()
+                .expect("validated collaboration manager request");
+            manager_request_object.insert(
+                "collaborationDispatch".to_owned(),
+                json!({"taskId": dispatch_task_id}),
+            );
+            let runtime_handle = manager_request_object
+                .entry("runtimeHandle")
+                .or_insert_with(|| json!({}));
+            if !runtime_handle.is_object() {
+                *runtime_handle = json!({});
+            }
+            runtime_handle
+                .as_object_mut()
+                .expect("collaboration Runtime handle was normalized")
+                .insert(
+                    COLLABORATION_MANAGER_CONTEXT_KEY.to_owned(),
+                    Value::String(manager_context),
+                );
+            runtime_handle
+                .as_object_mut()
+                .expect("collaboration Runtime handle was normalized")
+                .insert(
+                    "collaborationDispatchTaskId".to_owned(),
+                    Value::String(dispatch_task_id),
+                );
+            runtime_handle
+                .as_object_mut()
+                .expect("collaboration Runtime handle was normalized")
+                .insert(
+                    "collaborationMemberRuntimeProfiles".to_owned(),
+                    Value::Array(member_profiles),
+                );
+        }
+        self.create_task(manager_request).await
+    }
+
+    pub(super) async fn generate_friendly_title(
+        &self,
+        payload: Value,
+    ) -> Result<Value, AppIpcError> {
+        let source_title = string_field(&payload, "sourceTitle")
+            .or_else(|| string_field(&payload, "source_title"))
+            .ok_or_else(|| AppIpcError::new("bad_request", "sourceTitle is required"))?;
+        let link = self.task_link_from_payload(&payload, false).await?;
+        if link.title != source_title {
+            log_executor_event(
+                "friendly task title generation skipped",
+                &[
+                    ("local_task_id", link.local_task_id),
+                    ("reason", "title_changed_before_generation".to_owned()),
+                ],
+            );
+            return Ok(json!({"success": true, "skipped": true}));
+        }
+        let local_task_id = link.local_task_id.clone();
+        let mut request = execution_request(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "executionRequest is required"))?;
+        request.ephemeral = true;
+        let result = self
+            .codex_app_server
+            .run_turn_with_cancel(request.clone(), CodexAppServerTurnOptions::default())
+            .await;
+        let content = match result {
+            Ok(turn) => match turn.outcome {
+                ExecutionOutcome::Completed { content } => content,
+                ExecutionOutcome::Failed { message } => {
+                    log_executor_event(
+                        "friendly task title generation failed",
+                        &[
+                            ("local_task_id", local_task_id.clone()),
+                            ("reason", "model_request_failed".to_owned()),
+                            ("error", message.clone()),
+                        ],
+                    );
+                    return Ok(json!({"success": false, "error": message}));
+                }
+                outcome => {
+                    let error = format!("friendly title generation did not complete: {outcome:?}");
+                    log_executor_event(
+                        "friendly task title generation failed",
+                        &[
+                            ("local_task_id", local_task_id.clone()),
+                            ("reason", "model_request_incomplete".to_owned()),
+                            ("error", error.clone()),
+                        ],
+                    );
+                    return Ok(json!({"success": false, "error": error}));
+                }
+            },
+            Err(error) => {
+                log_executor_event(
+                    "friendly task title generation failed",
+                    &[
+                        ("local_task_id", local_task_id.clone()),
+                        ("reason", "model_transport_failed".to_owned()),
+                        ("error", error.clone()),
+                    ],
+                );
+                return Ok(json!({"success": false, "error": error}));
+            }
+        };
+        let Some(title) = normalize_friendly_title(&content) else {
+            log_executor_event(
+                "friendly task title generation failed",
+                &[
+                    ("local_task_id", local_task_id.clone()),
+                    ("reason", "empty_model_output".to_owned()),
+                ],
+            );
+            return Ok(json!({"success": false, "error": "friendly title was empty"}));
+        };
+        let mut latest_link = self.task_link_from_payload(&payload, false).await?;
+        for _ in 0..25 {
+            if latest_link.title != source_title {
+                log_executor_event(
+                    "friendly task title generation skipped",
+                    &[
+                        ("local_task_id", local_task_id.clone()),
+                        ("reason", "title_changed_during_generation".to_owned()),
+                    ],
+                );
+                return Ok(json!({"success": true, "skipped": true}));
+            }
+            if latest_link.thread_id.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(200)).await;
+            latest_link = self.task_link_from_payload(&payload, false).await?;
+        }
+        if latest_link.title != source_title {
+            log_executor_event(
+                "friendly task title generation skipped",
+                &[
+                    ("local_task_id", local_task_id.clone()),
+                    ("reason", "title_changed_before_update".to_owned()),
+                ],
+            );
+            return Ok(json!({"success": true, "skipped": true}));
+        }
+        if let Some(thread_id) = latest_link.thread_id.as_deref() {
+            if let Err(error) = self
+                .call_codex_thread_method(
+                    "thread/name/set",
+                    json!({"threadId": thread_id, "name": title}),
+                )
+                .await
+            {
+                log_executor_event(
+                    "friendly task title generation failed",
+                    &[
+                        ("local_task_id", local_task_id.clone()),
+                        ("reason", "thread_name_update_failed".to_owned()),
+                        ("error", error.clone()),
+                    ],
+                );
+                return Ok(json!({"success": false, "error": error}));
+            }
+        }
+        latest_link.title = title.clone();
+        latest_link.updated_at = now_ms();
+        self.upsert_local_task(latest_link);
+        emit_response_event(
+            &self.event_tx,
+            &self.device_id,
+            "runtime.task.title.updated",
+            &local_task_id,
+            &request,
+            json!({"title": title}),
+        );
+        log_executor_event(
+            "friendly task title generation completed",
+            &[("local_task_id", local_task_id)],
+        );
+        Ok(json!({"success": true, "title": title}))
+    }
+
+    pub(super) async fn fork_task_at_turn(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let source = self.task_link_from_payload(&payload, false).await?;
+        let requested_turn_id = string_field(&payload, "lastTurnId")
+            .or_else(|| string_field(&payload, "last_turn_id"))
+            .ok_or_else(|| AppIpcError::new("bad_request", "lastTurnId is required"))?;
+        let source_thread_id = runtime_session_id_from_payload(&payload)
+            .or_else(|| runtime_session_id_from_link(&source))
+            .ok_or_else(|| AppIpcError::new("bad_request", "source task session is not ready"))?;
+        log_executor_event(
+            "runtime task fork starting",
+            &[
+                ("local_task_id", source.local_task_id.clone()),
+                ("source_thread_id", source_thread_id.clone()),
+                ("requested_turn_id", requested_turn_id.clone()),
+            ],
+        );
+        let Some(last_turn_id) = resolve_codex_turn_id(&source, &requested_turn_id) else {
+            let mapping_keys = source
+                .runtime_handle
+                .get("turnIdsBySubtask")
+                .and_then(Value::as_object)
+                .map(|mappings| mappings.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            log_executor_event(
+                "runtime task fork rejected",
+                &[
+                    ("reason", "turn_not_found".to_owned()),
+                    ("local_task_id", source.local_task_id.clone()),
+                    ("requested_turn_id", requested_turn_id.clone()),
+                    ("mapping_keys", mapping_keys.join(",")),
+                ],
+            );
+            return Ok(json!({
+                "success": false,
+                "accepted": false,
+                "error": "fork turn was not found",
+                "code": "bad_request",
+            }));
+        };
+        log_executor_event(
+            "runtime task fork turn resolved",
+            &[
+                ("local_task_id", source.local_task_id.clone()),
+                ("source_thread_id", source_thread_id.clone()),
+                ("requested_turn_id", requested_turn_id),
+                ("last_turn_id", last_turn_id.clone()),
+            ],
+        );
+        let mut source_for_fork = source.clone();
+        set_runtime_handle_model_selection(&mut source_for_fork.runtime_handle, &payload);
+        let mut request = runtime_event_request_from_link(&source_for_fork);
+        apply_runtime_payload_metadata(&mut request, &payload);
+        if let Some(model_config) = payload
+            .get("modelConfig")
+            .or_else(|| payload.get("model_config"))
+            .filter(|value| value.is_object())
+            .cloned()
+        {
+            request.model_config = model_config;
+        }
+        store_runtime_execution_request(&mut source_for_fork.runtime_handle, &request);
+        self.ensure_notification_router().await;
+        let response = match self
+            .codex_app_server
+            .fork_thread_at(&source_thread_id, None, &last_turn_id, &request)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                log_executor_event(
+                    "runtime task fork failed",
+                    &[
+                        ("local_task_id", source.local_task_id.clone()),
+                        ("source_thread_id", source_thread_id),
+                        ("last_turn_id", last_turn_id),
+                        ("error", error.clone()),
+                    ],
+                );
+                return Ok(task_action_failure(&source, error));
+            }
+        };
+        let thread = response.get("thread").unwrap_or(&response);
+        let thread_id = string_field(thread, "id").ok_or_else(|| {
+            AppIpcError::new("invalid_response", "thread/fork did not return thread.id")
+        })?;
+        let local_task_id = thread_id.clone();
+        let title = string_field(&payload, "title").unwrap_or_else(|| source.title.clone());
+        let link = forked_task_link(
+            &source_for_fork,
+            local_task_id.clone(),
+            thread_id.clone(),
+            title,
+            json!({
+                "taskId": source.local_task_id,
+                "threadId": source_thread_id,
+                "lastTurnId": last_turn_id,
+            }),
+        );
+        self.upsert_local_task(link);
+        let (transcript, setup_error) =
+            match self.transcript(json!({ "taskId": local_task_id })).await {
+                Ok(transcript) => (Some(transcript), None),
+                Err(error) => {
+                    log_executor_event(
+                        "runtime task fork transcript failed",
+                        &[
+                            ("target_task_id", local_task_id.clone()),
+                            ("error", error.message.clone()),
+                        ],
+                    );
+                    (None, Some(error.message))
+                }
+            };
+        log_executor_event(
+            "runtime task fork completed",
+            &[
+                ("local_task_id", source.local_task_id.clone()),
+                ("target_task_id", local_task_id.clone()),
+            ],
+        );
+        Ok(json!({
+            "success": true,
+            "accepted": true,
+            "source": {
+                "deviceId": self.device_id,
+                "taskId": source.local_task_id,
+                "workspacePath": source.workspace_path,
+            },
+            "target": {
+                "deviceId": self.device_id,
+                "taskId": local_task_id,
+                "workspacePath": source.workspace_path,
+            },
+            "runtime": "codex",
+            "transcript": transcript,
+            "setupError": setup_error,
+        }))
+    }
+
+    pub(super) async fn create_task(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let schema_version = payload
+            .get("schemaVersion")
+            .or_else(|| payload.get("schema_version"))
+            .map(|value| {
+                value.as_u64().ok_or_else(|| {
+                    AppIpcError::new(
+                        "bad_request",
+                        "runtime task create schemaVersion must be an integer",
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(1);
+        if !matches!(schema_version, 1 | 2) {
+            return Err(AppIpcError::new(
+                "unsupported_schema_version",
+                format!("runtime task create schemaVersion {schema_version} is unsupported"),
+            ));
+        }
+        if schema_version == 2 {
+            crate::runtime_work::task_create_contract::validate_runtime_task_create_v2(&payload)
+                .map_err(|error| AppIpcError::new("invalid_request", error))?;
+        }
+        let runtime = string_field(&payload, "runtime").unwrap_or_else(|| "codex".to_owned());
+        if !is_codex_runtime(&runtime) && !is_claude_runtime(&runtime) {
+            return Err(AppIpcError::new(
+                "unsupported_runtime",
+                format!("unsupported runtime: {runtime}"),
+            ));
+        }
+        let runtime = if is_claude_runtime(&runtime) {
+            "claude_code".to_owned()
+        } else {
+            "codex".to_owned()
+        };
+        let force_start = bool_field(&payload, "forceStart")
+            .or_else(|| bool_field(&payload, "force_start"))
+            .unwrap_or(false);
+        let local_task_id = id_field(&payload, "taskId")
+            .or_else(|| id_field(&payload, "task_id"))
+            .unwrap_or_else(|| format!("{runtime}-local-{}", now_ms()));
+        let mut payload_workspace_path = workspace_path(&payload);
+        let title = string_field(&payload, "title")
+            .or_else(|| string_field(&payload, "message"))
+            .unwrap_or_else(|| local_task_id.clone());
+        let mut request = execution_request(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "executionRequest is required"))?;
+        apply_runtime_payload_metadata(&mut request, &payload);
+        let deferred_environment = project_preparation::configure(&mut request, &payload)?;
+        if deferred_environment {
+            payload_workspace_path = None;
+        }
+
+        if is_claude_runtime(&runtime) {
+            ensure_claude_execution_identity(&local_task_id, &mut request);
+        }
+        set_runtime_task_title(&mut request, &title);
+        self.retain_runtime_model_config(&local_task_id, &request.model_config);
+        log_executor_event(
+            "runtime task create identity",
+            &[
+                ("task_id", local_task_id.clone()),
+                ("schema_version", schema_version.to_string()),
+                ("device_id", self.device_id.clone()),
+                (
+                    "selected_model",
+                    string_field(&payload, "modelId")
+                        .or_else(|| string_field(&payload, "model_id"))
+                        .unwrap_or_default(),
+                ),
+                (
+                    "selected_model_type",
+                    string_field(&payload, "modelType")
+                        .or_else(|| string_field(&payload, "model_type"))
+                        .unwrap_or_default(),
+                ),
+                (
+                    "upstream_model",
+                    string_field(&request.model_config, "model_id")
+                        .or_else(|| string_field(&request.model_config, "model"))
+                        .unwrap_or_default(),
+                ),
+                (
+                    "upstream_protocol",
+                    string_field(&request.model_config, "protocol")
+                        .or_else(|| string_field(&request.model_config, "api_format"))
+                        .unwrap_or_default(),
+                ),
+            ],
+        );
+        if is_codex_runtime(&runtime) {
+            if let (Some(project_key), Some(project_name)) = (
+                request.runtime_project_key.as_deref(),
+                request.runtime_project_name.as_deref(),
+            ) {
+                if !request.runtime_workspace_roots.is_empty() {
+                    upsert_codex_global_local_project(
+                        project_key,
+                        project_name,
+                        &request.runtime_workspace_roots,
+                        None,
+                        None,
+                    )
+                    .map_err(|error| AppIpcError::new("codex_global_state_error", error))?;
+                }
+            }
+        }
+        let payload_has_workspace_path = payload_workspace_path.is_some();
+        let workspace_source_task = payload
+            .get("workspaceSourceTask")
+            .or_else(|| payload.get("workspace_source_task"))
+            .and_then(Value::as_object);
+        let mut side_source = side_source_thread(&payload)?;
+        let side_source_workspace_path = side_source
+            .as_ref()
+            .map(|source| source.workspace_path.clone());
+        if let Some(source_workspace_path) = side_source_workspace_path.as_deref() {
+            for requested_workspace_path in [payload_workspace_path.as_deref(), request.cwd()]
+                .into_iter()
+                .flatten()
+            {
+                if normalize_workspace_path(requested_workspace_path)
+                    != normalize_workspace_path(source_workspace_path)
+                {
+                    return Err(AppIpcError::new(
+                        "bad_request",
+                        "sideSource workspacePath conflicts with the requested workspace",
+                    ));
+                }
+            }
+        }
+        let inherited_workspace_path = if let Some(source) = workspace_source_task {
+            let source_device_id = source
+                .get("deviceId")
+                .or_else(|| source.get("device_id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AppIpcError::new("bad_request", "workspace source device is required")
+                })?;
+            let source_task_id = source
+                .get("taskId")
+                .or_else(|| source.get("task_id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AppIpcError::new("bad_request", "workspace source task is required")
+                })?;
+            if source_device_id != self.device_id {
+                return Err(AppIpcError::new(
+                    "workspace_source_unavailable",
+                    "inherited workflow workspace belongs to another device",
+                ));
+            }
+            Some(
+                self.local_task_link(source_task_id)
+                    .ok_or_else(|| {
+                        AppIpcError::new(
+                            "workspace_source_unavailable",
+                            "inherited workflow workspace is unavailable",
+                        )
+                    })?
+                    .workspace_path,
+            )
+        } else {
+            None
+        };
+        let source_workspace_path = side_source_workspace_path
+            .or(payload_workspace_path)
+            .or(inherited_workspace_path)
+            .or_else(|| request.cwd().map(str::to_owned))
+            .or_else(|| {
+                request
+                    .runtime_project_key
+                    .as_deref()
+                    .and_then(|project_key| {
+                        CodexGlobalProjectIndex::load()
+                            .project_for_key(project_key)
+                            .map(|project| project.workspace_path.clone())
+                    })
+            })
+            .or_else(|| {
+                (schema_version == 1).then(|| {
+                    id_field(&payload, "local_project_id")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .and_then(|project_id| {
+                            CodexGlobalProjectIndex::load()
+                                .project_for_ui_id(&self.device_id, project_id)
+                                .map(|project| project.workspace_path.clone())
+                        })
+                })?
+            })
+            .or_else(|| standalone_chat_workspace_path(&local_task_id, &request))
+            .ok_or_else(|| {
+                log_executor_event(
+                    "runtime task create missing workspace path",
+                    &[
+                        ("task_id", local_task_id.clone()),
+                        (
+                            "payload_has_workspace_path",
+                            payload_has_workspace_path.to_string(),
+                        ),
+                        ("request_cwd", request.cwd().unwrap_or_default().to_owned()),
+                        (
+                            "standalone_chat_workspace",
+                            is_standalone_chat_workspace(&request).to_string(),
+                        ),
+                        (
+                            "request_extra_keys",
+                            format!("{:?}", request.extra.keys().collect::<Vec<_>>()),
+                        ),
+                    ],
+                );
+                AppIpcError::new("bad_request", "workspacePath is required")
+            })?;
+        let workspace_path = if !deferred_environment
+            && side_source.is_none()
+            && request.workspace_source.as_deref() == Some("git_worktree")
+        {
+            let git_ref = payload
+                .get("execution")
+                .and_then(|execution| execution.get("workspace"))
+                .and_then(|workspace| workspace.get("branch"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|branch| !branch.is_empty())
+                .map(ToOwned::to_owned);
+            let worktrees = self.worktrees.clone();
+            let plan_source_path = PathBuf::from(&source_workspace_path);
+            let plan_worktree_id = local_task_id.clone();
+            let plan_git_ref = git_ref.clone();
+            let plan = tokio::task::spawn_blocking(move || {
+                worktrees.plan(
+                    &plan_source_path,
+                    &plan_worktree_id,
+                    plan_git_ref.as_deref(),
+                )
+            })
+            .await
+            .map_err(|error| {
+                AppIpcError::new(
+                    "worktree_prepare_failed",
+                    format!("Worktree planning task failed: {error}"),
+                )
+            })?
+            .map_err(|error| AppIpcError::new(worktree_error_code(&error), error))?;
+            request.extra.insert(
+                "deferred_worktree_source_path".to_owned(),
+                Value::String(plan.source_path.display().to_string()),
+            );
+            request.extra.insert(
+                "deferred_worktree_path".to_owned(),
+                Value::String(plan.path.display().to_string()),
+            );
+            request.extra.insert(
+                "deferred_worktree_repo_root_fingerprint".to_owned(),
+                Value::String(plan.repo_root_fingerprint),
+            );
+            if let Some(branch) = git_ref {
+                request
+                    .extra
+                    .insert("deferred_worktree_ref".to_owned(), Value::String(branch));
+            }
+            plan.path.display().to_string()
+        } else {
+            source_workspace_path
+        };
+        log_executor_event(
+            "runtime task workspace resolved",
+            &[
+                ("task_id", local_task_id.clone()),
+                (
+                    "requested_source",
+                    payload
+                        .pointer("/execution/workspace/source")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                ),
+                (
+                    "execution_source",
+                    request.workspace_source.clone().unwrap_or_default(),
+                ),
+                ("side_source", side_source.is_some().to_string()),
+                ("source_path", request.cwd().unwrap_or_default().to_owned()),
+                ("workspace_path", workspace_path.clone()),
+            ],
+        );
+        if request.project_workspace_path.as_deref() != Some(workspace_path.as_str()) {
+            request.project_workspace_path = Some(workspace_path.clone());
+        }
+        self.apply_project_workspace_roots(&mut request);
+
+        let mut link = RuntimeTaskLink::new_pending_with_runtime(
+            local_task_id.clone(),
+            workspace_path.clone(),
+            title.clone(),
+            runtime.clone(),
+        );
+        link.ephemeral = request.ephemeral || bool_field(&payload, "ephemeral").unwrap_or(false);
+        link.runtime_project_key = request.runtime_project_key.clone();
+        link.runtime_workspace_roots = request.runtime_workspace_roots.clone();
+        link.project_instructions = request.system_prompt.clone();
+        link.project_plugin_ids = project_plugin_ids(&request);
+        set_runtime_handle_model_selection(&mut link.runtime_handle, &payload);
+        store_runtime_execution_request(&mut link.runtime_handle, &request);
+        apply_runtime_profile_handle(&mut link.runtime_handle, &payload);
+        if let Some(executable_path) = request
+            .extra
+            .get("runtime_executable_path")
+            .or_else(|| request.extra.get("runtimeExecutablePath"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+        {
+            if let Some(runtime_handle) = link.runtime_handle.as_object_mut() {
+                runtime_handle.insert(
+                    "runtimeExecutablePath".to_owned(),
+                    Value::String(executable_path),
+                );
+            }
+        }
+        if let Some(permission_mode) = request
+            .extra
+            .get("claude_permission_mode")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+        {
+            if let Some(runtime_handle) = link.runtime_handle.as_object_mut() {
+                runtime_handle.insert(
+                    "claudePermissionMode".to_owned(),
+                    Value::String(permission_mode),
+                );
+            }
+        }
+        if let (Some(runtime_handle), Some(project_id)) = (
+            link.runtime_handle.as_object_mut(),
+            cloud_project_id(&request),
+        ) {
+            runtime_handle.insert("cloudProjectId".to_owned(), project_id);
+        }
+        if let (Some(runtime_handle), Some(origin)) = (
+            link.runtime_handle.as_object_mut(),
+            payload.get("origin").filter(|value| value.is_object()),
+        ) {
+            runtime_handle.insert("origin".to_owned(), origin.clone());
+        }
+        if let Some(message) = cached_user_message(&local_task_id, &request, &payload) {
+            set_runtime_handle_messages(&mut link.runtime_handle, vec![message]);
+        }
+        if let Some(presentation) = user_message_presentation(&payload) {
+            append_runtime_handle_user_message_presentation(&mut link.runtime_handle, presentation);
+        }
+        if is_codex_runtime(&runtime) {
+            if let Some(supervisor) = payload
+                .get("initialSupervisor")
+                .or_else(|| payload.get("initial_supervisor"))
+            {
+                let configured = super::supervisor::configured_supervisor(supervisor, None)?;
+                self.configure_supervisor_model(&local_task_id, &configured, supervisor)?;
+                link.supervisor = Some(configured);
+            }
+        }
+        let mut runtime_handle = runtime_handle_json(&link);
+        self.upsert_local_task(link);
+        self.schedule_worktree_prune();
+        if is_claude_runtime(&runtime) {
+            self.prepare_claude_goal(&local_task_id, &mut request, &payload);
+            if let Err(error) = self
+                .spawn_claude_turn(local_task_id.clone(), request, force_start)
+                .await
+            {
+                self.retain_failed_runtime_task(&local_task_id, &error);
+                return Err(error);
+            }
+        } else {
+            let initial_thread_goal = initial_thread_goal_from_payload(&payload);
+            if let Some(source) = &mut side_source {
+                self.wait_for_running_side_source_turn(&source.thread_id)
+                    .await;
+                if source.thread_path.is_none() {
+                    source.thread_path = self.thread_path_for_id(&source.thread_id).await;
+                }
+            }
+            let turn = SpawnTurnRequest {
+                local_task_id: local_task_id.clone(),
+                runtime: "codex".to_owned(),
+                request,
+                send_payload: None,
+                direct_thread_id: None,
+                fork_thread_id: side_source.as_ref().map(|source| source.thread_id.clone()),
+                fork_thread_path: side_source.and_then(|source| source.thread_path),
+                resume_thread_id: None,
+                initial_thread_goal,
+            };
+            let spawn_result = if force_start {
+                self.spawn_forced_turn(turn).await
+            } else {
+                self.spawn_turn(turn).await
+            };
+            if let Err(error) = spawn_result {
+                self.retain_failed_runtime_task(&local_task_id, &error);
+                self.forget_runtime_model_config(&local_task_id);
+                self.supervisor_model_configs
+                    .lock()
+                    .expect("supervisor model config map lock should not be poisoned")
+                    .remove(&local_task_id);
+                return Err(error);
+            }
+        }
+        let queue_position = self
+            .queued_local_task_position(&local_task_id)
+            .map(|position| position + 1);
+        if let (Some(queue_position), Some(runtime_handle)) =
+            (queue_position, runtime_handle.as_object_mut())
+        {
+            runtime_handle.insert("queuePosition".to_owned(), json!(queue_position));
+        }
+        if !self
+            .local_task_link(&local_task_id)
+            .is_some_and(|link| link.ephemeral)
+        {
+            self.track_default_work_item_async(
+                local_task_id.clone(),
+                title.clone(),
+                string_field(&payload, "message").unwrap_or_default(),
+            );
+        }
+        match payload
+            .get("friendlyTitleExecutionRequest")
+            .cloned()
+            .filter(|_| is_codex_runtime(&runtime))
+        {
+            Some(value) => match serde_json::from_value::<ExecutionRequest>(value) {
+                Ok(execution_request) => {
+                    log_executor_event(
+                        "friendly task title generation queued",
+                        &[("local_task_id", local_task_id.clone())],
+                    );
+                    let handler = self.clone();
+                    let friendly_payload = json!({
+                        "taskId": local_task_id,
+                        "sourceTitle": title,
+                        "executionRequest": execution_request,
+                    });
+                    tokio::spawn(async move {
+                        if let Err(error) = handler.generate_friendly_title(friendly_payload).await
+                        {
+                            log_executor_event(
+                                "friendly task title generation failed",
+                                &[("error", error.message)],
+                            );
+                        }
+                    });
+                }
+                Err(error) => log_executor_event(
+                    "friendly task title generation rejected",
+                    &[
+                        ("local_task_id", local_task_id.clone()),
+                        ("reason", "invalid_execution_request".to_owned()),
+                        ("error", error.to_string()),
+                    ],
+                ),
+            },
+            None => log_executor_event(
+                "friendly task title generation skipped",
+                &[
+                    ("local_task_id", local_task_id.clone()),
+                    ("reason", "missing_execution_request".to_owned()),
+                ],
+            ),
+        }
+
+        Ok(json!({
+            "success": true,
+            "accepted": true,
+            "deviceId": self.device_id,
+            "taskId": local_task_id,
+            "workspacePath": if deferred_environment { "" } else { &workspace_path },
+            "workspacePending": deferred_environment,
+            "runtime": runtime,
+            "runtimeHandle": runtime_handle,
+            "status": if queue_position.is_some() { "queued" } else { "running" },
+            "queuePosition": queue_position,
+        }))
+    }
+
+    fn retain_failed_runtime_task(&self, local_task_id: &str, error: &AppIpcError) {
+        self.store.update_task(local_task_id, |link| {
+            apply_runtime_task_start_failure(link, error);
+        });
+    }
+
+    pub(super) fn record_runtime_turn_id(
+        &self,
+        local_task_id: &str,
+        subtask_id: &str,
+        turn_id: &str,
+        client_user_message_id: Option<&str>,
+    ) {
+        self.store.update_task(local_task_id, |link| {
+            if !link.runtime_handle.is_object() {
+                link.runtime_handle = json!({});
+            }
+            if let Some(runtime_handle) = link.runtime_handle.as_object_mut() {
+                runtime_handle.insert("lastTurnId".to_owned(), Value::String(turn_id.to_owned()));
+                let mappings = runtime_handle
+                    .entry("turnIdsBySubtask")
+                    .or_insert_with(|| json!({}));
+                if let Some(mappings) = mappings.as_object_mut() {
+                    mappings.insert(subtask_id.to_owned(), Value::String(turn_id.to_owned()));
+                }
+            }
+            if let Some(client_user_message_id) = client_user_message_id {
+                bind_runtime_handle_user_message_presentation_to_turn(
+                    &mut link.runtime_handle,
+                    client_user_message_id,
+                    turn_id,
+                );
+            }
+        });
+    }
+
+    pub(super) fn record_superseded_runtime_transcript_turn(
+        &self,
+        local_task_id: &str,
+        turn_id: &str,
+    ) {
+        self.store.update_task(local_task_id, |link| {
+            let Some(runtime_handle) = link.runtime_handle.as_object_mut() else {
+                link.runtime_handle = json!({
+                    "supersededTranscriptTurnIds": [turn_id],
+                });
+                return;
+            };
+            let turn_ids = runtime_handle
+                .entry("supersededTranscriptTurnIds")
+                .or_insert_with(|| json!([]));
+            let Some(turn_ids) = turn_ids.as_array_mut() else {
+                *turn_ids = json!([turn_id]);
+                return;
+            };
+            if !turn_ids
+                .iter()
+                .any(|existing| existing.as_str() == Some(turn_id))
+            {
+                turn_ids.push(Value::String(turn_id.to_owned()));
+            }
+        });
+    }
+
+    pub(super) fn record_overload_recovery_turn(&self, local_task_id: &str, turn_id: &str) {
+        self.store.update_task(local_task_id, |link| {
+            let turns = link
+                .runtime_handle
+                .as_object_mut()
+                .expect("Codex task runtime handle must be an object")
+                .entry("overloadRecoveryTurnIds")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .expect("overload recovery turn IDs must be an array");
+            if !turns.iter().any(|value| value.as_str() == Some(turn_id)) {
+                turns.push(json!(turn_id));
+            }
+        });
+    }
+
+    pub(super) async fn send_message(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let local_task_id = runtime_task_id(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "taskId is required"))?;
+        let gate = self.task_send_gate(&local_task_id);
+        let _guard = gate.lock().await;
+        self.send_message_after_local_checks(payload).await
+    }
+
+    async fn send_message_after_local_checks(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let local_task_id = runtime_task_id(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "taskId is required"))?;
+        let existing_link = self.local_task_link(&local_task_id);
+        let payload_execution_request = execution_request(&payload);
+        let has_execution_request = payload_execution_request.is_some();
+        if let Some(response) = request_user_input_response(&payload) {
+            return self
+                .send_request_user_input_response(&local_task_id, response)
+                .await;
+        }
+        let queue_if_busy = bool_field(&payload, "queueIfBusy")
+            .or_else(|| bool_field(&payload, "queue_if_busy"))
+            .unwrap_or(false);
+        let was_busy = self.is_busy_local_task(&local_task_id);
+        if was_busy && !queue_if_busy {
+            return Ok(json!({
+                "success": false,
+                "error": "runtime task is already running",
+                "code": "bad_request",
+            }));
+        }
+        let workspace_path = existing_link
+            .as_ref()
+            .map(|link| link.workspace_path.clone())
+            .filter(|path| !path.trim().is_empty())
+            .or_else(|| workspace_path(&payload))
+            .unwrap_or_default();
+        let worktrees = self.worktrees.clone();
+        let restore_path = PathBuf::from(&workspace_path);
+        let restore_result =
+            tokio::task::spawn_blocking(move || worktrees.restore_if_known(&restore_path))
+                .await
+                .map_err(|error| {
+                    AppIpcError::new(
+                        "worktree_restore_required",
+                        format!("Worktree restore task failed: {error}"),
+                    )
+                })?;
+        if let Err(error) = restore_result {
+            return Ok(json!({
+                "success": false,
+                "accepted": false,
+                "error": error,
+                "code": "worktree_restore_required",
+                "taskId": local_task_id,
+                "workspacePath": workspace_path,
+            }));
+        }
+        let mut request = payload_execution_request
+            .ok_or_else(|| AppIpcError::new("bad_request", "executionRequest is required"))?;
+        apply_runtime_payload_metadata(&mut request, &payload);
+        if let Some(link) = existing_link.as_ref() {
+            // A failed preparation has no session yet. Retry its saved snapshot;
+            // established conversations never prepare a new project directory.
+            if link.thread_id.is_none() {
+                if let Some(definition) = link
+                    .runtime_handle
+                    .pointer("/executionRequest/deferred_project_environment")
+                {
+                    request.extra.insert(
+                        project_preparation::DEFERRED_ENVIRONMENT.into(),
+                        definition.clone(),
+                    );
+                    request.workspace_source = link
+                        .runtime_handle
+                        .pointer("/executionRequest/workspace_source")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+            }
+            set_runtime_task_title(&mut request, &link.title);
+        }
+        if let Some(link) = existing_link.as_ref() {
+            mark_runtime_model_switch(&mut request, link, &payload);
+        }
+        if let Some(link) = existing_link.as_ref() {
+            restore_cloud_project_id(&mut request, &link.runtime_handle);
+            restore_origin(&mut request, &link.runtime_handle);
+        }
+        request.new_session = false;
+        if request.runtime_project_key.is_none() {
+            request.runtime_project_key = existing_link
+                .as_ref()
+                .and_then(|link| link.runtime_project_key.clone());
+        }
+        if request.runtime_workspace_roots.is_empty() {
+            request.runtime_workspace_roots = existing_link
+                .as_ref()
+                .map(|link| link.runtime_workspace_roots.clone())
+                .unwrap_or_default();
+        }
+        if request.system_prompt.trim().is_empty() {
+            request.system_prompt = existing_link
+                .as_ref()
+                .map(|link| link.project_instructions.clone())
+                .unwrap_or_default();
+        }
+        if project_plugin_ids(&request).is_empty() {
+            if let Some(plugin_ids) = existing_link
+                .as_ref()
+                .map(|link| link.project_plugin_ids.clone())
+                .filter(|plugin_ids| !plugin_ids.is_empty())
+            {
+                request
+                    .extra
+                    .insert("project_plugin_ids".to_owned(), json!(plugin_ids));
+            }
+        }
+        if !workspace_path.is_empty() {
+            request.project_workspace_path = Some(workspace_path.clone());
+        }
+        self.apply_project_workspace_roots(&mut request);
+        let runtime = existing_link
+            .as_ref()
+            .map(|link| link.runtime.clone())
+            .or_else(|| string_field(&payload, "runtime"))
+            .unwrap_or_else(|| "codex".to_owned());
+        if is_claude_runtime(&runtime) {
+            ensure_claude_execution_identity(&local_task_id, &mut request);
+            if let Some(session) = existing_link
+                .as_ref()
+                .and_then(|link| link.runtime_handle.get("executorSession"))
+            {
+                request.inherited_sessions.insert(0, session.clone());
+            }
+            if request.extra.get("runtime_executable_path").is_none() {
+                if let Some(executable_path) = existing_link
+                    .as_ref()
+                    .and_then(|link| string_field(&link.runtime_handle, "runtimeExecutablePath"))
+                {
+                    request.extra.insert(
+                        "runtime_executable_path".to_owned(),
+                        Value::String(executable_path),
+                    );
+                }
+            }
+            if request.extra.get("claude_permission_mode").is_none() {
+                if let Some(permission_mode) = existing_link
+                    .as_ref()
+                    .and_then(|link| string_field(&link.runtime_handle, "claudePermissionMode"))
+                {
+                    request.extra.insert(
+                        "claude_permission_mode".to_owned(),
+                        Value::String(permission_mode),
+                    );
+                }
+            }
+            self.prepare_claude_goal(&local_task_id, &mut request, &payload);
+            self.prepare_claude_send(&local_task_id, &workspace_path, &request, &payload);
+            if was_busy {
+                self.queue_claude_turn(local_task_id.clone(), request)
+                    .await?;
+            } else {
+                self.spawn_claude_turn(local_task_id.clone(), request, false)
+                    .await?;
+            }
+            let queue_position = self
+                .queued_local_task_position(&local_task_id)
+                .map(|position| position + 1);
+            return Ok(json!({
+                "success": true,
+                "accepted": true,
+                "deviceId": self.device_id,
+                "taskId": local_task_id,
+                "runtime": "claude_code",
+                "status": if queue_position.is_some() { "queued" } else { "running" },
+                "queuePosition": queue_position,
+            }));
+        }
+        let retrying_preparation = request
+            .extra
+            .contains_key(project_preparation::DEFERRED_ENVIRONMENT);
+        let recovered_link = if retrying_preparation {
+            None
+        } else {
+            self.recover_send_task_link(&payload, &local_task_id, existing_link.as_ref())
+                .await
+        };
+        let thread_id = runtime_session_id_from_payload(&payload)
+            .or_else(|| {
+                existing_link
+                    .as_ref()
+                    .and_then(runtime_session_id_from_link)
+            })
+            .or_else(|| {
+                recovered_link
+                    .as_ref()
+                    .and_then(runtime_session_id_from_link)
+            });
+        if thread_id.is_none() && !retrying_preparation {
+            return Ok(json!({
+                "success": false,
+                "error": "runtime task session is not ready",
+                "code": "missing_runtime_session",
+                "taskId": local_task_id,
+                "runtime": "codex",
+            }));
+        }
+        let link_for_send = existing_link.as_ref().or(recovered_link.as_ref());
+        let ephemeral = request.ephemeral || link_for_send.is_some_and(|link| link.ephemeral);
+
+        let mut fields = task_fields(&request.task_id, &request.subtask_id);
+        fields.push(("local_task_id", local_task_id.clone()));
+        fields.push(("thread_id", thread_id.clone().unwrap_or_default()));
+        fields.push(("workspace_path", workspace_path.clone()));
+        fields.push(("has_execution_request", has_execution_request.to_string()));
+        fields.push(("prompt_len", prompt_text(&request.prompt).len().to_string()));
+        if let Some(cwd) = request.cwd() {
+            fields.push(("cwd", cwd.to_owned()));
+        }
+        fields.push((
+            "model_id",
+            string_field(&request.model_config, "model_id")
+                .or_else(|| string_field(&request.model_config, "modelId"))
+                .unwrap_or_default(),
+        ));
+        log_executor_event("runtime work send prepared", &fields);
+
+        if let Some(turn_id) = retry_source_turn_id(&payload) {
+            self.record_superseded_runtime_transcript_turn(&local_task_id, &turn_id);
+        }
+        self.schedule_worktree_prune();
+        let direct_thread_id = thread_id.clone().filter(|_| ephemeral);
+        let resume_thread_id = thread_id.filter(|_| !ephemeral);
+        let initial_thread_goal = initial_thread_goal_from_payload(&payload);
+
+        let turn = SpawnTurnRequest {
+            local_task_id: local_task_id.clone(),
+            runtime: "codex".to_owned(),
+            request,
+            send_payload: Some(payload),
+            direct_thread_id,
+            fork_thread_id: None,
+            fork_thread_path: None,
+            resume_thread_id,
+            initial_thread_goal,
+        };
+        if was_busy {
+            self.queue_turn(turn).await?;
+        } else {
+            self.spawn_turn(turn).await?;
+        }
+        let queue_position = self
+            .queued_local_task_position(&local_task_id)
+            .map(|position| position + 1);
+
+        Ok(json!({
+            "success": true,
+            "accepted": true,
+            "deviceId": self.device_id,
+            "taskId": local_task_id,
+            "runtime": "codex",
+            "status": if queue_position.is_some() { "queued" } else { "running" },
+            "queuePosition": queue_position,
+        }))
+    }
+
+    pub(super) async fn interrupt_and_send(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let local_task_id = runtime_task_id(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "taskId is required"))?;
+        let gate = self.task_send_gate(&local_task_id);
+        let _guard = gate.lock().await;
+        let check_provider_turn = !bool_field(&payload, "ephemeral").unwrap_or(false)
+            && !self
+                .local_task_link(&local_task_id)
+                .is_some_and(|link| link.ephemeral);
+        let thread_id = if check_provider_turn {
+            runtime_session_id_from_payload(&payload).or_else(|| {
+                self.local_task_link(&local_task_id)
+                    .as_ref()
+                    .and_then(runtime_session_id_from_link)
+            })
+        } else {
+            None
+        };
+        let had_active_local_execution = self.is_active_local_task(&local_task_id);
+        self.resolve_pending_request_user_input_for_stop(&local_task_id);
+        if had_active_local_execution {
+            self.request_active_turn_stop(&local_task_id);
+        }
+        if !had_active_local_execution {
+            if let Some(thread_id) = thread_id.as_deref() {
+                if self
+                    .settle_local_execution_from_terminal_codex_turn(
+                        &local_task_id,
+                        thread_id,
+                        "interrupt_and_send_provider_terminal",
+                        PROVIDER_STATE_RECONCILIATION_TIMEOUT,
+                    )
+                    .await
+                {
+                    return self.send_message_after_local_checks(payload).await;
+                }
+            }
+        }
+        let local_stop = self.abort_active_turn(&local_task_id);
+        let provider_stop = async {
+            match (had_active_local_execution, thread_id.as_deref()) {
+                (false, Some(thread_id)) => tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.interrupt_provider_active_turn(thread_id),
+                )
+                .await
+                .unwrap_or(false),
+                _ => true,
+            }
+        };
+        let (local_stopped, provider_stopped) = tokio::join!(local_stop, provider_stop);
+        if !local_stopped {
+            self.force_settle_local_task_execution(
+                &local_task_id,
+                thread_id,
+                "cancelled",
+                "interrupt_and_send_timeout",
+            );
+        }
+        if !provider_stopped {
+            log_executor_event(
+                "runtime work provider interrupt cleanup pending",
+                &[("local_task_id", local_task_id.clone())],
+            );
+        }
+        self.send_message_after_local_checks(payload).await
+    }
+
+    async fn settle_local_execution_from_terminal_codex_turn(
+        &self,
+        local_task_id: &str,
+        thread_id: &str,
+        reason: &str,
+        timeout: Duration,
+    ) -> bool {
+        let thread =
+            match tokio::time::timeout(timeout, self.read_codex_recent_turns(thread_id)).await {
+                Ok(Ok(thread)) => thread,
+                Ok(Err(error)) => {
+                    log_executor_event(
+                        "runtime work provider state read failed during reconciliation",
+                        &[
+                            ("local_task_id", local_task_id.to_owned()),
+                            ("thread_id", thread_id.to_owned()),
+                            ("error", error),
+                        ],
+                    );
+                    return false;
+                }
+                Err(_) => {
+                    log_executor_event(
+                        "runtime work provider state read timed out during reconciliation",
+                        &[
+                            ("local_task_id", local_task_id.to_owned()),
+                            ("thread_id", thread_id.to_owned()),
+                        ],
+                    );
+                    return false;
+                }
+            };
+        let Some(status) = codex_thread_terminal_task_status(&thread) else {
+            return false;
+        };
+        self.force_settle_local_task_execution(
+            local_task_id,
+            Some(thread_id.to_owned()),
+            status,
+            reason,
+        )
+    }
+
+    async fn interrupt_provider_active_turn(&self, thread_id: &str) -> bool {
+        let thread = match self.read_codex_recent_turns(thread_id).await {
+            Ok(thread) => thread,
+            Err(error) => {
+                log_executor_event(
+                    "runtime work provider turn read failed before interrupt",
+                    &[("thread_id", thread_id.to_owned()), ("error", error)],
+                );
+                return false;
+            }
+        };
+        let Some(turn_id) = codex_thread_in_progress_turn_id(&thread) else {
+            return !codex_thread_has_in_progress_turn(&thread);
+        };
+        if let Err(error) = self
+            .codex_app_server
+            .request(
+                "turn/interrupt",
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                }),
+            )
+            .await
+        {
+            log_executor_event(
+                "runtime work provider turn interrupt failed",
+                &[
+                    ("thread_id", thread_id.to_owned()),
+                    ("turn_id", turn_id),
+                    ("error", error),
+                ],
+            );
+            return false;
+        }
+        for _ in 0..PROVIDER_TURN_INTERRUPT_WAIT_ATTEMPTS {
+            match self.read_codex_recent_turns(thread_id).await {
+                Ok(thread) if !codex_thread_has_in_progress_turn(&thread) => return true,
+                Ok(_) => {
+                    sleep(Duration::from_millis(PROVIDER_TURN_INTERRUPT_WAIT_MS)).await;
+                }
+                Err(error) => {
+                    log_executor_event(
+                        "runtime work provider turn read failed after interrupt",
+                        &[("thread_id", thread_id.to_owned()), ("error", error)],
+                    );
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    pub(super) async fn rollback_task(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let requested_task_id = runtime_task_id(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "taskId is required"))?;
+        let existing_link = self.task_link_from_payload(&payload, false).await?;
+        let local_task_id = existing_link.local_task_id.clone();
+        if self.is_busy_local_task(&existing_link.local_task_id) {
+            return Ok(json!({
+                "success": false,
+                "accepted": false,
+                "taskId": local_task_id,
+                "runtime": "codex",
+                "error": "runtime task is already running",
+                "code": "bad_request",
+            }));
+        }
+
+        let mut request = execution_request(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "executionRequest is required"))?;
+        let workspace_path = (!existing_link.workspace_path.trim().is_empty())
+            .then(|| existing_link.workspace_path.clone())
+            .or_else(|| workspace_path(&payload))
+            .unwrap_or_default();
+        apply_runtime_payload_metadata(&mut request, &payload);
+        set_runtime_task_title(&mut request, &existing_link.title);
+        mark_runtime_model_switch(&mut request, &existing_link, &payload);
+        restore_cloud_project_id(&mut request, &existing_link.runtime_handle);
+        restore_origin(&mut request, &existing_link.runtime_handle);
+        request.new_session = false;
+        if !workspace_path.is_empty() {
+            request.project_workspace_path = Some(workspace_path.clone());
+        }
+        let Some(thread_id) = runtime_session_id_from_payload(&payload)
+            .or_else(|| runtime_session_id_from_link(&existing_link))
+        else {
+            return Ok(task_goal_missing_session(&existing_link));
+        };
+
+        let mut fields = task_fields(&request.task_id, &request.subtask_id);
+        fields.push(("requested_task_id", requested_task_id));
+        fields.push(("local_task_id", local_task_id.clone()));
+        fields.push(("thread_id", thread_id.clone()));
+        fields.push(("workspace_path", workspace_path.clone()));
+        fields.push(("prompt_len", prompt_text(&request.prompt).len().to_string()));
+        if let Some(cwd) = request.cwd() {
+            fields.push(("cwd", cwd.to_owned()));
+        }
+        log_executor_event("runtime work message edit prepared", &fields);
+
+        self.mark_task_running_for_send(
+            &local_task_id,
+            &thread_id,
+            &workspace_path,
+            &request,
+            &payload,
+        );
+        if let Some(turn_id) = retry_source_turn_id(&payload) {
+            self.record_superseded_runtime_transcript_turn(&local_task_id, &turn_id);
+        }
+        self.spawn_turn(SpawnTurnRequest {
+            local_task_id: local_task_id.clone(),
+            runtime: "codex".to_owned(),
+            request,
+            send_payload: None,
+            direct_thread_id: None,
+            fork_thread_id: None,
+            fork_thread_path: None,
+            resume_thread_id: Some(thread_id),
+            initial_thread_goal: None,
+        })
+        .await?;
+
+        Ok(json!({
+            "success": true,
+            "accepted": true,
+            "deviceId": self.device_id,
+            "taskId": local_task_id,
+            "runtime": "codex",
+        }))
+    }
+
+    pub(super) async fn send_guidance(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let local_task_id = runtime_task_id(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "taskId is required"))?;
+        let message = string_field(&payload, "message")
+            .or_else(|| string_field(&payload, "guidance"))
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default();
+        let steer_input = guidance_input_items(&message, payload.get("attachments"));
+        if steer_input.is_empty() {
+            return Err(AppIpcError::new(
+                "bad_request",
+                "message or image attachment is required",
+            ));
+        }
+        log_executor_event(
+            "runtime guidance requested",
+            &[("local_task_id", local_task_id.clone())],
+        );
+        let Some(mut active_turn) = self.wait_for_active_codex_turn(&local_task_id).await else {
+            log_executor_event(
+                "runtime guidance rejected",
+                &[
+                    ("local_task_id", local_task_id.clone()),
+                    ("code", "no_active_turn".to_owned()),
+                    (
+                        "active_local_task",
+                        self.is_active_local_task(&local_task_id).to_string(),
+                    ),
+                ],
+            );
+            return Ok(json!({
+                "success": false,
+                "accepted": false,
+                "error": "no active turn to guide",
+                "code": "no_active_turn",
+                "taskId": local_task_id,
+                "runtime": "codex",
+            }));
+        };
+
+        let guidance_id = string_field(&payload, "client_guidance_id")
+            .or_else(|| string_field(&payload, "clientGuidanceId"))
+            .unwrap_or_else(|| format!("guidance-{}", now_ms()));
+        let additional_context = payload
+            .get("additionalContext")
+            .or_else(|| payload.get("additional_context"))
+            .filter(|value| value.is_object())
+            .cloned();
+        let steer_result = self
+            .codex_app_server
+            .steer_turn(
+                &active_turn.thread_id,
+                &active_turn.turn_id,
+                Some(guidance_id.clone()),
+                Value::Array(steer_input.clone()),
+                additional_context.clone(),
+            )
+            .await;
+        let steer_result = match steer_result {
+            Err(error) => {
+                let Some(actual_turn_id) = active_turn_id_from_steer_mismatch(&error) else {
+                    return Ok(runtime_guidance_failure(
+                        &local_task_id,
+                        &active_turn,
+                        error,
+                    ));
+                };
+                if actual_turn_id == active_turn.turn_id {
+                    return Ok(runtime_guidance_failure(
+                        &local_task_id,
+                        &active_turn,
+                        error,
+                    ));
+                }
+                log_executor_event(
+                    "runtime guidance active turn corrected",
+                    &[
+                        ("local_task_id", local_task_id.clone()),
+                        ("thread_id", active_turn.thread_id.clone()),
+                        ("previous_turn_id", active_turn.turn_id.clone()),
+                        ("turn_id", actual_turn_id.clone()),
+                    ],
+                );
+                self.record_active_codex_turn(
+                    &local_task_id,
+                    active_turn.execution_id,
+                    active_turn.thread_id.clone(),
+                    actual_turn_id.clone(),
+                );
+                active_turn.turn_id = actual_turn_id.clone();
+                self.codex_app_server
+                    .steer_turn(
+                        &active_turn.thread_id,
+                        &actual_turn_id,
+                        Some(guidance_id.clone()),
+                        Value::Array(steer_input),
+                        additional_context,
+                    )
+                    .await
+            }
+            result => result,
+        };
+        match steer_result {
+            Ok(turn_id) => {
+                self.set_interaction_status(&local_task_id, None);
+                self.record_active_codex_turn(
+                    &local_task_id,
+                    active_turn.execution_id,
+                    active_turn.thread_id.clone(),
+                    turn_id.clone(),
+                );
+                log_executor_event(
+                    "runtime guidance accepted",
+                    &[
+                        ("local_task_id", local_task_id.clone()),
+                        ("thread_id", active_turn.thread_id.clone()),
+                        ("turn_id", turn_id.clone()),
+                    ],
+                );
+                Ok(json!({
+                    "success": true,
+                    "accepted": true,
+                    "guidance_id": guidance_id,
+                    "guidanceId": guidance_id,
+                    "taskId": local_task_id,
+                    "turnId": turn_id,
+                    "runtime": "codex",
+                }))
+            }
+            Err(error) => Ok(runtime_guidance_failure(
+                &local_task_id,
+                &active_turn,
+                error,
+            )),
+        }
+    }
+
+    pub(super) async fn compact_task(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let local_task_id = runtime_task_id(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "taskId is required"))?;
+        let link = self.task_link_from_payload(&payload, false).await?;
+        let Some(thread_id) = runtime_session_id_from_payload(&payload)
+            .or_else(|| runtime_session_id_from_link(&link))
+        else {
+            return Ok(task_action_failure(
+                &link,
+                "runtime task session is not ready".to_owned(),
+            ));
+        };
+
+        let request = runtime_model_request(&link, &payload)?;
+        let client = match self.codex_app_server.for_request(&request) {
+            Ok(client) => client,
+            Err(error) => return Ok(task_action_failure(&link, error)),
+        };
+        let handler = self.clone();
+        let action_client = client.clone();
+        client
+            .run_owned_thread_action(thread_id.clone(), async move {
+                handler
+                    .compact_codex_task(&action_client, &link, &local_task_id, &thread_id, request)
+                    .await
+            })
+            .await
+            .map_err(|error| AppIpcError::new("internal_error", error.to_string()))?
+    }
+
+    async fn compact_codex_task(
+        &self,
+        client: &CodexAppServerClient,
+        link: &RuntimeTaskLink,
+        local_task_id: &str,
+        thread_id: &str,
+        request: ExecutionRequest,
+    ) -> Result<Value, AppIpcError> {
+        let thread_id = match self
+            .resume_codex_thread_with_client(client, link, thread_id)
+            .await
+        {
+            Ok(resumed_thread_id) => resumed_thread_id,
+            Err(error) => return Ok(task_action_failure(link, error)),
+        };
+        // The compaction turn answers through the local model route, which only
+        // exists while a turn that registered it is alive. Register it for the
+        // duration of this action so compacting an idle thread still reaches a
+        // model instead of failing inside the Codex app-server.
+        let _model_route = match bind_codex_thread_model_route(&request, &thread_id) {
+            Ok(route) => route,
+            Err(error) => return Ok(task_action_failure(link, error)),
+        };
+        self.register_thread_event_route(&thread_id, link.local_task_id.clone(), request, true);
+        let previous_turn_id = match self
+            .read_codex_recent_turns_with_client(client, &thread_id)
+            .await
+        {
+            Ok(thread) => latest_codex_turn_id(&thread),
+            Err(error) => return Ok(task_action_failure(link, error)),
+        };
+        log_executor_event(
+            "context compaction requested",
+            &[
+                ("thread_id", thread_id.clone()),
+                (
+                    "previous_turn_id",
+                    previous_turn_id.clone().unwrap_or_default(),
+                ),
+                ("dedicated_home", client.has_dedicated_home().to_string()),
+            ],
+        );
+        // History can briefly label a newly admitted turn as interrupted.
+        // Subscribe before starting it and settle only on native completion.
+        let notifications = match client.subscribe_thread_notifications(&thread_id).await {
+            Ok(receiver) => receiver,
+            Err(error) => return Ok(task_action_failure(link, error)),
+        };
+        match client
+            .request(
+                "thread/compact/start",
+                json!({"threadId": thread_id.clone()}),
+            )
+            .await
+        {
+            Ok(_) => {
+                let (turn_id, item_id) = match wait_for_context_compaction(
+                    |message| {
+                        if client.has_dedicated_home() {
+                            self.route_codex_notification(message.clone());
+                        }
+                    },
+                    notifications,
+                    &thread_id,
+                    previous_turn_id.as_deref(),
+                )
+                .await
+                {
+                    Ok(completion) => completion,
+                    Err(error) => return Ok(task_action_failure(link, error)),
+                };
+                self.store.update_task(local_task_id, |stored| {
+                    stored.updated_at = now_ms();
+                });
+                let mut response = task_action_success(link);
+                if let Some(response) = response.as_object_mut() {
+                    response.insert("turnId".to_owned(), Value::String(turn_id));
+                    response.insert("compactionItemId".to_owned(), Value::String(item_id));
+                }
+                Ok(response)
+            }
+            Err(error) => Ok(task_action_failure(link, error)),
+        }
+    }
+
+    pub(super) async fn resume_codex_thread_for_action(
+        &self,
+        link: &RuntimeTaskLink,
+        thread_id: &str,
+    ) -> Result<String, String> {
+        let client = self
+            .codex_app_server
+            .for_request(&runtime_event_request_from_link(link))?;
+        self.resume_codex_thread_with_client(&client, link, thread_id)
+            .await
+    }
+
+    async fn resume_codex_thread_with_client(
+        &self,
+        client: &CodexAppServerClient,
+        link: &RuntimeTaskLink,
+        thread_id: &str,
+    ) -> Result<String, String> {
+        let mut params = Map::new();
+        params.insert("threadId".to_owned(), Value::String(thread_id.to_owned()));
+        params.insert(
+            "approvalPolicy".to_owned(),
+            codex_runtime_approval_policy(&runtime_event_request_from_link(link)),
+        );
+        params.insert("excludeTurns".to_owned(), Value::Bool(true));
+        if !link.workspace_path.trim().is_empty() {
+            params.insert("cwd".to_owned(), Value::String(link.workspace_path.clone()));
+        }
+        if let Some(thread_path) = runtime_thread_path_from_link(link) {
+            params.insert("path".to_owned(), Value::String(thread_path));
+        }
+
+        self.register_thread_event_route_from_store(thread_id);
+        self.ensure_notification_router().await;
+        let response = client
+            .request("thread/resume", Value::Object(params))
+            .await?;
+        Ok(response
+            .get("thread")
+            .and_then(|thread| string_field(thread, "id"))
+            .unwrap_or_else(|| thread_id.to_owned()))
+    }
+
+    pub(super) async fn send_request_user_input_response(
+        &self,
+        local_task_id: &str,
+        response: Value,
+    ) -> Result<Value, AppIpcError> {
+        let sender = self
+            .active_request_user_inputs
+            .lock()
+            .ok()
+            .and_then(|requests| requests.get(local_task_id).cloned())
+            .map(|request| request.sender);
+        let Some(sender) = sender else {
+            return Ok(json!({
+                "success": false,
+                "error": "request_user_input is not pending",
+                "code": "missing_request_user_input",
+                "taskId": local_task_id,
+                "runtime": "codex",
+            }));
+        };
+        if sender.send(response).await.is_err() {
+            return Ok(json!({
+                "success": false,
+                "error": "request_user_input response channel is closed",
+                "code": "closed_request_user_input",
+                "taskId": local_task_id,
+                "runtime": "codex",
+            }));
+        }
+        self.set_interaction_status(local_task_id, None);
+        Ok(json!({
+            "success": true,
+            "accepted": true,
+            "deviceId": self.device_id,
+            "taskId": local_task_id,
+            "runtime": "codex",
+        }))
+    }
+
+    pub(super) async fn cancel_task(&self, payload: Value) -> Result<Value, AppIpcError> {
+        self.cancel_task_with_timeout(payload, Duration::from_secs(10))
+            .await
+    }
+
+    pub(super) async fn cancel_task_with_timeout(
+        &self,
+        payload: Value,
+        stop_timeout: Duration,
+    ) -> Result<Value, AppIpcError> {
+        let local_task_id = runtime_task_id(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "taskId is required"))?;
+        let link = self.local_task_link(&local_task_id);
+        let thread_id = link.as_ref().and_then(runtime_session_id_from_link);
+        let is_codex = link
+            .as_ref()
+            .map_or(true, |link| link.runtime.eq_ignore_ascii_case("codex"));
+        let had_active_local_execution = self.is_active_local_task(&local_task_id);
+        self.resolve_pending_request_user_input_for_stop(&local_task_id);
+        if self.remove_queued_turn(&local_task_id).await? {
+            return Ok(match link {
+                Some(link) => task_action_success(&link),
+                None => json!({
+                    "success": true,
+                    "accepted": true,
+                    "taskId": local_task_id,
+                    "runtime": "codex",
+                }),
+            });
+        }
+        if self.cancel_preparing_worktree_turn(&local_task_id) {
+            return Ok(match link {
+                Some(link) => task_action_success(&link),
+                None => json!({
+                    "success": true,
+                    "accepted": true,
+                    "taskId": local_task_id,
+                    "runtime": "codex",
+                }),
+            });
+        }
+        if had_active_local_execution {
+            self.request_active_turn_stop(&local_task_id);
+        }
+        if is_codex && !had_active_local_execution {
+            if let Some(thread_id) = thread_id.as_deref() {
+                if self
+                    .settle_local_execution_from_terminal_codex_turn(
+                        &local_task_id,
+                        thread_id,
+                        "cancel_provider_terminal",
+                        PROVIDER_STATE_RECONCILIATION_TIMEOUT.min(stop_timeout),
+                    )
+                    .await
+                {
+                    return Ok(match self.local_task_link(&local_task_id).or(link) {
+                        Some(link) => task_action_success(&link),
+                        None => json!({
+                            "success": true,
+                            "accepted": true,
+                            "taskId": local_task_id,
+                            "runtime": "codex",
+                        }),
+                    });
+                }
+            }
+        }
+        let local_stop = self.abort_active_turn_with_timeout(&local_task_id, stop_timeout);
+        let provider_stop = async {
+            match (is_codex, had_active_local_execution, thread_id.as_deref()) {
+                (true, false, Some(thread_id)) => tokio::time::timeout(
+                    stop_timeout,
+                    self.interrupt_provider_active_turn(thread_id),
+                )
+                .await
+                .unwrap_or(false),
+                _ => true,
+            }
+        };
+        let (local_stopped, provider_stopped) = tokio::join!(local_stop, provider_stop);
+        if !local_stopped {
+            self.force_settle_local_task_execution(
+                &local_task_id,
+                thread_id,
+                "cancelled",
+                "cancel_timeout",
+            );
+        }
+        let cleanup_pending = !local_stopped || !provider_stopped;
+
+        Ok(match self.local_task_link(&local_task_id).or(link) {
+            Some(link) => {
+                let mut response = task_action_success(&link);
+                response["cleanupPending"] = Value::Bool(cleanup_pending);
+                response
+            }
+            None => json!({
+                "success": true,
+                "accepted": true,
+                "taskId": local_task_id,
+                "runtime": "codex",
+                "cleanupPending": cleanup_pending,
+            }),
+        })
+    }
+
+    pub(super) async fn force_start_task(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let local_task_id = runtime_task_id(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "taskId is required"))?;
+        let runtime = self
+            .store
+            .get_task(&local_task_id)
+            .map(|link| link.runtime)
+            .unwrap_or_else(|| "codex".to_owned());
+        let _operation = self.turn_queue_operation.lock().await;
+        let (previous, queued_turn, remaining_turns) = {
+            let mut scheduler = self
+                .turn_scheduler
+                .lock()
+                .expect("runtime turn scheduler lock should not be poisoned");
+            if scheduler.queued_position(&local_task_id).is_none() {
+                return Ok(json!({
+                    "success": false,
+                    "accepted": false,
+                    "taskId": local_task_id,
+                    "runtime": runtime,
+                    "error": "runtime task is not queued",
+                    "code": "not_queued",
+                }));
+            }
+            let previous = scheduler.clone();
+            let turn = scheduler.force_start(&local_task_id).ok_or_else(|| {
+                AppIpcError::new("runtime_queue_failed", "queued runtime task disappeared")
+            })?;
+            (previous, turn, scheduler.queued_turns.clone())
+        };
+        if let Err(error) = self.persist_turn_queue(remaining_turns).await {
+            *self
+                .turn_scheduler
+                .lock()
+                .expect("runtime turn scheduler lock should not be poisoned") = previous;
+            return Err(error);
+        }
+        self.reserve_worktree_preparation(&queued_turn);
+        drop(_operation);
+        log_executor_event(
+            "runtime work queued turn force started",
+            &[("local_task_id", local_task_id.clone())],
+        );
+        if queued_turn
+            .request
+            .extra
+            .contains_key(project_preparation::DEFERRED_ENVIRONMENT)
+        {
+            self.start_queued_turn(queued_turn);
+        } else if queued_turn
+            .request
+            .extra
+            .contains_key("deferred_worktree_source_path")
+        {
+            self.prepare_and_start_reserved_turn(queued_turn).await?;
+        } else {
+            self.start_turn(queued_turn);
+        }
+        Ok(json!({
+            "success": true,
+            "accepted": true,
+            "started": true,
+            "queued": false,
+            "taskId": local_task_id,
+            "runtime": runtime,
+        }))
+    }
+
+    pub(super) async fn reorder_queued_task(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let local_task_id = runtime_task_id(&payload)
+            .ok_or_else(|| AppIpcError::new("bad_request", "taskId is required"))?;
+        let runtime = self
+            .store
+            .get_task(&local_task_id)
+            .map(|link| link.runtime)
+            .unwrap_or_else(|| "codex".to_owned());
+        let target_position = integer_field(&payload, "queuePosition")
+            .or_else(|| integer_field(&payload, "queue_position"))
+            .ok_or_else(|| AppIpcError::new("bad_request", "queuePosition is required"))?;
+        if target_position < 1 {
+            return Err(AppIpcError::new(
+                "bad_request",
+                "queuePosition must be at least 1",
+            ));
+        }
+        let _operation = self.turn_queue_operation.lock().await;
+        let (previous, ordered_task_ids, reordered) = {
+            let mut scheduler = self
+                .turn_scheduler
+                .lock()
+                .expect("runtime turn scheduler lock should not be poisoned");
+            if scheduler.queued_position(&local_task_id).is_none() {
+                return Ok(json!({
+                    "success": false,
+                    "accepted": false,
+                    "taskId": local_task_id,
+                    "runtime": runtime,
+                    "error": "runtime task is not queued",
+                    "code": "not_queued",
+                }));
+            }
+            let reordered = scheduler
+                .reordered_queue(&local_task_id, target_position as usize)
+                .map_err(|error| AppIpcError::new("runtime_queue_failed", error))?;
+            let previous = scheduler.clone();
+            scheduler.queued_turns = reordered.clone();
+            let ordered_task_ids = scheduler
+                .queued_turns
+                .iter()
+                .map(|turn| turn.local_task_id.clone())
+                .collect::<Vec<_>>();
+            (previous, ordered_task_ids, reordered)
+        };
+        if let Err(error) = self.persist_turn_queue(reordered).await {
+            *self
+                .turn_scheduler
+                .lock()
+                .expect("runtime turn scheduler lock should not be poisoned") = previous;
+            return Err(error);
+        }
+        log_executor_event(
+            "runtime work queued turn reordered",
+            &[
+                ("local_task_id", local_task_id.clone()),
+                ("queue_position", target_position.to_string()),
+            ],
+        );
+        Ok(json!({
+            "success": true,
+            "accepted": true,
+            "taskId": local_task_id,
+            "runtime": runtime,
+            "orderedTaskIds": ordered_task_ids,
+        }))
+    }
+
+    pub(super) fn resolve_pending_request_user_input_for_stop(&self, local_task_id: &str) {
+        let sender = self
+            .active_request_user_inputs
+            .lock()
+            .ok()
+            .and_then(|requests| requests.get(local_task_id).cloned())
+            .map(|request| request.sender);
+        if let Some(sender) = sender {
+            let _ = sender.try_send(empty_request_user_input_response());
+        }
+    }
+
+    pub(super) fn mark_task_running_for_send(
+        &self,
+        local_task_id: &str,
+        thread_id: &str,
+        workspace_path: &str,
+        request: &ExecutionRequest,
+        payload: &Value,
+    ) {
+        let presentation = user_message_presentation(payload);
+        let updated = self.store.update_task(local_task_id, |link| {
+            if link.thread_id.as_deref() != Some(thread_id) {
+                clear_completed_transcript_messages(&mut link.runtime_handle);
+                clear_transcript_snapshot_messages(&mut link.runtime_handle);
+            }
+            link.thread_id = (!thread_id.is_empty()).then(|| thread_id.to_owned());
+            clear_runtime_handle_messages(&mut link.runtime_handle);
+            if let Some(presentation) = presentation.clone() {
+                append_runtime_handle_user_message_presentation(
+                    &mut link.runtime_handle,
+                    presentation,
+                );
+            }
+            link.workspace_path = workspace_path.to_owned();
+            link.ephemeral = link.ephemeral || request.ephemeral;
+            if request.runtime_project_key.is_some() {
+                link.runtime_project_key = request.runtime_project_key.clone();
+            }
+            if !request.runtime_workspace_roots.is_empty() {
+                link.runtime_workspace_roots = request.runtime_workspace_roots.clone();
+            }
+            if !request.system_prompt.trim().is_empty() {
+                link.project_instructions = request.system_prompt.clone();
+            }
+            let plugin_ids = project_plugin_ids(request);
+            if !plugin_ids.is_empty() {
+                link.project_plugin_ids = plugin_ids;
+            }
+            link.updated_at = now_ms();
+            set_runtime_handle_model_selection(&mut link.runtime_handle, payload);
+            apply_runtime_profile_handle(&mut link.runtime_handle, payload);
+            link.interaction_status = None;
+        });
+        if updated.is_some() {
+            return;
+        }
+
+        let mut link = RuntimeTaskLink::new_pending(
+            local_task_id.to_owned(),
+            workspace_path.to_owned(),
+            prompt_text(&request.prompt),
+        );
+        link.thread_id = Some(thread_id.to_owned());
+        link.ephemeral = request.ephemeral;
+        link.runtime_project_key = request.runtime_project_key.clone();
+        link.runtime_workspace_roots = request.runtime_workspace_roots.clone();
+        link.project_instructions = request.system_prompt.clone();
+        link.project_plugin_ids = project_plugin_ids(request);
+        set_runtime_handle_model_selection(&mut link.runtime_handle, payload);
+        apply_runtime_profile_handle(&mut link.runtime_handle, payload);
+        if let Some(presentation) = presentation {
+            append_runtime_handle_user_message_presentation(&mut link.runtime_handle, presentation);
+        }
+        self.upsert_local_task(link);
+    }
+}
+
+fn apply_runtime_profile_handle(runtime_handle: &mut Value, payload: &Value) {
+    if let (Some(handle), Some(profile)) = (
+        runtime_handle.as_object_mut(),
+        payload
+            .get("runtimeHandle")
+            .or_else(|| payload.get("runtime_handle"))
+            .and_then(Value::as_object),
+    ) {
+        for key in [
+            "wegentTeam",
+            COLLABORATION_MANAGER_CONTEXT_KEY,
+            "collaborationDispatchTaskId",
+            "collaborationMemberRuntimeProfiles",
+        ] {
+            if let Some(value) = profile.get(key) {
+                handle.insert(key.to_owned(), value.clone());
+            }
+        }
+    }
+}
+
+fn detach_collaboration_manager_from_backend_execution(
+    manager_request: &mut Value,
+    manager_task_id: &str,
+) {
+    let Some(request) = manager_request.as_object_mut() else {
+        return;
+    };
+    request.insert(
+        "taskId".to_owned(),
+        Value::String(manager_task_id.to_owned()),
+    );
+    request.insert(
+        "localTaskId".to_owned(),
+        Value::String(manager_task_id.to_owned()),
+    );
+    if let Some(origin) = request.get_mut("origin").and_then(Value::as_object_mut) {
+        origin.remove("executionId");
+        origin.remove("execution_id");
+    }
+    let execution_request = if request.contains_key("executionRequest") {
+        request.get_mut("executionRequest")
+    } else {
+        request.get_mut("execution_request")
+    };
+    if let Some(execution_request) = execution_request.and_then(Value::as_object_mut) {
+        execution_request.insert(
+            "task_id".to_owned(),
+            Value::String(manager_task_id.to_owned()),
+        );
+        execution_request.insert(
+            "subtask_id".to_owned(),
+            Value::String(format!("{manager_task_id}-initial")),
+        );
+        if let Some(origin) = execution_request
+            .get_mut("extra")
+            .and_then(Value::as_object_mut)
+            .and_then(|extra| extra.get_mut("origin"))
+            .and_then(Value::as_object_mut)
+        {
+            origin.remove("executionId");
+            origin.remove("execution_id");
+        }
+    }
+}
+
+pub(super) fn forked_task_link(
+    source: &RuntimeTaskLink,
+    local_task_id: String,
+    thread_id: String,
+    title: String,
+    parent: Value,
+) -> RuntimeTaskLink {
+    let mut link = RuntimeTaskLink::new_pending_with_runtime(
+        local_task_id,
+        source.workspace_path.clone(),
+        title,
+        source.runtime.clone(),
+    );
+    link.thread_id = Some(thread_id);
+    link.parent = Some(parent);
+    link.runtime_project_key = source.runtime_project_key.clone();
+    link.runtime_workspace_roots = source.runtime_workspace_roots.clone();
+    link.project_instructions = source.project_instructions.clone();
+    link.project_plugin_ids = source.project_plugin_ids.clone();
+    if let Some(execution_request) = source
+        .runtime_handle
+        .get("executionRequest")
+        .or_else(|| source.runtime_handle.get("execution_request"))
+    {
+        link.runtime_handle["executionRequest"] = execution_request.clone();
+    }
+    if let Some(model_selection) = source
+        .runtime_handle
+        .get("modelSelection")
+        .or_else(|| source.runtime_handle.get("model_selection"))
+    {
+        link.runtime_handle["modelSelection"] = model_selection.clone();
+    }
+    link
+}
+
+fn project_plugin_ids(request: &ExecutionRequest) -> Vec<String> {
+    request
+        .extra
+        .get("project_plugin_ids")
+        .or_else(|| request.extra.get("projectPluginIds"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn apply_runtime_task_start_failure(link: &mut RuntimeTaskLink, error: &AppIpcError) {
+    link.running = false;
+    link.status = "failed".to_owned();
+    link.thread_status = "failed".to_owned();
+    link.turn_status = Some("failed".to_owned());
+    link.updated_at = now_ms();
+    link.completed_at = Some(link.updated_at);
+    normalize_settled_task_state(link);
+    if !link.runtime_handle.is_object() {
+        link.runtime_handle = json!({});
+    }
+    if let Some(runtime_handle) = link.runtime_handle.as_object_mut() {
+        runtime_handle.remove("queuePosition");
+        runtime_handle.insert("lastError".to_owned(), Value::String(error.message.clone()));
+        runtime_handle.insert(
+            "lastErrorCode".to_owned(),
+            Value::String(error.code.clone()),
+        );
+    }
+}
+
+fn normalize_friendly_title(value: &str) -> Option<String> {
+    let title = value
+        .lines()
+        .find_map(|line| {
+            let trimmed = line
+                .trim()
+                .trim_matches(|ch| matches!(ch, '"' | '\'' | '“' | '”' | '‘' | '’' | '`'));
+            (!trimmed.is_empty()).then_some(trimmed)
+        })?
+        .chars()
+        .take(48)
+        .collect::<String>()
+        .trim()
+        .trim_end_matches(['。', '！', '？', '.', '!', '?'])
+        .trim()
+        .to_owned();
+    (!title.is_empty()).then_some(title)
+}
+
+pub(super) fn runtime_model_selection_changed(link: &RuntimeTaskLink, payload: &Value) -> bool {
+    let previous = model_selection_identity(
+        link.runtime_handle
+            .get("modelSelection")
+            .or_else(|| link.runtime_handle.get("model_selection")),
+    );
+    let next = model_selection_identity(
+        payload
+            .get("modelSelection")
+            .or_else(|| payload.get("model_selection")),
+    );
+    previous.is_some() && next.is_some() && previous != next
+}
+
+pub(super) fn mark_runtime_model_switch(
+    request: &mut ExecutionRequest,
+    link: &RuntimeTaskLink,
+    payload: &Value,
+) {
+    if runtime_model_selection_changed(link, payload) {
+        request
+            .extra
+            .insert("wework_model_switched".to_owned(), Value::Bool(true));
+    }
+}
+
+fn model_selection_identity(selection: Option<&Value>) -> Option<(String, Option<String>)> {
+    let selection = selection?.as_object()?;
+    let model_name = selection
+        .get("modelName")
+        .or_else(|| selection.get("model_name"))
+        .and_then(Value::as_str)?
+        .trim();
+    if model_name.is_empty() {
+        return None;
+    }
+    let model_type = selection
+        .get("modelType")
+        .or_else(|| selection.get("model_type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    Some((model_name.to_owned(), model_type))
+}
+
+fn runtime_guidance_failure(
+    local_task_id: &str,
+    active_turn: &ActiveCodexTurn,
+    error: String,
+) -> Value {
+    let code = codex_guidance_failure_code(&error);
+    log_executor_event(
+        "runtime guidance rejected",
+        &[
+            ("local_task_id", local_task_id.to_owned()),
+            ("code", code.to_owned()),
+            ("thread_id", active_turn.thread_id.clone()),
+            ("turn_id", active_turn.turn_id.clone()),
+        ],
+    );
+    json!({
+        "success": false,
+        "accepted": false,
+        "error": error,
+        "code": code,
+        "taskId": local_task_id,
+        "runtime": "codex",
+    })
+}
+
+pub(super) fn resolve_codex_turn_id(
+    link: &RuntimeTaskLink,
+    requested_turn_id: &str,
+) -> Option<String> {
+    let mappings = link
+        .runtime_handle
+        .get("turnIdsBySubtask")
+        .and_then(Value::as_object);
+    if let Some(turn_id) = mappings
+        .and_then(|mappings| mappings.get(requested_turn_id))
+        .and_then(Value::as_str)
+    {
+        return Some(turn_id.to_owned());
+    }
+    if mappings.is_some_and(|mappings| {
+        mappings
+            .values()
+            .any(|turn_id| turn_id.as_str() == Some(requested_turn_id))
+    }) || is_codex_thread_id(requested_turn_id)
+    {
+        return Some(requested_turn_id.to_owned());
+    }
+    if let Some(turn_id) = synthetic_transcript_turn_id_base(requested_turn_id) {
+        if mappings.is_some_and(|mappings| {
+            mappings
+                .values()
+                .any(|mapped_turn_id| mapped_turn_id.as_str() == Some(turn_id))
+        }) || is_codex_thread_id(turn_id)
+        {
+            return Some(turn_id.to_owned());
+        }
+    }
+    None
+}
+
+fn synthetic_transcript_turn_id_base(value: &str) -> Option<&str> {
+    let (turn_id, segment) = value.rsplit_once('-')?;
+    if segment.parse::<usize>().is_err() || !is_codex_thread_id(turn_id) {
+        return None;
+    }
+    Some(turn_id)
+}
+
+fn retry_source_turn_id(payload: &Value) -> Option<String> {
+    string_field(payload, "retrySourceTurnId")
+        .or_else(|| string_field(payload, "retry_source_turn_id"))
+        .filter(|turn_id| !turn_id.trim().is_empty())
+}
+
+fn latest_codex_turn_id(thread: &Value) -> Option<String> {
+    thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.last())
+        .and_then(|turn| string_field(turn, "id"))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::{local::app_ipc::AppIpcError, runtime_work::response::RuntimeTaskLink};
+
+    use super::{
+        apply_runtime_task_start_failure, context_compaction_outcome, normalize_friendly_title,
+    };
+
+    #[test]
+    fn normalizes_model_title_to_one_short_line() {
+        assert_eq!(
+            normalize_friendly_title("  “为任务创建友好标题。”\n这是解释"),
+            Some("为任务创建友好标题".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_empty_model_title() {
+        assert_eq!(normalize_friendly_title(" \n\t "), None);
+    }
+
+    #[test]
+    fn reads_a_completed_context_compaction_from_the_newest_turn() {
+        let thread = json!({
+            "turns": [
+                {
+                    "id": "turn-before",
+                    "items": [{"id": "message-1", "type": "agentMessage"}]
+                },
+                {
+                    "id": "turn-compact",
+                    "status": "completed",
+                    "items": [{"id": "compact-1", "type": "contextCompaction"}]
+                }
+            ]
+        });
+
+        assert_eq!(
+            context_compaction_outcome(&thread, Some("turn-before")),
+            Some(Ok(("turn-compact".to_owned(), "compact-1".to_owned())))
+        );
+        assert_eq!(
+            context_compaction_outcome(&thread, Some("turn-compact")),
+            None
+        );
+    }
+
+    #[test]
+    fn reports_a_compaction_turn_that_ended_without_compacting() {
+        let thread = json!({
+            "turns": [
+                {"id": "turn-before", "status": "completed", "items": []},
+                {
+                    "id": "turn-compact",
+                    "status": "failed",
+                    "error": {"message": "unexpected status 404 Not Found"},
+                    "items": [{"id": "user-1", "type": "userMessage"}]
+                }
+            ]
+        });
+
+        assert_eq!(
+            context_compaction_outcome(&thread, Some("turn-before")),
+            Some(Err(
+                "context compaction ended without compacting: unexpected status 404 Not Found"
+                    .to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn waits_while_the_compaction_turn_is_still_running() {
+        let thread = json!({
+            "turns": [{"id": "turn-compact", "status": "inProgress", "items": []}]
+        });
+
+        assert_eq!(
+            context_compaction_outcome(&thread, Some("turn-before")),
+            None
+        );
+    }
+
+    #[test]
+    fn does_not_treat_a_started_compaction_item_as_completion() {
+        let thread = json!({
+            "turns": [{
+                "id": "turn-compact",
+                "status": "inProgress",
+                "items": [{"id": "compact-1", "type": "contextCompaction"}]
+            }]
+        });
+
+        assert_eq!(
+            context_compaction_outcome(&thread, Some("turn-before")),
+            None
+        );
+    }
+
+    #[test]
+    fn reports_failure_after_a_compaction_item_started() {
+        let thread = json!({
+            "turns": [{
+                "id": "turn-compact",
+                "status": "failed",
+                "error": {"message": "provider rejected compaction"},
+                "items": [{"id": "compact-1", "type": "contextCompaction"}]
+            }]
+        });
+
+        assert_eq!(
+            context_compaction_outcome(&thread, Some("turn-before")),
+            Some(Err(
+                "context compaction ended without compacting: provider rejected compaction"
+                    .to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn ignores_the_turn_that_predates_compaction() {
+        let thread = json!({
+            "turns": [{"id": "turn-before", "status": "completed", "items": []}]
+        });
+
+        assert_eq!(
+            context_compaction_outcome(&thread, Some("turn-before")),
+            None
+        );
+        assert_eq!(
+            context_compaction_outcome(&thread, None),
+            Some(Err(
+                "context compaction ended without compacting (completed)".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn ignores_older_turns_while_the_compaction_turn_has_not_started() {
+        let thread = json!({
+            "turns": [
+                {"id": "turn-older", "status": "failed", "items": []},
+                {"id": "turn-before", "status": "completed", "items": []}
+            ]
+        });
+
+        assert_eq!(
+            context_compaction_outcome(&thread, Some("turn-before")),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_an_older_compaction_item_while_the_newest_turn_runs() {
+        let thread = json!({
+            "turns": [
+                {
+                    "id": "turn-older",
+                    "status": "completed",
+                    "items": [{"id": "compact-old", "type": "contextCompaction"}]
+                },
+                {"id": "turn-compact", "status": "inProgress", "items": []}
+            ]
+        });
+
+        assert_eq!(
+            context_compaction_outcome(&thread, Some("turn-older")),
+            None
+        );
+    }
+
+    #[test]
+    fn reports_the_newest_turn_failure_instead_of_an_older_compaction_item() {
+        let thread = json!({
+            "turns": [
+                {
+                    "id": "turn-older",
+                    "status": "completed",
+                    "items": [{"id": "compact-old", "type": "contextCompaction"}]
+                },
+                {"id": "turn-compact", "status": "failed", "items": []}
+            ]
+        });
+
+        assert_eq!(
+            context_compaction_outcome(&thread, Some("turn-older")),
+            Some(Err(
+                "context compaction ended without compacting (failed)".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn keeps_a_compacted_turn_out_of_the_failure_path() {
+        let thread = json!({
+            "turns": [{
+                "id": "turn-compact",
+                "status": "completed",
+                "items": [{"id": "compact-1", "type": "contextCompaction"}]
+            }]
+        });
+
+        assert_eq!(
+            context_compaction_outcome(&thread, Some("turn-before")),
+            Some(Ok(("turn-compact".to_owned(), "compact-1".to_owned())))
+        );
+    }
+
+    #[test]
+    fn failed_runtime_start_keeps_a_diagnosable_task_link() {
+        let mut link = RuntimeTaskLink::new_pending(
+            "task-1".to_owned(),
+            "/workspace/repository".to_owned(),
+            "Task".to_owned(),
+        );
+        link.runtime_handle = json!({"queuePosition": 1});
+        let error = AppIpcError::new(
+            "worktree_source_changed",
+            "Source repository identity changed after planning",
+        );
+
+        apply_runtime_task_start_failure(&mut link, &error);
+
+        assert!(!link.running);
+        assert_eq!(link.status, "failed");
+        assert_eq!(link.thread_status, "failed");
+        assert_eq!(link.turn_status.as_deref(), Some("failed"));
+        assert!(link.completed_at.is_some());
+        assert_eq!(
+            link.runtime_handle["lastError"],
+            "Source repository identity changed after planning"
+        );
+        assert_eq!(
+            link.runtime_handle["lastErrorCode"],
+            "worktree_source_changed"
+        );
+        assert!(link.runtime_handle.get("queuePosition").is_none());
+    }
+}

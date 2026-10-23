@@ -1,0 +1,2662 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import copy
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+from fastapi import HTTPException
+from sqlalchemy import and_, or_
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
+
+from app.core.config import settings
+from app.models.kind import Kind
+from app.models.user import User
+from app.schemas.base_role import BaseRole
+from app.schemas.bot import BotCreate, BotDetail, BotInDB, BotUpdate
+from app.schemas.kind import BaseGhostRef, Bot, Ghost, Model, Shell, SkillRefMeta, Team
+from app.services.adapters.public_model import is_public_model_allowed_for_user_id
+from app.services.adapters.shell_utils import (
+    get_shell_by_name,
+    get_shell_info_by_name,
+    get_shell_type,
+    get_shells_by_names_batch,
+)
+from app.services.adapters.task_kinds.running_tasks import get_running_tasks_for_team
+from app.services.base import BaseService
+from app.services.group_permission import check_group_permission
+from app.services.knowledge.knowledge_service import KnowledgeService
+from app.services.skill_binding_service import skill_binding_service
+from app.services.skill_resolution import build_skill_ref_meta
+from shared.utils.crypto import encrypt_sensitive_data, is_data_encrypted
+
+logger = logging.getLogger(__name__)
+
+
+def _apply_skill_id_mapping(
+    refs: Dict[str, Any], mapping: Dict[int, int]
+) -> Dict[str, Any]:
+    """Update skill_id values in skill_refs dict using the provided mapping."""
+    updated = {}
+    for skill_name, ref_meta in refs.items():
+        if isinstance(ref_meta, dict):
+            old_id = ref_meta.get("skill_id")
+            ref_dict = dict(ref_meta)
+        else:
+            old_id = getattr(ref_meta, "skill_id", None)
+            ref_dict = ref_meta.model_dump()
+        if old_id is not None and old_id in mapping:
+            ref_dict["skill_id"] = mapping[old_id]
+        updated[skill_name] = ref_dict
+    return updated
+
+
+class BotKindsService(BaseService[Kind, BotCreate, BotUpdate]):
+    """
+    Bot service class using kinds table
+    """
+
+    # List of sensitive keys that should be encrypted in agent_config
+    SENSITIVE_CONFIG_KEYS = [
+        "DIFY_API_KEY",
+        # Add more sensitive keys here as needed
+    ]
+
+    @staticmethod
+    def resolve_default_base_ghost_ref(db: Session) -> dict[str, Any]:
+        """Resolve the public chat default's Ghost as the shared baseline."""
+        configured = (settings.DEFAULT_TEAM_CHAT or "").strip()
+        if not configured:
+            raise HTTPException(
+                status_code=400,
+                detail="Default chat agent is not configured",
+            )
+        team_name, _, namespace = configured.partition("#")
+        namespace = namespace or "default"
+        team = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Team",
+                Kind.name == team_name,
+                Kind.namespace == namespace,
+                Kind.is_active.is_(True),
+            )
+            .first()
+        )
+        if not team or not team.json:
+            raise HTTPException(
+                status_code=400,
+                detail="Default chat agent is unavailable",
+            )
+        team_crd = Team.model_validate(team.json)
+        leader = next(
+            (
+                member
+                for member in (team_crd.spec.members or [])
+                if member.role == "leader"
+            ),
+            None,
+        ) or next(iter(team_crd.spec.members or []), None)
+        if leader is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Default chat agent has no bot",
+            )
+        bot = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Bot",
+                Kind.name == leader.botRef.name,
+                Kind.namespace == leader.botRef.namespace,
+                Kind.is_active.is_(True),
+            )
+            .first()
+        )
+        if not bot or not bot.json:
+            raise HTTPException(
+                status_code=400,
+                detail="Default chat agent bot is unavailable",
+            )
+        bot_crd = Bot.model_validate(bot.json)
+        return {
+            "name": bot_crd.spec.ghostRef.name,
+            "namespace": bot_crd.spec.ghostRef.namespace,
+            "user_id": 0,
+        }
+
+    @staticmethod
+    def _resolve_create_capability_mode(obj_in: BotCreate) -> str:
+        if obj_in.capability_mode is not None:
+            return obj_in.capability_mode
+        has_explicit_capabilities = any(
+            (
+                obj_in.inherit_base_capabilities,
+                obj_in.mcp_servers,
+                obj_in.plugins,
+                obj_in.skills,
+                obj_in.preload_skills,
+            )
+        )
+        return "manual" if has_explicit_capabilities else "follow_device"
+
+    def _require_bot_permission(
+        self,
+        db: Session,
+        *,
+        bot: Kind,
+        user_id: int,
+        required_role: BaseRole,
+    ) -> None:
+        """Require ownership or the requested role in the Bot namespace."""
+        if bot.user_id == user_id:
+            return
+        if bot.namespace != "default" and check_group_permission(
+            db,
+            user_id,
+            bot.namespace,
+            required_role,
+        ):
+            return
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    def _validate_default_knowledge_bases(
+        self,
+        db: Session,
+        refs: Optional[List[Any]],
+        user_id: int,
+        namespace: str,
+    ) -> None:
+        """Restrict group bots to current-group and organization knowledge bases."""
+        if not refs:
+            return
+
+        inaccessible_refs = [
+            ref.name
+            for ref in refs
+            if not KnowledgeService.can_directly_access_knowledge_base(
+                db,
+                ref.id,
+                user_id,
+            )
+        ]
+        if inaccessible_refs:
+            raise HTTPException(
+                status_code=400,
+                detail="Default knowledge bases are not directly accessible",
+            )
+
+        if namespace == "default":
+            return
+
+        grouped_kbs = KnowledgeService.get_all_knowledge_bases_grouped(
+            db=db,
+            user_id=user_id,
+        )
+
+        allowed_ids = {kb.id for kb in grouped_kbs.organization.knowledge_bases}
+        current_group = next(
+            (group for group in grouped_kbs.groups if group.group_name == namespace),
+            None,
+        )
+        if current_group is not None:
+            allowed_ids.update(kb.id for kb in current_group.knowledge_bases)
+
+        invalid_refs = [ref.name for ref in refs if ref.id not in allowed_ids]
+        if invalid_refs:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Group bots can only bind knowledge bases from the current "
+                    "group or the organization"
+                ),
+            )
+
+    def _encrypt_agent_config(self, agent_config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Encrypt sensitive data in agent_config before storing
+
+        Args:
+            agent_config: Original agent config dictionary
+
+        Returns:
+            Agent config with encrypted sensitive fields
+        """
+        # Create a deep copy to avoid modifying the original
+        encrypted_config = copy.deepcopy(agent_config)
+
+        # Encrypt sensitive keys in env section
+        if "env" in encrypted_config:
+            for key in self.SENSITIVE_CONFIG_KEYS:
+                if key in encrypted_config["env"]:
+                    value = encrypted_config["env"][key]
+                    # Only encrypt if not already encrypted
+                    if value and not is_data_encrypted(str(value)):
+                        encrypted_config["env"][key] = encrypt_sensitive_data(
+                            str(value)
+                        )
+
+        return encrypted_config
+
+    def _is_predefined_model(self, agent_config: Dict[str, Any]) -> bool:
+        """
+        Check if agent_config is a predefined model reference.
+
+        A predefined model config has:
+        - bind_model: model name
+        - bind_model_type: optional, 'public' or 'user' (defaults to auto-detect)
+        - bind_model_namespace: optional, namespace for the model
+
+        It should NOT have other keys like 'env', 'protocol' etc.
+        """
+        if not agent_config:
+            return False
+        keys = set(agent_config.keys())
+        # Allow bind_model, optional bind_model_type, and optional bind_model_namespace
+        allowed_keys = {"bind_model", "bind_model_type", "bind_model_namespace"}
+        return "bind_model" in keys and keys.issubset(allowed_keys)
+
+    def _get_model_name_from_config(self, agent_config: Dict[str, Any]) -> str:
+        """
+        Get model name from agent_config's bind_model field
+        """
+        if not agent_config:
+            return ""
+        return agent_config.get("bind_model", "")
+
+    def _get_model_type_from_config(
+        self, agent_config: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        Get model type from agent_config's bind_model_type field.
+
+        Returns:
+            'public' or 'user', or None if not specified (auto-detect)
+        """
+        if not agent_config:
+            return None
+        return agent_config.get("bind_model_type")
+
+    def _get_model_namespace_from_config(
+        self, agent_config: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        Get model namespace from agent_config's bind_model_namespace field.
+
+        Returns:
+            The model namespace, or None if not specified (defaults to bot's namespace)
+        """
+        if not agent_config:
+            return None
+        return agent_config.get("bind_model_namespace")
+
+    def _get_protocol_from_config(self, agent_config: Dict[str, Any]) -> Optional[str]:
+        """
+        Get protocol from agent_config's protocol field (for custom configs)
+        """
+        if not agent_config:
+            return None
+        return agent_config.get("protocol")
+
+    def _get_model_by_name_and_type(
+        self,
+        db: Session,
+        model_name: str,
+        namespace: str,
+        owner_id: int,
+        model_type: Optional[str] = None,
+        viewer_id: Optional[int] = None,
+    ) -> Optional[Any]:
+        """
+        Get model by name and optional type from kinds table or public_models table.
+
+        Args:
+            db: Database session
+            model_name: Model name
+            namespace: Namespace
+            owner_id: Owner user ID used for private model lookup
+            model_type: Optional model type ('public' or 'user').
+                       If None, tries user models first, then public.
+            viewer_id: Requesting user ID used for public model whitelist
+                       enforcement. Defaults to owner_id.
+
+        Returns:
+            A Kind object (for both user and public models),
+            or None if not found.
+
+        This lookup also enforces the public-model whitelist. When the supplied
+        user_id is not allowed, it returns None for a restricted public model.
+        Runtime model resolution enforces access separately.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        if model_type == "user":
+            # Only look in user's private models
+            model = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == owner_id,
+                    Kind.kind == "Model",
+                    Kind.name == model_name,
+                    Kind.namespace == namespace,
+                    Kind.is_active.is_(True),
+                )
+                .first()
+            )
+
+            if model:
+                logger.info(
+                    f"[DEBUG] _get_model_by_name_and_type: Found user model {model_name}"
+                )
+                return model
+            return None
+
+        elif model_type == "public":
+            # Only look in public models (kinds table with user_id=0)
+            public_model = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == 0,
+                    Kind.kind == "Model",
+                    Kind.name == model_name,
+                    Kind.namespace == namespace,
+                    Kind.is_active.is_(True),
+                )
+                .first()
+            )
+
+            if public_model:
+                if not is_public_model_allowed_for_user_id(
+                    db,
+                    public_model.json,
+                    viewer_id if viewer_id is not None else owner_id,
+                ):
+                    logger.info(
+                        f"[DEBUG] _get_model_by_name_and_type: public model {model_name} "
+                        "restricted, treating as unselected"
+                    )
+                    return None
+                logger.info(
+                    f"[DEBUG] _get_model_by_name_and_type: Found public model {model_name}"
+                )
+                return public_model
+            return None
+
+        else:
+            # Auto-detect: try user models first, then public
+            model = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == owner_id,
+                    Kind.kind == "Model",
+                    Kind.name == model_name,
+                    Kind.namespace == namespace,
+                    Kind.is_active.is_(True),
+                )
+                .first()
+            )
+
+            if model:
+                logger.info(
+                    f"[DEBUG] _get_model_by_name_and_type: Found user model {model_name} (auto-detect)"
+                )
+                return model
+
+            # Then try to find in public models (kinds table with user_id=0)
+            public_model = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == 0,
+                    Kind.kind == "Model",
+                    Kind.name == model_name,
+                    Kind.namespace == namespace,
+                    Kind.is_active.is_(True),
+                )
+                .first()
+            )
+
+            if public_model:
+                if not is_public_model_allowed_for_user_id(
+                    db,
+                    public_model.json,
+                    viewer_id if viewer_id is not None else owner_id,
+                ):
+                    logger.info(
+                        f"[DEBUG] _get_model_by_name_and_type: public model {model_name} "
+                        "restricted, treating as unselected (auto-detect)"
+                    )
+                    return None
+                logger.info(
+                    f"[DEBUG] _get_model_by_name_and_type: Found public model {model_name} (auto-detect)"
+                )
+                return public_model
+
+            logger.info(
+                f"[DEBUG] _get_model_by_name_and_type: Model {model_name} not found in either table"
+            )
+            return None
+
+    def _get_model_by_name(
+        self,
+        db: Session,
+        model_name: str,
+        namespace: str,
+        owner_id: int,
+        viewer_id: Optional[int] = None,
+    ) -> Optional[Any]:
+        """
+        Get model by name from kinds table (user's private models or public models).
+        Returns a Kind object for both user and public models.
+
+        This is a backward-compatible wrapper around _get_model_by_name_and_type.
+        """
+        return self._get_model_by_name_and_type(
+            db,
+            model_name,
+            namespace,
+            owner_id,
+            model_type=None,
+            viewer_id=viewer_id,
+        )
+
+    # Note: _get_shell_info_by_name has been moved to shell_utils.py
+    # Use get_shell_info_by_name from shell_utils instead
+
+    def create_with_user(
+        self,
+        db: Session,
+        *,
+        obj_in: BotCreate,
+        user_id: int,
+        commit: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Create user Bot using kinds table.
+
+        Bot's shellRef directly points to the user-selected Shell (custom or public),
+        instead of creating a dedicated shell for each bot.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        # Use namespace from request, default to 'default'
+        namespace = obj_in.namespace or "default"
+
+        # Check duplicate bot name under the same user and namespace (only active bots)
+        existing = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == user_id,
+                Kind.kind == "Bot",
+                Kind.name == obj_in.name,
+                Kind.namespace == namespace,
+                Kind.is_active == True,
+            )
+            .first()
+        )
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="Bot name already exists, please modify the name",
+            )
+
+        skill_refs = (
+            self._resolve_skill_refs(
+                db=db,
+                skill_names=obj_in.skills,
+                user_id=user_id,
+                namespace=namespace,
+                provided_refs=obj_in.skill_refs,
+                target_group_names=obj_in.target_group_names,
+            )
+            if obj_in.skills
+            else {}
+        )
+        preload_skill_refs = (
+            self._resolve_skill_refs(
+                db=db,
+                skill_names=obj_in.preload_skills,
+                user_id=user_id,
+                namespace=namespace,
+                provided_refs=obj_in.preload_skill_refs,
+                target_group_names=obj_in.target_group_names,
+            )
+            if obj_in.preload_skills
+            else {}
+        )
+        self._validate_default_knowledge_bases(
+            db,
+            obj_in.default_knowledge_base_refs,
+            user_id,
+            namespace,
+        )
+
+        # Encrypt sensitive data in agent_config before storing
+        encrypted_agent_config = self._encrypt_agent_config(obj_in.agent_config)
+
+        # Create Ghost
+        ghost_spec = {
+            "systemPrompt": obj_in.system_prompt or "",
+            "mcpServers": obj_in.mcp_servers or {},
+            "plugins": obj_in.plugins or [],
+        }
+        if obj_in.inherit_base_capabilities:
+            ghost_spec["baseGhostRef"] = self.resolve_default_base_ghost_ref(db)
+        if obj_in.default_knowledge_base_refs is not None:
+            ghost_spec["defaultKnowledgeBaseRefs"] = [
+                ref.model_dump() for ref in obj_in.default_knowledge_base_refs
+            ]
+        if obj_in.skills:
+            ghost_spec["skills"] = obj_in.skills
+            if skill_refs:
+                ghost_spec["skill_refs"] = {
+                    name: ref.model_dump() for name, ref in skill_refs.items()
+                }
+        if obj_in.preload_skills:
+            ghost_spec["preload_skills"] = obj_in.preload_skills
+            if preload_skill_refs:
+                ghost_spec["preload_skill_refs"] = {
+                    name: ref.model_dump() for name, ref in preload_skill_refs.items()
+                }
+
+        ghost_name = self._find_available_name(
+            db,
+            base_name=f"{obj_in.name}-ghost",
+            kind="Ghost",
+            user_id=user_id,
+            namespace=namespace,
+        )
+
+        ghost_json = {
+            "kind": "Ghost",
+            "spec": ghost_spec,
+            "status": {"state": "Available"},
+            "metadata": {"name": ghost_name, "namespace": namespace},
+            "apiVersion": "agent.wecode.io/v1",
+        }
+
+        ghost = Kind(
+            user_id=user_id,
+            kind="Ghost",
+            name=ghost_name,
+            namespace=namespace,
+            json=ghost_json,
+            is_active=True,
+        )
+        db.add(ghost)
+
+        # Determine model reference
+        # If agent_config is predefined model format (only bind_model), reference existing model
+        # Otherwise, create a private model for this bot
+        model = None
+        model_ref_name = f"{obj_in.name}-model"
+        model_ref_namespace = namespace
+
+        if bool(obj_in.execution_policy) != bool(obj_in.model_policy):
+            raise HTTPException(
+                422, "Environment and model policies must be configured together"
+            )
+        if obj_in.execution_policy is not None:
+            model_ref_name = None
+        elif self._is_predefined_model(obj_in.agent_config):
+            # Reference existing model by bind_model name
+            model_ref_name = self._get_model_name_from_config(obj_in.agent_config)
+            model_type = self._get_model_type_from_config(obj_in.agent_config)
+            # For public/user models, namespace should be 'default'
+            # For group models, use the specified namespace or bot's namespace
+            if model_type == "group":
+                model_ref_namespace = (
+                    self._get_model_namespace_from_config(obj_in.agent_config)
+                    or namespace
+                )
+            else:
+                # public or user models use 'default' namespace
+                model_ref_namespace = (
+                    self._get_model_namespace_from_config(obj_in.agent_config)
+                    or "default"
+                )
+            # Don't create a new model, just reference the existing one
+        else:
+            # Create private Model for custom config
+            # Extract protocol from agent_config (it's a top-level field, not inside modelConfig)
+            protocol = self._get_protocol_from_config(obj_in.agent_config)
+
+            # Remove protocol from the config that goes into modelConfig (it's stored separately)
+            model_config = {
+                k: v for k, v in obj_in.agent_config.items() if k != "protocol"
+            }
+
+            model_json = {
+                "kind": "Model",
+                "spec": {
+                    "modelConfig": model_config,
+                    "isCustomConfig": True,  # Mark as user custom config
+                    "protocol": protocol,  # Store protocol at spec level
+                },
+                "status": {"state": "Available"},
+                "metadata": {"name": f"{obj_in.name}-model", "namespace": namespace},
+                "apiVersion": "agent.wecode.io/v1",
+            }
+
+            model = Kind(
+                user_id=user_id,
+                kind="Model",
+                name=f"{obj_in.name}-model",
+                namespace=namespace,
+                json=model_json,
+                is_active=True,
+            )
+            db.add(model)
+
+        # Get shell info by name (resolves actual shell_type from shell_name)
+        # The shell_name is the name of the user-selected Shell (custom or public)
+        try:
+            shell_info = get_shell_info_by_name(db, obj_in.shell_name, user_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        logger.info(
+            f"[DEBUG] create_with_user: shell_name={obj_in.shell_name}, "
+            f"resolved shell_type={shell_info['shell_type']}, "
+            f"execution_type={shell_info['execution_type']}, "
+            f"base_image={shell_info['base_image']}, "
+            f"is_custom={shell_info['is_custom']}"
+        )
+
+        from app.services.runner_routing import validate_agent_policies
+
+        validate_agent_policies(
+            db,
+            user_id=user_id,
+            policy=obj_in.execution_policy,
+            model_policy=obj_in.model_policy,
+            runtime={"Codex": "codex", "ClaudeCode": "claude_code"}.get(
+                shell_info["shell_type"], shell_info["shell_type"]
+            ),
+        )
+
+        # Bot's shellRef directly points to the user-selected Shell
+        # No need to create a dedicated shell for each bot
+        # Use the shell's actual namespace (public shells are in 'default' namespace)
+        shell_ref_name = obj_in.shell_name
+        shell_ref_namespace = shell_info.get("namespace", "default")
+
+        # Create Bot with shellRef pointing to the user-selected Shell
+        bot_spec = {
+            "ghostRef": {"name": ghost_name, "namespace": namespace},
+            "shellRef": {"name": shell_ref_name, "namespace": shell_ref_namespace},
+            "modelRef": (
+                {"name": model_ref_name, "namespace": model_ref_namespace}
+                if model_ref_name
+                else None
+            ),
+            "capability_mode": self._resolve_create_capability_mode(obj_in),
+        }
+        for field in ("execution_policy", "model_policy"):
+            value = getattr(obj_in, field)
+            if value is not None:
+                bot_spec[field] = value.model_dump()
+        if obj_in.secondary_model_name:
+            bot_spec["secondaryModelRef"] = {
+                "name": obj_in.secondary_model_name,
+                "namespace": obj_in.secondary_model_namespace or "default",
+            }
+
+        bot_json = {
+            "kind": "Bot",
+            "spec": bot_spec,
+            "status": {"state": "Available"},
+            "metadata": {"name": obj_in.name, "namespace": namespace},
+            "apiVersion": "agent.wecode.io/v1",
+        }
+
+        bot = Kind(
+            user_id=user_id,
+            kind="Bot",
+            name=obj_in.name,
+            namespace=namespace,
+            json=bot_json,
+            is_active=True,
+        )
+        db.add(bot)
+
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+        db.refresh(bot)
+
+        # Get the referenced model for response
+        if model is None:
+            # For predefined model, fetch from database
+            model = self._get_model_by_name(
+                db, model_ref_name, model_ref_namespace, user_id
+            )
+        else:
+            db.refresh(model)
+
+        # Get the shell for response (from user's custom shells or public shells)
+        shell = get_shell_by_name(db, shell_ref_name, user_id)
+
+        # Return bot-like structure
+        return self._convert_to_bot_dict(bot, ghost, shell, model, obj_in.agent_config)
+
+    def query_bots_by_namespaces(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        namespaces: List[str],
+        skip: int = 0,
+        limit: int = 100,
+    ) -> List[Kind]:
+        """
+        Query bots from specified namespaces with namespace-specific logic.
+        Public method that can be called by other services.
+
+        Query logic:
+        - If namespace='default': first query user_id==user_id, if not found then query user_id==0 (public)
+        - If namespace!='default': query without user_id condition (group bots)
+
+        Args:
+            db: Database session
+            user_id: User ID
+            namespaces: List of namespaces to query
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+
+        Returns:
+            List of Bot Kind objects
+        """
+        # Separate default and non-default namespaces
+        default_namespaces = [ns for ns in namespaces if ns == "default"]
+        group_namespaces = [ns for ns in namespaces if ns != "default"]
+
+        bots = []
+
+        # Query for default namespace: first try user_id==user_id, then user_id==0
+        if default_namespaces:
+            # First query: user's personal bots in default namespace
+            user_bots = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == user_id,
+                    Kind.kind == "Bot",
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+                .order_by(Kind.created_at.desc())
+                .offset(skip)
+                .limit(limit)
+                .all()
+            )
+
+            if user_bots:
+                bots.extend(user_bots)
+            else:
+                # If no user bots found, query public bots (user_id==0)
+                public_bots = (
+                    db.query(Kind)
+                    .filter(
+                        Kind.user_id == 0,
+                        Kind.kind == "Bot",
+                        Kind.namespace == "default",
+                        Kind.is_active == True,
+                    )
+                    .order_by(Kind.created_at.desc())
+                    .offset(skip)
+                    .limit(limit)
+                    .all()
+                )
+                bots.extend(public_bots)
+
+        # Query for group namespaces: no user_id condition
+        if group_namespaces:
+            group_bots = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Bot",
+                    Kind.namespace.in_(group_namespaces),
+                    Kind.is_active == True,
+                )
+                .order_by(Kind.created_at.desc())
+                .offset(skip)
+                .limit(limit)
+                .all()
+            )
+            bots.extend(group_bots)
+
+        return bots
+
+    def get_user_bots(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        skip: int = 0,
+        limit: int = 100,
+        scope: str = "personal",
+        group_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get user's Bot list (only active bots)
+        Optimization: avoid N+1 queries by batch-fetching Ghost/Shell/Model components to significantly reduce database round trips.
+
+        Scope behavior:
+        - scope='personal' (default): personal bots only (namespace='default')
+        - scope='group': group bots (requires group_name or queries all user's groups)
+        - scope='all': personal + all user's groups
+        """
+        from app.services.group_permission import get_user_groups
+
+        # Determine which namespaces to query based on scope
+        namespaces_to_query = []
+
+        if scope == "personal":
+            # Personal bots only (default namespace)
+            namespaces_to_query = ["default"]
+        elif scope == "group":
+            # Group bots - if group_name not provided, query all user's groups
+            if group_name:
+                namespaces_to_query = [group_name]
+            else:
+                # Query all user's groups (excluding default)
+                user_groups = get_user_groups(db, user_id)
+                namespaces_to_query = user_groups if user_groups else []
+        elif scope == "all":
+            # Personal + all user's groups
+            namespaces_to_query = ["default"] + get_user_groups(db, user_id)
+        else:
+            raise ValueError(f"Invalid scope: {scope}")
+
+        # Handle empty namespaces case
+        if not namespaces_to_query:
+            return []
+
+        # Use the extracted query method
+        bots = self.query_bots_by_namespaces(
+            db, user_id=user_id, namespaces=namespaces_to_query, skip=skip, limit=limit
+        )
+
+        if not bots:
+            return []
+
+        # Batch-fetch related components to avoid 3 separate queries per bot
+        bot_crds, ghost_map, shell_map, model_map = self._get_bot_components_batch(
+            db, bots, user_id
+        )
+
+        result = []
+        for bot in bots:
+            bot_crd = bot_crds.get(bot.id)
+            ghost = None
+            shell = None
+            model = None
+            if bot_crd:
+                ghost = ghost_map.get(
+                    (bot_crd.spec.ghostRef.name, bot_crd.spec.ghostRef.namespace)
+                )
+                shell = shell_map.get(
+                    (bot_crd.spec.shellRef.name, bot_crd.spec.shellRef.namespace)
+                )
+                # modelRef is optional, only get if it exists
+                if bot_crd.spec.modelRef:
+                    model = model_map.get(
+                        (bot_crd.spec.modelRef.name, bot_crd.spec.modelRef.namespace)
+                    )
+            result.append(self._convert_to_bot_dict(bot, ghost, shell, model))
+
+        return result
+
+    def get_by_id_and_user(
+        self, db: Session, *, bot_id: int, user_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get Bot by ID and user ID (only active bots)
+        """
+        bot = (
+            db.query(Kind)
+            .filter(
+                Kind.id == bot_id,
+                Kind.kind == "Bot",
+                Kind.is_active == True,
+            )
+            .first()
+        )
+
+        if not bot:
+            raise HTTPException(status_code=404, detail="Bot not found")
+
+        self._require_bot_permission(
+            db,
+            bot=bot,
+            user_id=user_id,
+            required_role=BaseRole.Developer,
+        )
+
+        ghost, shell, model = self._get_bot_components(
+            db, bot, bot.user_id, viewer_id=user_id
+        )
+        return self._convert_to_bot_dict(bot, ghost, shell, model)
+
+    def get_bot_detail(
+        self, db: Session, *, bot_id: int, user_id: int
+    ) -> Dict[str, Any]:
+        """
+        Get detailed bot information including related user
+        """
+        bot_dict = self.get_by_id_and_user(db, bot_id=bot_id, user_id=user_id)
+
+        # Get related user
+        user = db.query(User).filter(User.id == user_id).first()
+        bot_dict["user"] = user
+
+        return bot_dict
+
+    def update_with_user(
+        self, db: Session, *, bot_id: int, obj_in: BotUpdate, user_id: int
+    ) -> Dict[str, Any]:
+        """
+        Update user Bot
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        bot = (
+            db.query(Kind)
+            .filter(
+                Kind.id == bot_id,
+                Kind.kind == "Bot",
+                Kind.is_active == True,
+            )
+            .first()
+        )
+
+        if not bot:
+            raise HTTPException(status_code=404, detail="Bot not found")
+
+        self._require_bot_permission(
+            db,
+            bot=bot,
+            user_id=user_id,
+            required_role=BaseRole.Developer,
+        )
+
+        update_data = obj_in.model_dump(exclude_unset=True)
+        logger.info(f"[DEBUG] update_with_user: update_data={update_data}")
+        provided_skill_refs = obj_in.skill_refs if "skill_refs" in update_data else None
+        provided_preload_skill_refs = (
+            obj_in.preload_skill_refs if "preload_skill_refs" in update_data else None
+        )
+
+        # If updating name, ensure uniqueness under the same user (only active bots), excluding current bot
+        if "name" in update_data:
+            new_name = update_data["name"]
+            if new_name != bot.name:
+                # Build dynamic filter conditions based on namespace
+                filter_conditions = [
+                    Kind.kind == "Bot",
+                    Kind.name == new_name,
+                    Kind.namespace == obj_in.namespace,
+                    Kind.is_active == True,
+                    Kind.id != bot.id,
+                ]
+
+                # Only add user_id filter for default namespace
+                if obj_in.namespace == "default":
+                    filter_conditions.append(Kind.user_id == user_id)
+
+                conflict = db.query(Kind).filter(*filter_conditions).first()
+                if conflict:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Bot name already exists, please modify the name",
+                    )
+
+        # Get related components
+        ghost, shell, model = self._get_bot_components(
+            db, bot, bot.user_id, viewer_id=user_id
+        )
+        if "default_knowledge_base_refs" in update_data:
+            self._validate_default_knowledge_bases(
+                db,
+                obj_in.default_knowledge_base_refs,
+                user_id,
+                bot.namespace or "default",
+            )
+
+        # Track the agent_config to return (for predefined models)
+        return_agent_config = None
+
+        # Update components based on update_data
+        if "name" in update_data:
+            new_name = update_data["name"]
+            # Update bot
+            bot.name = new_name
+            bot_crd = Bot.model_validate(bot.json)
+            bot_crd.metadata.name = new_name
+            bot.json = bot_crd.model_dump()
+            flag_modified(bot, "json")  # Mark JSON field as modified
+        if "shell_name" in update_data:
+            # Update Bot's shellRef to point directly to the user-selected Shell
+            new_shell_name = update_data["shell_name"]
+            try:
+                shell_info = get_shell_info_by_name(db, new_shell_name, user_id)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            logger.info(
+                f"[DEBUG] update_with_user: shell_name={new_shell_name}, "
+                f"resolved shell_type={shell_info['shell_type']}, "
+                f"execution_type={shell_info['execution_type']}, "
+                f"base_image={shell_info['base_image']}, "
+                f"is_custom={shell_info['is_custom']}, "
+                f"namespace={shell_info.get('namespace', 'default')}"
+            )
+
+            # Update Bot's shellRef to point to the user-selected Shell
+            # Use the shell's actual namespace (public shells are in 'default' namespace)
+            bot_crd = Bot.model_validate(bot.json)
+            bot_crd.spec.shellRef.name = new_shell_name
+            bot_crd.spec.shellRef.namespace = shell_info.get("namespace", "default")
+            bot.json = bot_crd.model_dump()
+            flag_modified(bot, "json")
+
+            # Update shell reference for response
+            shell = get_shell_by_name(db, new_shell_name, user_id)
+
+        if "agent_config" in update_data:
+            bot_crd = Bot.model_validate(bot.json)
+            new_agent_config = update_data["agent_config"]
+            logger.info(f"[DEBUG] Updating agent_config: {new_agent_config}")
+
+            if obj_in.execution_policy is not None:
+                bot_crd.spec.modelRef = None
+                return_agent_config = new_agent_config
+            elif self._is_predefined_model(new_agent_config):
+                # For predefined model, update bot's modelRef to point to the selected model
+                model_name = self._get_model_name_from_config(new_agent_config)
+                model_type = self._get_model_type_from_config(new_agent_config)
+                # For public/user models, namespace should be 'default'
+                # For group models, use the specified namespace or bot's namespace
+                if model_type == "group":
+                    model_namespace = (
+                        self._get_model_namespace_from_config(new_agent_config)
+                        or bot.namespace
+                        or "default"
+                    )
+                else:
+                    # public or user models use 'default' namespace
+                    model_namespace = (
+                        self._get_model_namespace_from_config(new_agent_config)
+                        or "default"
+                    )
+                logger.info(
+                    f"[DEBUG] Predefined model detected, updating modelRef to: {model_name}, type: {model_type}, namespace: {model_namespace}"
+                )
+
+                # Update bot's modelRef
+                bot_crd = Bot.model_validate(bot.json)
+                from app.schemas.kind import ModelRef
+
+                if bot_crd.spec.modelRef:
+                    bot_crd.spec.modelRef.name = model_name
+                    bot_crd.spec.modelRef.namespace = model_namespace
+                else:
+                    # Create new modelRef if it doesn't exist
+                    bot_crd.spec.modelRef = ModelRef(
+                        name=model_name, namespace=model_namespace
+                    )
+                bot.json = bot_crd.model_dump()
+                flag_modified(bot, "json")
+
+                # Only delete old model if it's a user's private custom model (not public or predefined)
+                # A private custom model must satisfy:
+                # 1. It's a Kind object with user_id matching the bot's owner (not public model with user_id=0)
+                # 2. It has the naming pattern "{bot.name}-model" (dedicated to this bot)
+                # 3. It has isCustomConfig=True in the model spec
+                if model and model.name != model_name:
+                    # Check if it's a user's private model (not public)
+                    is_user_model = isinstance(model, Kind) and model.user_id != 0
+                    if is_user_model:
+                        # Check if it's a dedicated private custom model for this bot
+                        dedicated_model_name = f"{bot.name}-model"
+                        is_dedicated_model = model.name == dedicated_model_name
+
+                        # Check if it has isCustomConfig=True
+                        is_custom_config = False
+                        if model.json:
+                            model_crd = Model.model_validate(model.json)
+                            is_custom_config = model_crd.spec.isCustomConfig or False
+
+                        # Only delete if it's a dedicated private custom model
+                        if is_dedicated_model and is_custom_config:
+                            logger.info(
+                                f"[DEBUG] Deleting old private custom model: {model.name}"
+                            )
+                            db.delete(model)
+                            model = None
+                        else:
+                            logger.info(
+                                f"[DEBUG] Not deleting model {model.name}: is_dedicated={is_dedicated_model}, is_custom_config={is_custom_config}"
+                            )
+                    else:
+                        logger.info(
+                            f"[DEBUG] Not deleting model {model.name}: it's a public model"
+                        )
+
+                # Get the new model for response using type hint
+                model = self._get_model_by_name_and_type(
+                    db, model_name, model_namespace, user_id, model_type
+                )
+                return_agent_config = new_agent_config
+            else:
+                # For custom config, we need to check if we should update existing model or create new one
+                # We should only update if the model is a dedicated private model for this bot
+                # Otherwise, we need to create a new private model
+
+                # Extract protocol from agent_config
+                protocol = self._get_protocol_from_config(new_agent_config)
+                # Remove protocol from the config that goes into modelConfig
+                model_config = {
+                    k: v for k, v in new_agent_config.items() if k != "protocol"
+                }
+
+                dedicated_model_name = f"{bot.name}-model"
+
+                # Check if we have an existing dedicated private model for this bot
+                is_dedicated_private_model = False
+                if model and isinstance(model, Kind):
+                    # Check if it's a dedicated model for this bot
+                    is_dedicated_model = model.name == dedicated_model_name
+                    # Check if it has isCustomConfig=True
+                    is_custom_config = False
+                    if model.json:
+                        model_crd = Model.model_validate(model.json)
+                        is_custom_config = model_crd.spec.isCustomConfig or False
+                    is_dedicated_private_model = is_dedicated_model and is_custom_config
+
+                if is_dedicated_private_model:
+                    # Update the existing dedicated private model
+                    logger.info(
+                        f"[DEBUG] Custom config, updating existing dedicated private model: {model.name}"
+                    )
+                    model_crd = Model.model_validate(model.json)
+                    model_crd.spec.modelConfig = model_config
+                    model_crd.spec.isCustomConfig = True
+                    model_crd.spec.protocol = protocol
+                    model.json = model_crd.model_dump()
+                    flag_modified(model, "json")
+                    db.add(model)
+                elif (
+                    model
+                    and isinstance(model, Kind)
+                    and model.name == dedicated_model_name
+                ):
+                    # The model exists with the dedicated name but is not marked as custom config, update it
+                    logger.info(
+                        f"[DEBUG] Custom config, updating existing model (marking as custom): {model.name}"
+                    )
+                    model_crd = Model.model_validate(model.json)
+                    model_crd.spec.modelConfig = model_config
+                    model_crd.spec.isCustomConfig = True
+                    model_crd.spec.protocol = protocol
+                    model.json = model_crd.model_dump()
+                    flag_modified(model, "json")
+                    db.add(model)
+                else:
+                    # No existing dedicated private model, create a new one
+                    # This happens when:
+                    # 1. model is None (no model at all)
+                    # 2. model is a public model (user_id=0, can't be modified)
+                    # 3. model is a Kind but not dedicated to this bot (shared model)
+                    logger.info("[DEBUG] Creating new private model for custom config")
+
+                    # Use the bot's namespace for the custom model
+                    bot_namespace = bot.namespace or "default"
+                    model_json = {
+                        "kind": "Model",
+                        "spec": {
+                            "modelConfig": model_config,
+                            "isCustomConfig": True,
+                            "protocol": protocol,
+                        },
+                        "status": {"state": "Available"},
+                        "metadata": {
+                            "name": f"{bot.name}-model",
+                            "namespace": bot_namespace,
+                        },
+                        "apiVersion": "agent.wecode.io/v1",
+                    }
+
+                    model = Kind(
+                        user_id=user_id,
+                        kind="Model",
+                        name=dedicated_model_name,
+                        namespace=bot_namespace,
+                        json=model_json,
+                        is_active=True,
+                    )
+                    db.add(model)
+
+                    # Update bot's modelRef to point to the new dedicated model
+                    bot_crd = Bot.model_validate(bot.json)
+                    from app.schemas.kind import ModelRef
+
+                    if bot_crd.spec.modelRef:
+                        bot_crd.spec.modelRef.name = dedicated_model_name
+                        bot_crd.spec.modelRef.namespace = bot_namespace
+                    else:
+                        # Create new modelRef
+                        bot_crd.spec.modelRef = ModelRef(
+                            name=dedicated_model_name, namespace=bot_namespace
+                        )
+                    bot.json = bot_crd.model_dump()
+                    flag_modified(bot, "json")
+
+        if "secondary_model_name" in update_data:
+            from app.schemas.kind import ModelRef
+
+            bot_crd = Bot.model_validate(bot.json)
+            secondary_model_name = update_data.get("secondary_model_name")
+            if secondary_model_name:
+                bot_crd.spec.secondaryModelRef = ModelRef(
+                    name=secondary_model_name,
+                    namespace=update_data.get("secondary_model_namespace") or "default",
+                )
+            else:
+                bot_crd.spec.secondaryModelRef = None
+            bot.json = bot_crd.model_dump()
+            flag_modified(bot, "json")
+
+        if {"execution_policy", "model_policy"} & update_data.keys():
+            bot_crd = Bot.model_validate(bot.json)
+            for field in ("execution_policy", "model_policy"):
+                if field in update_data:
+                    setattr(bot_crd.spec, field, getattr(obj_in, field))
+            if bool(bot_crd.spec.execution_policy) != bool(bot_crd.spec.model_policy):
+                raise HTTPException(
+                    422, "Environment and model policies must be configured together"
+                )
+            if bot_crd.spec.execution_policy:
+                bot_crd.spec.modelRef = None
+                bot_crd.spec.routing_configuration_required = False
+                from app.services.runner_routing import validate_agent_policies
+
+                validate_agent_policies(
+                    db,
+                    user_id=user_id,
+                    policy=bot_crd.spec.execution_policy,
+                    model_policy=bot_crd.spec.model_policy,
+                )
+            bot.json = bot_crd.model_dump()
+            flag_modified(bot, "json")
+        if "capability_mode" in update_data:
+            bot_crd = Bot.model_validate(bot.json)
+            bot_crd.spec.capability_mode = update_data["capability_mode"]
+            bot.json = bot_crd.model_dump()
+            flag_modified(bot, "json")
+
+        if "inherit_base_capabilities" in update_data and ghost:
+            ghost_crd = Ghost.model_validate(ghost.json)
+            if obj_in.inherit_base_capabilities:
+                ghost_crd.spec.baseGhostRef = BaseGhostRef(
+                    **self.resolve_default_base_ghost_ref(db)
+                )
+                bot_crd = Bot.model_validate(bot.json)
+                bot_crd.spec.capability_mode = "manual"
+                bot.json = bot_crd.model_dump()
+                flag_modified(bot, "json")
+            else:
+                ghost_crd.spec.baseGhostRef = None
+            ghost.json = ghost_crd.model_dump()
+            flag_modified(ghost, "json")
+            db.add(ghost)
+
+        if "system_prompt" in update_data and ghost:
+            ghost_crd = Ghost.model_validate(ghost.json)
+            ghost_crd.spec.systemPrompt = update_data["system_prompt"] or ""
+            ghost.json = ghost_crd.model_dump()
+            flag_modified(ghost, "json")  # Mark JSON field as modified
+
+        if "mcp_servers" in update_data and ghost:
+            ghost_crd = Ghost.model_validate(ghost.json)
+            ghost_crd.spec.mcpServers = update_data["mcp_servers"] or {}
+            ghost.json = ghost_crd.model_dump()
+            flag_modified(ghost, "json")  # Mark JSON field as modified
+            db.add(ghost)  # Add to session
+
+        if "plugins" in update_data and ghost:
+            ghost_crd = Ghost.model_validate(ghost.json)
+            ghost_crd.spec.plugins = update_data["plugins"] or []
+            ghost.json = ghost_crd.model_dump()
+            flag_modified(ghost, "json")
+            db.add(ghost)
+
+        if "default_knowledge_base_refs" in update_data and ghost:
+            ghost_crd = Ghost.model_validate(ghost.json)
+            ghost_crd.spec.defaultKnowledgeBaseRefs = (
+                obj_in.default_knowledge_base_refs or []
+            )
+            ghost.json = ghost_crd.model_dump()
+            flag_modified(ghost, "json")
+            db.add(ghost)
+
+        if "skills" in update_data and ghost:
+            skills = update_data["skills"] or []
+            ghost_crd = Ghost.model_validate(ghost.json)
+            ghost_crd.spec.skills = skills
+            if skills:
+                skill_refs = self._resolve_skill_refs(
+                    db=db,
+                    skill_names=skills,
+                    user_id=user_id,
+                    namespace=bot.namespace or "default",
+                    provided_refs=provided_skill_refs,
+                    target_group_names=obj_in.target_group_names,
+                )
+                if skill_refs:
+                    ghost_crd.spec.skill_refs = {
+                        name: ref.model_dump() for name, ref in skill_refs.items()
+                    }
+            else:
+                ghost_crd.spec.skill_refs = None
+            ghost.json = ghost_crd.model_dump()
+            flag_modified(ghost, "json")
+            db.add(ghost)
+
+        if "preload_skills" in update_data and ghost:
+            # Update preload_skills in Ghost CRD
+            preload_skills = update_data["preload_skills"] or []
+            ghost_crd = Ghost.model_validate(ghost.json)
+            ghost_crd.spec.preload_skills = preload_skills
+            if preload_skills:
+                preload_skill_refs = self._resolve_skill_refs(
+                    db=db,
+                    skill_names=preload_skills,
+                    user_id=user_id,
+                    namespace=bot.namespace or "default",
+                    provided_refs=provided_preload_skill_refs,
+                    target_group_names=obj_in.target_group_names,
+                )
+                if preload_skill_refs:
+                    ghost_crd.spec.preload_skill_refs = {
+                        name: ref.model_dump()
+                        for name, ref in preload_skill_refs.items()
+                    }
+            else:
+                ghost_crd.spec.preload_skill_refs = None
+            ghost.json = ghost_crd.model_dump()
+            flag_modified(ghost, "json")
+            db.add(ghost)
+
+        # Timestamps are maintained by the ORM onupdate hook (database clock).
+        db.commit()
+        db.refresh(bot)
+        if ghost:
+            db.refresh(ghost)
+        # Note: shell may be a public shell (user_id=0) which doesn't need refresh
+        if shell and isinstance(shell, Kind):
+            db.refresh(shell)
+        if model and hasattr(model, "id"):
+            try:
+                db.refresh(model)
+            except (AttributeError, TypeError) as e:
+                logger.debug("Model refresh skipped: %s", e)
+
+        return self._convert_to_bot_dict(bot, ghost, shell, model, return_agent_config)
+
+    def _get_teams_using_bot(
+        self, db: Session, bot_name: str, bot_namespace: str, user_id: int
+    ) -> List[Kind]:
+        """
+        Get all teams that reference this bot.
+
+        Args:
+            db: Database session
+            bot_name: Bot name
+            bot_namespace: Bot namespace
+            user_id: User ID
+
+        Returns:
+            List of teams that reference this bot
+        """
+        teams = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == user_id, Kind.kind == "Team", Kind.is_active == True
+            )
+            .all()
+        )
+
+        teams_using_bot = []
+        for team in teams:
+            team_crd = Team.model_validate(team.json)
+            for member in team_crd.spec.members:
+                if (
+                    member.botRef.name == bot_name
+                    and member.botRef.namespace == bot_namespace
+                ):
+                    teams_using_bot.append(team)
+                    break
+
+        return teams_using_bot
+
+    def _get_running_tasks_for_teams(
+        self, db: Session, teams: List[Kind]
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all running tasks for the given teams.
+
+        Args:
+            db: Database session
+            teams: List of teams to check
+
+        Returns:
+            List of running task info dictionaries
+        """
+        if not teams:
+            return []
+
+        running_tasks = []
+        for team in teams:
+            for running_task in get_running_tasks_for_team(db, team):
+                running_tasks.append({**running_task, "team_name": team.name})
+
+        return running_tasks
+
+    def check_running_tasks(
+        self, db: Session, *, bot_id: int, user_id: int
+    ) -> Dict[str, Any]:
+        """
+        Check if a bot has any running tasks (through teams that use this bot).
+
+        Args:
+            db: Database session
+            bot_id: Bot ID to check
+            user_id: User ID
+
+        Returns:
+            Dictionary with has_running_tasks flag and list of running tasks
+        """
+        bot = (
+            db.query(Kind)
+            .filter(
+                Kind.id == bot_id,
+                Kind.kind == "Bot",
+                Kind.is_active == True,
+            )
+            .first()
+        )
+
+        if not bot:
+            raise HTTPException(status_code=404, detail="Bot not found")
+
+        self._require_bot_permission(
+            db,
+            bot=bot,
+            user_id=user_id,
+            required_role=BaseRole.Developer,
+        )
+
+        bot_name = bot.name
+        bot_namespace = bot.namespace
+
+        # Get teams that use this bot
+        teams_using_bot = self._get_teams_using_bot(
+            db, bot_name, bot_namespace, user_id
+        )
+
+        # Get running tasks for those teams
+        running_tasks = self._get_running_tasks_for_teams(db, teams_using_bot)
+
+        return {
+            "has_running_tasks": len(running_tasks) > 0,
+            "running_tasks_count": len(running_tasks),
+            "running_tasks": running_tasks,
+        }
+
+    def delete_with_user(
+        self, db: Session, *, bot_id: int, user_id: int, force: bool = False
+    ) -> None:
+        """
+        Delete user Bot and related components.
+
+        Note: Shell is not deleted because it's now a reference to user's custom shell
+        or public shell, not a dedicated shell for this bot.
+
+        Args:
+            db: Database session
+            bot_id: Bot ID to delete
+            user_id: User ID
+            force: If True, force delete even if there are running tasks
+        """
+        bot = (
+            db.query(Kind)
+            .filter(
+                Kind.id == bot_id,
+                Kind.kind == "Bot",
+                Kind.is_active == True,
+            )
+            .first()
+        )
+
+        if not bot:
+            raise HTTPException(status_code=404, detail="Bot not found")
+
+        self._require_bot_permission(
+            db,
+            bot=bot,
+            user_id=user_id,
+            required_role=BaseRole.Developer,
+        )
+
+        bot_name = bot.name
+        bot_namespace = bot.namespace
+
+        # Get teams that use this bot
+        teams_using_bot = self._get_teams_using_bot(
+            db, bot_name, bot_namespace, user_id
+        )
+
+        # Check for running tasks if not force delete
+        if not force:
+            running_tasks = self._get_running_tasks_for_teams(db, teams_using_bot)
+            if running_tasks:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Bot '{bot_name}' has {len(running_tasks)} running task(s). Use force=true to delete anyway.",
+                )
+
+        # Check if bot is referenced in any team (still prevent delete if used in teams)
+        if teams_using_bot and not force:
+            team_names = [t.name for t in teams_using_bot]
+            raise HTTPException(
+                status_code=400,
+                detail=f"Bot '{bot_name}' is being used in team(s): {', '.join(team_names)}. Please remove it from the team(s) first.",
+            )
+
+        # Get related components (only ghost needs to be deleted)
+        ghost, shell, model = self._get_bot_components(db, bot, user_id)
+
+        # Delete bot and ghost only
+        # Shell is not deleted because it's a reference to user's custom shell or public shell
+        db.delete(bot)
+        if ghost:
+            db.delete(ghost)
+        # Note: shell is not deleted - it's a shared resource
+
+        db.commit()
+
+    def count_user_bots(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        scope: str = "personal",
+        group_name: Optional[str] = None,
+    ) -> int:
+        """
+        Count user's active bots based on scope.
+
+        Scope behavior:
+        - scope='personal' (default): personal bots only
+        - scope='group': group bots (requires group_name or counts all user's groups)
+        - scope='all': personal + all user's groups
+        """
+        from app.services.group_permission import get_user_groups
+
+        # Determine which namespaces to count based on scope
+        namespaces_to_count = []
+
+        if scope == "personal":
+            namespaces_to_count = ["default"]
+        elif scope == "group":
+            # Group bots - if group_name not provided, count all user's groups
+            if group_name:
+                namespaces_to_count = [group_name]
+            else:
+                # Count all user's groups (excluding default)
+                user_groups = get_user_groups(db, user_id)
+                namespaces_to_count = user_groups if user_groups else []
+        elif scope == "all":
+            namespaces_to_count = ["default"] + get_user_groups(db, user_id)
+        else:
+            raise ValueError(f"Invalid scope: {scope}")
+
+        # Handle empty namespaces case
+        if not namespaces_to_count:
+            return 0
+
+        return (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == user_id,
+                Kind.kind == "Bot",
+                Kind.namespace.in_(namespaces_to_count),
+                Kind.is_active == True,
+            )
+            .count()
+        )
+
+    def _get_bot_components(
+        self, db: Session, bot: Kind, owner_id: int, viewer_id: Optional[int] = None
+    ):
+        """
+        Get Ghost, Shell, Model components for a bot.
+        Model can be from kinds table (private) or public_models table.
+
+        For group resources (namespace != 'default'), components are queried without
+        user_id filter since they may be created by different users in the same group.
+        owner_id loads owner-owned components; viewer_id enforces the public-model
+        whitelist and defaults to owner_id.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        bot_crd = Bot.model_validate(bot.json)
+        model_ref_name = bot_crd.spec.modelRef.name if bot_crd.spec.modelRef else None
+        model_ref_namespace = (
+            bot_crd.spec.modelRef.namespace if bot_crd.spec.modelRef else None
+        )
+        logger.info(
+            f"[DEBUG] _get_bot_components: bot.name={bot.name}, modelRef.name={model_ref_name}, modelRef.namespace={model_ref_namespace}"
+        )
+
+        # Determine if this is a group resource
+        is_group_resource = bot.namespace and bot.namespace != "default"
+
+        # Get ghost - for group resources, don't filter by user_id
+        ghost_query = db.query(Kind).filter(
+            Kind.kind == "Ghost",
+            Kind.name == bot_crd.spec.ghostRef.name,
+            Kind.namespace == bot_crd.spec.ghostRef.namespace,
+            Kind.is_active == True,
+        )
+        if not is_group_resource:
+            ghost_query = ghost_query.filter(Kind.user_id == owner_id)
+        ghost = ghost_query.first()
+
+        # Get shell - try user's custom shells first, then public shells
+        shell_ref_name = bot_crd.spec.shellRef.name
+        shell = get_shell_by_name(db, shell_ref_name, owner_id)
+
+        logger.info(
+            f"[DEBUG] _get_bot_components: shellRef.name={shell_ref_name}, "
+            f"shell found={shell is not None}, "
+            f"shell type={type(shell).__name__ if shell else 'None'}"
+        )
+        # Get model - try private models first, then public models
+        # modelRef is optional, only get if it exists
+        model = None
+        if bot_crd.spec.modelRef:
+            model = self._get_model_by_name(
+                db,
+                bot_crd.spec.modelRef.name,
+                bot_crd.spec.modelRef.namespace,
+                owner_id,
+                viewer_id=viewer_id,
+            )
+
+        logger.info(
+            f"[DEBUG] _get_bot_components: ghost={ghost is not None}, shell={shell is not None}, model={model is not None}"
+        )
+        if model:
+            logger.info(f"[DEBUG] _get_bot_components: model.json={model.json}")
+
+        return ghost, shell, model
+
+    def _get_bot_components_batch(self, db: Session, bots: List[Kind], user_id: int):
+        """
+        Batch-fetch Ghost/Shell/Model components for multiple bots to avoid N+1 queries.
+        Models can be from kinds table (private) or public_models table.
+
+        For group resources (namespace != 'default'), components are queried without
+        user_id filter since they may be created by different users in the same group.
+
+        Returns:
+          - bot_crds: {bot.id: Bot} mapping to avoid repeated parsing
+          - ghost_map: {(name, namespace): Kind}
+          - shell_map: {(name, namespace): Kind}
+          - model_map: {(name, namespace): Kind}
+        """
+        if not bots:
+            return {}, {}, {}, {}
+
+        # Separate keys for personal and group resources
+        personal_ghost_keys = set()
+        group_ghost_keys = set()
+        personal_model_keys = set()
+        group_model_keys = set()
+        shell_keys = set()
+        bot_crds = {}
+
+        for bot in bots:
+            # Parse bot.json once and reuse later
+            bot_crd = Bot.model_validate(bot.json)
+            bot_crds[bot.id] = bot_crd
+
+            is_group_resource = bot.namespace and bot.namespace != "default"
+            ghost_key = (bot_crd.spec.ghostRef.name, bot_crd.spec.ghostRef.namespace)
+
+            if is_group_resource:
+                group_ghost_keys.add(ghost_key)
+            else:
+                personal_ghost_keys.add(ghost_key)
+
+            shell_keys.add(
+                (bot_crd.spec.shellRef.name, bot_crd.spec.shellRef.namespace)
+            )
+            # modelRef is optional, only add if it exists
+            if bot_crd.spec.modelRef:
+                model_key = (
+                    bot_crd.spec.modelRef.name,
+                    bot_crd.spec.modelRef.namespace,
+                )
+                if is_group_resource:
+                    group_model_keys.add(model_key)
+                else:
+                    personal_model_keys.add(model_key)
+
+        def build_or_filters(kind_name: str, keys: set):
+            # Compose OR of AND clauses: or_(and_(kind==X, name==N, namespace==NS), ...)
+            return (
+                or_(
+                    *[
+                        and_(
+                            Kind.kind == kind_name, Kind.name == n, Kind.namespace == ns
+                        )
+                        for (n, ns) in keys
+                    ]
+                )
+                if keys
+                else None
+            )
+
+        ghosts = []
+        models = []
+
+        # Query personal ghosts (with user_id filter)
+        if personal_ghost_keys:
+            personal_ghost_filter = build_or_filters("Ghost", personal_ghost_keys)
+            if personal_ghost_filter is not None:
+                personal_ghosts = (
+                    db.query(Kind)
+                    .filter(Kind.user_id == user_id, Kind.is_active == True)
+                    .filter(personal_ghost_filter)
+                    .all()
+                )
+                ghosts.extend(personal_ghosts)
+
+        # Query group ghosts (without user_id filter)
+        if group_ghost_keys:
+            group_ghost_filter = build_or_filters("Ghost", group_ghost_keys)
+            if group_ghost_filter is not None:
+                group_ghosts = (
+                    db.query(Kind)
+                    .filter(Kind.is_active == True)
+                    .filter(group_ghost_filter)
+                    .all()
+                )
+                ghosts.extend(group_ghosts)
+
+        # Use unified shell query function that checks both user shells and public shells
+        shell_map = get_shells_by_names_batch(db, shell_keys, user_id)
+
+        # Query personal models (with user_id filter)
+        if personal_model_keys:
+            personal_model_filter = build_or_filters("Model", personal_model_keys)
+            if personal_model_filter is not None:
+                personal_models = (
+                    db.query(Kind)
+                    .filter(Kind.user_id == user_id, Kind.is_active == True)
+                    .filter(personal_model_filter)
+                    .all()
+                )
+                models.extend(personal_models)
+
+        # Query group models (without user_id filter)
+        if group_model_keys:
+            group_model_filter = build_or_filters("Model", group_model_keys)
+            if group_model_filter is not None:
+                group_models = (
+                    db.query(Kind)
+                    .filter(Kind.is_active == True)
+                    .filter(group_model_filter)
+                    .all()
+                )
+                models.extend(group_models)
+
+        ghost_map = {(g.name, g.namespace): g for g in ghosts}
+        # shell_map is already populated by get_shells_by_names_batch
+        model_map = {(m.name, m.namespace): m for m in models}
+
+        # For models not found in kinds table (user models), try to find in public models (user_id=0)
+        all_model_keys = personal_model_keys | group_model_keys
+        missing_model_keys = all_model_keys - set(model_map.keys())
+        if missing_model_keys:
+
+            def build_public_model_or_filters(keys: set):
+                return (
+                    or_(
+                        *[
+                            and_(
+                                Kind.user_id == 0,
+                                Kind.kind == "Model",
+                                Kind.name == n,
+                                Kind.namespace == ns,
+                            )
+                            for (n, ns) in keys
+                        ]
+                    )
+                    if keys
+                    else None
+                )
+
+            public_model_filter = build_public_model_or_filters(missing_model_keys)
+            if public_model_filter is not None:
+                public_models = (
+                    db.query(Kind)
+                    .filter(Kind.is_active.is_(True))
+                    .filter(public_model_filter)
+                    .all()
+                )
+
+                for pm in public_models:
+                    if is_public_model_allowed_for_user_id(db, pm.json, user_id):
+                        model_map[(pm.name, pm.namespace)] = pm
+
+        return bot_crds, ghost_map, shell_map, model_map
+
+    def _convert_to_bot_dict(
+        self,
+        bot: Kind,
+        ghost: Kind | None = None,
+        shell: Kind | None = None,
+        model=None,
+        override_agent_config: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Convert kinds to bot-like dictionary.
+
+        Args:
+            bot: The Bot Kind object
+            ghost: The Ghost Kind object (optional)
+            shell: The Shell Kind object (optional)
+            model: The Model object - always a Kind (for both private and public models)
+            override_agent_config: If provided, use this instead of extracting from model.
+                                   Used for predefined models where we want to return { bind_model: "xxx" }
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        # Extract data from components
+        system_prompt = ""
+        mcp_servers = {}
+        plugins = []
+        shell_type = ""
+        shell_name = ""
+        agent_config = {}
+
+        # Get shell_name from bot's shellRef - this is the name user selected
+        bot_crd = Bot.model_validate(bot.json)
+        shell_name = bot_crd.spec.shellRef.name if bot_crd.spec.shellRef else ""
+
+        if ghost and ghost.json:
+            ghost_crd = Ghost.model_validate(ghost.json)
+            system_prompt = ghost_crd.spec.systemPrompt
+            mcp_servers = ghost_crd.spec.mcpServers or {}
+            plugins = ghost_crd.spec.plugins or []
+
+        if shell and shell.json:
+            shell_crd = Shell.model_validate(shell.json)
+            shell_type = shell_crd.spec.shellType or ""
+
+        # Determine agent_config
+        # For frontend display, we need to return { bind_model: "xxx", bind_model_type: "public"|"user" } format when:
+        # 1. override_agent_config is provided (explicit override)
+        # 2. The model is a public model (Kind with user_id=0)
+        # 3. The model is a shared/predefined model (modelRef.name != "{bot.name}-model")
+        # 4. The model's isCustomConfig is False/None
+        # Only return full modelConfig when it's a bot's dedicated private model with isCustomConfig=True
+        #
+        # The bind_model_type field is important for:
+        # - Avoiding naming conflicts between public and user models
+        # - Determining which table to query when resolving a model
+        if override_agent_config is not None:
+            # Use the override (for predefined models)
+            agent_config = override_agent_config
+            logger.info(
+                f"[DEBUG] _convert_to_bot_dict: Using override_agent_config={agent_config}"
+            )
+        elif model and model.json:
+            model_json = model.json
+            model_crd = Model.model_validate(model_json)
+            model_config = model_crd.spec.modelConfig
+            is_custom_config = model_crd.spec.isCustomConfig
+            protocol = model_crd.spec.protocol
+
+            # Get the modelRef name and namespace from bot to determine if it's a dedicated private model
+            bot_crd = Bot.model_validate(bot.json)
+            model_ref_name = (
+                bot_crd.spec.modelRef.name if bot_crd.spec.modelRef else None
+            )
+            model_ref_namespace = (
+                bot_crd.spec.modelRef.namespace if bot_crd.spec.modelRef else "default"
+            )
+            dedicated_model_name = f"{bot.name}-model"
+
+            # Check if this is a dedicated private model for this bot
+            # A dedicated private model must satisfy BOTH conditions:
+            # 1. Has the naming pattern "{bot.name}-model"
+            # 2. Has isCustomConfig=True in the model spec
+            is_dedicated_private_model = (
+                (model_ref_name == dedicated_model_name and is_custom_config)
+                if model_ref_name
+                else False
+            )
+
+            if model.user_id == 0:
+                # This is a public model (user_id=0), return bind_model format with type
+                agent_config = {
+                    "bind_model": model.name,
+                    "bind_model_type": "public",  # Identify as public model
+                }
+                # Include namespace if not default
+                if model_ref_namespace and model_ref_namespace != "default":
+                    agent_config["bind_model_namespace"] = model_ref_namespace
+                logger.info(
+                    f"[DEBUG] _convert_to_bot_dict: Public model, returning bind_model format: {agent_config}"
+                )
+            elif not is_dedicated_private_model:
+                # This is a shared/predefined model (not dedicated to this bot)
+                # Return bind_model format with type so frontend can display the dropdown
+                # Determine model type: 'group' for group models, 'user' for personal models
+                model_type = (
+                    "group"
+                    if model_ref_namespace and model_ref_namespace != "default"
+                    else "user"
+                )
+                agent_config = {
+                    "bind_model": model_ref_name,
+                    "bind_model_type": model_type,
+                }
+                # Include namespace if not default
+                if model_ref_namespace and model_ref_namespace != "default":
+                    agent_config["bind_model_namespace"] = model_ref_namespace
+                logger.info(
+                    f"[DEBUG] _convert_to_bot_dict: Shared model (modelRef={model_ref_name}), returning bind_model format: {agent_config}"
+                )
+            elif is_custom_config:
+                # This is a dedicated private model with custom config
+                # Return the full config with protocol included
+                agent_config = dict(model_config) if model_config else {}
+                if protocol:
+                    agent_config["protocol"] = protocol
+                logger.info(
+                    f"[DEBUG] _convert_to_bot_dict: Custom config model, returning full config with protocol: {agent_config}"
+                )
+            else:
+                # This is a dedicated private model but not marked as custom config
+                # Return bind_model format with type for backward compatibility
+                # Determine model type: 'group' for group models, 'user' for personal models
+                model_type = (
+                    "group"
+                    if model_ref_namespace and model_ref_namespace != "default"
+                    else "user"
+                )
+                agent_config = {
+                    "bind_model": model_ref_name,
+                    "bind_model_type": model_type,
+                }
+                # Include namespace if not default
+                if model_ref_namespace and model_ref_namespace != "default":
+                    agent_config["bind_model_namespace"] = model_ref_namespace
+                logger.info(
+                    f"[DEBUG] _convert_to_bot_dict: Dedicated model without isCustomConfig, returning bind_model format: {agent_config}"
+                )
+
+        # Extract skills and preload_skills from ghost
+        skills = []
+        preload_skills = []
+        skill_refs = {}
+        preload_skill_refs = {}
+        default_knowledge_base_refs = []
+        inherit_base_capabilities = False
+        if ghost:
+            ghost_crd = Ghost.model_validate(ghost.json)
+            inherit_base_capabilities = ghost_crd.spec.baseGhostRef is not None
+            skills = ghost_crd.spec.skills or []
+            preload_skills = ghost_crd.spec.preload_skills or []
+            default_knowledge_base_refs = [
+                ref.model_dump()
+                for ref in (ghost_crd.spec.defaultKnowledgeBaseRefs or [])
+            ]
+            skill_refs = (
+                {
+                    name: ref.model_dump()
+                    for name, ref in (ghost_crd.spec.skill_refs or {}).items()
+                }
+                if ghost_crd.spec.skill_refs
+                else {}
+            )
+            preload_skill_refs = (
+                {
+                    name: ref.model_dump()
+                    for name, ref in (ghost_crd.spec.preload_skill_refs or {}).items()
+                }
+                if ghost_crd.spec.preload_skill_refs
+                else {}
+            )
+
+        secondary_model_ref = bot_crd.spec.secondaryModelRef
+
+        return {
+            "id": bot.id,
+            "user_id": bot.user_id,
+            "name": bot.name,
+            "namespace": bot.namespace,  # Namespace for group bots (default: 'default')
+            "shell_name": shell_name,  # The shell name user selected (e.g., 'ClaudeCode', 'my-custom-shell')
+            "shell_type": shell_type,  # The actual agent type (e.g., 'ClaudeCode', 'Agno', 'Dify')
+            "agent_config": agent_config,
+            "system_prompt": system_prompt,
+            "mcp_servers": mcp_servers,
+            "plugins": plugins,
+            "capability_mode": bot_crd.spec.capability_mode,
+            "execution_policy": bot_crd.spec.execution_policy,
+            "model_policy": bot_crd.spec.model_policy,
+            "inherit_base_capabilities": inherit_base_capabilities,
+            "default_knowledge_base_refs": default_knowledge_base_refs,
+            "skills": skills,
+            "skill_refs": skill_refs,
+            "preload_skills": preload_skills,
+            "preload_skill_refs": preload_skill_refs,
+            "is_active": bot.is_active,
+            "created_at": bot.created_at,
+            "updated_at": bot.updated_at,
+            "secondary_model_name": (
+                secondary_model_ref.name if secondary_model_ref else None
+            ),
+            "secondary_model_namespace": (
+                secondary_model_ref.namespace if secondary_model_ref else None
+            ),
+        }
+
+    def _validate_skills(
+        self,
+        db: Session,
+        skill_names: List[str],
+        user_id: int,
+        namespace: str = "default",
+    ) -> None:
+        """
+        Validate that all skill names exist for the user or as system skills.
+
+        Search order (consistent with /api/v1/kinds/skills/unified):
+        1. User's personal skills (user_id=user_id, namespace='default')
+        2. Group skills in namespace (any user, if namespace != 'default')
+        3. Public/system skills (user_id=0, namespace='default')
+
+        Args:
+            db: Database session
+            skill_names: List of skill names to validate
+            user_id: User ID
+            namespace: Bot's namespace (for group skills lookup)
+
+        Raises:
+            HTTPException: If any skill does not exist
+        """
+        if not skill_names:
+            return
+
+        existing_skill_names = set()
+
+        # 1. Query user's personal skills (user_id=user_id, namespace='default')
+        personal_skills = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == user_id,
+                Kind.kind == "Skill",
+                Kind.name.in_(skill_names),
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )
+            .all()
+        )
+        existing_skill_names.update(skill.name for skill in personal_skills)
+
+        # 2. Query group skills if namespace is not 'default'
+        # Group skills can be from any user in that namespace
+        if namespace != "default":
+            remaining_names = [
+                name for name in skill_names if name not in existing_skill_names
+            ]
+            if remaining_names:
+                group_skills = (
+                    db.query(Kind)
+                    .filter(
+                        Kind.kind == "Skill",
+                        Kind.name.in_(remaining_names),
+                        Kind.namespace == namespace,
+                        Kind.is_active == True,
+                    )
+                    .all()
+                )
+                existing_skill_names.update(skill.name for skill in group_skills)
+
+        # 3. Query Skills installed into the target group.
+        if namespace != "default":
+            remaining_names = [
+                name for name in skill_names if name not in existing_skill_names
+            ]
+            bound_skill_ids = skill_binding_service.list_group_skill_ids(
+                db,
+                namespace,
+                user_id,
+            )
+            if remaining_names and bound_skill_ids:
+                bound_skills = (
+                    db.query(Kind)
+                    .filter(
+                        Kind.id.in_(bound_skill_ids),
+                        Kind.kind == "Skill",
+                        Kind.name.in_(remaining_names),
+                        Kind.is_active == True,
+                    )
+                    .all()
+                )
+                existing_skill_names.update(skill.name for skill in bound_skills)
+
+        # 4. Query Skills installed into the user's defaults.
+        if namespace == "default":
+            remaining_names = [
+                name for name in skill_names if name not in existing_skill_names
+            ]
+            user_default_skill_ids = skill_binding_service.list_user_default_skill_ids(
+                db, user_id
+            )
+            if remaining_names and user_default_skill_ids:
+                default_skills = (
+                    db.query(Kind)
+                    .filter(
+                        Kind.id.in_(user_default_skill_ids),
+                        Kind.kind == "Skill",
+                        Kind.name.in_(remaining_names),
+                        Kind.is_active == True,
+                    )
+                    .all()
+                )
+                existing_skill_names.update(skill.name for skill in default_skills)
+
+        # 5. Query public/system skills (user_id=0)
+        remaining_names = [
+            name for name in skill_names if name not in existing_skill_names
+        ]
+        if remaining_names:
+            public_skills = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == 0,
+                    Kind.kind == "Skill",
+                    Kind.name.in_(remaining_names),
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+                .all()
+            )
+            existing_skill_names.update(skill.name for skill in public_skills)
+
+        missing_skills = [
+            name for name in skill_names if name not in existing_skill_names
+        ]
+
+        if missing_skills:
+            raise HTTPException(
+                status_code=400,
+                detail=f"The following Skills do not exist: {', '.join(missing_skills)}",
+            )
+
+    def _get_skill_refs(
+        self,
+        db: Session,
+        skill_names: List[str],
+        user_id: int,
+        namespace: str = "default",
+    ) -> Dict[str, SkillRefMeta]:
+        """
+        Get skill references (skill_id, namespace, is_public) for given skill names.
+
+        Search order (consistent with _validate_skills):
+        1. User's personal skills (user_id=user_id, namespace='default')
+        2. Group skills in namespace (any user, if namespace != 'default')
+        3. Public/system skills (user_id=0, namespace='default')
+
+        Args:
+            db: Database session
+            skill_names: List of skill names to look up
+            user_id: User ID
+            namespace: Bot's namespace (for group skills lookup)
+
+        Returns:
+            Dict mapping skill name to SkillRefMeta
+        """
+        if not skill_names:
+            return {}
+
+        skill_refs: Dict[str, SkillRefMeta] = {}
+        remaining_names = list(skill_names)
+        logger.info(
+            f"[_get_skill_refs] Start: skill_names={skill_names}, namespace={namespace}, user_id={user_id}"
+        )
+
+        # 1. Query user's personal skills first (user_id=user_id, namespace='default')
+        if remaining_names:
+            personal_skills = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == user_id,
+                    Kind.kind == "Skill",
+                    Kind.name.in_(remaining_names),
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+                .all()
+            )
+            logger.info(
+                f"[_get_skill_refs] Found {len(personal_skills)} personal skills: {[s.name for s in personal_skills]}"
+            )
+            for skill in personal_skills:
+                skill_refs[skill.name] = SkillRefMeta(**build_skill_ref_meta(skill))
+                remaining_names.remove(skill.name)
+
+        # 2. Query group skills if namespace is not 'default'
+        if remaining_names and namespace != "default":
+            logger.info(
+                f"[_get_skill_refs] Searching group skills in namespace={namespace}, remaining={remaining_names}"
+            )
+            group_skills = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Skill",
+                    Kind.name.in_(remaining_names),
+                    Kind.namespace == namespace,
+                    Kind.is_active == True,
+                )
+                .all()
+            )
+            logger.info(
+                f"[_get_skill_refs] Found {len(group_skills)} group skills: {[s.name for s in group_skills]}"
+            )
+            for skill in group_skills:
+                if skill.name not in remaining_names:
+                    continue
+                skill_refs[skill.name] = SkillRefMeta(**build_skill_ref_meta(skill))
+                remaining_names.remove(skill.name)
+
+        # 3. Resolve Skills installed into the target group.
+        if remaining_names and namespace != "default":
+            bound_skill_ids = skill_binding_service.list_group_skill_ids(
+                db,
+                namespace,
+                user_id,
+            )
+            if bound_skill_ids:
+                bound_skills = (
+                    db.query(Kind)
+                    .filter(
+                        Kind.id.in_(bound_skill_ids),
+                        Kind.kind == "Skill",
+                        Kind.name.in_(remaining_names),
+                        Kind.is_active == True,
+                    )
+                    .all()
+                )
+                for skill in bound_skills:
+                    if skill.name not in remaining_names:
+                        continue
+                    skill_refs[skill.name] = SkillRefMeta(**build_skill_ref_meta(skill))
+                    remaining_names.remove(skill.name)
+
+        # 4. Resolve Skills installed into the user's defaults.
+        if remaining_names:
+            user_default_skill_ids = skill_binding_service.list_user_default_skill_ids(
+                db, user_id
+            )
+            if user_default_skill_ids:
+                default_skills = (
+                    db.query(Kind)
+                    .filter(
+                        Kind.id.in_(user_default_skill_ids),
+                        Kind.kind == "Skill",
+                        Kind.name.in_(remaining_names),
+                        Kind.is_active == True,
+                    )
+                    .all()
+                )
+                for skill in default_skills:
+                    if skill.name not in remaining_names:
+                        continue
+                    skill_refs[skill.name] = SkillRefMeta(**build_skill_ref_meta(skill))
+                    remaining_names.remove(skill.name)
+
+        # 5. Query public/system skills (user_id=0)
+        if remaining_names:
+            public_skills = (
+                db.query(Kind)
+                .filter(
+                    Kind.user_id == 0,
+                    Kind.kind == "Skill",
+                    Kind.name.in_(remaining_names),
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+                .all()
+            )
+            for skill in public_skills:
+                skill_refs[skill.name] = SkillRefMeta(**build_skill_ref_meta(skill))
+                remaining_names.remove(skill.name)
+
+        # Note: remaining_names at this point are skills that weren't found
+        # This shouldn't happen if _validate_skills was called first
+
+        return skill_refs
+
+    def _resolve_skill_refs(
+        self,
+        db: Session,
+        skill_names: List[str],
+        user_id: int,
+        namespace: str,
+        provided_refs: Optional[Dict[str, SkillRefMeta]],
+        target_group_names: Optional[List[str]] = None,
+    ) -> Dict[str, SkillRefMeta]:
+        """Resolve skill refs from request payload or fallback by skill name."""
+        unique_skill_names = list(dict.fromkeys(skill_names or []))
+        normalized_group_names = list(
+            dict.fromkeys(
+                group_name.strip()
+                for group_name in target_group_names or []
+                if group_name.strip() and group_name.strip() != "default"
+            )
+        )
+        unauthorized_groups = [
+            group_name
+            for group_name in normalized_group_names
+            if not check_group_permission(
+                db,
+                user_id,
+                group_name,
+                BaseRole.Reporter,
+            )
+        ]
+        if unauthorized_groups:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Group access denied: {', '.join(sorted(unauthorized_groups))}",
+            )
+        if not unique_skill_names:
+            return {}
+
+        if not provided_refs:
+            lookup_namespace = (
+                normalized_group_names[0] if normalized_group_names else namespace
+            )
+            resolved_refs = self._get_skill_refs(
+                db, unique_skill_names, user_id, lookup_namespace
+            )
+            missing_names = [
+                name for name in unique_skill_names if name not in resolved_refs
+            ]
+            if missing_names:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "The following Skills do not exist: "
+                        f"{', '.join(missing_names)}"
+                    ),
+                )
+            return self._resolve_skill_refs(
+                db=db,
+                skill_names=unique_skill_names,
+                user_id=user_id,
+                namespace=namespace,
+                provided_refs=resolved_refs,
+                target_group_names=normalized_group_names,
+            )
+
+        provided_keys = set(provided_refs.keys())
+        expected_keys = set(unique_skill_names)
+        unknown_refs = sorted(provided_keys - expected_keys)
+        if unknown_refs:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown skill_refs keys: {', '.join(unknown_refs)}",
+            )
+
+        resolved: Dict[str, SkillRefMeta] = {}
+        missing_names = [
+            name for name in unique_skill_names if name not in provided_keys
+        ]
+
+        for skill_name in unique_skill_names:
+            provided_ref = provided_refs.get(skill_name)
+            if not provided_ref:
+                continue
+
+            skill = (
+                db.query(Kind)
+                .filter(
+                    Kind.id == provided_ref.skill_id,
+                    Kind.kind == "Skill",
+                    Kind.is_active == True,
+                )
+                .first()
+            )
+            if not skill:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid skill reference for '{skill_name}': skill_id {provided_ref.skill_id} not found",
+                )
+            if skill.name != skill_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid skill reference for '{skill_name}': name does not match skill_id {provided_ref.skill_id}",
+                )
+
+            is_public = skill.user_id == 0
+            if not is_public:
+                accessible_personal = (
+                    skill.user_id == user_id and skill.namespace == "default"
+                )
+                accessible_group = (
+                    namespace != "default" and skill.namespace == namespace
+                )
+                accessible_binding = skill.id in (
+                    skill_binding_service.list_user_default_skill_ids(db, user_id)
+                )
+                if namespace != "default" and not accessible_binding:
+                    accessible_binding = (
+                        skill_binding_service.is_skill_available_to_group(
+                            db,
+                            group_namespace=namespace,
+                            skill_id=skill.id,
+                            user_id=user_id,
+                        )
+                    )
+                accessible_target_groups = bool(normalized_group_names) and all(
+                    skill.namespace == group_name
+                    or skill_binding_service.is_skill_available_to_group(
+                        db,
+                        group_namespace=group_name,
+                        skill_id=skill.id,
+                        user_id=user_id,
+                    )
+                    for group_name in normalized_group_names
+                )
+                if not (
+                    accessible_personal
+                    or accessible_group
+                    or accessible_binding
+                    or accessible_target_groups
+                ):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Permission denied for skill '{skill_name}'",
+                    )
+
+            resolved[skill_name] = SkillRefMeta(**build_skill_ref_meta(skill))
+
+        if missing_names:
+            fallback_refs = self._resolve_skill_refs(
+                db=db,
+                skill_names=missing_names,
+                user_id=user_id,
+                namespace=namespace,
+                provided_refs=None,
+                target_group_names=normalized_group_names,
+            )
+            resolved.update(fallback_refs)
+
+        return resolved
+
+    def _find_available_name(
+        self,
+        db: Session,
+        *,
+        base_name: str,
+        kind: str,
+        user_id: int,
+        namespace: str = "default",
+    ) -> str:
+        """Find an available name by appending (2), (3), etc. if needed."""
+        is_group_namespace = namespace != "default"
+        candidate = base_name
+        counter = 2
+        while True:
+            query = db.query(Kind).filter(
+                Kind.kind == kind,
+                Kind.name == candidate,
+                Kind.namespace == namespace,
+                Kind.is_active == True,
+            )
+            # For personal namespace, scope uniqueness check to the user
+            # For group namespaces, uniqueness is across all users in the namespace
+            if not is_group_namespace:
+                query = query.filter(Kind.user_id == user_id)
+            existing = query.first()
+            if not existing:
+                return candidate
+            candidate = f"{base_name} ({counter})"
+            counter += 1
+
+    def clone_bot(
+        self,
+        db: Session,
+        *,
+        bot_id: int,
+        user_id: int,
+        new_name: str,
+        namespace: str = "default",
+        skill_id_mapping: Optional[Dict[int, int]] = None,
+        commit: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Clone an existing bot with a new name.
+        Copies all config fields; ghost/shell/model refs are preserved by value.
+
+        Args:
+            skill_id_mapping: Optional mapping from old skill IDs to new skill IDs.
+                When provided, skill_refs and preload_skill_refs are updated to use
+                the new IDs. Useful when cloning a bot to a different namespace where
+                skills have been copied under new IDs.
+        """
+        from app.schemas.bot import BotCreate
+        from app.schemas.kind import KnowledgeBaseDefaultRef, SkillRefMeta
+
+        original = (
+            db.query(Kind)
+            .filter(
+                Kind.id == bot_id,
+                Kind.kind == "Bot",
+                Kind.is_active == True,
+            )
+            .first()
+        )
+        if not original:
+            raise HTTPException(status_code=404, detail="Bot not found for cloning")
+
+        # Get full bot dict (decrypted agent_config, resolved shell_name, etc.)
+        ghost, shell, model = self._get_bot_components(db, original, original.user_id)
+        bot_dict = self._convert_to_bot_dict(original, ghost, shell, model)
+
+        # Build knowledge base refs
+        kb_refs = None
+        if bot_dict.get("default_knowledge_base_refs"):
+            kb_refs = [
+                KnowledgeBaseDefaultRef(**ref)
+                for ref in bot_dict["default_knowledge_base_refs"]
+            ]
+
+        # Apply skill_id_mapping to skill_refs and preload_skill_refs if provided
+        skill_refs_raw = bot_dict.get("skill_refs") or {}
+        preload_skill_refs_raw = bot_dict.get("preload_skill_refs") or {}
+
+        if skill_id_mapping:
+            skill_refs_raw = _apply_skill_id_mapping(skill_refs_raw, skill_id_mapping)
+            preload_skill_refs_raw = _apply_skill_id_mapping(
+                preload_skill_refs_raw, skill_id_mapping
+            )
+
+        # Build SkillRefMeta objects
+        skill_refs_meta = None
+        if skill_refs_raw:
+            skill_refs_meta = {
+                k: SkillRefMeta(**v) if isinstance(v, dict) else v
+                for k, v in skill_refs_raw.items()
+            }
+
+        preload_skill_refs_meta = None
+        if preload_skill_refs_raw:
+            preload_skill_refs_meta = {
+                k: SkillRefMeta(**v) if isinstance(v, dict) else v
+                for k, v in preload_skill_refs_raw.items()
+            }
+
+        bot_create = BotCreate(
+            name=new_name,
+            shell_name=bot_dict["shell_name"],
+            agent_config=bot_dict.get("agent_config") or {},
+            system_prompt=bot_dict.get("system_prompt"),
+            mcp_servers=bot_dict.get("mcp_servers"),
+            default_knowledge_base_refs=kb_refs,
+            skills=bot_dict.get("skills"),
+            skill_refs=skill_refs_meta,
+            preload_skills=bot_dict.get("preload_skills"),
+            preload_skill_refs=preload_skill_refs_meta,
+            plugins=bot_dict.get("plugins"),
+            capability_mode=bot_dict["capability_mode"],
+            execution_policy=bot_dict.get("execution_policy"),
+            model_policy=bot_dict.get("model_policy"),
+            inherit_base_capabilities=bot_dict.get("inherit_base_capabilities", False),
+            namespace=namespace,
+        )
+
+        return self.create_with_user(
+            db=db,
+            obj_in=bot_create,
+            user_id=user_id,
+            commit=commit,
+        )
+
+
+bot_kinds_service = BotKindsService(Kind)

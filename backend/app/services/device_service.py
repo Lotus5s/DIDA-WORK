@@ -1,0 +1,658 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Device service for managing local device connections and state.
+
+This service handles:
+- Device registration and authentication via Kind CRD
+- Online state management via Redis
+- Heartbeat monitoring
+- Task routing to devices
+- Version management and update checking
+
+The service delegates device-type-specific operations to providers
+via the DeviceProviderFactory, allowing for extensibility to support
+different device types (local, cloud, etc.) in the future.
+"""
+
+import copy
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import and_
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
+
+from app.models.kind import Kind
+from app.schemas.device import DeviceType
+from app.services.device.display_name import (
+    resolve_device_display_name,
+    set_device_display_name,
+)
+from app.services.device.identity import (
+    DeviceIdentityConflictError,
+    RuntimeInstanceMismatchError,
+    find_registration_device,
+    owned_active_device,
+    resolve_owned_device_alias,
+    validate_persistent_runtime_instance_id,
+)
+from shared.telemetry.decorators import trace_sync
+
+logger = logging.getLogger(__name__)
+
+
+class DeviceService:
+    """Service for managing device connections and state.
+
+    This service acts as a facade over device providers, delegating
+    operations to the appropriate provider based on device type.
+
+    For backward compatibility, methods without explicit device_type
+    parameter default to LOCAL device type.
+    """
+
+    @staticmethod
+    def _get_provider(device_type: DeviceType = DeviceType.LOCAL):
+        """Get the provider for a device type."""
+        from app.services.device.provider_factory import DeviceProviderFactory
+
+        provider = DeviceProviderFactory.get_provider(device_type)
+        if provider is None:
+            raise ValueError(f"No provider registered for device type: {device_type}")
+        return provider
+
+    @staticmethod
+    def generate_online_key(user_id: int, device_id: str) -> str:
+        """Generate Redis key for device online status.
+
+        Maintained for backward compatibility with existing code.
+        """
+        from app.services.device.local_provider import LocalDeviceProvider
+
+        return LocalDeviceProvider.generate_online_key(user_id, device_id)
+
+    @staticmethod
+    async def set_device_online(
+        user_id: int,
+        device_id: str,
+        socket_id: str,
+        name: str,
+        status: str = "online",
+        executor_version: Optional[str] = None,
+        client_ip: Optional[str] = None,
+        runtime_transfer_host: Optional[str] = None,
+        runtime_transfer_port: Optional[int] = None,
+        runtime_instance_id: Optional[str] = None,
+        runtime_features: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Set device online status in Redis.
+
+        Args:
+            user_id: Device owner user ID
+            device_id: Device unique identifier
+            socket_id: WebSocket session ID
+            name: Device name
+            status: Device status (online, busy)
+            executor_version: Executor version (e.g., '1.0.0')
+            client_ip: Device-reported or websocket-observed IP address
+            runtime_transfer_host: Host peers should use for direct transfers
+            runtime_transfer_port: Executor session gateway port
+            runtime_instance_id: Stable Runtime installation ID
+            runtime_features: Features implemented by the online Runtime
+
+        Returns:
+            True if set successfully
+        """
+        provider = DeviceService._get_provider(DeviceType.LOCAL)
+        return await provider._set_online(
+            user_id=user_id,
+            device_id=device_id,
+            socket_id=socket_id,
+            name=name,
+            status=status,
+            executor_version=executor_version,
+            client_ip=client_ip,
+            runtime_transfer_host=runtime_transfer_host,
+            runtime_transfer_port=runtime_transfer_port,
+            runtime_instance_id=runtime_instance_id,
+            runtime_features=runtime_features,
+        )
+
+    @staticmethod
+    async def refresh_device_heartbeat(
+        user_id: int,
+        device_id: str,
+        running_task_ids: list[int] = None,
+        executor_version: Optional[str] = None,
+        runtime_transfer_host: Optional[str] = None,
+        runtime_transfer_port: Optional[int] = None,
+        runtime_instance_id: Optional[str] = None,
+        runtime_capacity: Optional[Dict[str, Any]] = None,
+        runtime_features: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Refresh device heartbeat in Redis (extend TTL) and update running task IDs.
+
+        Args:
+            user_id: Device owner user ID
+            device_id: Device unique identifier
+            running_task_ids: List of task IDs currently running on this device
+            executor_version: Executor version (e.g., '1.0.0')
+            runtime_transfer_port: Executor session gateway port
+
+        Returns:
+            True if refreshed successfully
+        """
+        provider = DeviceService._get_provider(DeviceType.LOCAL)
+        return await provider.refresh_heartbeat(
+            user_id=user_id,
+            device_id=device_id,
+            running_task_ids=running_task_ids,
+            executor_version=executor_version,
+            runtime_transfer_host=runtime_transfer_host,
+            runtime_transfer_port=runtime_transfer_port,
+            runtime_instance_id=runtime_instance_id,
+            runtime_capacity=runtime_capacity,
+            runtime_features=runtime_features,
+        )
+
+    @staticmethod
+    async def set_device_offline(user_id: int, device_id: str) -> bool:
+        """Remove device online status from Redis.
+
+        Args:
+            user_id: Device owner user ID
+            device_id: Device unique identifier
+
+        Returns:
+            True if deleted successfully
+        """
+        provider = DeviceService._get_provider(DeviceType.LOCAL)
+        return await provider.unregister(db=None, user_id=user_id, device_id=device_id)
+
+    @staticmethod
+    async def update_device_status_in_redis(
+        user_id: int, device_id: str, status: str
+    ) -> bool:
+        """Update device status in Redis.
+
+        Args:
+            user_id: Device owner user ID
+            device_id: Device unique identifier
+            status: New status (online, busy)
+
+        Returns:
+            True if updated successfully
+        """
+        provider = DeviceService._get_provider(DeviceType.LOCAL)
+        return await provider.update_status(
+            user_id=user_id,
+            device_id=device_id,
+            status=status,
+        )
+
+    @staticmethod
+    async def get_device_online_info(
+        user_id: int, device_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Get device online information from Redis.
+
+        Args:
+            user_id: Device owner user ID
+            device_id: Device unique identifier
+
+        Returns:
+            Device online info dict or None if offline
+        """
+        provider = DeviceService._get_provider(DeviceType.LOCAL)
+        return await provider._get_online_info(user_id, device_id)
+
+    @staticmethod
+    async def store_device_capabilities_state(
+        user_id: int, device_id: str, capabilities: Dict[str, Any]
+    ) -> bool:
+        """Store sanitized local global capability heartbeat state."""
+        provider = DeviceService._get_provider(DeviceType.LOCAL)
+        return await provider.store_capabilities_state(user_id, device_id, capabilities)
+
+    @staticmethod
+    async def get_device_capabilities_state(
+        user_id: int, device_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Get latest sanitized local global capability heartbeat state."""
+        provider = DeviceService._get_provider(DeviceType.LOCAL)
+        return await provider.get_capabilities_state(user_id, device_id)
+
+    @staticmethod
+    async def get_device_online_info_by_type(
+        user_id: int, device_id: str, device_type: DeviceType
+    ) -> Optional[Dict[str, Any]]:
+        """Get device online information using the matching provider."""
+
+        provider = DeviceService._get_provider(device_type)
+        return await provider._get_online_info(user_id, device_id)
+
+    @staticmethod
+    async def is_device_online(user_id: int, device_id: str) -> bool:
+        """Check if device is online.
+
+        Args:
+            user_id: Device owner user ID
+            device_id: Device unique identifier
+
+        Returns:
+            True if device is online
+        """
+        provider = DeviceService._get_provider(DeviceType.LOCAL)
+        return await provider.is_online(user_id, device_id)
+
+    @staticmethod
+    async def get_device_slot_usage_async(
+        db: Session, user_id: int, device_id: str
+    ) -> Dict[str, Any]:
+        """Get slot usage information for a device (async version).
+
+        Args:
+            db: Database session
+            user_id: User ID (for Redis key)
+            device_id: Device unique identifier
+
+        Returns:
+            Dict with slot usage info: {"used": int, "max": int, "running_tasks": list}
+        """
+        provider = DeviceService._get_provider(DeviceType.LOCAL)
+        return await provider.get_slot_usage(db, user_id, device_id)
+
+    @staticmethod
+    def get_device_slot_usage(
+        db: Session, user_id: int, device_id: str
+    ) -> Dict[str, Any]:
+        """Get slot usage information for a device from sync code paths."""
+        provider = DeviceService._get_provider(DeviceType.LOCAL)
+        return provider.get_slot_usage_sync(db, user_id, device_id)
+
+    @staticmethod
+    def is_update_available(current: Optional[str], latest: str) -> bool:
+        """Check if update is available using semantic version comparison.
+
+        Args:
+            current: Current executor version (e.g., '1.0.0'), None for old executors
+            latest: Latest available version (e.g., '1.1.0')
+
+        Returns:
+            True if update is available (current < latest or current is None)
+        """
+        from app.services.device.local_provider import LocalDeviceProvider
+
+        return LocalDeviceProvider._is_update_available(current, latest)
+
+    @staticmethod
+    async def get_all_devices(db: Session, user_id: int) -> List[Dict[str, Any]]:
+        """Get all devices for a user (both online and offline).
+
+        Queries kinds table for Device CRDs and enriches with Redis online status.
+        Currently only returns local devices. Future versions may aggregate
+        devices from multiple providers.
+
+        Args:
+            db: Database session
+            user_id: User ID
+
+        Returns:
+            List of device info dicts
+        """
+        from app.services.device.provider_factory import DeviceProviderFactory
+
+        devices: List[Dict[str, Any]] = []
+        for provider in DeviceProviderFactory.get_all_providers().values():
+            devices.extend(
+                await provider.list_devices(db, user_id, include_offline=True)
+            )
+        return devices
+
+    @staticmethod
+    async def get_online_devices(db: Session, user_id: int) -> List[Dict[str, Any]]:
+        """Get only online devices for a user.
+
+        Args:
+            db: Database session
+            user_id: User ID
+
+        Returns:
+            List of online device info dicts
+        """
+        from app.services.device.provider_factory import DeviceProviderFactory
+
+        devices: List[Dict[str, Any]] = []
+        for provider in DeviceProviderFactory.get_all_providers().values():
+            devices.extend(
+                await provider.list_devices(db, user_id, include_offline=False)
+            )
+        return devices
+
+    @staticmethod
+    @trace_sync("device.upsert", tracer_name="backend")
+    def upsert_device_crd(
+        db: Session,
+        user_id: int,
+        device_id: str,
+        name: str,
+        client_ip: Optional[str] = None,
+        device_type: Optional[str] = None,
+        bind_shell: Optional[str] = None,
+        runtime_transfer_host: Optional[str] = None,
+        runtime_transfer_port: Optional[int] = None,
+        update_runtime_transfer_port: bool = False,
+        runtime_instance_id: Optional[str] = None,
+        app_device_id: Optional[str] = None,
+        capabilities: Optional[List[str]] = None,
+    ) -> Kind:
+        """Register in a fresh owner-serialized transaction and commit the result."""
+        if not device_id.strip():
+            raise DeviceIdentityConflictError("Device ID is required for registration")
+        if (
+            device_type == DeviceType.APP.value
+            and not (runtime_instance_id or "").strip()
+        ):
+            raise DeviceIdentityConflictError(
+                "App registration requires a persistent Runtime ID"
+            )
+        # Registration owns its commit boundary. Finish authentication reads
+        # before taking the owner lock so the identity read has a fresh snapshot.
+        db.commit()
+        device_kind = find_registration_device(
+            db,
+            user_id,
+            device_id,
+            runtime_instance_id,
+            app_device_id,
+            device_type=device_type,
+        )
+
+        if device_kind:
+            # Update existing device (reactivate if soft-deleted)
+            # Use deepcopy to ensure SQLAlchemy detects nested JSON changes
+            device_json = copy.deepcopy(device_kind.json)
+            validate_persistent_runtime_instance_id(
+                device_json,
+                runtime_instance_id,
+                device_id=device_id,
+            )
+            persisted_app_id = device_json.get("spec", {}).get("appDeviceId")
+            if persisted_app_id and app_device_id != persisted_app_id:
+                raise DeviceIdentityConflictError(
+                    f"App device ID mismatch for device {device_id}"
+                )
+            persisted_display_name = resolve_device_display_name(device_json, name)
+            set_device_display_name(device_json, persisted_display_name)
+            # Update device type if provided, otherwise preserve existing value
+            if device_type is not None:
+                device_json["spec"]["deviceType"] = device_type
+            elif "deviceType" not in device_json["spec"]:
+                device_json["spec"]["deviceType"] = DeviceType.LOCAL.value
+            if "connectionMode" not in device_json["spec"]:
+                device_json["spec"]["connectionMode"] = "websocket"
+            # Update client IP if provided
+            if client_ip is not None:
+                device_json["spec"]["clientIp"] = client_ip
+            if runtime_transfer_host is not None:
+                device_json["spec"]["runtimeTransferHost"] = runtime_transfer_host
+            if update_runtime_transfer_port:
+                device_json["spec"]["runtimeTransferPort"] = runtime_transfer_port
+            if runtime_instance_id is not None:
+                device_json["spec"]["runtimeInstanceId"] = runtime_instance_id
+            if app_device_id is not None:
+                device_json["spec"]["appDeviceId"] = app_device_id
+            if capabilities is not None:
+                device_json["spec"]["capabilities"] = capabilities
+            # Update bind_shell if provided, otherwise preserve existing value
+            if bind_shell is not None:
+                device_json["spec"]["bindShell"] = bind_shell
+            elif "bindShell" not in device_json["spec"]:
+                device_json["spec"]["bindShell"] = "claudecode"
+            device_kind.json = device_json
+            flag_modified(device_kind, "json")
+            device_kind.updated_at = datetime.now()
+            device_kind.is_active = True
+            db.add(device_kind)
+            logger.info(f"Updated device CRD: user_id={user_id}, device_id={device_id}")
+        else:
+            # Resolve device type: use provided value, or default to 'local'
+            resolved_device_type = device_type or DeviceType.LOCAL.value
+            # Resolve bind_shell: use provided value, or default to 'claudecode'
+            resolved_bind_shell = bind_shell or "claudecode"
+
+            # Check if this is the first device for the user
+            existing_devices = (
+                db.query(Kind)
+                .filter(
+                    and_(
+                        Kind.user_id == user_id,
+                        Kind.kind == "Device",
+                        Kind.namespace == "default",
+                        Kind.is_active == True,
+                    )
+                )
+                .all()
+            )
+            existing_device_count = sum(
+                1
+                for device in existing_devices
+                if device.json.get("spec", {}).get("deviceType", DeviceType.LOCAL.value)
+                == DeviceType.LOCAL.value
+            )
+            is_first_device = (
+                resolved_device_type == DeviceType.LOCAL.value
+                and existing_device_count == 0
+            )
+
+            # Create new device CRD
+            device_json = {
+                "apiVersion": "agent.wecode.io/v1",
+                "kind": "Device",
+                "metadata": {
+                    "name": device_id,
+                    "namespace": "default",
+                },
+                "spec": {
+                    "deviceId": device_id,
+                    "deviceType": resolved_device_type,
+                    "connectionMode": "websocket",
+                    "bindShell": resolved_bind_shell,
+                    "isDefault": is_first_device,
+                    "capabilities": capabilities,
+                    "clientIp": client_ip,
+                    "runtimeTransferHost": runtime_transfer_host,
+                    "runtimeInstanceId": runtime_instance_id,
+                    "appDeviceId": app_device_id,
+                },
+                "status": {
+                    "state": "Available",
+                },
+            }
+            if update_runtime_transfer_port:
+                device_json["spec"]["runtimeTransferPort"] = runtime_transfer_port
+            set_device_display_name(device_json, name)
+
+            device_kind = Kind(
+                user_id=user_id,
+                kind="Device",
+                name=device_id,
+                namespace="default",
+                json=device_json,
+            )
+            db.add(device_kind)
+            logger.info(
+                f"Registered new device CRD: user_id={user_id}, device_id={device_id}, "
+                f"is_default={is_first_device}"
+            )
+
+        db.commit()
+        db.refresh(device_kind)
+        return device_kind
+
+    @staticmethod
+    def set_device_as_default(
+        db: Session,
+        user_id: int,
+        device_id: str,
+    ) -> bool:
+        """Set a device as the default for the user.
+
+        Args:
+            db: Database session
+            user_id: Device owner user ID
+            device_id: Device unique identifier (stored in Kind.name)
+
+        Returns:
+            True if device was found and set as default
+        """
+        # Get all Device CRDs for this user
+        devices = (
+            db.query(Kind)
+            .filter(
+                and_(
+                    Kind.user_id == user_id,
+                    Kind.kind == "Device",
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+            )
+            .all()
+        )
+
+        found = False
+        target_type = None
+        selected = owned_active_device(db, user_id, device_id)
+        if selected is None:
+            return False
+        for device_kind in devices:
+            if device_kind.id == selected.id:
+                target_type = device_kind.json.get("spec", {}).get(
+                    "deviceType", DeviceType.LOCAL.value
+                )
+                break
+
+        for device_kind in devices:
+            device_json = copy.deepcopy(device_kind.json)
+            device_type = device_json.get("spec", {}).get(
+                "deviceType", DeviceType.LOCAL.value
+            )
+
+            if device_kind.id == selected.id:
+                device_json["spec"]["isDefault"] = True
+                found = True
+            elif target_type and device_type == target_type:
+                device_json["spec"]["isDefault"] = False
+
+            device_kind.json = device_json
+            flag_modified(device_kind, "json")
+            db.add(device_kind)
+
+        if found:
+            db.commit()
+            logger.info(
+                f"Set device as default: user_id={user_id}, device_id={device_id}"
+            )
+
+        return found
+
+    @staticmethod
+    def get_device_by_device_id(
+        db: Session,
+        user_id: int,
+        device_id: str,
+    ) -> Optional[Kind]:
+        """Get one unambiguous Device CRD by any registered identity.
+
+        Returns:
+            Kind model instance or None if not found
+        """
+        return resolve_owned_device_alias(
+            db,
+            user_id=user_id,
+            device_id=device_id,
+        )
+
+    @staticmethod
+    def get_default_device_for_type(
+        db: Session,
+        user_id: int,
+        device_type: DeviceType,
+    ) -> Optional[Kind]:
+        """Get the default device for a specific device type.
+
+        If no explicit default exists for the type and there is exactly one active
+        device of the requested type, that device is returned.
+        """
+        devices = (
+            db.query(Kind)
+            .filter(
+                and_(
+                    Kind.user_id == user_id,
+                    Kind.kind == "Device",
+                    Kind.namespace == "default",
+                    Kind.is_active == True,
+                )
+            )
+            .all()
+        )
+
+        matching_devices = []
+        default_device = None
+        for device in devices:
+            spec = device.json.get("spec", {})
+            if spec.get("deviceType", DeviceType.LOCAL.value) != device_type.value:
+                continue
+            matching_devices.append(device)
+            if spec.get("isDefault", False):
+                default_device = device
+
+        if default_device:
+            return default_device
+        if len(matching_devices) == 1:
+            return matching_devices[0]
+        return None
+
+    @staticmethod
+    def update_device_alias(
+        db: Session,
+        user_id: int,
+        device_id: str,
+        alias: str,
+    ) -> bool:
+        """Update a device's display name (alias).
+
+        Args:
+            db: Database session
+            user_id: Device owner user ID
+            device_id: Device unique identifier (stored in Kind.name)
+            alias: New display name for the device
+
+        Returns:
+            True if device was found and updated
+        """
+        device_kind = owned_active_device(db, user_id, device_id)
+
+        if not device_kind:
+            return False
+
+        # Update displayName in spec
+        device_json = copy.deepcopy(device_kind.json)
+        set_device_display_name(device_json, alias)
+        device_kind.json = device_json
+        flag_modified(device_kind, "json")
+        device_kind.updated_at = datetime.now()
+        db.commit()
+
+        logger.info(
+            f"Updated device alias: user_id={user_id}, device_id={device_id}, alias={alias}"
+        )
+        return True
+
+
+# Singleton instance
+device_service = DeviceService()

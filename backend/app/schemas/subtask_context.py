@@ -1,0 +1,277 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Subtask context schemas for API responses and request validation.
+
+Provides schemas for the unified context system that supports
+attachments, knowledge bases, and other context types.
+"""
+
+import logging
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.context_display import build_context_display_fields
+
+logger = logging.getLogger(__name__)
+
+
+class ContextType(str, Enum):
+    """Context type enumeration."""
+
+    ATTACHMENT = "attachment"
+    KNOWLEDGE_BASE = "knowledge_base"
+    SELECTED_DOCUMENTS = "selected_documents"
+    EXTERNAL_KNOWLEDGE = "external_knowledge"
+
+
+class ContextStatus(str, Enum):
+    """Context processing status.
+
+    For knowledge_base type contexts:
+    - PENDING: Retrieval not yet executed
+    - READY: Retrieval successful with results
+    - EMPTY: Retrieval successful but no results found
+    - FAILED: Retrieval execution failed
+    """
+
+    PENDING = "pending"
+    UPLOADING = "uploading"
+    PARSING = "parsing"
+    READY = "ready"
+    FAILED = "failed"
+    EMPTY = "empty"  # Retrieval successful but no results
+
+
+# ============================================================
+# Truncation Info (shared with attachment responses)
+# ============================================================
+
+
+class TruncationInfo(BaseModel):
+    """Information about content truncation."""
+
+    is_truncated: bool = False
+    original_length: Optional[int] = None
+    truncated_length: Optional[int] = None
+    truncation_message_key: Optional[str] = None  # i18n key for frontend
+
+
+# ============================================================
+# Full Response Schema
+# ============================================================
+
+
+class SubtaskContextResponse(BaseModel):
+    """Full context response schema."""
+
+    id: int
+    subtask_id: int
+    user_id: int
+    context_type: ContextType
+    name: str
+    status: ContextStatus
+    error_message: Optional[str] = None
+    text_length: int = 0
+    type_data: Dict[str, Any] = {}
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ============================================================
+# Brief Schema for Message Display
+# ============================================================
+
+
+class SubtaskContextBrief(BaseModel):
+    """Brief context info for message list display."""
+
+    id: int
+    context_type: ContextType
+    name: str
+    status: ContextStatus
+    # Attachment fields (from type_data)
+    file_extension: Optional[str] = None
+    file_size: Optional[int] = None
+    mime_type: Optional[str] = None
+    # Knowledge base fields (from type_data)
+    knowledge_id: Optional[int] = None
+    document_count: Optional[int] = None
+    document_ids: Optional[list[int]] = None
+    folder_ids: Optional[list[int]] = None
+    folder_names: Optional[list[str]] = None
+    include_subfolders: Optional[bool] = None
+    scope_restricted: Optional[bool] = None
+    # External knowledge fields (from type_data)
+    external_provider: Optional[str] = None
+    external_mode: Optional[str] = None
+    external_id: Optional[str] = None
+    external_scope: Optional[str] = None
+    external_target_type: Optional[str] = None
+    external_node_id: Optional[str] = None
+    external_document_id: Optional[str] = None
+    external_parent_id: Optional[str] = None
+    # External web content fields
+    video_count: Optional[int] = None
+    site: Optional[str] = None
+    source_url: Optional[str] = None
+    cover_url: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @classmethod
+    def from_model(cls, context) -> "SubtaskContextBrief":
+        """Create brief from SubtaskContext model."""
+        type_data = context.type_data or {}
+
+        # Handle context type as string or enum
+        context_type = context.context_type
+        if hasattr(context_type, "value"):
+            context_type_str = context_type.value
+        else:
+            context_type_str = str(context_type)
+
+        return cls(
+            id=context.id,
+            context_type=context.context_type,
+            name=context.name,
+            status=context.status,
+            **build_context_display_fields(context_type_str, type_data),
+        )
+
+
+# ============================================================
+# Attachment Response (backward compatible)
+# ============================================================
+
+
+class AttachmentResponse(BaseModel):
+    """Attachment upload/query response (backward compatible)."""
+
+    id: int
+    filename: str
+    file_size: int
+    mime_type: str
+    status: str
+    file_extension: str = ""
+    text_length: Optional[int] = None
+    error_message: Optional[str] = None
+    error_code: Optional[str] = None  # Error code for i18n mapping
+    truncation_info: Optional[TruncationInfo] = None
+    created_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @classmethod
+    def from_context(
+        cls,
+        context,
+        truncation_info: Optional[TruncationInfo] = None,
+    ) -> "AttachmentResponse":
+        """Create from SubtaskContext model."""
+        type_data = context.type_data or {}
+        return cls(
+            id=context.id,
+            filename=type_data.get("original_filename", context.name),
+            file_size=type_data.get("file_size", 0),
+            mime_type=type_data.get("mime_type", ""),
+            status=(
+                context.status
+                if isinstance(context.status, str)
+                else context.status.value
+            ),
+            file_extension=type_data.get("file_extension", ""),
+            text_length=context.text_length,
+            error_message=context.error_message,
+            truncation_info=truncation_info,
+            created_at=context.created_at,
+        )
+
+
+class AttachmentDetailResponse(AttachmentResponse):
+    """Detailed attachment response including subtask_id."""
+
+    subtask_id: Optional[int] = None
+
+    @classmethod
+    def from_context(
+        cls,
+        context,
+        truncation_info: Optional[TruncationInfo] = None,
+    ) -> "AttachmentDetailResponse":
+        """Create from SubtaskContext model."""
+        type_data = context.type_data or {}
+        return cls(
+            id=context.id,
+            filename=type_data.get("original_filename", context.name),
+            file_size=type_data.get("file_size", 0),
+            mime_type=type_data.get("mime_type", ""),
+            status=(
+                context.status
+                if isinstance(context.status, str)
+                else context.status.value
+            ),
+            file_extension=type_data.get("file_extension", ""),
+            text_length=context.text_length,
+            error_message=context.error_message,
+            truncation_info=truncation_info,
+            created_at=context.created_at,
+            subtask_id=context.subtask_id if context.subtask_id > 0 else None,
+        )
+
+
+class AttachmentPreviewResponse(AttachmentDetailResponse):
+    """Attachment preview response with extracted text snippet."""
+
+    preview_type: Literal["text", "image", "none"]
+    preview_text: Optional[str] = None
+    download_url: str
+
+    @classmethod
+    def from_context(
+        cls,
+        context,
+        preview_type: str,
+        preview_text: Optional[str],
+        download_url: str,
+        truncation_info: Optional[TruncationInfo] = None,
+    ) -> "AttachmentPreviewResponse":
+        """Create preview response from SubtaskContext model."""
+        base = AttachmentDetailResponse.from_context(context, truncation_info)
+        return cls(
+            **base.model_dump(),
+            preview_type=preview_type,
+            preview_text=preview_text,
+            download_url=download_url,
+        )
+
+
+# ============================================================
+# Create Schemas
+# ============================================================
+
+
+class AttachmentContextCreate(BaseModel):
+    """Data for creating attachment context (internal use)."""
+
+    original_filename: str
+    file_extension: str
+    file_size: int
+    mime_type: str
+    storage_backend: str = "mysql"
+    storage_key: Optional[str] = None
+
+
+class KnowledgeBaseContextCreate(BaseModel):
+    """Data for creating knowledge base context."""
+
+    knowledge_id: int
+    name: str
+    document_count: Optional[int] = None

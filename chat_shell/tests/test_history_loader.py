@@ -1,0 +1,344 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from types import SimpleNamespace
+
+import pytest
+
+from chat_shell.history.loader import (
+    _build_document_text_prefix,
+    _build_knowledge_base_text_prefix,
+    _extract_user_text,
+    _truncate_history,
+    get_chat_history,
+)
+
+
+class TestBuildDocumentTextPrefix:
+    def _context(self, **extra):
+        return SimpleNamespace(
+            id=7,
+            name="report.pdf",
+            extracted_text="partial content",
+            mime_type="application/pdf",
+            file_size=2048,
+            **extra,
+        )
+
+    def test_truncated_context_gets_partial_content_notice(self):
+        prefix = _build_document_text_prefix(self._context(is_truncated=True))
+        assert "only partial content is shown" in prefix
+        assert "characters" not in prefix
+
+    def test_non_truncated_context_has_no_notice(self):
+        prefix = _build_document_text_prefix(self._context(is_truncated=False))
+        assert "only partial content is shown" not in prefix
+
+    def test_missing_flag_defaults_to_no_notice(self):
+        # Remote-mode contexts may not carry the attribute at all.
+        prefix = _build_document_text_prefix(self._context())
+        assert "only partial content is shown" not in prefix
+
+
+class TestHistoryLoaderRestrictedKnowledgeBase:
+    def test_restricted_kb_context_is_not_injected_into_history(self):
+        context = SimpleNamespace(
+            id=10,
+            name="KB",
+            knowledge_id=123,
+            extracted_text="sensitive text",
+            type_data={"rag_result": {"restricted_mode": True}},
+        )
+
+        assert _build_knowledge_base_text_prefix(context) == ""
+
+
+class TestExtractUserText:
+    """Tests for _extract_user_text which extracts the user's plain text
+    from a content block list, skipping context and system-reminder blocks."""
+
+    def test_extracts_first_non_context_block(self):
+        content = [
+            {"type": "text", "text": "hello world"},
+            {"type": "text", "text": "<attachment>file</attachment>"},
+        ]
+        assert _extract_user_text(content) == "hello world"
+
+    def test_skips_attachment_block(self):
+        content = [
+            {"type": "text", "text": "<attachment>file content</attachment>"},
+            {"type": "text", "text": "user question"},
+        ]
+        assert _extract_user_text(content) == "user question"
+
+    def test_skips_knowledge_base_block(self):
+        content = [
+            {"type": "text", "text": "<knowledge_base>kb content</knowledge_base>"},
+            {"type": "text", "text": "user question"},
+        ]
+        assert _extract_user_text(content) == "user question"
+
+    def test_skips_selected_documents_block(self):
+        content = [
+            {"type": "text", "text": "<selected_documents>docs</selected_documents>"},
+            {"type": "text", "text": "user question"},
+        ]
+        assert _extract_user_text(content) == "user question"
+
+    def test_skips_system_reminder_block(self):
+        content = [
+            {"type": "text", "text": "user question"},
+            {
+                "type": "text",
+                "text": "<system-reminder><CurrentTime>now</CurrentTime></system-reminder>",
+            },
+        ]
+        assert _extract_user_text(content) == "user question"
+
+    def test_skips_image_url_blocks(self):
+        content = [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            {"type": "text", "text": "describe this"},
+        ]
+        assert _extract_user_text(content) == "describe this"
+
+    def test_skips_all_context_types(self):
+        content = [
+            {"type": "text", "text": "<attachment>file</attachment>"},
+            {"type": "text", "text": "<knowledge_base>kb</knowledge_base>"},
+            {"type": "text", "text": "<selected_documents>docs</selected_documents>"},
+            {"type": "image_url", "image_url": {"url": "data:..."}},
+            {
+                "type": "text",
+                "text": "<system-reminder><CurrentTime>t</CurrentTime></system-reminder>",
+            },
+            {"type": "text", "text": "the actual question"},
+        ]
+        assert _extract_user_text(content) == "the actual question"
+
+    def test_returns_none_when_no_user_text(self):
+        content = [
+            {"type": "text", "text": "<attachment>file</attachment>"},
+            {"type": "text", "text": "<system-reminder>time</system-reminder>"},
+        ]
+        assert _extract_user_text(content) is None
+
+    def test_empty_list(self):
+        assert _extract_user_text([]) is None
+
+    def test_user_text_with_group_chat_prefix(self):
+        content = [
+            {"type": "text", "text": "User[Alice]: hello everyone"},
+            {"type": "text", "text": "<attachment>file</attachment>"},
+        ]
+        assert _extract_user_text(content) == "User[Alice]: hello everyone"
+
+
+class TestTruncateHistory:
+    def test_preserves_tool_call_groups_at_head_and_tail_boundaries(self, monkeypatch):
+        monkeypatch.setattr(
+            "chat_shell.history.loader.settings.GROUP_CHAT_HISTORY_FIRST_MESSAGES", 2
+        )
+        monkeypatch.setattr(
+            "chat_shell.history.loader.settings.GROUP_CHAT_HISTORY_LAST_MESSAGES", 2
+        )
+
+        history = [
+            {"role": "user", "content": "User 0"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "Result 1", "tool_call_id": "call_1"},
+            {"role": "assistant", "content": "Assistant 1"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "Result 2", "tool_call_id": "call_2"},
+            {"role": "assistant", "content": "Assistant 2"},
+        ]
+
+        truncated = _truncate_history(history)
+
+        assert [msg["role"] for msg in truncated] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+        assert truncated[1]["tool_calls"][0]["id"] == "call_1"
+        assert truncated[2]["tool_call_id"] == "call_1"
+        assert truncated[3]["tool_calls"][0]["id"] == "call_2"
+        assert truncated[4]["tool_call_id"] == "call_2"
+
+
+class TestGetChatHistory:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_http_mode", [True, False])
+    async def test_limit_zero_returns_empty_without_loading(
+        self, monkeypatch, is_http_mode
+    ):
+        monkeypatch.setattr(
+            "chat_shell.history.loader._is_http_mode", lambda: is_http_mode
+        )
+
+        async def _should_not_call_async(*args, **kwargs):
+            raise AssertionError("history loader should not be called when limit <= 0")
+
+        monkeypatch.setattr(
+            "chat_shell.history.loader._load_history_from_remote",
+            _should_not_call_async,
+        )
+        monkeypatch.setattr(
+            "chat_shell.history.loader._load_history_from_db",
+            _should_not_call_async,
+        )
+
+        history = await get_chat_history(
+            task_id=1,
+            is_group_chat=False,
+            exclude_after_message_id=None,
+            limit=0,
+        )
+
+        assert history == []
+
+
+@pytest.mark.asyncio
+async def test_get_history_sends_from_latest_compaction(monkeypatch):
+    from chat_shell.storage.remote import RemoteHistoryStore
+
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        http_version = "HTTP/1.1"
+        elapsed = None
+        headers: dict = {}
+
+        def raise_for_status(self):
+            pass
+
+        async def aread(self):
+            return b"{}"
+
+        async def aclose(self):
+            pass
+
+        def json(self):
+            return {"messages": []}
+
+    class _FakeClient:
+        def build_request(self, method, url, params=None, headers=None):
+            captured["params"] = params
+            return object()
+
+        async def send(self, *_a, **_k):
+            return _Resp()
+
+    store = RemoteHistoryStore(base_url="http://x", auth_token="t")
+
+    async def _get_client():
+        return _FakeClient()
+
+    monkeypatch.setattr(store, "_get_client", _get_client)
+
+    await store.get_history(session_id="task-1", from_latest_compaction=True)
+    assert captured["params"].get("from_latest_compaction") == "true"
+
+
+@pytest.mark.asyncio
+async def test_remote_restores_summary_marker_from_metadata(monkeypatch):
+    from chat_shell.history import loader
+    from chat_shell.storage.interfaces import Message
+
+    class _FakeStore:
+        async def get_history(self, **kwargs):
+            return [
+                Message(
+                    role="user",
+                    content="[COMPACT SUMMARY] body",
+                    id="s1",
+                    metadata={"summary_compacted": True},
+                ),
+                Message(role="user", content="real", id="u1"),
+            ]
+
+    monkeypatch.setattr(loader, "_get_remote_history_store", lambda: _FakeStore())
+
+    history = await loader._load_history_from_remote(task_id=1, is_group_chat=False)
+
+    assert history[0]["additional_kwargs"]["summary_compacted"] is True
+    assert not history[1].get("additional_kwargs")
+
+
+@pytest.mark.asyncio
+async def test_recovery_checkpoint_chain_reloads_with_marker_and_tool_pairing(
+    monkeypatch,
+):
+    """A recovery-path checkpoint (summary + post-compaction tool pair + reply)
+    reloads through the loader identically to a normal-completion checkpoint:
+    marker restored, order preserved, tool-call/result still paired."""
+    from chat_shell.history import loader
+    from chat_shell.storage.interfaces import Message
+
+    class _FakeStore:
+        async def get_history(self, **kwargs):
+            return [
+                Message(
+                    role="user",
+                    content="[COMPACT SUMMARY] body",
+                    id="s1",
+                    metadata={"summary_compacted": True},
+                ),
+                Message(
+                    role="assistant",
+                    content="",
+                    id="a2",
+                    tool_calls=[
+                        {
+                            "id": "t2",
+                            "type": "function",
+                            "function": {"name": "probe", "arguments": "{}"},
+                        }
+                    ],
+                ),
+                Message(role="tool", content="ok", id="tm2", tool_call_id="t2"),
+                Message(role="assistant", content="final answer", id="a3"),
+            ]
+
+    monkeypatch.setattr(loader, "_get_remote_history_store", lambda: _FakeStore())
+
+    history = await loader._load_history_from_remote(task_id=1, is_group_chat=False)
+
+    # Summary marker restored so backend checkpoint scoping can anchor here.
+    assert history[0]["additional_kwargs"]["summary_compacted"] is True
+    # Order preserved.
+    assert [entry["role"] for entry in history] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    # Tool-call / tool-result pairing intact after reload.
+    tool_call_ids = [tc["id"] for tc in history[1]["tool_calls"]]
+    assert tool_call_ids == ["t2"]
+    assert history[2]["tool_call_id"] == "t2"

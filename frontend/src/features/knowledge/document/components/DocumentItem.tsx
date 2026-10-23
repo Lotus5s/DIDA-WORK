@@ -1,0 +1,931 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { ExternalDocumentBadge } from './ExternalDocumentBadge'
+import { ExternalSourceStatusBadge } from './ExternalSourceStatusBadge'
+
+import {
+  Trash2,
+  Pencil,
+  ExternalLink,
+  MoreVertical,
+  CloudDownload,
+  RefreshCw,
+  RotateCcw,
+  Download,
+  FolderInput,
+} from 'lucide-react'
+import { Badge } from '@/components/ui/badge'
+import { DocumentFormatIcon } from '@/components/icons/DocumentFormatIcon'
+import { Checkbox } from '@/components/ui/checkbox'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import type { KnowledgeDocument } from '@/types/knowledge'
+import { useTranslation } from '@/hooks/useTranslation'
+import { formatDate } from '@/utils/dateTime'
+import { getProcessingErrorMessage } from '../utils/processing-error'
+import {
+  getDocumentDisplayUpdatedAt,
+  getExternalSourceInfo,
+  getSyncedWikiConnectorType,
+  isDingtalkCopyDocument,
+  isDocumentIndexInFlight,
+  isSyncedWikiDocument,
+} from '../utils/documentUtils'
+import { toast } from '@/hooks/use-toast'
+import { useMultimodalDocActions } from '@/features/knowledge/multimodal/hooks/useMultimodalDocActions'
+import { useKnowledgeDocumentDownload } from '../hooks/useKnowledgeDocumentDownload'
+import { useDingtalkSyncLabel } from '../hooks/useDingtalkSyncLabel'
+import {
+  ReanalyzeDropdownItem,
+  ReanalyzeIconButton,
+} from '@/features/knowledge/multimodal/components/ReanalyzeActions'
+
+interface DocumentItemProps {
+  document: KnowledgeDocument
+  onEdit?: (doc: KnowledgeDocument) => void
+  onDelete?: (doc: KnowledgeDocument) => void
+  onRefresh?: (doc: KnowledgeDocument) => void
+  onReindex?: (doc: KnowledgeDocument) => void
+  onSync?: (doc: KnowledgeDocument) => void
+  onViewDetail?: (doc: KnowledgeDocument) => void
+  onMove?: (doc: KnowledgeDocument) => void
+  /** Open the "modify prompt & re-analyze" dialog (video/image docs only) */
+  onReanalyze?: (doc: KnowledgeDocument) => void
+  canManage?: boolean
+  canSelect?: boolean
+  /** Keep the selection control visible but disabled. */
+  selectionDisabled?: boolean
+  /** Explanation shown when selection is disabled. */
+  selectionDisabledHint?: string
+  showBorder?: boolean
+  selected?: boolean
+  includedInFolderScope?: boolean
+  onSelect?: (doc: KnowledgeDocument, selected: boolean) => void
+  /** Compact mode for sidebar display - uses card layout */
+  compact?: boolean
+  /** Whether the document is currently being refreshed */
+  isRefreshing?: boolean
+  /** Whether the document is currently being reindexed */
+  isReindexing?: boolean
+  isSyncing?: boolean
+  /** Whether the knowledge base has RAG configured (retriever + embedding model) */
+  ragConfigured?: boolean
+  /** Width of the name column in pixels (for table mode column resize) */
+  nameColumnWidth?: number
+  /** Whether to reserve the table action column */
+  showActionsColumn?: boolean
+  /** Indentation for nested documents (in pixels, applied to name column only) */
+  indent?: number
+  /** Whether this knowledge base permits original document downloads. */
+  allowDownload?: boolean
+}
+
+export function getDocumentTableGridTemplate(options: {
+  showSelectionColumn: boolean
+  showActionsColumn: boolean
+  nameColumnWidth?: number
+}) {
+  const selectionColumn = options.showSelectionColumn ? '20px ' : ''
+  const nameColumn = options.nameColumnWidth ? `${options.nameColumnWidth}px` : 'minmax(200px, 1fr)'
+  const actionsColumn = options.showActionsColumn ? '80px' : ''
+  return `${selectionColumn}${nameColumn} 28px 80px 80px 96px 160px 160px 96px ${actionsColumn}`.trim()
+}
+
+export function DocumentItem({
+  document,
+  onEdit,
+  onDelete,
+  onRefresh,
+  onReindex,
+  onSync,
+  onViewDetail,
+  onMove,
+  canManage = true,
+  canSelect = canManage,
+  selectionDisabled = false,
+  selectionDisabledHint,
+  showBorder = true,
+  selected = false,
+  includedInFolderScope = false,
+  onSelect,
+  compact = false,
+  isRefreshing = false,
+  isReindexing = false,
+  isSyncing = false,
+  ragConfigured = true,
+  nameColumnWidth,
+  showActionsColumn: showActionsColumnProp,
+  indent = 0,
+  onReanalyze,
+  allowDownload = true,
+}: DocumentItemProps) {
+  const { t } = useTranslation()
+  const downloadDocument = useKnowledgeDocumentDownload()
+  const getDingtalkSyncLabel = useDingtalkSyncLabel()
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  }
+
+  // Format date with time to seconds level: YYYY/MM/DD HH:mm:ss
+  const formatDateTime = (dateString: string) => {
+    const date = new Date(dateString)
+    const year = date.getFullYear()
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    const hours = String(date.getHours()).padStart(2, '0')
+    const minutes = String(date.getMinutes()).padStart(2, '0')
+    const seconds = String(date.getSeconds()).padStart(2, '0')
+    return `${year}/${month}/${day} ${hours}:${minutes}:${seconds}`
+  }
+
+  // Effective display update time: wiki rows use the latest successful index time
+  // (see getDocumentDisplayUpdatedAt); regular rows keep the '-' rule.
+  const displayUpdatedAt = getDocumentDisplayUpdatedAt(document)
+
+  const checkboxChecked = selected || includedInFolderScope
+  const checkboxDisabled = includedInFolderScope || selectionDisabled
+
+  const handleCheckboxChange = (checked: boolean | 'indeterminate') => {
+    if (checkboxDisabled) return
+    onSelect?.(document, checked === true)
+  }
+
+  const handleCheckboxClick = (e: React.MouseEvent) => {
+    e.stopPropagation()
+  }
+
+  const handleEdit = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    onEdit?.(document)
+  }
+
+  const handleMove = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    onMove?.(document)
+  }
+
+  const handleDelete = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    onDelete?.(document)
+  }
+
+  const handleRefresh = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    onRefresh?.(document)
+  }
+
+  const handleReindex = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    onReindex?.(document)
+  }
+
+  const handleSync = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    onSync?.(document)
+  }
+
+  const handleOpenLink = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    const url = sourceUrl
+    if (url) {
+      window.open(url, '_blank', 'noopener,noreferrer')
+    }
+  }
+
+  const handleDownload = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    try {
+      await downloadDocument(document)
+    } catch {
+      toast({
+        title: t('knowledge:document.document.downloadFailed'),
+        variant: 'destructive',
+      })
+    }
+  }
+
+  // Whether to show download button
+  const isSyncedWiki = isSyncedWikiDocument(document)
+  const syncedWikiConnectorType = getSyncedWikiConnectorType(document)
+  const showDownload =
+    allowDownload && !!document.attachment_id && (document.source_type === 'file' || isSyncedWiki)
+  // Check document source type
+  const isWeb = document.source_type === 'web'
+  const isNotIndexed = document.index_status === 'not_indexed'
+  const isIndexFailed = document.index_status === 'failed'
+  const isPendingConversion = document.index_status === 'pending_conversion'
+  const isConverting = document.index_status === 'converting'
+  const isBackendIndexing = isDocumentIndexInFlight(document)
+  const showIndexingState = isReindexing || isSyncing || isBackendIndexing
+  const isExternal = document.source_type === 'external'
+  const isWiki = isSyncedWiki
+  // A copy with its own source-refresh entry retries through that entry: for an
+  // external document a retry re-fetches the provider's latest body, so a
+  // separate import-retry control would repeat the same action under a second
+  // name.
+  const canSyncDingtalkCopy = isDingtalkCopyDocument(document) && !!onSync
+  const canSyncWiki = isSyncedWiki && !!onSync && !showIndexingState
+  // Documents without such an entry keep the dedicated import-retry control,
+  // which fetches the provider's latest body before replacing the attachment
+  // and reindexing. Regular documents reindex from failed or not-indexed states.
+  const canReindex =
+    !!onReindex &&
+    !showIndexingState &&
+    (isSyncedWiki
+      ? ragConfigured && !!document.attachment_id && isIndexFailed
+      : isExternal
+        ? isIndexFailed && !canSyncDingtalkCopy
+        : ragConfigured && (isIndexFailed || isNotIndexed))
+  // The same control serves as "retry import" for external documents; the
+  // DocumentList handler routes external documents to the retry entry.
+  const reindexActionLabel =
+    isExternal && !isSyncedWiki
+      ? t('knowledge:document.document.retryImport')
+      : t('knowledge:document.document.reindex')
+
+  // Multimodal (video/image) document actions — re-analyze gate + handler.
+  const { canReanalyze, handleReanalyze } = useMultimodalDocActions(
+    document,
+    onReanalyze,
+    showIndexingState
+  )
+
+  // Check if Excel file exceeds size limit (2MB)
+  const EXCEL_FILE_SIZE_LIMIT = 2 * 1024 * 1024 // 2MB
+  const isExcel = ['xls', 'xlsx'].includes(document.file_extension?.toLowerCase() || '')
+  const isExcelExceedingSizeLimit = isExcel && document.file_size > EXCEL_FILE_SIZE_LIMIT
+  // URL for web and imported external documents
+  const externalSource = getExternalSourceInfo(document)
+  const sourceUrl =
+    isWeb && document.source_config?.url && typeof document.source_config.url === 'string'
+      ? document.source_config.url
+      : isExternal && typeof externalSource?.url === 'string'
+        ? externalSource.url
+        : null
+  // Get display name - for web documents, remove .md extension
+  const displayName =
+    isWeb && document.name.endsWith('.md') ? document.name.slice(0, -3) : document.name
+
+  const handleRowClick = () => {
+    onViewDetail?.(document)
+  }
+
+  // DingTalk copies sync through the shared source-refresh entry; the entry
+  // stays visible while busy so the row can report "syncing".
+  const dingtalkSyncLabel = getDingtalkSyncLabel(document, showIndexingState)
+
+  const showSelectionColumn = Boolean(onSelect)
+  const canEditDocument = Boolean(onEdit) && !isWiki
+  const showActionsColumn =
+    showActionsColumnProp ??
+    Boolean(
+      onMove || canEditDocument || onDelete || onRefresh || onReindex || onSync || showDownload
+    )
+  const hasManageActions = Boolean(
+    onMove || canEditDocument || onDelete || onRefresh || onReindex || onSync || showDownload
+  )
+  const tableGridTemplate = getDocumentTableGridTemplate({
+    showSelectionColumn,
+    showActionsColumn,
+    nameColumnWidth,
+  })
+
+  let unavailableHint = t('knowledge:document.document.indexStatus.unavailableHint')
+  if (isExcelExceedingSizeLimit) {
+    unavailableHint = t('knowledge:document.document.excelFileSizeExceeded', {
+      extension: document.file_extension,
+      limit: 2,
+      size: (document.file_size / (1024 * 1024)).toFixed(2),
+    })
+  } else if (isNotIndexed) {
+    unavailableHint = t('knowledge:document.document.indexStatus.notIndexedHint')
+  } else if (isIndexFailed && document.processing_error) {
+    unavailableHint = getProcessingErrorMessage(document.processing_error, t)
+  } else if (isIndexFailed) {
+    unavailableHint = t('knowledge:document.document.indexStatus.failedHint')
+  }
+
+  const unavailableLabel = isIndexFailed
+    ? t('knowledge:document.document.indexStatus.failed')
+    : isNotIndexed
+      ? t('knowledge:document.document.indexStatus.notIndexed')
+      : t('knowledge:document.document.indexStatus.unavailable')
+
+  const unavailableDotColor = isNotIndexed ? 'bg-slate-400' : 'bg-yellow-500'
+
+  // Compact mode: Card layout for sidebar (notebook mode)
+  if (compact) {
+    const selectionControl = (
+      <div className="flex-shrink-0" onClick={handleCheckboxClick}>
+        <Checkbox
+          checked={checkboxChecked}
+          disabled={checkboxDisabled}
+          onCheckedChange={handleCheckboxChange}
+          className="data-[state=checked]:bg-primary data-[state=checked]:border-primary h-3.5 w-3.5 disabled:opacity-60"
+        />
+      </div>
+    )
+
+    return (
+      <div
+        className={`flex items-center gap-2 px-2 py-2 bg-base hover:bg-surface transition-colors rounded-lg border border-border group ${onViewDetail ? 'cursor-pointer' : ''}`}
+        onClick={handleRowClick}
+      >
+        {/* Checkbox for batch selection */}
+        {(canSelect || includedInFolderScope) && (
+          <>
+            {selectionDisabled && selectionDisabledHint ? (
+              <TooltipProvider>
+                <Tooltip delayDuration={200}>
+                  <TooltipTrigger asChild>{selectionControl}</TooltipTrigger>
+                  <TooltipContent side="top" className="max-w-xs">
+                    <p className="text-xs">{selectionDisabledHint}</p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            ) : (
+              selectionControl
+            )}
+          </>
+        )}
+
+        {/* File name and info */}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1">
+            <TooltipProvider>
+              <Tooltip delayDuration={300}>
+                <TooltipTrigger asChild>
+                  <span className="text-xs font-medium text-text-primary truncate">
+                    {displayName}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="max-w-xs">
+                  <p className="text-xs break-all">{displayName}</p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            {sourceUrl && (
+              <button
+                className="p-0.5 rounded text-primary hover:bg-primary/10 transition-colors flex-shrink-0"
+                onClick={handleOpenLink}
+                title={t('knowledge:document.document.openLink')}
+              >
+                <ExternalLink className="w-2.5 h-2.5" />
+              </button>
+            )}
+          </div>
+          <div className="flex items-center justify-between mt-0.5">
+            <div className="flex items-center gap-1.5 min-w-0">
+              {/* Type badge */}
+              {isWeb ? (
+                <Badge
+                  variant="default"
+                  size="sm"
+                  className="bg-green-500/10 text-green-600 border-green-500/20 text-[9px] px-1 py-0"
+                >
+                  {t('knowledge:document.document.type.web')}
+                </Badge>
+              ) : isExternal ? (
+                <ExternalDocumentBadge
+                  syncedWiki={isSyncedWiki}
+                  extension={document.file_extension}
+                  connectorType={syncedWikiConnectorType}
+                  className="text-[9px] px-1 py-0"
+                />
+              ) : (
+                <span className="text-[9px] text-text-muted uppercase">
+                  {document.file_extension}
+                </span>
+              )}
+              <ExternalSourceStatusBadge
+                document={document}
+                testId="external-source-inaccessible-compact"
+                className="max-w-[9rem] truncate px-1 py-0 text-[9px]"
+              />
+              {/* Size */}
+              {!isWeb && (
+                <span className="text-[9px] text-text-muted">
+                  {formatFileSize(document.file_size)}
+                </span>
+              )}
+              {/* Status indicator. Indexing-in-progress takes precedence over
+                  is_active: a re-analyze/re-index keeps the old index queryable
+                  but the UI must surface the in-flight state. */}
+              {showIndexingState ? (
+                <TooltipProvider>
+                  <Tooltip delayDuration={200}>
+                    <TooltipTrigger asChild>
+                      <span className="w-1 h-1 rounded-full flex-shrink-0 bg-blue-500 cursor-help animate-pulse" />
+                    </TooltipTrigger>
+                    <TooltipContent side="top" className="max-w-xs">
+                      <p className="text-xs">
+                        {isPendingConversion
+                          ? t('knowledge:document.document.indexStatus.pendingConversionHint')
+                          : isConverting
+                            ? t('knowledge:document.document.indexStatus.convertingHint')
+                            : t('knowledge:document.document.indexStatus.indexingHint')}
+                      </p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              ) : isIndexFailed ? (
+                <TooltipProvider>
+                  <Tooltip delayDuration={200}>
+                    <TooltipTrigger asChild>
+                      <span className="w-1 h-1 rounded-full flex-shrink-0 bg-error cursor-help" />
+                    </TooltipTrigger>
+                    <TooltipContent side="top" className="max-w-xs">
+                      <p className="text-xs">{unavailableHint}</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              ) : document.is_active ? (
+                <span
+                  className="w-1 h-1 rounded-full flex-shrink-0 bg-green-500"
+                  title={t('knowledge:document.document.indexStatus.available')}
+                />
+              ) : (
+                <TooltipProvider>
+                  <Tooltip delayDuration={200}>
+                    <TooltipTrigger asChild>
+                      <span
+                        className={`w-1 h-1 rounded-full flex-shrink-0 cursor-help ${unavailableDotColor}`}
+                      />
+                    </TooltipTrigger>
+                    <TooltipContent side="top" className="max-w-xs">
+                      <p className="text-xs">{unavailableHint}</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5 flex-shrink-0">
+              {document.created_by && (
+                <span className="text-[9px] text-text-muted truncate max-w-[60px]">
+                  {document.created_by}
+                </span>
+              )}
+              <span className="text-[9px] text-text-muted">
+                {displayUpdatedAt ? formatDate(displayUpdatedAt) : '-'}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* File icon / More actions - icon shown by default, more actions on hover */}
+        <div className="flex-shrink-0 relative w-6 h-6 flex items-center justify-center">
+          {/* File icon - hidden on hover when canManage */}
+          <div
+            className={`p-1 bg-primary/10 rounded ${canManage ? 'group-hover:opacity-0' : ''} transition-opacity`}
+          >
+            <DocumentFormatIcon
+              extension={document.file_extension}
+              sourceType={document.source_type}
+              className="h-3 w-3"
+            />
+          </div>
+          {/* More actions dropdown - shown on hover, replaces icon */}
+          {canManage && hasManageActions && (
+            <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    className="p-1 rounded text-text-muted hover:text-text-primary hover:bg-surface transition-colors"
+                    onClick={e => e.stopPropagation()}
+                    data-testid={`document-actions-${document.id}`}
+                  >
+                    <MoreVertical className="w-3.5 h-3.5" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="min-w-[120px]">
+                  {canEditDocument && (
+                    <DropdownMenuItem onClick={handleEdit}>
+                      <Pencil className="w-3.5 h-3.5 mr-2" />
+                      {t('common:actions.edit')}
+                    </DropdownMenuItem>
+                  )}
+                  {onMove && (
+                    <DropdownMenuItem onClick={handleMove}>
+                      <FolderInput className="w-3.5 h-3.5 mr-2" />
+                      {t('knowledge:document.folder.moveDocument')}
+                    </DropdownMenuItem>
+                  )}
+                  {isWeb && onRefresh && (
+                    <DropdownMenuItem onClick={handleRefresh} disabled={isRefreshing}>
+                      <CloudDownload
+                        className={`w-3.5 h-3.5 mr-2 ${isRefreshing ? 'animate-pulse' : ''}`}
+                      />
+                      {isRefreshing
+                        ? t('knowledge:document.upload.web.refetching')
+                        : t('knowledge:document.upload.web.refetch')}
+                    </DropdownMenuItem>
+                  )}
+                  {canSyncDingtalkCopy && (
+                    <DropdownMenuItem
+                      onClick={handleSync}
+                      disabled={showIndexingState}
+                      className="max-md:min-h-[44px]"
+                      data-testid={`sync-dingtalk-document-${document.id}`}
+                    >
+                      <RefreshCw
+                        className={`mr-2 h-3.5 w-3.5 ${showIndexingState ? 'animate-spin' : ''}`}
+                      />
+                      {dingtalkSyncLabel}
+                    </DropdownMenuItem>
+                  )}
+                  {canSyncWiki && (
+                    <DropdownMenuItem
+                      onClick={handleSync}
+                      data-testid={`sync-document-${document.id}`}
+                    >
+                      <CloudDownload className="mr-2 h-3.5 w-3.5" />
+                      {t('knowledge:document.document.resync')}
+                    </DropdownMenuItem>
+                  )}
+                  {canReindex && (
+                    <DropdownMenuItem onClick={handleReindex} disabled={showIndexingState}>
+                      <RotateCcw
+                        className={`w-3.5 h-3.5 mr-2 ${showIndexingState ? 'animate-spin' : ''}`}
+                      />
+                      {showIndexingState
+                        ? t('knowledge:document.document.reindexing')
+                        : isNotIndexed
+                          ? t('knowledge:document.document.index')
+                          : reindexActionLabel}
+                    </DropdownMenuItem>
+                  )}
+                  <ReanalyzeDropdownItem
+                    show={canReanalyze}
+                    disabled={showIndexingState}
+                    onClick={handleReanalyze}
+                  />
+                  {showDownload && (
+                    <DropdownMenuItem onClick={handleDownload}>
+                      <Download className="w-3.5 h-3.5 mr-2" />
+                      {t('knowledge:document.document.download')}
+                    </DropdownMenuItem>
+                  )}
+                  {onDelete && (
+                    <DropdownMenuItem danger onClick={handleDelete}>
+                      <Trash2 className="w-3.5 h-3.5 mr-2" />
+                      {t('common:actions.delete')}
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // Normal mode: Table row layout
+  return (
+    <div
+      className={`grid items-center gap-4 px-4 py-3 bg-base hover:bg-surface transition-colors group min-w-[880px] ${showBorder ? 'border-b border-border' : ''} ${onViewDetail ? 'cursor-pointer' : ''}`}
+      style={{ gridTemplateColumns: tableGridTemplate }}
+      onClick={handleRowClick}
+    >
+      {/* Checkbox for batch selection */}
+      {showSelectionColumn && (
+        <div
+          onClick={handleCheckboxClick}
+          title={selectionDisabled ? selectionDisabledHint : undefined}
+        >
+          {(canSelect || includedInFolderScope) && (
+            <Checkbox
+              checked={checkboxChecked}
+              disabled={checkboxDisabled}
+              onCheckedChange={handleCheckboxChange}
+              className="data-[state=checked]:bg-primary data-[state=checked]:border-primary disabled:opacity-60"
+            />
+          )}
+        </div>
+      )}
+
+      {/* Icon + Name container - indent applied to both */}
+      <div
+        className="flex items-center gap-2 overflow-hidden min-w-0"
+        style={{
+          ...(indent > 0 ? { paddingLeft: `${indent}px` } : {}),
+        }}
+      >
+        {/* File icon */}
+        <div className="flex-shrink-0">
+          <DocumentFormatIcon
+            extension={document.file_extension}
+            sourceType={document.source_type}
+          />
+        </div>
+
+        {/* File name */}
+        <TooltipProvider>
+          <Tooltip delayDuration={300}>
+            <TooltipTrigger asChild>
+              <span className="min-w-0 flex-1 text-sm font-medium text-text-primary truncate">
+                {displayName}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-xs">
+              <p className="text-xs break-all">{displayName}</p>
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+        {sourceUrl && (
+          <button
+            className="p-1 rounded-md text-primary hover:bg-primary/10 transition-colors flex-shrink-0"
+            onClick={handleOpenLink}
+            title={t('knowledge:document.document.openLink')}
+          >
+            <ExternalLink className="w-3.5 h-3.5" />
+          </button>
+        )}
+      </div>
+      {/* Edit button - right aligned */}
+      <div className="flex items-center justify-end">
+        {canManage && canEditDocument && (
+          <button
+            className="p-1 rounded-md text-primary hover:bg-primary/10 transition-colors"
+            onClick={handleEdit}
+            title={t('common:actions.edit')}
+          >
+            <Pencil className="w-3.5 h-3.5" />
+          </button>
+        )}
+      </div>
+
+      {/* Type */}
+      <div className="text-center min-w-0">
+        {isWeb ? (
+          <Badge
+            variant="default"
+            size="sm"
+            className="bg-green-500/10 text-green-600 border-green-500/20"
+          >
+            {t('knowledge:document.document.type.web')}
+          </Badge>
+        ) : isExternal ? (
+          <ExternalDocumentBadge
+            syncedWiki={isSyncedWiki}
+            extension={document.file_extension}
+            connectorType={syncedWikiConnectorType}
+          />
+        ) : (
+          <span className="text-xs text-text-muted uppercase">{document.file_extension}</span>
+        )}
+        <ExternalSourceStatusBadge
+          document={document}
+          testId="external-source-inaccessible"
+          className="ml-1"
+        />
+      </div>
+
+      {/* Size — wiki rows carry the real Markdown byte size since the
+          metadata fix, so they format like regular documents. */}
+      <div className="text-center min-w-0">
+        <span className="text-xs text-text-muted">
+          {isWeb ? '-' : formatFileSize(document.file_size)}
+        </span>
+      </div>
+      {/* Creator */}
+      <div className="text-center min-w-0" data-testid="creator-cell">
+        <TooltipProvider>
+          <Tooltip delayDuration={300}>
+            <TooltipTrigger asChild>
+              <span className="block text-xs text-text-muted truncate">
+                {document.created_by || '-'}
+              </span>
+            </TooltipTrigger>
+            {document.created_by && (
+              <TooltipContent side="top" className="max-w-xs">
+                <p className="text-xs">{document.created_by}</p>
+              </TooltipContent>
+            )}
+          </Tooltip>
+        </TooltipProvider>
+      </div>
+      {/* Upload date with time */}
+      <div className="text-center min-w-0">
+        <span className="text-xs text-text-muted">{formatDateTime(document.created_at)}</span>
+      </div>
+      {/* Updated date */}
+      <div className="text-center min-w-0" data-testid="updated-at-cell">
+        <span className="text-xs text-text-muted">
+          {displayUpdatedAt ? formatDateTime(displayUpdatedAt) : '-'}
+        </span>
+      </div>
+
+      {/* Index status — indexing-in-progress takes precedence over is_active
+          (a re-analyze/re-index keeps the old index queryable but the UI must
+          surface the in-flight state). Mirrors the compact-mode indicator. */}
+      <div className="text-center min-w-0">
+        {showIndexingState ? (
+          <TooltipProvider>
+            <Tooltip delayDuration={200}>
+              <TooltipTrigger asChild>
+                <span>
+                  <Badge
+                    variant="default"
+                    size="sm"
+                    className="whitespace-nowrap cursor-help bg-blue-500/10 text-blue-600 border-blue-500/20"
+                  >
+                    {isPendingConversion
+                      ? t('knowledge:document.document.indexStatus.pendingConversion')
+                      : isConverting
+                        ? t('knowledge:document.document.indexStatus.converting')
+                        : t('knowledge:document.document.indexStatus.indexing')}
+                  </Badge>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-xs">
+                <p className="text-xs">
+                  {isPendingConversion
+                    ? t('knowledge:document.document.indexStatus.pendingConversionHint')
+                    : isConverting
+                      ? t('knowledge:document.document.indexStatus.convertingHint')
+                      : t('knowledge:document.document.indexStatus.indexingHint')}
+                </p>
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        ) : isIndexFailed ? (
+          <TooltipProvider>
+            <Tooltip delayDuration={200}>
+              <TooltipTrigger asChild>
+                <span>
+                  <Badge
+                    variant="error"
+                    size="sm"
+                    className="whitespace-nowrap cursor-help"
+                    data-testid={`document-processing-error-${document.id}`}
+                  >
+                    {unavailableLabel}
+                  </Badge>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-xs">
+                <p className="text-xs">{unavailableHint}</p>
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        ) : document.is_active ? (
+          <Badge
+            variant="success"
+            size="sm"
+            className="whitespace-nowrap"
+            data-testid={isSyncedWiki ? `document-wiki-status-${document.id}` : undefined}
+          >
+            {t('knowledge:document.document.indexStatus.available')}
+          </Badge>
+        ) : (
+          <TooltipProvider>
+            <Tooltip delayDuration={200}>
+              <TooltipTrigger asChild>
+                <span>
+                  <Badge variant="warning" size="sm" className="whitespace-nowrap cursor-help">
+                    {unavailableLabel}
+                  </Badge>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-xs">
+                <p className="text-xs">{unavailableHint}</p>
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
+      </div>
+
+      {/* Action buttons */}
+      {showActionsColumn && (
+        <div className="flex items-center justify-center gap-1">
+          {canManage && (
+            <>
+              {/* Move to folder button */}
+              {onMove && (
+                <button
+                  className="p-1.5 rounded-md text-text-muted hover:text-primary hover:bg-primary/10 transition-colors"
+                  onClick={handleMove}
+                  title={t('knowledge:document.folder.moveDocument')}
+                  data-testid="move-button"
+                >
+                  <FolderInput className="w-3.5 h-3.5" />
+                </button>
+              )}
+              {/* Re-fetch button - only for web documents */}
+              {isWeb && onRefresh && (
+                <button
+                  className={`p-1.5 rounded-md transition-colors ${
+                    isRefreshing
+                      ? 'text-primary cursor-not-allowed'
+                      : 'text-text-muted hover:text-primary hover:bg-primary/10'
+                  }`}
+                  onClick={handleRefresh}
+                  disabled={isRefreshing}
+                  title={
+                    isRefreshing
+                      ? t('knowledge:document.upload.web.refetching')
+                      : t('knowledge:document.upload.web.refetch')
+                  }
+                  data-testid={`refresh-document-${document.id}`}
+                >
+                  <CloudDownload className={`w-4 h-4 ${isRefreshing ? 'animate-pulse' : ''}`} />
+                </button>
+              )}
+              {canSyncDingtalkCopy && (
+                <button
+                  className={`p-1.5 rounded-md transition-colors max-md:min-h-[44px] max-md:min-w-[44px] ${
+                    showIndexingState
+                      ? 'text-primary cursor-not-allowed'
+                      : 'text-text-muted hover:text-primary hover:bg-primary/10'
+                  }`}
+                  onClick={handleSync}
+                  disabled={showIndexingState}
+                  title={dingtalkSyncLabel}
+                  aria-label={dingtalkSyncLabel}
+                  data-testid={`sync-dingtalk-document-${document.id}`}
+                >
+                  <RefreshCw className={`h-4 w-4 ${showIndexingState ? 'animate-spin' : ''}`} />
+                </button>
+              )}
+              {canSyncWiki && (
+                <button
+                  className="p-1.5 rounded-md text-text-muted hover:text-primary hover:bg-primary/10 transition-colors"
+                  onClick={handleSync}
+                  title={t('knowledge:document.document.resync')}
+                  data-testid={`sync-document-${document.id}`}
+                >
+                  <CloudDownload className="h-4 w-4" />
+                </button>
+              )}
+              {/* Reindex button - only when RAG configured and document not indexed */}
+              {canReindex && (
+                <button
+                  className={`p-1.5 rounded-md transition-colors ${
+                    showIndexingState
+                      ? 'text-primary cursor-not-allowed'
+                      : 'text-text-muted hover:text-primary hover:bg-primary/10'
+                  }`}
+                  onClick={handleReindex}
+                  disabled={showIndexingState}
+                  title={
+                    showIndexingState
+                      ? t('knowledge:document.document.reindexing')
+                      : reindexActionLabel
+                  }
+                  data-testid={
+                    isExternal && !isSyncedWiki
+                      ? `retry-import-document-${document.id}`
+                      : `reindex-document-${document.id}`
+                  }
+                >
+                  <RotateCcw className={`w-4 h-4 ${showIndexingState ? 'animate-spin' : ''}`} />
+                </button>
+              )}
+              <ReanalyzeIconButton
+                show={canReanalyze}
+                disabled={showIndexingState}
+                documentId={document.id}
+                onClick={handleReanalyze}
+              />
+              {/* Download button - only for file documents with attachment */}
+              {showDownload && (
+                <button
+                  className="p-1.5 rounded-md text-text-muted hover:text-primary hover:bg-primary/10 transition-colors"
+                  onClick={handleDownload}
+                  title={t('knowledge:document.document.download')}
+                  data-testid={`download-document-${document.id}`}
+                >
+                  <Download className="w-4 h-4" />
+                </button>
+              )}
+              {/* Delete button */}
+              {onDelete && (
+                <button
+                  className="p-1.5 rounded-md text-text-muted hover:text-error hover:bg-error/10 transition-colors"
+                  onClick={handleDelete}
+                  title={t('common:actions.delete')}
+                  data-testid={`delete-document-${document.id}`}
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,1824 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Skills API endpoints for managing Claude Code Skills
+"""
+
+import hashlib
+import io
+import json
+import logging
+import zipfile
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Security,
+    UploadFile,
+    status,
+)
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
+
+from app.api.dependencies import get_db
+from app.core import security
+from app.models.kind import Kind
+from app.models.user import User
+from app.schemas.kind import (
+    GitBatchUpdateRequest,
+    GitBatchUpdateResponse,
+    GitImportRequest,
+    GitImportResponse,
+    GitScanResponse,
+    GitSkillUpdateRequest,
+    Skill,
+    SkillList,
+)
+from app.schemas.namespace import GroupRole
+from app.schemas.resource_library import ResourceLibraryPublicationUpdateRequest
+from app.schemas.skill_binding import (
+    SkillAvailability,
+    SkillBindingResponse,
+    SkillBindingUpdateRequest,
+)
+from app.services.adapters.public_skill import public_skill_service
+from app.services.adapters.skill_kinds import skill_kinds_service
+from app.services.auth import verify_skill_identity_token
+from app.services.git_skill import git_skill_service
+from app.services.group_permission import check_group_permission
+from app.services.marketplace_tag_service import marketplace_tag_service
+from app.services.resource_library_service import resource_library_service
+from app.services.skill_binding_service import skill_binding_service
+
+router = APIRouter(prefix="/kinds/skills")
+
+
+class GroupSkillBindingBatchRequest(BaseModel):
+    """Groups that should receive access to a Skill."""
+
+    group_names: List[str] = Field(min_length=1, max_length=100)
+
+
+def _release_read_transaction(db: Session) -> None:
+    """Release read-only DB transactions before slow response streaming."""
+    db.rollback()
+
+
+def _skill_content_etag(binary_data: bytes) -> str:
+    return f'"sha256:{hashlib.sha256(binary_data).hexdigest()}"'
+
+
+def _etag_matches(if_none_match: Optional[str], etag: str) -> bool:
+    if not if_none_match or not isinstance(if_none_match, str):
+        return False
+    candidates = [value.strip() for value in if_none_match.split(",")]
+    return "*" in candidates or etag in candidates
+
+
+def _is_runtime_skill_download(request: Request) -> bool:
+    """Return whether a validated request uses an executor credential."""
+    from app.core.auth_utils import is_api_key
+    from app.services.auth.task_token import verify_task_token
+
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key and is_api_key(api_key):
+        return True
+
+    authorization = request.headers.get("Authorization", "")
+    token = authorization[7:] if authorization.startswith("Bearer ") else authorization
+    return bool(
+        token
+        and (
+            is_api_key(token)
+            or verify_task_token(token)
+            or verify_skill_identity_token(token)
+        )
+    )
+
+
+def _ensure_system_skill_download_allowed(
+    request: Request,
+    current_user: User,
+) -> None:
+    """Restrict system Skill archives to admins and executor credentials."""
+    if current_user.role == "admin" or _is_runtime_skill_download(request):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="System skills cannot be downloaded by individual users",
+    )
+
+
+def _get_skill_archive_by_id(
+    db: Session,
+    skill_id: int,
+) -> tuple[Optional[Skill], Optional[bytes]]:
+    """Load an active Skill archive after the caller has authorized its use."""
+    skill_kind = (
+        db.query(Kind)
+        .filter(
+            Kind.id == skill_id,
+            Kind.kind == "Skill",
+            Kind.is_active == True,  # noqa: E712
+        )
+        .first()
+    )
+    if not skill_kind:
+        return None, None
+
+    skill = skill_kinds_service.get_skill_by_id_in_namespace(
+        db=db,
+        skill_id=skill_id,
+        namespace=skill_kind.namespace,
+    )
+    binary_data = skill_kinds_service.get_skill_binary_in_namespace(
+        db=db,
+        skill_id=skill_id,
+        namespace=skill_kind.namespace,
+    )
+    return skill, binary_data
+
+
+def _extract_bearer_token(authorization: str, oauth2_token: Optional[str]) -> str:
+    """Extract a bearer token from FastAPI auth sources."""
+    if authorization.startswith("Bearer "):
+        return authorization[7:]
+    return oauth2_token or ""
+
+
+def _get_current_user_or_skill_identity(
+    db: Session = Depends(get_db),
+    oauth2_token: Optional[str] = Security(security.oauth2_scheme_optional),
+    authorization: str = Header(default="", include_in_schema=False),
+) -> User:
+    """
+    Authenticate Skill package publishing requests.
+
+    Supports the normal user JWT used by Settings and the skill runtime identity
+    token used by Skill scripts. It intentionally does not accept generic task
+    auth tokens.
+    """
+    token = _extract_bearer_token(authorization, oauth2_token)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing authentication token")
+
+    try:
+        return security.get_current_user(token=token, db=db)
+    except HTTPException as jwt_error:
+        token_info = verify_skill_identity_token(token)
+        if not token_info:
+            raise jwt_error
+
+    user = db.query(User).filter(User.id == token_info.user_id).first()
+    if not user or not user.is_active or user.user_name != token_info.user_name:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+
+    return user
+
+
+def _get_current_user_or_skill_query_identity(
+    db: Session = Depends(get_db),
+    oauth2_token: Optional[str] = Security(security.oauth2_scheme_optional),
+    x_api_key_security: Optional[str] = Security(security.api_key_header_optional),
+    authorization: str = Header(default="", include_in_schema=False),
+    x_api_key: str = Header(
+        default="",
+        alias="X-API-Key",
+        include_in_schema=False,
+    ),
+) -> User:
+    """Authenticate Skill read requests, including runtime Skill identity tokens."""
+    try:
+        return security.get_current_user_jwt_apikey_tasktoken(
+            db=db,
+            oauth2_token=oauth2_token,
+            x_api_key_security=x_api_key_security,
+            authorization=authorization,
+            x_api_key=x_api_key,
+        )
+    except HTTPException as auth_error:
+        token = _extract_bearer_token(authorization, oauth2_token)
+        if not token:
+            raise auth_error
+
+        token_info = verify_skill_identity_token(token)
+        if not token_info:
+            raise auth_error
+
+    user = db.query(User).filter(User.id == token_info.user_id).first()
+    if not user or not user.is_active or user.user_name != token_info.user_name:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+
+    return user
+
+
+def _resolve_manageable_skill(
+    db: Session, skill_id: int, current_user: User, action: str
+) -> Kind:
+    """
+    Resolve a skill for management operations with unified permission checks.
+
+    Permission rules:
+    - Skill owner can manage
+    - System admin can manage any skill
+    - Group Owner/Maintainer can manage any skill in their group namespace
+    """
+    from app.services.group_permission import get_effective_role_in_group
+
+    skill_kind = (
+        db.query(Kind)
+        .filter(
+            Kind.id == skill_id,
+            Kind.kind == "Skill",
+            Kind.is_active == True,
+        )
+        .first()
+    )
+
+    if not skill_kind:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    if skill_kind.user_id == current_user.id:
+        return skill_kind
+
+    if current_user.role == "admin":
+        return skill_kind
+
+    if skill_kind.namespace != "default":
+        user_role = get_effective_role_in_group(
+            db, current_user.id, skill_kind.namespace
+        )
+        if user_role and user_role.value in {"Owner", "Maintainer"}:
+            return skill_kind
+
+    raise HTTPException(
+        status_code=403,
+        detail=f"You don't have permission to {action} this skill",
+    )
+
+
+# Request/Response schemas for new endpoints
+class PublicSkillCreate(BaseModel):
+    """Schema for creating a public skill"""
+
+    name: str
+    description: str
+    prompt: Optional[str] = None
+    version: Optional[str] = None
+    author: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version(cls, v):
+        """Convert float/int version to string to handle YAML parsing."""
+        if v is None:
+            return v
+        return str(v)
+
+
+class PublicSkillUpdate(BaseModel):
+    """Schema for updating a public skill"""
+
+    description: Optional[str] = None
+    prompt: Optional[str] = None
+    version: Optional[str] = None
+    author: Optional[str] = None
+    tags: Optional[List[str]] = None
+    visible: Optional[bool] = None
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version(cls, v):
+        """Convert float/int version to string to handle YAML parsing."""
+        if v is None:
+            return v
+        return str(v)
+
+
+class InvokeSkillRequest(BaseModel):
+    """Schema for invoking a skill"""
+
+    skill_name: str
+
+
+class InvokeSkillResponse(BaseModel):
+    """Schema for invoke skill response"""
+
+    prompt: str
+
+
+class SkillSourceResponse(BaseModel):
+    """Schema for skill source information"""
+
+    type: str = "upload"  # 'upload' or 'git'
+    repo_url: Optional[str] = None
+    skill_path: Optional[str] = None
+    imported_at: Optional[str] = None
+
+
+class UnifiedSkillResponse(BaseModel):
+    """Schema for unified skill list item"""
+
+    id: int
+    name: str
+    namespace: str
+    description: str
+    displayName: Optional[str] = None
+    version: Optional[str] = None
+    author: Optional[str] = None
+    tags: Optional[List[str]] = None
+    bindShells: Optional[List[str]] = None  # Shell types this skill is compatible with
+    visible: bool = True
+    is_active: bool
+    is_public: bool
+    user_id: int  # ID of the user who uploaded this skill
+    is_group_shared: bool = False
+    publication_status: Optional[str] = None
+    availability: SkillAvailability = Field(default_factory=SkillAvailability)
+    source: Optional[SkillSourceResponse] = (
+        None  # Source information for git-imported skills
+    )
+    created_at: Any
+    updated_at: Any
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version(cls, v):
+        """Convert float/int version to string to handle YAML parsing."""
+        if v is None:
+            return v
+        return str(v)
+
+
+class ReferencedGhostResponse(BaseModel):
+    """Schema for a Ghost that references a Skill."""
+
+    id: int
+    name: str
+    namespace: str
+
+
+class SkillReferencesResponse(BaseModel):
+    """Schema for queried Skill references."""
+
+    skill_id: int
+    skill_name: str
+    referenced_ghosts: List[ReferencedGhostResponse]
+
+
+@router.post("/upload", response_model=Skill, status_code=201)
+async def upload_skill(
+    file: UploadFile = File(..., description="Skill ZIP package (max 10MB)"),
+    name: str = Form(..., description="Skill name (unique)"),
+    namespace: str = Form("default", description="Namespace"),
+    current_user: User = Depends(_get_current_user_or_skill_identity),
+    db: Session = Depends(get_db),
+):
+    """
+    Upload and create a new Skill.
+
+    The ZIP package must contain a skill folder as root directory with the following structure:
+    ```
+    my-skill.zip
+      └── my-skill/
+          ├── SKILL.md
+          └── resources/
+    ```
+
+    The SKILL.md file must contain YAML frontmatter:
+    ```
+    ---
+    description: "Skill description"
+    version: "1.0.0"
+    author: "Author name"
+    tags: ["tag1", "tag2"]
+    ---
+    ```
+
+    Requirements:
+    - ZIP file must contain exactly one skill folder as root directory
+    - Skill folder name must match the ZIP file name (without .zip extension)
+    - SKILL.md must be located inside the skill folder
+    """
+    # Validate file type
+    if not file.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="File must be a ZIP package (.zip)")
+
+    # Read file content
+    file_content = await file.read()
+
+    # Create skill using service
+    skill = skill_kinds_service.create_skill(
+        db=db,
+        name=name.strip(),
+        namespace=namespace,
+        file_content=file_content,
+        file_name=file.filename,
+        user_id=current_user.id,
+    )
+
+    return skill
+
+
+@router.get("", response_model=SkillList)
+def list_skills(
+    skip: int = Query(0, ge=0, description="Number of items to skip"),
+    limit: int = Query(100, ge=1, le=100, description="Number of items to return"),
+    namespace: str = Query(
+        "default", description="Namespace filter (team namespace for group skills)"
+    ),
+    name: str = Query(None, description="Filter by skill name"),
+    exact_match: bool = Query(
+        False,
+        description="If true, only search in the specified namespace (for upload check). "
+        "If false, search with fallback: personal -> group -> task_owner -> public (for usage).",
+    ),
+    task_id: int = Query(
+        None,
+        description="Task ID for task-based authorization. "
+        "If provided, also searches skills owned by the task owner.",
+    ),
+    current_user: User = Depends(_get_current_user_or_skill_query_identity),
+    db: Session = Depends(get_db),
+):
+    """
+    Get current user's Skill list.
+
+    If 'name' parameter is provided, returns only the skill with that name.
+
+    Search behavior depends on 'exact_match':
+    - exact_match=true: Only search in the specified namespace (used for upload duplicate check)
+    - exact_match=false (default): Search with fallback order (used for skill usage):
+      1. User's skill in default namespace (personal)
+      2. Group-level skill in specified namespace (any user in that group, if namespace != 'default')
+      3. Task owner's skill (if task_id provided and user is task member)
+      4. Public skill (user_id=0)
+
+    Task-based authorization:
+    When task_id is provided, the API will also search for skills owned by the
+    task owner. This enables shared team scenarios where user B executes a task
+    using user A's team, and needs to find user A's private skills.
+    Authorization is verified by checking if current_user is a member of the task.
+    """
+    if name:
+        logger.info(
+            f"[list_skills] Searching for skill: name={name}, namespace={namespace}, exact_match={exact_match}, user_id={current_user.id}"
+        )
+        if exact_match:
+            # Exact match mode: only search in the specified namespace
+            skill = skill_kinds_service.get_skill_by_name(
+                db=db, name=name, namespace=namespace, user_id=current_user.id
+            )
+            logger.info(
+                f"[list_skills] Exact match result: skill={skill.metadata.name if skill else None}"
+            )
+            return SkillList(items=[skill] if skill else [])
+
+        # Fallback mode: search with priority order
+        # 1. User's personal skill (default namespace)
+        skill = skill_kinds_service.get_skill_by_name(
+            db=db, name=name, namespace="default", user_id=current_user.id
+        )
+
+        # 2. Group-level skill (if namespace is not default)
+        # Search ALL skills in the group namespace, not just current user's
+        if not skill and namespace != "default":
+            skill = skill_kinds_service.get_skill_by_name_in_namespace(
+                db=db, name=name, namespace=namespace
+            )
+
+        # 3. Team owner's skill (if task_id provided)
+        # This enables shared team scenarios where executor queries skills
+        # owned by the original team owner
+        if not skill and task_id:
+            from app.schemas.kind import Task
+            from app.services.task_member_service import task_member_service
+            from app.stores.tasks import task_store
+
+            # Verify current user is a member of the task (owner or group member)
+            if task_member_service.is_member(db, task_id, current_user.id):
+                # Get task to find the team owner
+                from app.models.task import TaskResource
+
+                task = task_store.get_task_by_states(
+                    db,
+                    task_id=task_id,
+                    states=TaskResource.is_active_query(),
+                )
+                if task:
+                    # Get team owner user_id from task's teamRef
+                    task_crd = Task.model_validate(task.json)
+                    team_owner_user_id = task_crd.spec.teamRef.user_id
+
+                    # If teamRef.user_id is set and different from current user,
+                    # search skill owned by team owner
+                    if team_owner_user_id and team_owner_user_id != current_user.id:
+                        skill = skill_kinds_service.get_skill_by_name(
+                            db=db,
+                            name=name,
+                            namespace="default",
+                            user_id=team_owner_user_id,
+                        )
+
+        # 4. Public skill (user_id=0)
+        if not skill:
+            skill = skill_kinds_service.get_skill_by_name(
+                db=db, name=name, namespace="default", user_id=0
+            )
+
+        return SkillList(items=[skill] if skill else [])
+
+    # List all skills
+    skills = skill_kinds_service.list_skills(
+        db=db, user_id=current_user.id, skip=skip, limit=limit, namespace=namespace
+    )
+    return skills
+
+
+# ============================================================================
+# Git Repository Import Endpoints (Personal Skills)
+# NOTE: Static routes must be defined BEFORE dynamic routes like /{skill_id}
+# ============================================================================
+
+
+@router.get("/git/scan", response_model=GitScanResponse)
+def scan_git_repository(
+    repo_url: str = Query(..., description="Git repository URL"),
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Scan a Git repository for skills.
+
+    Supports GitHub, GitLab, Gitee, and Gitea platforms.
+    Supports both public and private repositories via:
+    - URL embedded credentials (e.g., https://token@github.com/owner/repo)
+    - Platform integration tokens configured in Settings
+
+    Returns a list of skills found in the repository (directories containing SKILL.md)
+    along with repository authentication information.
+    """
+    skills = git_skill_service.scan_repository(repo_url, user_id=current_user.id, db=db)
+
+    return GitScanResponse(
+        repo_url=repo_url,
+        skills=[
+            {
+                "path": s.path,
+                "name": s.name,
+                "description": s.description,
+                "version": s.version,
+                "author": s.author,
+                "display_name": s.display_name,
+                "tags": s.tags,
+            }
+            for s in skills
+        ],
+        total_count=len(skills),
+    )
+
+
+@router.post("/git/import", response_model=GitImportResponse)
+def import_from_git_repository(
+    request: GitImportRequest,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Import selected skills from a Git repository.
+
+    Supports GitHub, GitLab, Gitee, and Gitea platforms.
+    Supports both public and private repositories via:
+    - URL embedded credentials (e.g., https://token@github.com/owner/repo)
+    - Platform integration tokens configured in Settings
+
+    Skills are imported to the user's personal namespace by default.
+    If a skill with the same name already exists:
+    - If the name is in overwrite_names, the existing skill will be updated
+    - Otherwise, the skill will be skipped
+    """
+    result = git_skill_service.import_skills(
+        repo_url=request.repo_url,
+        skill_paths=request.skill_paths,
+        namespace=request.namespace,
+        user_id=current_user.id,
+        overwrite_names=request.overwrite_names,
+        db=db,
+    )
+
+    return GitImportResponse(
+        success=[
+            {
+                "name": s["name"],
+                "path": s["path"],
+                "id": s["id"],
+                "action": s["action"],
+            }
+            for s in result.success
+        ],
+        skipped=[
+            {
+                "name": s["name"],
+                "path": s["path"],
+                "reason": s["reason"],
+            }
+            for s in result.skipped
+        ],
+        failed=[
+            {
+                "name": s["name"],
+                "path": s["path"],
+                "error": s["error"],
+            }
+            for s in result.failed
+        ],
+        total_success=len(result.success),
+        total_skipped=len(result.skipped),
+        total_failed=len(result.failed),
+    )
+
+
+@router.post("/git/batch-update", response_model=GitBatchUpdateResponse)
+def batch_update_skills_from_git(
+    request: GitBatchUpdateRequest,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Batch update multiple skills from their original Git repository sources.
+
+    This endpoint optimizes the update process by:
+    1. Grouping skills by their source repository
+    2. Downloading each repository only once
+    3. Updating all skills from the same repository in a single pass
+
+    This is more efficient than calling update-from-git for each skill individually,
+    especially when multiple skills come from the same repository.
+
+    Supports both public and private repositories via:
+    - URL embedded credentials in the original repo_url
+    - Platform integration tokens configured in Settings
+
+    Only skills that were imported from Git (source.type === 'git') can be updated.
+    Skills that don't exist, are not from Git, or have incomplete source info will be skipped.
+
+    Returns:
+        GitBatchUpdateResponse with success, skipped, and failed lists
+    """
+    result = git_skill_service.batch_update_skills_from_git(
+        skill_ids=request.skill_ids,
+        user_id=current_user.id,
+        db=db,
+    )
+
+    return GitBatchUpdateResponse(
+        success=[
+            {
+                "id": s["id"],
+                "name": s["name"],
+                "version": s.get("version"),
+                "source": s.get("source"),
+            }
+            for s in result.success
+        ],
+        skipped=[
+            {
+                "id": s["id"],
+                "name": s.get("name"),
+                "reason": s["reason"],
+            }
+            for s in result.skipped
+        ],
+        failed=[
+            {
+                "id": s["id"],
+                "name": s.get("name"),
+                "error": s["error"],
+            }
+            for s in result.failed
+        ],
+        total_success=len(result.success),
+        total_skipped=len(result.skipped),
+        total_failed=len(result.failed),
+    )
+
+
+@router.post("/git/update/{skill_id}", response_model=Dict[str, Any])
+def update_skill_from_selected_git_source(
+    skill_id: int,
+    request: GitSkillUpdateRequest,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update an existing skill from a selected repository path."""
+    skill_kind = _resolve_manageable_skill(
+        db=db,
+        skill_id=skill_id,
+        current_user=current_user,
+        action="update",
+    )
+    return git_skill_service.update_skill_from_repository(
+        skill_id=skill_id,
+        skill_owner_user_id=skill_kind.user_id,
+        auth_user_id=current_user.id,
+        repo_url=request.repo_url,
+        skill_path=request.skill_path,
+        db=db,
+    )
+
+
+# ============================================================================
+# Public Skill Endpoints (System-level skills, admin only)
+# NOTE: Static routes must be defined BEFORE dynamic routes like /{skill_id}
+# ============================================================================
+
+
+@router.get("/public/list", response_model=List[Dict[str, Any]])
+def list_public_skills(
+    skip: int = Query(0, ge=0, description="Number of items to skip"),
+    limit: int = Query(100, ge=1, le=100, description="Number of items to return"),
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List all public (system-level) skills."""
+    user_default_skill_ids = skill_binding_service.list_user_default_skill_ids(
+        db, current_user.id
+    )
+    skills = public_skill_service.get_skills(db, skip=skip, limit=limit)
+    for skill in skills:
+        skill["availability"] = {
+            "in_my_default": skill["id"] in user_default_skill_ids,
+            "agent_builtin": False,
+        }
+    return skills
+
+
+@router.post("/public", response_model=Dict[str, Any], status_code=201)
+def create_public_skill(
+    skill_in: PublicSkillCreate,
+    current_user: User = Depends(security.get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Create a public skill (admin only)."""
+    return public_skill_service.create_skill(
+        db,
+        name=skill_in.name,
+        description=skill_in.description,
+        prompt=skill_in.prompt,
+        version=skill_in.version,
+        author=skill_in.author,
+        tags=skill_in.tags,
+    )
+
+
+@router.put("/public/{skill_id}", response_model=Dict[str, Any])
+def update_public_skill(
+    skill_id: int,
+    skill_in: PublicSkillUpdate,
+    current_user: User = Depends(security.get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Update a public skill (admin only)."""
+    return public_skill_service.update_skill(
+        db,
+        skill_id=skill_id,
+        description=skill_in.description,
+        prompt=skill_in.prompt,
+        version=skill_in.version,
+        author=skill_in.author,
+        tags=skill_in.tags,
+        visible=skill_in.visible,
+    )
+
+
+@router.delete("/public/{skill_id}", status_code=204)
+def delete_public_skill(
+    skill_id: int,
+    current_user: User = Depends(security.get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a public skill (admin only)."""
+    public_skill_service.delete_skill(db, skill_id=skill_id)
+    return None
+
+
+@router.post("/public/upload", response_model=Dict[str, Any], status_code=201)
+async def upload_public_skill(
+    file: UploadFile = File(..., description="Skill ZIP package (max 10MB)"),
+    name: str = Form(..., description="Skill name (unique)"),
+    marketplace_tags: str = Form("[]", description="JSON array of marketplace tag IDs"),
+    current_user: User = Depends(security.get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Upload and create a new public Skill ZIP package (admin only).
+
+    Uses user_id=0 to indicate a public/system-level skill.
+    The ZIP package must contain a skill folder as root directory with the following structure:
+    ```
+    my-skill.zip
+      └── my-skill/
+          ├── SKILL.md
+          └── resources/
+    ```
+
+    The SKILL.md file must contain YAML frontmatter:
+    ```
+    ---
+    description: "Skill description"
+    version: "1.0.0"
+    author: "Author name"
+    tags: ["tag1", "tag2"]
+    ---
+    ```
+    """
+    # Validate file type
+    if not file.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="File must be a ZIP package (.zip)")
+
+    try:
+        parsed_marketplace_tags = json.loads(marketplace_tags)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Marketplace tags must be a JSON array",
+        ) from exc
+    if not isinstance(parsed_marketplace_tags, list) or not all(
+        isinstance(tag, str) for tag in parsed_marketplace_tags
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Marketplace tags must be a JSON array of strings",
+        )
+    validated_marketplace_tags = marketplace_tag_service.validate_resource_tags(
+        db,
+        parsed_marketplace_tags,
+        require_nonempty=True,
+    )
+
+    # Read file content
+    file_content = await file.read()
+
+    # Create public skill using service with user_id=0
+    skill = skill_kinds_service.create_skill(
+        db=db,
+        name=name.strip(),
+        namespace="default",
+        file_content=file_content,
+        file_name=file.filename,
+        user_id=0,  # Public skill
+        add_to_user_default=False,
+    )
+
+    skill_id = int(skill.metadata.labels.get("id", 0))
+    resource_library_service.update_publication(
+        db,
+        listing_id=skill_id,
+        request=ResourceLibraryPublicationUpdateRequest(
+            tags=validated_marketplace_tags,
+        ),
+        current_user=current_user,
+    )
+    return public_skill_service.get_skill_by_id(db, skill_id=skill_id)
+
+
+@router.put("/public/{skill_id}/upload", response_model=Dict[str, Any])
+async def update_public_skill_with_upload(
+    skill_id: int,
+    file: UploadFile = File(..., description="New Skill ZIP package (max 10MB)"),
+    current_user: User = Depends(security.get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Update a public Skill by uploading a new ZIP package (admin only).
+
+    Validates that the skill_id corresponds to a public skill (user_id=0).
+    The ZIP package must contain a skill folder as root directory with the following structure:
+    ```
+    my-skill.zip
+      └── my-skill/
+          ├── SKILL.md
+          └── resources/
+    ```
+
+    The Skill name and namespace cannot be changed.
+    """
+    # Verify this is a public skill (user_id=0)
+    existing_skill = (
+        db.query(Kind)
+        .filter(
+            Kind.id == skill_id,
+            Kind.user_id == 0,
+            Kind.kind == "Skill",
+            Kind.is_active == True,  # noqa: E712
+        )
+        .first()
+    )
+
+    if not existing_skill:
+        raise HTTPException(status_code=404, detail="Public skill not found")
+
+    # Validate file type
+    if not file.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="File must be a ZIP package (.zip)")
+
+    # Read file content
+    file_content = await file.read()
+
+    # Update public skill using service with user_id=0
+    skill = skill_kinds_service.update_skill(
+        db=db,
+        skill_id=skill_id,
+        user_id=0,  # Public skill
+        file_content=file_content,
+        file_name=file.filename,
+    )
+
+    # Convert to dict format for consistency with other public skill endpoints
+    return {
+        "id": int(skill.metadata.labels.get("id", 0)),
+        "name": skill.metadata.name,
+        "namespace": skill.metadata.namespace,
+        "description": skill.spec.description,
+        "prompt": skill.spec.prompt,
+        "version": skill.spec.version,
+        "author": skill.spec.author,
+        "tags": skill.spec.tags,
+        "bindShells": skill.spec.bindShells,
+        "is_active": True,
+        "is_public": True,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
+@router.get("/public/{skill_id}/download")
+def download_public_skill(
+    skill_id: int,
+    request: Request,
+    current_user: User = Depends(_get_current_user_or_skill_query_identity),
+    db: Session = Depends(get_db),
+):
+    """
+    Download a public Skill ckage.
+
+    Validates that the skill_id corresponds to a public skill (user_id=0).
+    Administrators and executor credentials can download public skills.
+    """
+    _ensure_system_skill_download_allowed(request, current_user)
+
+    # Verify this is a public skill (user_id=0)
+    skill = (
+        db.query(Kind)
+        .filter(
+            Kind.id == skill_id,
+            Kind.user_id == 0,
+            Kind.kind == "Skill",
+            Kind.is_active == True,  # noqa: E712
+        )
+        .first()
+    )
+
+    if not skill:
+        raise HTTPException(status_code=404, detail="Public skill not found")
+
+    # Get binary data using service with user_id=0
+    binary_data = skill_kinds_service.get_skill_binary(
+        db=db, skill_id=skill_id, user_id=0
+    )
+    if not binary_data:
+        raise HTTPException(status_code=404, detail="Public skill binary not found")
+
+    filename = f"{skill.name}.zip"
+    encoded_filename = quote(filename, safe="")
+    content_disposition = f"attachment; filename*=UTF-8''{encoded_filename}"
+    _release_read_transaction(db)
+
+    # Return as streaming response
+    return StreamingResponse(
+        io.BytesIO(binary_data),
+        media_type="application/zip",
+        headers={"Content-Disposition": content_disposition},
+    )
+
+
+@router.get("/public/{skill_id}/content", response_model=Dict[str, str])
+def get_public_skill_content(
+    skill_id: int,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Get the SKILL.md content from a public Skill ckage.
+
+    Validates that the skill_id corresponds to a public skill (user_id=0).
+    Any authenticated user can view public skill content.
+
+    Returns:
+        {"content": "SKILL.md raw content"}
+    """
+    # Verify this is a public skill (user_id=0)
+    skill = (
+        db.query(Kind)
+        .filter(
+            Kind.id == skill_id,
+            Kind.user_id == 0,
+            Kind.kind == "Skill",
+            Kind.is_active == True,  # noqa: E712
+        )
+        .first()
+    )
+
+    if not skill:
+        raise HTTPException(status_code=404, detail="Public skill not found")
+
+    # Get binary data using service with user_id=0
+    binary_data = skill_kinds_service.get_skill_binary(
+        db=db, skill_id=skill_id, user_id=0
+    )
+    if not binary_data:
+        raise HTTPException(status_code=404, detail="Public skill binary not found")
+
+    # Extract SKILL.md content from ZIP
+    try:
+        with zipfile.ZipFile(io.BytesIO(binary_data), "r") as zip_file:
+            # Find SKILL.md file
+            skill_md_content = None
+            for file_info in zip_file.filelist:
+                # Skip directory entries
+                if file_info.filename.endswith("/"):
+                    continue
+                # Check if this is SKILL.md (in format: skill-folder/SKILL.md)
+                if file_info.filename.endswith("SKILL.md"):
+                    path_parts = file_info.filename.split("/")
+                    # SKILL.md must be in a subdirectory (skill-folder/SKILL.md)
+                    if len(path_parts) == 2:
+                        with zip_file.open(file_info) as f:
+                            skill_md_content = f.read().decode("utf-8", errors="ignore")
+                        break
+
+            if not skill_md_content:
+                raise HTTPException(
+                    status_code=404, detail="SKILL.md not found in skill package"
+                )
+
+            return {"content": skill_md_content}
+
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Corrupted ZIP file")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to read SKILL.md: {str(e)}"
+        )
+
+
+# ============================================================================
+# Public Skill Git Import Endpoints (Admin only)
+# ============================================================================
+
+
+@router.get("/public/git/scan", response_model=GitScanResponse)
+def scan_git_repository_for_public(
+    repo_url: str = Query(..., description="Git repository URL"),
+    current_user: User = Depends(security.get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Scan a Git repository for skills (admin only, for public skill import).
+
+    Supports GitHub, GitLab, Gitee, and Gitea platforms.
+    Supports both public and private repositories via:
+    - URL embedded credentials (e.g., https://token@github.com/owner/repo)
+    - Platform integration tokens configured in Settings
+
+    Returns a list of skills found in the repository (directories containing SKILL.md)
+    along with repository authentication information.
+    """
+    skills = git_skill_service.scan_repository(repo_url, user_id=current_user.id, db=db)
+
+    return GitScanResponse(
+        repo_url=repo_url,
+        skills=[
+            {
+                "path": s.path,
+                "name": s.name,
+                "description": s.description,
+                "version": s.version,
+                "author": s.author,
+                "display_name": s.display_name,
+                "tags": s.tags,
+            }
+            for s in skills
+        ],
+        total_count=len(skills),
+    )
+
+
+@router.post("/public/git/import", response_model=GitImportResponse)
+def import_from_git_repository_for_public(
+    request: GitImportRequest,
+    current_user: User = Depends(security.get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Import selected skills from a Git repository as public skills (admin only).
+
+    Supports GitHub, GitLab, Gitee, and Gitea platforms.
+    Supports both public and private repositories via:
+    - URL embedded credentials (e.g., https://token@github.com/owner/repo)
+    - Platform integration tokens configured in Settings
+
+    Skills are imported as public skills (user_id=0).
+    If a skill with the same name already exists:
+    - If the name is in overwrite_names, the existing skill will be updated
+    - Otherwise, the skill will be skipped
+    """
+    validated_marketplace_tags = marketplace_tag_service.validate_resource_tags(
+        db,
+        request.marketplace_tags or [],
+        require_nonempty=True,
+    )
+    result = git_skill_service.import_skills(
+        repo_url=request.repo_url,
+        skill_paths=request.skill_paths,
+        namespace="default",  # Public skills always use default namespace
+        user_id=0,  # Public skill
+        overwrite_names=request.overwrite_names,
+        db=db,
+    )
+    for imported_skill in result.success:
+        resource_library_service.update_publication(
+            db,
+            listing_id=imported_skill["id"],
+            request=ResourceLibraryPublicationUpdateRequest(
+                tags=validated_marketplace_tags,
+            ),
+            current_user=current_user,
+        )
+
+    return GitImportResponse(
+        success=[
+            {
+                "name": s["name"],
+                "path": s["path"],
+                "id": s["id"],
+                "action": s["action"],
+            }
+            for s in result.success
+        ],
+        skipped=[
+            {
+                "name": s["name"],
+                "path": s["path"],
+                "reason": s["reason"],
+            }
+            for s in result.skipped
+        ],
+        failed=[
+            {
+                "name": s["name"],
+                "path": s["path"],
+                "error": s["error"],
+            }
+            for s in result.failed
+        ],
+        total_success=len(result.success),
+        total_skipped=len(result.skipped),
+        total_failed=len(result.failed),
+    )
+
+
+# ============================================================================
+# Unified Skill Endpoints (User + Public)
+# NOTE: Static routes must be defined BEFORE dynamic routes like /{skill_id}
+# ============================================================================
+
+
+@router.get("/unified", response_model=List[UnifiedSkillResponse])
+def list_unified_skills(
+    skip: int = Query(0, ge=0, description="Number of items to skip"),
+    limit: int = Query(100, ge=1, le=100, description="Number of items to return"),
+    scope: str = Query(
+        "personal",
+        description="Query scope: 'personal' (default), 'group', or 'all'",
+    ),
+    group_name: Optional[str] = Query(
+        None, description="Group name (required when scope='group')"
+    ),
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    List all skills (user's/group's + public).
+
+    Scope behavior:
+    - scope='personal' (default): personal skills (current user only) + public skills
+    - scope='group': ALL group skills in namespace (from any user) + public skills (requires group_name)
+    - scope='all': personal + public + all user's groups
+
+    Returns combined list with user/group skills first, then public skills.
+    User/group skills with same name take precedence over public skills.
+    """
+    from sqlalchemy import or_
+
+    from app.services.group_permission import get_user_groups
+
+    user_skills = []
+    user_skill_keys = set()
+    user_skill_names = set()
+    user_default_skill_ids = skill_binding_service.list_user_default_skill_ids(
+        db, current_user.id
+    )
+    group_namespaces: list[str] = []
+    group_shared_skill_ids: set[int] = set()
+    if scope != "group" or not group_name:
+        user_groups = get_user_groups(db, current_user.id)
+        group_namespaces = [group for group in user_groups if group != "default"]
+        group_shared_skill_ids = (
+            skill_binding_service.list_group_skill_ids_for_authorized_namespaces(
+                db, group_namespaces
+            )
+        )
+    bound_skill_ids = (
+        set(user_default_skill_ids) if scope in {"personal", "all"} else set()
+    )
+
+    # Build optimized query based on scope
+    if scope == "personal":
+        # Personal scope: only query current user's skills in default namespace
+        skill_kinds = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == current_user.id,
+                Kind.kind == "Skill",
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )
+            .order_by(Kind.created_at.desc())
+            .all()
+        )
+    elif scope == "group":
+        if group_name:
+            has_group_access = current_user.role == "admin" or check_group_permission(
+                db, current_user.id, group_name, GroupRole.Reporter
+            )
+            if not has_group_access:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You don't have permission to view this group's skills",
+                )
+
+            # Group scope with specific group: query ALL skills in that namespace
+            skill_kinds = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "Skill",
+                    Kind.namespace == group_name,
+                    Kind.is_active == True,
+                )
+                .order_by(Kind.created_at.desc())
+                .all()
+            )
+            group_shared_skill_ids = (
+                skill_binding_service.list_group_skill_ids_for_authorized_namespaces(
+                    db, [group_name]
+                )
+            )
+            bound_skill_ids.update(group_shared_skill_ids)
+        else:
+            # Query all user's groups (excluding default)
+            if group_namespaces:
+                skill_kinds = (
+                    db.query(Kind)
+                    .filter(
+                        Kind.kind == "Skill",
+                        Kind.namespace.in_(group_namespaces),
+                        Kind.is_active == True,
+                    )
+                    .order_by(Kind.created_at.desc())
+                    .all()
+                )
+            else:
+                skill_kinds = []
+            bound_skill_ids.update(group_shared_skill_ids)
+    else:  # scope == "all"
+        # Query personal + all user's groups in a single query
+        # Build OR conditions for optimized single query
+        conditions = [
+            # Personal skills in default namespace
+            (Kind.user_id == current_user.id)
+            & (Kind.namespace == "default")
+        ]
+        if group_namespaces:
+            # Group skills in any of user's groups
+            conditions.append(Kind.namespace.in_(group_namespaces))
+
+        skill_kinds = (
+            db.query(Kind)
+            .filter(
+                Kind.kind == "Skill",
+                Kind.is_active == True,
+                or_(*conditions),
+            )
+            .order_by(Kind.created_at.desc())
+            .all()
+        )
+        bound_skill_ids.update(group_shared_skill_ids)
+
+    direct_skill_ids = {skill.id for skill in skill_kinds}
+    missing_bound_skill_ids = bound_skill_ids - direct_skill_ids
+    if missing_bound_skill_ids:
+        bound_skills = (
+            db.query(Kind)
+            .filter(
+                Kind.id.in_(missing_bound_skill_ids),
+                Kind.kind == "Skill",
+                Kind.is_active == True,
+            )
+            .order_by(Kind.created_at.desc())
+            .all()
+        )
+        skill_kinds.extend(bound_skills)
+
+    # Convert Kind objects to response format
+    for kind in skill_kinds:
+        skill_key = (kind.namespace, kind.name)
+        if skill_key not in user_skill_keys:
+            user_skill_keys.add(skill_key)
+            user_skill_names.add(kind.name)
+            spec = kind.json.get("spec", {})
+            capability = spec.get("capability") or {}
+
+            # Extract source information if available
+            source_data = spec.get("source")
+            source_info = None
+            if source_data:
+                source_info = {
+                    "type": source_data.get("type", "upload"),
+                    "repo_url": source_data.get("repo_url"),
+                    "skill_path": source_data.get("skill_path"),
+                    "imported_at": source_data.get("imported_at"),
+                }
+
+            user_skills.append(
+                {
+                    "id": kind.id,
+                    "name": kind.name,
+                    "namespace": kind.namespace,
+                    "description": spec.get("description", ""),
+                    "displayName": spec.get("displayName"),
+                    "version": spec.get("version"),
+                    "author": spec.get("author"),
+                    "tags": spec.get("tags"),
+                    "bindShells": spec.get("bindShells"),
+                    "visible": spec.get("visible", True),
+                    "is_active": True,
+                    "is_public": False,
+                    "user_id": kind.user_id,
+                    "is_group_shared": kind.id in group_shared_skill_ids,
+                    "publication_status": capability.get("publishStatus"),
+                    "availability": {
+                        "in_my_default": kind.id in user_default_skill_ids,
+                        "agent_builtin": False,
+                    },
+                    "source": source_info,
+                    "created_at": kind.created_at,
+                    "updated_at": kind.updated_at,
+                }
+            )
+
+    # Get public skills (user_id=0) - single query
+    public_skill_kinds = (
+        db.query(Kind)
+        .filter(
+            Kind.user_id == 0,
+            Kind.kind == "Skill",
+            Kind.namespace == "default",
+            Kind.is_active == True,
+        )
+        .order_by(Kind.created_at.desc())
+        .all()
+    )
+
+    # Merge: public skills that don't exist in user's skills
+    for kind in public_skill_kinds:
+        if kind.name not in user_skill_names:
+            spec = kind.json.get("spec", {})
+            capability = spec.get("capability") or {}
+            user_skills.append(
+                {
+                    "id": kind.id,
+                    "name": kind.name,
+                    "namespace": kind.namespace,
+                    "description": spec.get("description", ""),
+                    "displayName": spec.get("displayName"),
+                    "version": spec.get("version"),
+                    "author": spec.get("author"),
+                    "tags": spec.get("tags"),
+                    "bindShells": spec.get("bindShells"),
+                    "visible": spec.get("visible", True),
+                    "is_active": True,
+                    "is_public": True,
+                    "user_id": kind.user_id,
+                    "is_group_shared": kind.id in group_shared_skill_ids,
+                    "publication_status": capability.get("publishStatus"),
+                    "availability": {
+                        "in_my_default": kind.id in user_default_skill_ids,
+                        "agent_builtin": False,
+                    },
+                    "source": None,
+                    "created_at": kind.created_at,
+                    "updated_at": kind.updated_at,
+                }
+            )
+
+    # Apply pagination
+    return user_skills[skip : skip + limit]
+
+
+# ============================================================================
+# Invoke Skill Endpoint
+# NOTE: Static routes must be defined BEFORE dynamic routes like /{skill_id}
+# ============================================================================
+
+
+@router.post("/invoke", response_model=InvokeSkillResponse)
+def invoke_skill(
+    request: InvokeSkillRequest,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Get skill prompt content for runtime expansion.
+
+    Searches user's skills first, then public skills.
+    """
+    # Search user's skill first
+    skill = (
+        db.query(Kind)
+        .filter(
+            Kind.user_id == current_user.id,
+            Kind.kind == "Skill",
+            Kind.name == request.skill_name,
+            Kind.is_active == True,  # noqa: E712
+        )
+        .first()
+    )
+
+    # Then search public skill
+    if not skill:
+        skill = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Skill",
+                Kind.name == request.skill_name,
+                Kind.is_active == True,  # noqa: E712
+            )
+            .first()
+        )
+
+    if not skill:
+        raise HTTPException(404, f"Skill '{request.skill_name}' not found")
+
+    skill_crd = Skill.model_validate(skill.json)
+    if not skill_crd.spec.prompt:
+        raise HTTPException(400, f"Skill '{request.skill_name}' has no prompt content")
+
+    return InvokeSkillResponse(prompt=skill_crd.spec.prompt)
+
+
+# ============================================================================
+# Skill Binding Endpoints
+# NOTE: Static routes must be defined BEFORE dynamic routes like /{skill_id}
+# ============================================================================
+
+
+@router.get("/bindings/me", response_model=List[SkillBindingResponse])
+def list_my_default_skill_bindings(
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List Skills that are enabled by default for the current user."""
+    bindings = skill_binding_service.list_user_default_bindings(db, current_user.id)
+    return [skill_binding_service.to_response(binding) for binding in bindings]
+
+
+@router.post("/{skill_id}/bindings/me", response_model=SkillBindingResponse)
+def add_skill_to_my_default(
+    skill_id: int,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Enable a Skill by default for the current user."""
+    binding = skill_binding_service.add_user_default_skill(
+        db,
+        user_id=current_user.id,
+        skill_id=skill_id,
+        created_by=current_user.id,
+    )
+    return skill_binding_service.to_response(binding)
+
+
+@router.patch("/{skill_id}/bindings/me", response_model=SkillBindingResponse)
+def update_my_default_skill_binding(
+    skill_id: int,
+    request: SkillBindingUpdateRequest,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update exception rules for a Skill automatically enabled for the current user."""
+    skill_binding_service.get_accessible_skill(db, skill_id, current_user.id)
+    binding = skill_binding_service.update_user_default_skill_exceptions(
+        db,
+        user_id=current_user.id,
+        skill_id=skill_id,
+        exceptions=request.exceptions,
+        force_preload=request.force_preload,
+    )
+    return skill_binding_service.to_response(binding)
+
+
+@router.delete("/{skill_id}/bindings/me", status_code=status.HTTP_204_NO_CONTENT)
+def remove_skill_from_my_default(
+    skill_id: int,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Disable a Skill by default for the current user."""
+    skill_binding_service.remove_user_default_skill(
+        db,
+        user_id=current_user.id,
+        skill_id=skill_id,
+    )
+    return None
+
+
+@router.post(
+    "/{skill_id}/bindings/groups",
+    response_model=List[SkillBindingResponse],
+)
+def add_skill_to_groups(
+    skill_id: int,
+    request: GroupSkillBindingBatchRequest,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Add a Skill to one or more groups managed by the current user."""
+    group_names = list(
+        dict.fromkeys(name.strip() for name in request.group_names if name.strip())
+    )
+    if not group_names:
+        raise HTTPException(status_code=400, detail="At least one group is required")
+
+    bindings = [
+        skill_binding_service.add_group_skill(
+            db,
+            group_namespace=group_name,
+            skill_id=skill_id,
+            created_by=current_user.id,
+            commit=False,
+        )
+        for group_name in group_names
+    ]
+    db.commit()
+    for binding in bindings:
+        db.refresh(binding)
+    return [skill_binding_service.to_response(binding) for binding in bindings]
+
+
+@router.delete(
+    "/{skill_id}/bindings/groups",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def remove_skill_from_group(
+    skill_id: int,
+    group_name: str = Query(..., min_length=1),
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove a Skill from a group managed by the current user."""
+    skill_binding_service.remove_group_skill(
+        db,
+        group_namespace=group_name,
+        skill_id=skill_id,
+        removed_by=current_user.id,
+    )
+    return None
+
+
+# ============================================================================
+# Dynamic Skill Endpoints (with path parameter)
+# NOTE: These routes MUST be defined AFTER all static routes to avoid
+# path parameter matching static route names like "unified", "public", "invoke"
+# ============================================================================
+
+
+@router.get("/{skill_id}", response_model=Skill)
+def get_skill(
+    skill_id: int,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get Skill details by ID"""
+    skill = skill_kinds_service.get_skill_by_id(
+        db=db, skill_id=skill_id, user_id=current_user.id
+    )
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+    return skill
+
+
+@router.post("/{skill_id}/remove-references", response_model=Dict[str, Any])
+def remove_skill_references(
+    skill_id: int,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Remove all Ghost references to this Skill.
+
+    This allows the Skill to be deleted afterwards.
+    Returns the count of removed references and affected Ghost names.
+    """
+    skill_kind = _resolve_manageable_skill(
+        db=db,
+        skill_id=skill_id,
+        current_user=current_user,
+        action="remove references from",
+    )
+
+    result = skill_kinds_service.remove_skill_references(
+        db=db, skill_id=skill_id, user_id=skill_kind.user_id
+    )
+    return result
+
+
+@router.post("/{skill_id}/remove-reference/{ghost_id}", response_model=Dict[str, Any])
+def remove_single_skill_reference(
+    skill_id: int,
+    ghost_id: int,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Remove a Skill reference from a single Ghost.
+
+    Returns success status and the affected Ghost name.
+    """
+    skill_kind = _resolve_manageable_skill(
+        db=db,
+        skill_id=skill_id,
+        current_user=current_user,
+        action="remove references from",
+    )
+
+    result = skill_kinds_service.remove_single_skill_reference(
+        db=db, skill_id=skill_id, ghost_id=ghost_id, user_id=skill_kind.user_id
+    )
+    return result
+
+
+@router.get("/{skill_id}/references", response_model=SkillReferencesResponse)
+def get_skill_references(
+    skill_id: int,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Query Ghost references for a Skill without deleting it.
+
+    Permission rules are the same as other skill management operations.
+    """
+    skill_kind = _resolve_manageable_skill(
+        db=db,
+        skill_id=skill_id,
+        current_user=current_user,
+        action="inspect references for",
+    )
+
+    return skill_kinds_service.get_skill_references(
+        db=db, skill_id=skill_id, user_id=skill_kind.user_id
+    )
+
+
+@router.post("/{skill_id}/update-from-git", response_model=Dict[str, Any])
+def update_skill_from_git(
+    skill_id: int,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Update a skill from its original Git repository source.
+
+    This endpoint is only available for skills that were imported from a Git repository.
+    It will re-download the skill from the original repository and update the local copy.
+
+    Returns:
+        Dict with updated skill info including id, name, version, and source
+    """
+    skill_kind = _resolve_manageable_skill(
+        db=db,
+        skill_id=skill_id,
+        current_user=current_user,
+        action="update",
+    )
+
+    result = git_skill_service.update_skill_from_git(
+        skill_id=skill_id,
+        user_id=skill_kind.user_id,
+        db=db,
+    )
+    return result
+
+
+@router.put("/{skill_id}", response_model=Skill)
+async def update_skill(
+    skill_id: int,
+    file: UploadFile = File(..., description="New Skill ZIP package (max 10MB)"),
+    current_user: User = Depends(_get_current_user_or_skill_identity),
+    db: Session = Depends(get_db),
+):
+    """
+    Update Skill by uploading a new ZIP package.
+
+    The ZIP package must contain a skill folder as root directory with the following structure:
+    ```
+    my-skill.zip
+      └── my-skill/
+          ├── SKILL.md
+          └── resources/
+    ```
+
+    The Skill name and namespace cannot be changed.
+    """
+    # Validate file type
+    if not file.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="File must be a ZIP package (.zip)")
+
+    # Read file content
+    file_content = await file.read()
+
+    # Update skill
+    skill_kind = _resolve_manageable_skill(
+        db=db,
+        skill_id=skill_id,
+        current_user=current_user,
+        action="update",
+    )
+
+    skill = skill_kinds_service.update_skill(
+        db=db,
+        skill_id=skill_id,
+        user_id=skill_kind.user_id,
+        file_content=file_content,
+        file_name=file.filename,
+    )
+
+    return skill
+
+
+@router.delete("/{skill_id}", status_code=204)
+def delete_skill(
+    skill_id: int,
+    current_user: User = Depends(security.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Delete Skill.
+
+    Permission rules:
+    - Users can delete their own skills
+    - Group Owners/Maintainers can delete any skill in their group
+    - System admins can delete any skill
+
+    Returns 400 error if the Skill is referenced by any Ghost.
+    """
+    skill_kind = _resolve_manageable_skill(
+        db=db,
+        skill_id=skill_id,
+        current_user=current_user,
+        action="delete",
+    )
+
+    # Use the original user_id for deletion to bypass the service-level check
+    skill_kinds_service.delete_skill(
+        db=db, skill_id=skill_id, user_id=skill_kind.user_id
+    )
+    return None

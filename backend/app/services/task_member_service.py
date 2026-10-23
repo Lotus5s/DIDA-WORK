@@ -1,0 +1,410 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Service for task member (group chat) management.
+
+Uses the unified ResourceMember model instead of the legacy TaskMember table.
+"""
+
+import logging
+from datetime import datetime
+from typing import List, Optional
+
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
+
+import app.stores.tasks as task_stores
+from app.models.kind import Kind
+from app.models.resource_member import (
+    EPOCH_TIME,
+    MemberStatus,
+    ResourceMember,
+    ResourceRole,
+)
+from app.models.share_link import ResourceType
+from app.models.user import User
+from app.schemas.task_member import MemberStatus as SchemaMemberStatus
+from app.schemas.task_member import (
+    TaskMemberListResponse,
+    TaskMemberResponse,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class TaskMemberService:
+    """Service for managing group chat members using ResourceMember."""
+
+    def get_task(self, db: Session, task_id: int):
+        """Get a task by ID (including subscription tasks)"""
+        return task_stores.task_access_store.get_task(db, task_id=task_id)
+
+    def get_user(self, db: Session, user_id: int) -> Optional[User]:
+        """Get a user by ID"""
+        return db.query(User).filter(User.id == user_id, User.is_active == True).first()
+
+    def get_task_owner_id(self, db: Session, task_id: int) -> Optional[int]:
+        """Get the owner (creator) user_id of a task"""
+        return task_stores.task_access_store.get_task_owner_id(db, task_id=task_id)
+
+    def is_task_owner(self, db: Session, task_id: int, user_id: int) -> bool:
+        """Check if a user is the owner of a task"""
+        return task_stores.task_access_store.is_task_owner(
+            db, task_id=task_id, user_id=user_id
+        )
+
+    def is_member(self, db: Session, task_id: int, user_id: int) -> bool:
+        """Check if a user is an active member of a task"""
+        if self.is_task_owner(db, task_id, user_id):
+            return True
+
+        member = (
+            db.query(ResourceMember.id)
+            .filter(
+                ResourceMember.resource_type == ResourceType.TASK,
+                ResourceMember.resource_id == task_id,
+                ResourceMember.entity_type == "user",
+                ResourceMember.entity_id == str(user_id),
+                ResourceMember.status == MemberStatus.APPROVED,
+                ResourceMember.copied_resource_id == 0,
+            )
+            .first()
+        )
+        return member is not None
+
+    def is_group_chat(self, db: Session, task_id: int) -> bool:
+        """Check if a task is configured as a group chat"""
+        logger.info(f"[is_group_chat] Checking task_id={task_id}")
+        task = self.get_task(db, task_id)
+        if not task:
+            is_group_chat = False
+        else:
+            task_json = task.json if isinstance(task.json, dict) else {}
+            task_flag = getattr(task, "is_group_chat", False)
+            is_group_chat = bool(
+                task_flag is True
+                or task_flag == 1
+                or (task_json.get("spec") or {}).get("is_group_chat", False)
+            )
+        logger.info(f"[is_group_chat] task_id={task_id}, is_group_chat={is_group_chat}")
+        return is_group_chat
+
+    def convert_to_group_chat(
+        self, db: Session, task_id: int, *, commit: bool = True
+    ) -> bool:
+        """Convert an existing task to a group chat"""
+        task = self.get_task(db, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        # Get current task JSON
+        task_json = task.json if isinstance(task.json, dict) else {}
+        spec = task_json.get("spec", {})
+
+        # Check if already a group chat
+        if spec.get("is_group_chat", False):
+            return False  # Already a group chat
+
+        # Set is_group_chat flag in JSON
+        spec["is_group_chat"] = True
+        task_json["spec"] = spec
+
+        # IMPORTANT: Mark the json field as modified so SQLAlchemy detects the change
+        task.json = task_json
+        flag_modified(task, "json")
+
+        # Sync to physical column for optimized queries
+        task.is_group_chat = True
+
+        task.updated_at = datetime.utcnow()
+
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+        db.refresh(task)
+
+        logger.info(f"Task {task_id} converted to group chat")
+        return True
+
+    def get_member_count(self, db: Session, task_id: int) -> int:
+        """Get the number of active members in a task (including owner)"""
+        # Exclude share records (copied_resource_id > 0), only count actual group chat members
+        member_count = (
+            db.query(ResourceMember)
+            .filter(
+                ResourceMember.resource_type == ResourceType.TASK,
+                ResourceMember.resource_id == task_id,
+                ResourceMember.status == MemberStatus.APPROVED,
+                ResourceMember.copied_resource_id == 0,
+            )
+            .count()
+        )
+        # Add 1 for the task owner
+        return member_count + 1
+
+    def get_members(self, db: Session, task_id: int) -> TaskMemberListResponse:
+        """Get all active members of a task"""
+        task = self.get_task(db, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        task_owner_id = task.user_id
+
+        # Get task owner info
+        owner = self.get_user(db, task_owner_id)
+        if not owner:
+            raise HTTPException(status_code=404, detail="Task owner not found")
+
+        # Build member list, starting with owner
+        members = []
+
+        # Add owner as first member
+        owner_member = TaskMemberResponse(
+            id=0,  # Special ID for owner
+            task_id=task_id,
+            user_id=task_owner_id,
+            username=owner.user_name,
+            avatar=None,  # Add avatar field if exists in User model
+            invited_by=task_owner_id,
+            inviter_name=owner.user_name,
+            status=SchemaMemberStatus.ACTIVE,
+            joined_at=task.created_at,
+            is_owner=True,
+        )
+        members.append(owner_member)
+
+        # Get other members from ResourceMember
+        # Exclude share records (copied_resource_id > 0), only get actual group chat members
+        task_members = (
+            db.query(ResourceMember)
+            .filter(
+                ResourceMember.resource_type == ResourceType.TASK,
+                ResourceMember.resource_id == task_id,
+                ResourceMember.status == MemberStatus.APPROVED,
+                ResourceMember.copied_resource_id == 0,
+            )
+            .all()
+        )
+
+        for tm in task_members:
+            user = self.get_user(db, tm.user_id)
+            inviter = (
+                self.get_user(db, tm.invited_by_user_id)
+                if tm.invited_by_user_id > 0
+                else None
+            )
+
+            if user:
+                member = TaskMemberResponse(
+                    id=tm.id,
+                    task_id=task_id,
+                    user_id=tm.user_id,
+                    username=user.user_name,
+                    avatar=None,
+                    invited_by=tm.invited_by_user_id,
+                    inviter_name=inviter.user_name if inviter else "Unknown",
+                    status=SchemaMemberStatus.ACTIVE,
+                    joined_at=tm.requested_at,
+                    is_owner=False,
+                )
+                members.append(member)
+
+        return TaskMemberListResponse(
+            members=members,
+            total=len(members),
+            task_owner_id=task_owner_id,
+        )
+
+    def add_member(
+        self,
+        db: Session,
+        task_id: int,
+        user_id: int,
+        invited_by: int,
+        *,
+        commit: bool = True,
+    ) -> ResourceMember:
+        """Add a user as a member to a task"""
+        logger.info(
+            f"[add_member] Adding member: task_id={task_id}, user_id={user_id}, invited_by={invited_by}"
+        )
+
+        # Check if user already exists (even if rejected)
+        existing = (
+            db.query(ResourceMember)
+            .filter(
+                ResourceMember.resource_type == ResourceType.TASK,
+                ResourceMember.resource_id == task_id,
+                ResourceMember.entity_type == "user",
+                ResourceMember.entity_id == str(user_id),
+            )
+            .first()
+        )
+
+        if existing:
+            logger.info(
+                f"[add_member] Existing member found: id={existing.id}, status={existing.status}"
+            )
+            if existing.status == MemberStatus.APPROVED:
+                logger.warning(
+                    f"[add_member] User {user_id} is already a member of task {task_id}"
+                )
+                raise HTTPException(status_code=400, detail="User is already a member")
+            # Reactivate rejected/pending member
+            logger.info(
+                f"[add_member] Reactivating member: id={existing.id}, old_status={existing.status}"
+            )
+            existing.status = MemberStatus.APPROVED
+            existing.invited_by_user_id = invited_by
+            existing.requested_at = datetime.utcnow()
+            existing.updated_at = datetime.utcnow()
+            existing.role = (
+                ResourceRole.Maintainer.value
+            )  # Group chat members get maintainer role
+            # Clear stale review metadata from previous rejection
+            existing.reviewed_by_user_id = 0
+            existing.reviewed_at = EPOCH_TIME
+            if commit:
+                db.commit()
+            else:
+                db.flush()
+            db.refresh(existing)
+            logger.info(
+                f"[add_member] Member reactivated successfully: id={existing.id}"
+            )
+            return existing
+
+        # Create new member
+        logger.info(
+            f"[add_member] Creating new member for task {task_id}, user {user_id}"
+        )
+        new_member = ResourceMember(
+            resource_type=ResourceType.TASK,
+            resource_id=task_id,
+            entity_type="user",
+            entity_id=str(user_id),
+            role=ResourceRole.Maintainer.value,  # Group chat members get maintainer role
+            status=MemberStatus.APPROVED,
+            invited_by_user_id=invited_by,
+            share_link_id=0,
+            reviewed_by_user_id=0,
+            copied_resource_id=0,
+            requested_at=datetime.utcnow(),
+        )
+        db.add(new_member)
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+        db.refresh(new_member)
+        logger.info(f"[add_member] New member created successfully: id={new_member.id}")
+        return new_member
+
+    def remove_member(
+        self,
+        db: Session,
+        task_id: int,
+        user_id: int,
+        removed_by: int,
+    ) -> bool:
+        """Remove a member from a task (soft delete by setting status to rejected)"""
+        # Cannot remove the task owner
+        if self.is_task_owner(db, task_id, user_id):
+            raise HTTPException(status_code=400, detail="Cannot remove the task owner")
+
+        member = (
+            db.query(ResourceMember)
+            .filter(
+                ResourceMember.resource_type == ResourceType.TASK,
+                ResourceMember.resource_id == task_id,
+                ResourceMember.entity_type == "user",
+                ResourceMember.entity_id == str(user_id),
+                ResourceMember.status == MemberStatus.APPROVED,
+            )
+            .first()
+        )
+
+        if not member:
+            raise HTTPException(status_code=404, detail="Member not found")
+
+        member.status = MemberStatus.REJECTED
+        member.reviewed_by_user_id = removed_by
+        member.reviewed_at = datetime.utcnow()
+        member.updated_at = datetime.utcnow()
+        db.commit()
+
+        return True
+
+    def get_team_id(self, db: Session, task_id: int) -> Optional[int]:
+        """Get the team ID associated with a task"""
+        task = self.get_task(db, task_id)
+        if not task:
+            return None
+
+        try:
+            task_json = task.json if isinstance(task.json, dict) else {}
+            spec = task_json.get("spec", {})
+            team_ref = spec.get("teamRef", {})
+            team_name = team_ref.get("name")
+            team_namespace = team_ref.get("namespace", "default")
+
+            if team_name:
+                # Get the team Kind to get its ID
+                team = (
+                    db.query(Kind)
+                    .filter(
+                        Kind.name == team_name,
+                        Kind.namespace == team_namespace,
+                        Kind.kind == "Team",
+                        Kind.is_active == True,
+                    )
+                    .first()
+                )
+                if team:
+                    return team.id
+        except Exception as e:
+            logger.warning(f"Failed to get team ID: {e}")
+
+        return None
+
+    def get_team_name(self, db: Session, task_id: int) -> Optional[str]:
+        """Get the team name associated with a task"""
+        task = self.get_task(db, task_id)
+        if not task:
+            return None
+
+        try:
+            task_json = task.json if isinstance(task.json, dict) else {}
+            spec = task_json.get("spec", {})
+            team_ref = spec.get("teamRef", {})
+            team_name = team_ref.get("name")
+            team_namespace = team_ref.get("namespace", "default")
+
+            if team_name:
+                # Get the team Kind to get its display name
+                team = (
+                    db.query(Kind)
+                    .filter(
+                        Kind.name == team_name,
+                        Kind.namespace == team_namespace,
+                        Kind.kind == "Team",
+                        Kind.is_active == True,
+                    )
+                    .first()
+                )
+                if team:
+                    team_json = team.json if isinstance(team.json, dict) else {}
+                    team_spec = team_json.get("spec", {})
+                    return team_spec.get("displayName", team_name)
+                return team_name
+        except Exception as e:
+            logger.warning(f"Failed to get team name: {e}")
+
+        return None
+
+
+task_member_service = TaskMemberService()

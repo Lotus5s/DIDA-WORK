@@ -1,0 +1,54 @@
+.popout-document,
+.popout-document body,
+.popout-document #root {
+  background: transparent !important;
+}
+
+.popout-window-compact {
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.popout-window-compact .popout-window-content {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 112px;
+  overflow: hidden;
+  border: 0.5px solid rgb(var(--color-border));
+  border-radius: 30px;
+  background: rgb(var(--color-bg-surface));
+  box-shadow: 0 8px 24px rgb(0 0 0 / 8%);
+}
+
+.popout-window-compact [data-testid='project-chat-composer'] {
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.popout-window-compact [data-testid='project-chat-composer-form'] {
+  height: 112px;
+  min-height: 112px;
+  max-height: 112px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.popout-window-compact [data-composer-scroll-container] {
+  max-height: 64px;
+}
+
+.popout-window-compact .composer-prosemirror-editor,
+.popout-window-compact .composer-prosemirror-placeholder {
+  padding-top: 12px;
+}
+
+.popout-window [data-testid='desktop-empty-composer-dock'] > div {
+  margin: 0;
+}

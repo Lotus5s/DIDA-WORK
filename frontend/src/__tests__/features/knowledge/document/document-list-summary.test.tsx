@@ -1,0 +1,742 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import '@testing-library/jest-dom'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+
+import { DocumentList } from '@/features/knowledge/document/components/DocumentList'
+import type { KnowledgeBase, KnowledgeDocument, KnowledgeFolder } from '@/types/knowledge'
+
+let mockDocuments: KnowledgeDocument[] = []
+let mockFolders: KnowledgeFolder[] = []
+const mockFolderTree = jest.fn()
+const mockKnowledgeDocumentTreeGrid = jest.fn()
+const mockCreateWebDocument = jest.fn()
+const mockRefreshDocuments = jest.fn()
+const mockGetDocumentProtection = jest.fn()
+const mockSynchronizeExternalDocument = jest.fn()
+const mockToast = jest.fn()
+
+jest.mock('@/hooks/use-toast', () => ({
+  toast: (...args: unknown[]) => mockToast(...args),
+}))
+
+jest.mock('@/apis/knowledge', () => ({
+  ...jest.requireActual('@/apis/knowledge'),
+  createWebDocument: (...args: unknown[]) => mockCreateWebDocument(...args),
+  getDocumentProtection: (...args: unknown[]) => mockGetDocumentProtection(...args),
+  synchronizeExternalDocument: (...args: unknown[]) => mockSynchronizeExternalDocument(...args),
+}))
+
+jest.mock('@/hooks/useTranslation', () => ({
+  useTranslation: () => ({
+    t: (key: string) => key,
+  }),
+}))
+
+jest.mock('next/navigation', () => ({
+  useSearchParams: () => new URLSearchParams(),
+  useRouter: () => ({
+    replace: jest.fn(),
+  }),
+  usePathname: () => '/',
+}))
+
+jest.mock('@/features/common/UserContext', () => ({
+  useUser: () => ({
+    user: {
+      id: 1,
+    },
+  }),
+}))
+
+jest.mock('@/features/knowledge/document/hooks/useDocuments', () => ({
+  useDocuments: () => ({
+    documents: mockDocuments,
+    loading: false,
+    error: null,
+    create: jest.fn(),
+    update: jest.fn(),
+    remove: jest.fn(),
+    batchDelete: jest.fn(),
+    transfer: jest.fn(),
+    refresh: mockRefreshDocuments,
+    fetchWithFolder: jest.fn(),
+    page: 1,
+    pageSize: 20,
+    totalCount: mockDocuments.length,
+    totalPages: 1,
+    hasMore: false,
+    setPage: jest.fn(),
+    setPageSize: jest.fn(),
+  }),
+}))
+
+jest.mock('@/features/knowledge/document/hooks/useFolders', () => ({
+  useFolders: () => ({
+    folders: mockFolders,
+    loading: false,
+    createFolder: jest.fn(),
+    updateFolder: jest.fn(),
+    deleteFolder: jest.fn(),
+    fetchFolders: jest.fn(),
+    moveDocument: jest.fn(),
+    batchMove: jest.fn(),
+  }),
+}))
+
+jest.mock('@/features/knowledge/document/hooks/useColumnResize', () => ({
+  useColumnResize: () => ({
+    widthOverride: undefined,
+    isResizing: false,
+    handleMouseDown: jest.fn(),
+    columnRef: { current: null },
+  }),
+}))
+
+jest.mock('@/features/knowledge/document/components/DocumentDetailDialog', () => ({
+  DocumentDetailDialog: ({
+    open,
+    document,
+  }: {
+    open: boolean
+    document: KnowledgeDocument | null
+  }) =>
+    open && document ? (
+      <div data-testid="document-detail-preview">{`${document.source_type}:${document.id}`}</div>
+    ) : null,
+}))
+jest.mock('@/features/knowledge/document/components/DocumentUpload', () => ({
+  DocumentUpload: ({
+    open,
+    onWebAdd,
+    onOpenChange,
+  }: {
+    open: boolean
+    onWebAdd: (url: string) => Promise<void>
+    onOpenChange: (open: boolean) => void
+  }) =>
+    open ? (
+      <div data-testid="upload-dialog">
+        <button
+          data-testid="submit-web"
+          onClick={() => void onWebAdd('https://example.com/article')}
+        >
+          Submit web
+        </button>
+        <button data-testid="close-upload" onClick={() => onOpenChange(false)}>
+          Close
+        </button>
+      </div>
+    ) : null,
+}))
+jest.mock('@/features/knowledge/document/components/DeleteDocumentDialog', () => ({
+  DeleteDocumentDialog: () => null,
+}))
+jest.mock('@/features/knowledge/document/components/EditDocumentDialog', () => ({
+  EditDocumentDialog: () => null,
+}))
+jest.mock('@/features/knowledge/document/components/RetrievalTestDialog', () => ({
+  RetrievalTestDialog: () => null,
+}))
+jest.mock('@/features/knowledge/document/components/FolderTree', () => ({
+  FolderTree: (props: {
+    documents: KnowledgeDocument[]
+    selectedIds: Set<number>
+    isSelectionDisabled?: (document: KnowledgeDocument) => boolean
+    onSelect?: (document: KnowledgeDocument, selected: boolean) => void
+    onViewDetail?: (document: KnowledgeDocument) => void
+  }) => {
+    mockFolderTree(props)
+    return (
+      <div>
+        {props.documents.map(document => (
+          <div key={document.id}>
+            <button
+              data-testid={`compact-select-document-${document.id}`}
+              disabled={props.isSelectionDisabled?.(document)}
+              onClick={() => props.onSelect?.(document, !props.selectedIds.has(document.id))}
+            />
+            <button
+              data-testid={`open-document-${document.id}`}
+              onClick={() => props.onViewDetail?.(document)}
+            />
+          </div>
+        ))}
+      </div>
+    )
+  },
+}))
+jest.mock('@/features/knowledge/document/components/knowledge-document-tree-grid', () => ({
+  KnowledgeDocumentTreeGrid: (props: {
+    documents: KnowledgeDocument[]
+    showSelectionColumn: boolean
+    canSelect?: (document: KnowledgeDocument) => boolean
+    onSelect?: (document: KnowledgeDocument, selected: boolean) => void
+    onSync?: (document: KnowledgeDocument) => void
+    isSyncing?: (documentId: number) => boolean
+    allowDownload?: boolean
+  }) => {
+    mockKnowledgeDocumentTreeGrid(props)
+    return (
+      <div>
+        {props.documents.map(document => (
+          <div key={document.id}>
+            <button
+              type="button"
+              data-testid={`select-document-${document.id}`}
+              disabled={!props.showSelectionColumn || !props.canSelect?.(document)}
+              onClick={() => props.onSelect?.(document, true)}
+            >
+              {document.name}
+            </button>
+            <button
+              type="button"
+              data-testid={`sync-document-${document.id}`}
+              disabled={props.isSyncing?.(document.id)}
+              onClick={() => props.onSync?.(document)}
+            >
+              Sync
+            </button>
+          </div>
+        ))}
+      </div>
+    )
+  },
+}))
+jest.mock('@/features/knowledge/document/components/CreateFolderDialog', () => ({
+  CreateFolderDialog: () => null,
+}))
+jest.mock('@/features/knowledge/document/components/DeleteFolderDialog', () => ({
+  DeleteFolderDialog: () => null,
+}))
+jest.mock('@/features/knowledge/document/components/MoveDocumentDialog', () => ({
+  MoveDocumentDialog: () => null,
+}))
+jest.mock('@/features/knowledge/document/components/EditKnowledgeBaseSummaryDialog', () => ({
+  EditKnowledgeBaseSummaryDialog: () => null,
+}))
+
+function createKnowledgeBase(overrides?: Partial<KnowledgeBase>): KnowledgeBase {
+  return {
+    id: 1,
+    name: 'Test KB',
+    description: null,
+    user_id: 1,
+    namespace: 'default',
+    document_count: 0,
+    is_active: true,
+    summary_enabled: true,
+    summary: {
+      status: 'failed',
+      long_summary: 'AI summary',
+      manual_long_summary: 'Manual summary',
+      error: 'AI failed',
+    },
+    kb_type: 'classic',
+    max_calls_per_conversation: 10,
+    exempt_calls_before_check: 5,
+    created_at: '2026-05-01T00:00:00Z',
+    updated_at: '2026-05-01T00:00:00Z',
+    ...overrides,
+  }
+}
+
+function createDocument(overrides?: Partial<KnowledgeDocument>): KnowledgeDocument {
+  return {
+    id: 10,
+    kind_id: 1,
+    user_id: 1,
+    name: 'doc.txt',
+    file_extension: 'txt',
+    file_size: 128,
+    status: 'enabled',
+    is_active: true,
+    index_status: 'success',
+    index_generation: 1,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    folder_id: 0,
+    source_type: 'file',
+    source_config: {},
+    attachment_id: null,
+    created_by: 'alice',
+    ...overrides,
+  }
+}
+
+function createFolder(overrides?: Partial<KnowledgeFolder>): KnowledgeFolder {
+  return {
+    id: 1,
+    kind_id: 1,
+    parent_id: 0,
+    name: 'Reports',
+    document_count: 1,
+    direct_document_count: 1,
+    total_document_count: 1,
+    children: [],
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    ...overrides,
+  }
+}
+
+function createDingtalkCopy(overrides?: Partial<KnowledgeDocument>): KnowledgeDocument {
+  return createDocument({
+    id: 20,
+    name: '钉钉文档',
+    source_type: 'external',
+    attachment_id: 2000,
+    source_config: {
+      external: {
+        provider: 'dingtalk',
+        resource_id: 'node-20',
+        title: '钉钉文档',
+        status: 'accessible',
+      },
+    },
+    ...overrides,
+  })
+}
+
+describe('DocumentList summary header', () => {
+  beforeEach(() => {
+    mockDocuments = []
+    mockFolders = []
+    mockFolderTree.mockClear()
+    mockKnowledgeDocumentTreeGrid.mockClear()
+    mockCreateWebDocument.mockReset()
+    mockRefreshDocuments.mockReset()
+    mockGetDocumentProtection.mockReturnValue(new Promise(() => {}))
+    mockSynchronizeExternalDocument.mockReset()
+    mockToast.mockReset()
+  })
+
+  it('refreshes added web documents without closing the source dialog from the parent', async () => {
+    mockCreateWebDocument.mockResolvedValue({ success: true, document: createDocument() })
+    render(<DocumentList knowledgeBase={createKnowledgeBase()} canUpload={true} />)
+    fireEvent.click(screen.getByTestId('upload-documents-button'))
+    fireEvent.click(screen.getByTestId('submit-web'))
+    await waitFor(() => expect(mockCreateWebDocument).toHaveBeenCalled())
+    await waitFor(() => expect(mockRefreshDocuments).toHaveBeenCalled())
+    expect(screen.getByTestId('upload-dialog')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('close-upload'))
+    expect(screen.queryByTestId('upload-dialog')).not.toBeInTheDocument()
+  })
+
+  it('fails closed while a new knowledge base protection policy is loading', async () => {
+    mockDocuments = [createDocument()]
+    let resolveProtectedKnowledgeBase: (value: {
+      original_download_allowed: boolean
+      watermark_text: string | null
+    }) => void
+    const protectedKnowledgeBase = new Promise<{
+      original_download_allowed: boolean
+      watermark_text: string | null
+    }>(resolve => {
+      resolveProtectedKnowledgeBase = resolve
+    })
+    mockGetDocumentProtection
+      .mockResolvedValueOnce({
+        original_download_allowed: true,
+        watermark_text: null,
+      })
+      .mockReturnValueOnce(protectedKnowledgeBase)
+
+    const { rerender } = render(<DocumentList knowledgeBase={createKnowledgeBase()} />)
+
+    await waitFor(() => {
+      expect(mockKnowledgeDocumentTreeGrid).toHaveBeenLastCalledWith(
+        expect.objectContaining({ allowDownload: true })
+      )
+    })
+
+    rerender(<DocumentList knowledgeBase={createKnowledgeBase({ id: 2 })} />)
+
+    await waitFor(() => {
+      expect(mockGetDocumentProtection).toHaveBeenLastCalledWith(2)
+      expect(mockKnowledgeDocumentTreeGrid).toHaveBeenLastCalledWith(
+        expect.objectContaining({ allowDownload: false })
+      )
+    })
+
+    await act(async () => {
+      resolveProtectedKnowledgeBase!({
+        original_download_allowed: true,
+        watermark_text: null,
+      })
+    })
+
+    await waitFor(() => {
+      expect(mockKnowledgeDocumentTreeGrid).toHaveBeenLastCalledWith(
+        expect.objectContaining({ allowDownload: true })
+      )
+    })
+  })
+
+  it.each([
+    ['notebook', 'lucide-book-open', 'text-primary'],
+    ['classic', 'lucide-database', 'text-text-secondary'],
+    ['code_wiki', 'lucide-code-xml', 'text-primary'],
+  ] as const)(
+    'shows the %s header icon and retains summary editing after AI failure',
+    (kbType, icon, color) => {
+      const { container } = render(
+        <DocumentList
+          knowledgeBase={createKnowledgeBase({ kb_type: kbType })}
+          canManageAllDocuments={true}
+        />
+      )
+
+      expect(container.querySelector('svg')).toHaveClass(icon, color, 'w-5', 'h-5', 'flex-shrink-0')
+      expect(screen.getByTestId('kb-summary-inline-edit-button')).toBeInTheDocument()
+    }
+  )
+
+  it('shows inline summary edit button when no summary exists yet', () => {
+    render(
+      <DocumentList
+        knowledgeBase={createKnowledgeBase({
+          summary: {
+            status: 'pending',
+          },
+        })}
+        canManageAllDocuments={true}
+      />
+    )
+
+    expect(screen.getByTestId('kb-summary-inline-edit-button')).toBeInTheDocument()
+  })
+
+  it('hides retry button when summary generation is disabled', () => {
+    render(
+      <DocumentList
+        knowledgeBase={createKnowledgeBase({
+          summary_enabled: false,
+        })}
+        canManageAllDocuments={true}
+      />
+    )
+
+    expect(screen.queryByText('chatPage.summaryRetry')).not.toBeInTheDocument()
+  })
+
+  it('shows create-folder action for folder managers without upload permission', () => {
+    render(
+      <DocumentList
+        knowledgeBase={createKnowledgeBase()}
+        canUpload={false}
+        canManageAllDocuments={true}
+      />
+    )
+
+    expect(screen.getByText('document.folder.create')).toBeInTheDocument()
+    expect(screen.queryByText('document.document.upload')).not.toBeInTheDocument()
+  })
+
+  it('shows batch actions for document-area editors without knowledge-base manage permission', () => {
+    mockDocuments = [createDocument()]
+
+    render(
+      <DocumentList
+        knowledgeBase={createKnowledgeBase({ document_count: 1 })}
+        canUpload={true}
+        canManageAllDocuments={false}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('select-document-10'))
+
+    expect(screen.getByTestId('batch-move-button')).toBeInTheDocument()
+    expect(screen.getByTestId('batch-transfer-button')).toBeInTheDocument()
+  })
+
+  it('hides expand-all when the knowledge base has no folders', () => {
+    mockDocuments = [createDocument()]
+
+    render(<DocumentList knowledgeBase={createKnowledgeBase({ document_count: 1 })} />)
+
+    expect(screen.queryByTestId('expand-all-toggle')).not.toBeInTheDocument()
+  })
+
+  it('opens synchronized wiki documents in the standard document preview', () => {
+    mockDocuments = [
+      createDocument({
+        source_type: 'external',
+        source_config: {
+          external: {
+            provider: 'wiki',
+            url: 'https://wiki.example.com/operations/handbook',
+            sync: { enabled: true },
+          },
+        },
+      }),
+    ]
+
+    render(<DocumentList knowledgeBase={createKnowledgeBase({ document_count: 1 })} compact />)
+
+    fireEvent.click(screen.getByTestId('open-document-10'))
+
+    expect(screen.getByTestId('document-detail-preview')).toHaveTextContent('external:10')
+  })
+
+  it('keeps each wiki document busy until its own synchronization completes', async () => {
+    const resolvers = new Map<number, () => void>()
+    mockDocuments = [
+      createDocument({
+        id: 10,
+        source_type: 'external',
+        source_config: {
+          external: {
+            provider: 'wiki',
+            sync: { enabled: true },
+          },
+        },
+      }),
+      createDocument({
+        id: 11,
+        source_type: 'external',
+        source_config: {
+          external: {
+            provider: 'wiki',
+            sync: { enabled: true },
+          },
+        },
+      }),
+    ]
+    mockSynchronizeExternalDocument.mockImplementation(
+      (documentId: number) =>
+        new Promise<void>(resolve => {
+          resolvers.set(documentId, resolve)
+        })
+    )
+
+    render(
+      <DocumentList
+        knowledgeBase={createKnowledgeBase({ document_count: 2 })}
+        canManageAllDocuments
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('sync-document-10'))
+    await waitFor(() => expect(screen.getByTestId('sync-document-10')).toBeDisabled())
+    fireEvent.click(screen.getByTestId('sync-document-11'))
+    await waitFor(() => expect(screen.getByTestId('sync-document-11')).toBeDisabled())
+
+    await act(async () => {
+      resolvers.get(10)?.()
+    })
+
+    await waitFor(() => expect(screen.getByTestId('sync-document-10')).not.toBeDisabled())
+    expect(screen.getByTestId('sync-document-11')).toBeDisabled()
+
+    await act(async () => {
+      resolvers.get(11)?.()
+    })
+
+    await waitFor(() => expect(screen.getByTestId('sync-document-11')).not.toBeDisabled())
+  })
+
+  it('shows expand-all when the knowledge base has folders and fewer than 200 documents', () => {
+    mockFolders = [createFolder()]
+
+    render(<DocumentList knowledgeBase={createKnowledgeBase({ document_count: 1 })} />)
+
+    expect(screen.getByTestId('expand-all-toggle')).toBeInTheDocument()
+  })
+
+  it('orders workspace source controls and keeps folder management out of the workspace', () => {
+    mockFolders = [createFolder()]
+    mockDocuments = [createDocument()]
+    const onSelectionChange = jest.fn()
+
+    render(
+      <DocumentList
+        knowledgeBase={createKnowledgeBase({ document_count: 1 })}
+        canUpload
+        canManageAllDocuments
+        compact
+        sourceWorkspace
+        selectedDocumentIds={[]}
+        availableDocumentCount={48}
+        onSelectionChange={onSelectionChange}
+      />
+    )
+
+    const addSource = screen.getByTestId('document-add-source-full-width')
+    const breadcrumb = screen.getByTestId('breadcrumb-root')
+    const breadcrumbRow = screen.getByTestId('document-source-breadcrumb-row')
+    const expandAll = screen.getByTestId('expand-all-toggle')
+    const search = screen.getByTestId('document-source-search-input')
+    const scopeSummary = screen.getByTestId('document-source-scope-summary')
+    const selectCurrentPage = screen.getByTestId('document-select-current-page')
+    const defaultScopeHint = screen.getByText('artifact.sourceDialog.defaultAllHint')
+
+    expect(addSource).toHaveClass(
+      'w-full',
+      'h-11',
+      'bg-primary',
+      'text-white',
+      'hover:bg-primary/90'
+    )
+    expect(search).toHaveClass('w-full')
+    expect(search).toHaveAccessibleName()
+    expect(screen.getByText('artifact.addMaterials')).toBeInTheDocument()
+    expect(scopeSummary).toContainElement(selectCurrentPage)
+    expect(selectCurrentPage.compareDocumentPosition(defaultScopeHint)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING
+    )
+    expect(addSource.compareDocumentPosition(breadcrumb)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(breadcrumb.compareDocumentPosition(search)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(search.compareDocumentPosition(scopeSummary)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(breadcrumbRow).toContainElement(expandAll)
+    expect(defaultScopeHint).toBeInTheDocument()
+    expect(screen.queryByTestId('document-use-all-sources')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('summary-info-button')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('kb-summary-inline-edit-button')).not.toBeInTheDocument()
+
+    fireEvent.click(expandAll)
+    expect(screen.getByTestId('document-source-breadcrumb-row')).toContainElement(
+      screen.getByTestId('expand-all-toggle')
+    )
+
+    expect(mockFolderTree).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        canManageFolders: false,
+        onCreateFolder: undefined,
+        onRenameFolder: undefined,
+        onDeleteFolder: undefined,
+      })
+    )
+  })
+
+  it('keeps controlled source selection and disables unavailable documents', () => {
+    const available = createDocument({ id: 10 })
+    const unavailable = createDocument({
+      id: 11,
+      name: 'unavailable.txt',
+      is_active: false,
+      index_status: 'failed',
+    })
+    mockDocuments = [available, unavailable]
+    const onSelectionChange = jest.fn()
+
+    render(
+      <DocumentList
+        knowledgeBase={createKnowledgeBase({ document_count: 2 })}
+        compact
+        sourceWorkspace
+        selectedDocumentIds={[10]}
+        availableDocumentCount={1}
+        onSelectionChange={onSelectionChange}
+      />
+    )
+
+    expect(mockFolderTree).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        selectedIds: new Set([10]),
+      })
+    )
+    expect(screen.getByTestId('compact-select-document-11')).toBeDisabled()
+    expect(screen.getByText('artifact.sourceDialog.selectedHint')).toBeInTheDocument()
+    expect(screen.queryByTestId('document-use-all-sources')).not.toBeInTheDocument()
+
+    onSelectionChange.mockClear()
+    fireEvent.click(screen.getByTestId('compact-select-document-10'))
+    expect(onSelectionChange).toHaveBeenCalledWith([])
+  })
+})
+
+describe('DocumentList DingTalk manual sync', () => {
+  beforeEach(() => {
+    mockDocuments = []
+    mockFolders = []
+    mockCreateWebDocument.mockReset()
+    mockRefreshDocuments.mockReset()
+    mockGetDocumentProtection.mockReturnValue(new Promise(() => {}))
+    mockSynchronizeExternalDocument.mockReset()
+    mockToast.mockReset()
+  })
+
+  it('synchronizes the clicked DingTalk copy only', async () => {
+    mockSynchronizeExternalDocument.mockResolvedValue(createDingtalkCopy())
+    mockDocuments = [createDingtalkCopy({ id: 20 }), createDingtalkCopy({ id: 21 })]
+
+    render(
+      <DocumentList
+        knowledgeBase={createKnowledgeBase({ document_count: 2 })}
+        canManageAllDocuments
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('sync-document-20'))
+
+    await waitFor(() => expect(mockSynchronizeExternalDocument).toHaveBeenCalledTimes(1))
+    expect(mockSynchronizeExternalDocument).toHaveBeenCalledWith(20)
+  })
+
+  it('refetches the list after a DingTalk copy synchronized', async () => {
+    mockSynchronizeExternalDocument.mockResolvedValue(createDingtalkCopy())
+    mockDocuments = [createDingtalkCopy({ id: 20 })]
+
+    render(
+      <DocumentList
+        knowledgeBase={createKnowledgeBase({ document_count: 1 })}
+        canManageAllDocuments
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('sync-document-20'))
+
+    await waitFor(() => expect(mockRefreshDocuments).toHaveBeenCalled())
+    expect(mockToast).toHaveBeenCalledWith({
+      description: 'document.document.syncSuccess',
+    })
+  })
+
+  it('keeps the backend failure reason and restores the entry for another attempt', async () => {
+    mockSynchronizeExternalDocument.mockRejectedValue(new Error('钉钉文档已失效'))
+    mockDocuments = [createDingtalkCopy({ id: 20 })]
+
+    render(
+      <DocumentList
+        knowledgeBase={createKnowledgeBase({ document_count: 1 })}
+        canManageAllDocuments
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('sync-document-20'))
+
+    await waitFor(() =>
+      expect(mockToast).toHaveBeenCalledWith({
+        variant: 'destructive',
+        description: '钉钉文档已失效',
+      })
+    )
+    expect(mockRefreshDocuments).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.getByTestId('sync-document-20')).not.toBeDisabled())
+  })
+
+  it('refetches through the current query without dropping the selection', async () => {
+    mockSynchronizeExternalDocument.mockResolvedValue(createDingtalkCopy())
+    mockDocuments = [createDingtalkCopy({ id: 20 }), createDingtalkCopy({ id: 21 })]
+
+    render(
+      <DocumentList
+        knowledgeBase={createKnowledgeBase({ document_count: 2 })}
+        canManageAllDocuments
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('select-document-20'))
+    expect(mockKnowledgeDocumentTreeGrid.mock.lastCall?.[0].selectedDocumentIds.has(20)).toBe(true)
+
+    fireEvent.click(screen.getByTestId('sync-document-20'))
+    await waitFor(() => expect(mockRefreshDocuments).toHaveBeenCalled())
+
+    // The refetch reuses the active folder/sort/page query and keeps selection.
+    expect(mockRefreshDocuments).toHaveBeenCalledWith()
+    expect(mockKnowledgeDocumentTreeGrid.mock.lastCall?.[0].selectedDocumentIds.has(20)).toBe(true)
+  })
+})

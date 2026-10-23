@@ -1,0 +1,229 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Chat Shell API client.
+ *
+ * NOTE: Streaming chat now uses WebSocket via TaskSessionContext.
+ * This module provides utility functions for chat operations.
+ */
+
+import { getToken } from './user'
+import { getApiBaseUrl } from '@/lib/runtime-config'
+
+// Use dynamic API base URL from runtime config
+const getApiUrl = () => getApiBaseUrl()
+
+/**
+ * Response from check direct chat API
+ */
+export interface CheckDirectChatResponse {
+  supports_direct_chat: boolean
+  shell_type: string
+}
+
+/**
+ * Check if a team supports direct chat mode.
+ *
+ * @param teamId - Team ID to check
+ * @returns Whether the team supports direct chat and its shell type
+ */
+export async function checkDirectChat(teamId: number): Promise<CheckDirectChatResponse> {
+  const token = getToken()
+
+  const response = await fetch(`${getApiUrl()}/chat/check-direct-chat/${teamId}`, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token && { Authorization: `Bearer ${token}` }),
+    },
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    let errorMsg = errorText
+    try {
+      const json = JSON.parse(errorText)
+      if (json && typeof json.detail === 'string') {
+        errorMsg = json.detail
+      }
+    } catch {
+      // Not JSON
+    }
+    throw new Error(errorMsg)
+  }
+
+  return response.json()
+}
+
+/**
+ * Request parameters for cancelling a chat stream
+ */
+export interface CancelChatRequest {
+  /** Subtask ID to cancel */
+  subtask_id: number
+  /** Partial content received before cancellation (optional) */
+  partial_content?: string
+}
+
+/**
+ * Response from cancel chat API
+ */
+export interface CancelChatResponse {
+  success: boolean
+  message: string
+}
+
+/**
+ * Cancel an ongoing chat stream via HTTP API.
+ *
+ * @deprecated This function is deprecated. Use WebSocket-based cancellation via
+ * `cancelChatStream` from `SocketContext` instead, which provides better performance
+ * and real-time feedback. This HTTP-based implementation is kept for fallback scenarios
+ * but will be removed in a future version.
+ *
+ * @param request - Cancel request parameters
+ * @returns Cancel result
+ */
+export async function cancelChat(request: CancelChatRequest): Promise<CancelChatResponse> {
+  const token = getToken()
+
+  const response = await fetch(`${getApiUrl()}/chat/cancel`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token && { Authorization: `Bearer ${token}` }),
+    },
+    body: JSON.stringify(request),
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    let errorMsg = errorText
+    try {
+      const json = JSON.parse(errorText)
+      if (json && typeof json.detail === 'string') {
+        errorMsg = json.detail
+      }
+    } catch {
+      // Not JSON
+    }
+    throw new Error(errorMsg)
+  }
+
+  return response.json()
+}
+
+/**
+ * Response from get streaming content API
+ */
+export interface StreamingContentResponse {
+  /** The accumulated content */
+  content: string
+  /** Source of the content: "redis" (most recent) or "database" (fallback) */
+  source: 'redis' | 'database'
+  /** Whether still streaming */
+  streaming: boolean
+  /** Subtask status */
+  status: string
+  /** Whether content is incomplete (client disconnected) */
+  incomplete: boolean
+}
+
+/**
+ * Get streaming content for a subtask (for recovery on refresh).
+ *
+ * This endpoint tries to get the most recent content from:
+ * 1. Redis streaming cache (most recent, updated every 1 second)
+ * 2. Database result field (fallback, updated every 5 seconds)
+ *
+ * @param subtaskId - Subtask ID to get content for
+ * @returns Streaming content and metadata
+ */
+export async function getStreamingContent(subtaskId: number): Promise<StreamingContentResponse> {
+  const token = getToken()
+
+  const response = await fetch(`${getApiUrl()}/chat/streaming-content/${subtaskId}`, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token && { Authorization: `Bearer ${token}` }),
+    },
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    let errorMsg = errorText
+    try {
+      const json = JSON.parse(errorText)
+      if (json && typeof json.detail === 'string') {
+        errorMsg = json.detail
+      }
+    } catch {
+      // Not JSON
+    }
+    throw new Error(errorMsg)
+  }
+
+  return response.json()
+}
+
+/**
+ * Search engine information
+ */
+export interface SearchEngine {
+  name: string
+  display_name: string
+}
+
+/**
+ * Response from get search engines API
+ */
+export interface SearchEnginesResponse {
+  enabled: boolean
+  engines: SearchEngine[]
+}
+
+/**
+ * Get available search engines from backend configuration.
+ *
+ * @returns Search engines configuration
+ */
+export async function getSearchEngines(): Promise<SearchEnginesResponse> {
+  const token = getToken()
+
+  const response = await fetch(`${getApiUrl()}/chat/search-engines`, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token && { Authorization: `Bearer ${token}` }),
+    },
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    let errorMsg = errorText
+    try {
+      const json = JSON.parse(errorText)
+      if (json && typeof json.detail === 'string') {
+        errorMsg = json.detail
+      }
+    } catch {
+      // Not JSON
+    }
+    throw new Error(errorMsg)
+  }
+
+  return response.json()
+}
+
+/**
+ * Chat API exports
+ */
+export const chatApis = {
+  checkDirectChat,
+  cancelChat,
+  getStreamingContent,
+  getSearchEngines,
+}

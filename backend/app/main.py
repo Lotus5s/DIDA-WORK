@@ -1,0 +1,996 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Redis instrumentation must be set up BEFORE importing redis module
+from shared.telemetry.config import get_otel_config as _get_otel_config_early
+
+if _get_otel_config_early("wegent-backend").enabled:
+    try:
+        from opentelemetry.instrumentation.redis import RedisInstrumentor
+
+        RedisInstrumentor().instrument()
+    except Exception:
+        pass
+
+import asyncio
+import json
+import logging
+import signal
+import sys
+import time
+import uuid
+from contextlib import asynccontextmanager
+
+import redis
+import socketio
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import QueryParams
+
+from app.api.api import api_router
+from app.api.endpoints.health import probe_router
+from app.api.endpoints.oauth_provider import metadata_router as oauth_metadata_router
+from app.core.cache import cache_manager
+from app.core.config import settings
+from app.core.exceptions import (
+    CustomHTTPException,
+    RequestValidationError,
+    http_exception_handler,
+    python_exception_handler,
+    validation_exception_handler,
+)
+from app.core.logging import setup_logging
+from app.core.sdk_startup import preload_openai_sdk
+from app.core.shutdown import shutdown_manager
+from app.core.yaml_init import run_yaml_initialization
+from app.db.base import Base
+from app.db.pool_observability import log_registered_pool_configurations
+from app.db.session import SessionLocal, engine
+from app.models import *  # noqa: F401,F403
+from app.services.auth.internal_service_token import (
+    require_internal_service_token_configured,
+)
+from app.services.jobs import start_background_jobs, stop_background_jobs
+from app.services.plugin_write_resources import close_plugin_write_resources
+from shared.telemetry.context.large_data import log_json_body
+
+# Redis lock key for startup operations (migrations + YAML init)
+# Only used to prevent concurrent initialization, not to skip initialization
+STARTUP_LOCK_KEY = "wegent:startup_lock"
+STARTUP_LOCK_TIMEOUT = 120  # 120 seconds timeout for migrations + YAML init
+FORWARDED_LOG_HEADER_NAMES = (
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-prefix",
+    "x-real-ip",
+    "forwarded",
+)
+MAX_LOGGED_HEADER_VALUE_LENGTH = 512
+HIGH_FREQUENCY_HTTP_PATHS = {
+    "/api/internal/callback",
+    "/api/internal/callback/batch",
+}
+SENSITIVE_QUERY_PARAM_NAMES = {"access_token", "api_key", "signature", "token"}
+SENSITIVE_HTTP_BODY_PATHS = {
+    f"{settings.API_PREFIX}/external/oauth/revoke",
+    f"{settings.API_PREFIX}/external/oauth/token",
+}
+
+# Initialize logging at module level for use in lifespan
+setup_logging()
+log_registered_pool_configurations()
+_logger = logging.getLogger(__name__)
+
+
+def _truncate_logged_header_value(value: str) -> str:
+    if len(value) <= MAX_LOGGED_HEADER_VALUE_LENGTH:
+        return value
+    return f"{value[:MAX_LOGGED_HEADER_VALUE_LENGTH]}... [truncated]"
+
+
+def _format_forwarded_headers_for_log(headers) -> str:
+    forwarded_headers = []
+    for header_name in FORWARDED_LOG_HEADER_NAMES:
+        header_value = headers.get(header_name)
+        if header_value:
+            forwarded_headers.append(
+                f"{header_name}={_truncate_logged_header_value(header_value)}"
+            )
+
+    if not forwarded_headers:
+        return ""
+
+    return f" headers={{{', '.join(forwarded_headers)}}}"
+
+
+def _format_query_params_for_log(query_params: QueryParams) -> str:
+    return str(
+        QueryParams(
+            [
+                (
+                    name,
+                    (
+                        "[REDACTED]"
+                        if name.lower() in SENSITIVE_QUERY_PARAM_NAMES
+                        else value
+                    ),
+                )
+                for name, value in query_params.multi_items()
+            ]
+        )
+    )
+
+
+def _request_context_fields(request_body: str) -> tuple[object, object, object]:
+    """Extract trace context only from JSON object request bodies."""
+
+    try:
+        body_json = json.loads(request_body)
+    except (json.JSONDecodeError, TypeError):
+        return None, None, None
+    if not isinstance(body_json, dict):
+        return None, None, None
+    return (
+        body_json.get("task_id"),
+        body_json.get("subtask_id"),
+        body_json.get("user_id"),
+    )
+
+
+def _should_capture_http_body(path: str) -> bool:
+    if path in SENSITIVE_HTTP_BODY_PATHS:
+        return False
+    return not (
+        path.startswith(f"{settings.API_PREFIX}/sites/")
+        and "/environment-variables" in path
+    )
+
+
+def _load_system_initialization_state(logger: logging.Logger) -> None:
+    from app.services.admin_password_bootstrap import (
+        load_admin_password_setup_state,
+        set_admin_password_setup_required_cache,
+    )
+
+    if not settings.CHECK_SYSTEM_INITIALIZATION_STATUS:
+        set_admin_password_setup_required_cache(False)
+        logger.info(
+            "System initialization state check disabled "
+            "(CHECK_SYSTEM_INITIALIZATION_STATUS=false)"
+        )
+        return
+
+    logger.info("Loading system initialization state...")
+    db = SessionLocal()
+    try:
+        setup_required = load_admin_password_setup_state(db)
+        logger.info(
+            "✓ System initialization state loaded (admin password setup required: %s)",
+            setup_required,
+        )
+    finally:
+        db.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Keep the cache available through startup, channel draining and shutdown.
+    from app.services.execution.chat_shell_client import chat_shell_clients
+
+    await cache_manager.start()
+    try:
+        async with chat_shell_clients.lifespan(), _application_lifespan(app):
+            yield
+    finally:
+        try:
+            close_plugin_write_resources()
+        finally:
+            await cache_manager.aclose()
+
+
+@asynccontextmanager
+async def _application_lifespan(app: FastAPI):
+    """
+    Lifespan context manager for FastAPI application.
+    Handles startup and shutdown events.
+    """
+    # Re-apply logging configuration after uvicorn's default config
+    # uvicorn applies its LOGGING_CONFIG which overrides our setup_logging()
+    setup_logging()
+
+    logger = _logger
+
+    # ==================== STARTUP ====================
+    require_internal_service_token_configured()
+    # Load SDK resources before IM/background consumers can dispatch requests.
+    await asyncio.to_thread(preload_openai_sdk)
+    from app.services.builtin_plugin_service import builtin_plugin_service
+
+    # Every Backend process validates any plugins marked as required.
+    # Optional plugins may be absent and are published only when staged.
+    builtin_plugin_service.validate_required_plugins()
+
+    # Try to get Redis client for distributed locking
+    redis_client = None
+    try:
+        redis_client = redis.from_url(settings.REDIS_URL)
+    except Exception as e:
+        logger.warning(f"Failed to connect to Redis for startup lock: {e}")
+
+    # Try to acquire lock for startup initialization (migrations + YAML)
+    # The lock only prevents concurrent initialization, not repeated initialization
+    # YAML initialization is idempotent (checks if resources exist before creating)
+    acquired_lock = False
+    if redis_client:
+        acquired_lock = redis_client.set(
+            STARTUP_LOCK_KEY, "locked", nx=True, ex=STARTUP_LOCK_TIMEOUT
+        )
+        if acquired_lock:
+            logger.info("Acquired startup initialization lock")
+        else:
+            # Another worker is running startup initialization, skip and continue
+            logger.info("Another worker is running startup initialization, skipping...")
+
+    # Run startup initialization only if we acquired the distributed lock
+    # Redis is required for distributed locking - fail fast if unavailable
+    if not redis_client:
+        logger.error(
+            "Redis client is not available. Distributed locking is required for startup initialization. "
+            "Please ensure Redis is running and accessible."
+        )
+        raise RuntimeError(
+            "Redis is required for distributed locking during startup initialization"
+        )
+
+    if acquired_lock:
+        try:
+            # Step 1: Run database migrations
+            if settings.ENVIRONMENT == "development" and settings.DB_AUTO_MIGRATE:
+                logger.info(
+                    "Running database migrations automatically (development mode)..."
+                )
+                try:
+                    import os
+                    import subprocess
+
+                    # Get the alembic.ini path
+                    backend_dir = os.path.dirname(
+                        os.path.dirname(os.path.abspath(__file__))
+                    )
+
+                    logger.info("Executing Alembic upgrade to head...")
+
+                    # Run Alembic as subprocess to avoid output buffering issues
+                    result = subprocess.run(
+                        ["alembic", "upgrade", "head"],
+                        cwd=backend_dir,
+                        capture_output=False,  # Let output go directly to stdout/stderr
+                        text=True,
+                        check=True,
+                    )
+
+                    logger.info("✓ Alembic migrations completed successfully")
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"✗ Error running Alembic migrations: {e}")
+                    raise
+                except Exception as e:
+                    logger.error(f"✗ Unexpected error running Alembic migrations: {e}")
+                    raise
+            elif settings.ENVIRONMENT == "production":
+                logger.warning(
+                    "Running in production mode. Database migrations must be run manually. "
+                    "Please execute 'alembic upgrade head' to apply pending migrations."
+                )
+                # Check migration status
+                try:
+                    import os
+
+                    from alembic import command
+                    from alembic.config import Config as AlembicConfig
+                    from alembic.runtime.migration import MigrationContext
+                    from alembic.script import ScriptDirectory
+
+                    backend_dir = os.path.dirname(
+                        os.path.dirname(os.path.abspath(__file__))
+                    )
+                    alembic_ini_path = os.path.join(backend_dir, "alembic.ini")
+
+                    alembic_cfg = AlembicConfig(alembic_ini_path)
+                    script = ScriptDirectory.from_config(alembic_cfg)
+
+                    # Get current revision from database
+                    with engine.connect() as connection:
+                        context = MigrationContext.configure(connection)
+                        current_rev = context.get_current_revision()
+                        head_rev = script.get_current_head()
+
+                        if current_rev != head_rev:
+                            logger.warning(
+                                f"Database migration pending: current={current_rev}, latest={head_rev}. "
+                                "Run 'alembic upgrade head' manually in production."
+                            )
+                        else:
+                            logger.info("Database schema is up to date")
+                except Exception as e:
+                    logger.warning(f"Could not check migration status: {e}")
+            else:
+                logger.info("Alembic auto-upgrade is disabled")
+
+            # Step 2: Initialize database with YAML configuration
+            # This is idempotent - existing resources are skipped
+            logger.info("Starting YAML data initialization...")
+            db = SessionLocal()
+            try:
+                run_yaml_initialization(
+                    db, skip_lock=True
+                )  # Skip internal lock since we already have one
+                logger.info("✓ YAML data initialization completed")
+            except Exception as e:
+                logger.error(f"✗ Failed to initialize database from YAML: {e}")
+            finally:
+                db.close()
+
+            # Step 3: Publish staged built-in plugins to the cloud marketplace.
+            logger.info("Starting built-in plugin marketplace synchronization...")
+            db = SessionLocal()
+            try:
+                published = builtin_plugin_service.sync_marketplace_plugins(db)
+                logger.info(
+                    "✓ Built-in plugin marketplace synchronization completed: count=%s",
+                    len(published),
+                )
+            except Exception as e:
+                logger.error(
+                    "✗ Failed to synchronize built-in plugins: %s",
+                    e,
+                    exc_info=True,
+                )
+                raise
+            finally:
+                db.close()
+
+        except Exception as e:
+            logger.error(f"✗ Startup initialization failed: {e}")
+            # Re-raise the exception to terminate startup
+            # This ensures the application does not start with a broken database state
+            raise
+        finally:
+            # Release lock
+            redis_client.delete(STARTUP_LOCK_KEY)
+            logger.info("Released startup initialization lock")
+
+    # Load system initialization state once per process after startup data exists.
+    _load_system_initialization_state(logger)
+
+    from app.services.task_run_metric_hooks import task_run_metric_hooks
+
+    task_run_metric_hooks.register()
+    logger.info("✓ Task run metric transaction hooks registered")
+
+    if settings.SCHEDULED_TASKS_ENABLED:
+        logger.info("Starting background jobs...")
+        start_background_jobs(app)
+        logger.info("✓ Background jobs started")
+    else:
+        logger.info("Scheduled tasks are disabled; skipping background jobs")
+
+    # Start scheduler backend (for Flow scheduling)
+    # The scheduler backend is selected based on SCHEDULER_BACKEND config:
+    # - "celery" (default): Uses Celery Beat with embedded/standalone mode
+    # - "apscheduler": Uses APScheduler (lightweight, no Redis required)
+    # - "xxljob": Uses XXL-JOB distributed scheduler
+    if settings.SCHEDULED_TASKS_ENABLED:
+        logger.info(f"Starting scheduler backend: {settings.SCHEDULER_BACKEND}...")
+        from app.core.scheduler import start_scheduler
+
+        scheduler = start_scheduler()
+        if scheduler:
+            logger.info(f"✓ Scheduler backend '{scheduler.backend_type}' started")
+        else:
+            logger.warning(
+                "Failed to start scheduler backend. Flow scheduling may not work."
+            )
+    else:
+        logger.info("Scheduled tasks are disabled; skipping scheduler backend")
+
+    # Initialize Socket.IO WebSocket emitter
+    # Note: Chat namespace is already registered in create_socketio_asgi_app()
+    logger.info("Initializing Socket.IO...")
+    from app.core.socketio import initialize_socketio_server
+    from app.services.chat.webpage_ws_chat_emitter import init_ws_emitter
+    from app.services.loop_item_executions.wake import bind_socketio_loop
+
+    sio = initialize_socketio_server()
+    try:
+        bind_socketio_loop(asyncio.get_running_loop())
+    except RuntimeError:
+        pass
+    init_ws_emitter(sio)
+    logger.info("✓ Socket.IO initialized")
+
+    # Initialize event bus and register event handlers
+    # This enables decoupled communication between modules (e.g., pet experience updates)
+    logger.info("Initializing event bus and registering handlers...")
+    from app.core.events import init_event_bus
+    from app.services.pet.event_handlers import register_pet_event_handlers
+    from app.services.subscription.task_completion_handler import (
+        TaskCompletedEvent,
+        handle_task_completed,
+    )
+
+    event_bus = init_event_bus()
+    register_pet_event_handlers()
+
+    # Register subscription task completion handler
+    event_bus.subscribe(TaskCompletedEvent, handle_task_completed)
+    logger.info("✓ Subscription task completion handler registered")
+
+    # Register IM channel task completion handler
+    # This sends task results back to IM channels (DingTalk, Feishu, etc.)
+    from app.services.channels import handle_channel_task_completed
+
+    event_bus.subscribe(TaskCompletedEvent, handle_channel_task_completed)
+    logger.info("✓ IM channel task completion handler registered")
+
+    # Register the durable Wework board-automation projection handler.
+    from app.services.project_automation_completion import (
+        register_project_automation_task_completion_handler,
+    )
+
+    register_project_automation_task_completion_handler(event_bus)
+    logger.info("✓ Project automation task completion handler registered")
+
+    # Register code wiki run completion handler. A version's outcome is normally
+    # reported by the agent itself; this covers the agent never getting to speak,
+    # where the version would otherwise stay RUNNING until the staleness sweep looks
+    # at it — which only happens when the next run starts.
+    from app.services.knowledge.code_wiki.task_completion import conclude_code_wiki_run
+
+    event_bus.subscribe(TaskCompletedEvent, conclude_code_wiki_run)
+    logger.info("✓ Code wiki run completion handler registered")
+
+    # Register inbox auto-process handler
+    from app.core.events import QueueMessageCreatedEvent
+    from app.services.inbox.auto_process_handler import handle_inbox_message_created
+
+    event_bus.subscribe(QueueMessageCreatedEvent, handle_inbox_message_created)
+    logger.info("✓ Inbox auto-process handler registered")
+
+    logger.info("✓ Event bus initialized and handlers registered")
+
+    # Initialize PendingRequestRegistry for skill frontend interactions
+    # This starts the Redis Pub/Sub listener for cross-worker communication
+    logger.info("Initializing PendingRequestRegistry...")
+    from chat_shell.tools import (
+        get_pending_request_registry,
+    )
+
+    await get_pending_request_registry()
+    logger.info("✓ PendingRequestRegistry initialized")
+
+    # Start device heartbeat monitor for local device support.
+    if settings.SCHEDULED_TASKS_ENABLED:
+        logger.info("Starting device heartbeat monitor...")
+        from app.services.device_monitor import start_device_monitor
+
+        start_device_monitor()
+        logger.info("✓ Device heartbeat monitor started")
+    else:
+        logger.info("Scheduled tasks are disabled; skipping device heartbeat monitor")
+
+    # Initialize IM Channel Manager and start enabled channels
+    # This enables DingTalk, Feishu, WeChat bot integrations
+    logger.info("Initializing IM Channel Manager...")
+    from app.services.channels import get_channel_manager
+
+    channel_manager = get_channel_manager()
+    db = SessionLocal()
+    try:
+        started_count = await channel_manager.start_all_enabled(db)
+        logger.info(
+            f"✓ IM Channel Manager initialized, {started_count} channels started"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to start IM channels: {e}")
+    finally:
+        db.close()
+
+    logger.info("Recovering in-progress video jobs...")
+    try:
+        from app.services.execution.agents.video.recovery import (
+            recover_video_jobs,
+            recover_video_jobs_after_stale_delay,
+        )
+
+        recovered_count = await recover_video_jobs()
+        logger.info("✓ Recovered %d in-progress video job(s)", recovered_count)
+        app.state.video_recovery_task = asyncio.create_task(
+            recover_video_jobs_after_stale_delay()
+        )
+    except Exception as e:
+        logger.warning("Failed to recover video jobs: %s", e, exc_info=True)
+
+    logger.info("Starting terminal session invalidation listener...")
+    from app.services.device.terminal_session_service import terminal_session_service
+
+    await terminal_session_service.start()
+    logger.info("✓ Terminal session invalidation listener started")
+
+    logger.info("=" * 60)
+    logger.info("Application startup completed successfully!")
+    logger.info("=" * 60)
+
+    # ==================== YIELD (app is running) ====================
+    # Mounted ASGI applications do not receive parent lifespan events, so the
+    # backend lifespan explicitly owns every mounted MCP session manager.
+    from app.mcp_server.server import mcp_session_managers_lifespan
+
+    async with mcp_session_managers_lifespan():
+        yield
+
+        # ==================== SHUTDOWN ====================
+        logger.info("=" * 60)
+        logger.info("Graceful shutdown initiated...")
+        logger.info("=" * 60)
+
+        video_recovery_task = getattr(app.state, "video_recovery_task", None)
+        if video_recovery_task and not video_recovery_task.done():
+            video_recovery_task.cancel()
+            try:
+                await video_recovery_task
+            except asyncio.CancelledError:
+                pass
+
+        # Step 1: Initiate graceful shutdown (mark as shutting down)
+        await shutdown_manager.initiate_shutdown()
+        logger.info(
+            "✓ Shutdown state set. Active streams: %d",
+            shutdown_manager.get_active_stream_count(),
+        )
+
+        # Step 2: Wait for active streaming requests to complete
+        shutdown_timeout = settings.GRACEFUL_SHUTDOWN_TIMEOUT
+        if shutdown_manager.get_active_stream_count() > 0:
+            logger.info(
+                "Waiting for %d active streams to complete (timeout: %ds)...",
+                shutdown_manager.get_active_stream_count(),
+                shutdown_timeout,
+            )
+            streams_completed = await shutdown_manager.wait_for_streams(
+                timeout=shutdown_timeout
+            )
+
+            if not streams_completed:
+                # Timeout reached, cancel remaining streams
+                remaining = shutdown_manager.get_active_stream_count()
+                logger.warning(
+                    "Timeout reached. Cancelling %d remaining streams...", remaining
+                )
+                cancelled = await shutdown_manager.cancel_all_streams()
+                logger.info("Cancelled %d streams", cancelled)
+
+                # Give a short grace period for cancellation to propagate
+                await asyncio.sleep(1)
+        else:
+            logger.info("No active streams, proceeding with shutdown")
+
+        # Step 3: Stop IM Channel Manager
+        from app.services.channels import get_channel_manager
+
+        channel_manager = get_channel_manager()
+        stopped_count = await channel_manager.stop_all()
+        logger.info(f"✓ IM Channel Manager stopped, {stopped_count} channels stopped")
+
+        # Step 4: Stop background jobs
+        await stop_background_jobs(app)
+        task_run_metric_hooks.unregister()
+        logger.info("✓ Background jobs stopped")
+
+        # Step 5: Stop scheduler backend
+        from app.core.scheduler import get_active_scheduler, stop_scheduler
+
+        scheduler = get_active_scheduler()
+        if scheduler:
+            stop_scheduler()
+            logger.info(f"✓ Scheduler backend '{scheduler.backend_type}' stopped")
+
+        # Step 6: Shutdown PendingRequestRegistry
+        from chat_shell.tools import (
+            shutdown_pending_request_registry,
+        )
+
+        await shutdown_pending_request_registry()
+        logger.info("✓ PendingRequestRegistry shutdown completed")
+
+        await terminal_session_service.stop()
+        logger.info("✓ Terminal session invalidation listener stopped")
+
+        from app.services.loop_items.external_provider import (
+            external_loop_item_provider,
+        )
+
+        external_loop_item_provider.close()
+
+        # Step 7: Stop device heartbeat monitor
+        from app.services.device_monitor import stop_device_monitor_async
+
+        await stop_device_monitor_async()
+        logger.info("✓ Device heartbeat monitor stopped")
+
+        # Step 8: Shutdown OpenTelemetry
+        from shared.telemetry.config import get_otel_config
+        from shared.telemetry.core import is_telemetry_enabled, shutdown_telemetry
+
+        if get_otel_config().enabled and is_telemetry_enabled():
+            shutdown_telemetry()
+            logger.info("✓ OpenTelemetry shutdown completed")
+
+        logger.info("=" * 60)
+        logger.info(
+            "Application shutdown completed. Duration: %.2fs",
+            shutdown_manager.shutdown_duration,
+        )
+        logger.info("=" * 60)
+
+
+def create_app():
+    # Toggle API docs/OpenAPI via environment (settings.ENABLE_API_DOCS, default True)
+    enable_docs = settings.ENABLE_API_DOCS
+    openapi_url = f"{settings.API_PREFIX}/openapi.json" if enable_docs else None
+    docs_url = f"{settings.API_PREFIX}/docs" if enable_docs else None
+    redoc_url = f"{settings.API_PREFIX}/redoc" if enable_docs else None
+
+    app = FastAPI(
+        title=settings.PROJECT_NAME,
+        description="Task Management Backend System API",
+        version=settings.VERSION,
+        openapi_url=openapi_url,
+        docs_url=docs_url,
+        redoc_url=redoc_url,
+        lifespan=lifespan,
+    )
+
+    # Keep frequent probes ahead of business routes. With an empty API prefix,
+    # the existing database-aware /health route must retain precedence.
+    if settings.API_PREFIX:
+        app.include_router(probe_router)
+
+    logger = _logger
+
+    # Initialize OpenTelemetry if enabled (configuration from shared/telemetry/config.py)
+    from shared.telemetry.config import get_otel_config
+
+    otel_config = get_otel_config("wegent-backend")
+    if otel_config.enabled:
+        try:
+            from shared.telemetry.core import init_telemetry
+
+            init_telemetry(
+                service_name=otel_config.service_name,
+                enabled=otel_config.enabled,
+                otlp_endpoint=otel_config.otlp_endpoint,
+                sampler_ratio=otel_config.sampler_ratio,
+                service_version=settings.VERSION,
+                deployment_environment=settings.ENVIRONMENT,
+                metrics_enabled=otel_config.metrics_enabled,
+                capture_request_headers=otel_config.capture_request_headers,
+                capture_request_body=otel_config.capture_request_body,
+                capture_response_headers=otel_config.capture_response_headers,
+                capture_response_body=otel_config.capture_response_body,
+                max_body_size=otel_config.max_body_size,
+            )
+            logger.info("OpenTelemetry initialized successfully")
+
+            # Apply instrumentation with SQLAlchemy support
+            from shared.telemetry.instrumentation import (
+                setup_opentelemetry_instrumentation,
+            )
+
+            setup_opentelemetry_instrumentation(
+                app=app,
+                logger=logger,
+                sqlalchemy_engine=engine,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize OpenTelemetry: {e}")
+    else:
+        logger.debug("OpenTelemetry is disabled")
+
+    @app.middleware("http")
+    async def attach_database_request_path(request: Request, call_next):
+        from app.db.pool_observability import reset_request_path, set_request_path
+
+        token = set_request_path(request.url.path)
+        try:
+            return await call_next(request)
+        finally:
+            reset_request_path(token)
+
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        from starlette.responses import StreamingResponse
+
+        # Skip logging for health check/probe requests (root path)
+        if request.url.path == "/":
+            return await call_next(request)
+
+        # Reuse X-Request-ID from upstream if present, otherwise generate new one
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:8]
+        request.state.request_id = request_id
+
+        start_time = time.time()
+
+        # Extract username from Authorization header
+        from app.core.security import get_username_from_request
+
+        username = get_username_from_request(request)
+
+        client_ip = request.client.host if request.client else "Unknown"
+        forwarded_headers_log = _format_forwarded_headers_for_log(request.headers)
+
+        # Always set request context for logging (works even without OTEL)
+        from shared.telemetry.context import (
+            set_request_context,
+            set_task_context,
+            set_user_context,
+        )
+
+        set_request_context(request_id)
+        if username:
+            set_user_context(user_name=username)
+
+        # Capture request body if OTEL is enabled and body capture is configured
+        request_body = None
+        if (
+            otel_config.enabled
+            and otel_config.capture_request_body
+            and request.method in ("POST", "PUT", "PATCH")
+            and _should_capture_http_body(request.url.path)
+        ):
+            try:
+                # Read the body
+                body_bytes = await request.body()
+                if body_bytes:
+                    # Limit body size to avoid huge spans
+                    max_body_size = otel_config.max_body_size
+                    if len(body_bytes) <= max_body_size:
+                        request_body = body_bytes.decode("utf-8", errors="replace")
+                    else:
+                        request_body = (
+                            body_bytes[:max_body_size].decode("utf-8", errors="replace")
+                            + f"... [truncated, total size: {len(body_bytes)} bytes]"
+                        )
+            except Exception as e:
+                logger.debug(f"Failed to capture request body: {e}")
+
+        # Add OpenTelemetry span attributes if enabled
+        if otel_config.enabled:
+            from opentelemetry import trace
+
+            from shared.telemetry.core import is_telemetry_enabled
+
+            if is_telemetry_enabled():
+                # Extract task_id and subtask_id from request body for tracing
+                if request_body:
+                    task_id, subtask_id, user_id = _request_context_fields(request_body)
+                    if task_id is not None or subtask_id is not None:
+                        set_task_context(task_id=task_id, subtask_id=subtask_id)
+                    if user_id is not None:
+                        set_user_context(user_id=str(user_id))
+
+                # Add request body to current span
+                if request_body:
+                    current_span = trace.get_current_span()
+                    if current_span and current_span.is_recording():
+                        log_json_body("http.request.body", request_body)
+
+        # Pre-request logging with request ID
+        request_log_message = (
+            f"request : {request.method} {request.url.path} "
+            f"{_format_query_params_for_log(request.query_params)} "
+            f"{request_id} {client_ip} [{username}]{forwarded_headers_log}"
+        )
+        high_frequency_request = request.url.path in HIGH_FREQUENCY_HTTP_PATHS
+        if high_frequency_request:
+            logger.debug(request_log_message)
+        else:
+            logger.info(request_log_message)
+
+        # Process request
+        response = await call_next(request)
+        process_time = (time.time() - start_time) * 1000
+
+        # Capture response headers and body if OTEL is enabled
+        if otel_config.enabled:
+            from opentelemetry import trace
+
+            from shared.telemetry.core import is_telemetry_enabled
+
+            if is_telemetry_enabled():
+                current_span = trace.get_current_span()
+                if current_span and current_span.is_recording():
+                    # Capture response headers
+                    if otel_config.capture_response_headers:
+                        for header_name, header_value in response.headers.items():
+                            # Skip sensitive headers
+                            if header_name.lower() in (
+                                "authorization",
+                                "cookie",
+                                "set-cookie",
+                            ):
+                                header_value = "[REDACTED]"
+                            current_span.set_attribute(
+                                f"http.response.header.{header_name}", header_value
+                            )
+
+                    # Capture response body (only for non-streaming responses)
+                    if otel_config.capture_response_body and _should_capture_http_body(
+                        request.url.path
+                    ):
+                        if not isinstance(response, StreamingResponse):
+                            try:
+                                # For regular responses, we need to read and reconstruct the body
+                                response_body_chunks = []
+                                async for chunk in response.body_iterator:
+                                    response_body_chunks.append(chunk)
+
+                                response_body = b"".join(response_body_chunks)
+
+                                # Limit body size
+                                max_body_size = otel_config.max_body_size
+                                if response_body:
+                                    if len(response_body) <= max_body_size:
+                                        body_str = response_body.decode(
+                                            "utf-8", errors="replace"
+                                        )
+                                    else:
+                                        body_str = (
+                                            response_body[:max_body_size].decode(
+                                                "utf-8", errors="replace"
+                                            )
+                                            + f"... [truncated, total size: {len(response_body)} bytes]"
+                                        )
+                                    current_span.set_attribute(
+                                        "http.response.body", body_str
+                                    )
+
+                                # Reconstruct the response with the body
+                                from starlette.responses import Response
+
+                                response = Response(
+                                    content=response_body,
+                                    status_code=response.status_code,
+                                    headers=dict(response.headers),
+                                    media_type=response.media_type,
+                                )
+                            except Exception as e:
+                                logger.debug(f"Failed to capture response body: {e}")
+
+        # Post-request logging with request ID
+        response_log_message = (
+            f"response: {request.method} {request.url.path} "
+            f"{_format_query_params_for_log(request.query_params)} "
+            f"{request_id} {client_ip} [{username}]{forwarded_headers_log} "
+            f"{response.status_code} {process_time:.2f}ms"
+        )
+        if high_frequency_request and response.status_code < 400:
+            logger.debug(response_log_message)
+        else:
+            logger.info(response_log_message)
+
+        if response.status_code == 429:
+            from shared.telemetry.metrics import record_http_429_response
+
+            record_http_429_response()
+
+        # Add request ID to response headers for client-side tracking
+        response.headers["X-Request-ID"] = request_id
+
+        return response
+
+    # Setup CORS
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Content-Disposition", "X-Request-ID"],
+    )
+
+    # Register exception handlers
+    app.add_exception_handler(CustomHTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(Exception, python_exception_handler)
+
+    # Register rate limiter exception handler and state
+    from app.core.rate_limit import get_limiter, is_rate_limit_enabled
+
+    if is_rate_limit_enabled():
+        from slowapi import _rate_limit_exceeded_handler
+        from slowapi.errors import RateLimitExceeded
+
+        limiter = get_limiter()
+        app.state.limiter = limiter
+        app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+        logger.info("Rate limiting enabled for API endpoints")
+
+    # Include API routes
+    app.include_router(oauth_metadata_router)
+    app.include_router(api_router, prefix=settings.API_PREFIX)
+    if not settings.API_PREFIX:
+        app.include_router(probe_router)
+
+    # Mount MCP Server endpoints
+    # These provide system-level tools (silent_exit) and knowledge base tools
+    try:
+        from app.mcp_server.server import register_mcp_apps
+
+        register_mcp_apps(app)
+        if settings.API_PREFIX:
+            register_mcp_apps(app, settings.API_PREFIX)
+    except Exception:
+        logger.exception("Failed to mount MCP servers")
+        # In production, fail fast to surface configuration problems early
+        if settings.ENVIRONMENT.lower() == "production":
+            raise
+
+    return app
+
+
+# Create FastAPI app
+_fastapi_app = create_app()
+
+
+def create_socketio_asgi_app():
+    """
+    Create combined ASGI app with Socket.IO mounted.
+
+    Returns a combined app that routes Socket.IO traffic to Socket.IO server
+    and everything else through registered distribution wrappers to FastAPI.
+    """
+    from app.api.ws import register_chat_namespace
+    from app.api.ws.device_namespace import register_device_namespace
+    from app.api.ws.terminal_namespace import register_terminal_namespace
+    from app.api.ws.wework_runtime_namespace import register_wework_runtime_namespace
+    from app.core.socketio import create_socketio_app, get_sio
+
+    sio = get_sio()
+
+    # Register chat namespace before creating ASGI app
+    # This ensures the namespace is available when clients connect
+    register_chat_namespace(sio)
+    _logger.info("Chat namespace registered during ASGI app creation")
+
+    # Register device namespace for local device connections
+    register_device_namespace(sio)
+    _logger.info("Device namespace registered during ASGI app creation")
+
+    # Register terminal namespace for browser terminal clients
+    register_terminal_namespace(sio)
+    _logger.info("Terminal namespace registered during ASGI app creation")
+
+    # Register Wework runtime relay namespace for app IPC over WebSocket
+    register_wework_runtime_namespace(sio)
+    _logger.info("Wework runtime namespace registered during ASGI app creation")
+
+    socketio_app = create_socketio_app(sio)
+
+    # Distribution-specific WebSocket handlers wrap FastAPI before Socket.IO.
+    from app.core.asgi_extensions import wrap_asgi_app
+
+    wrapped_app = wrap_asgi_app(_fastapi_app)
+
+    # Create combined ASGI app
+    return socketio.ASGIApp(
+        sio,
+        other_asgi_app=wrapped_app,
+        socketio_path="/socket.io",
+    )
+
+
+# Combined ASGI app (Socket.IO + FastAPI)
+app = create_socketio_asgi_app()

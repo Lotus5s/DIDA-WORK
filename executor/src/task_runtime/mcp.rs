@@ -1,0 +1,5189 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::{
+    collections::{BTreeMap, HashSet},
+    env, fmt, fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
+};
+
+#[cfg(not(test))]
+use std::sync::OnceLock;
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use chrono::Local;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+use crate::logging::log_executor_event;
+use crate::protocol::ExecutionRequest;
+
+mod assignment_notifications;
+#[cfg(test)]
+mod issue_access_tests;
+
+use assignment_notifications::emit_local_assignment_notifications;
+
+use super::{
+    BinaryInput, DeliveryCreate, LocalCommentCreate, ProjectCreate, RuntimeTaskAddress,
+    TaskRuntime, TaskSearch, TaskUpdate,
+};
+
+mod comments;
+
+pub const SPACE_MCP_SERVER_NAME: &str = "wework_space";
+pub const NOTIFICATIONS_MCP_SERVER_NAME: &str = "wework_notifications";
+const SPACE_MCP_LOG_FILE: &str = "space-mcp.log";
+pub const SPACE_CONTEXT_GRANT_ENV: &str = "WEWORK_SPACE_CONTEXT_GRANT";
+const SPACE_CONTEXT_GRANT_TTL_SECONDS: i64 = 60 * 60;
+pub(crate) const SPACE_MCP_TOOL_TIMEOUT_SECONDS: u64 = 60;
+static SPACE_MCP_LOG_WRITE_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
+static ACTIVE_SPACE_CONTEXT_GRANT: OnceLock<Option<SpaceContextGrant>> = OnceLock::new();
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct CloudCollaborationRoundCommand {
+    pub(crate) manager_runtime_task_id: String,
+    pub(crate) project_id: String,
+    pub(crate) item_id: String,
+    pub(crate) dispatch_id: String,
+    pub(crate) round_id: String,
+    pub(crate) assignments: Vec<Value>,
+    pub(crate) human_assignment_ids: Vec<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CloudCollaborationRoundDispatcher(
+    Arc<dyn Fn(CloudCollaborationRoundCommand) -> Result<(), String> + Send + Sync>,
+);
+
+impl CloudCollaborationRoundDispatcher {
+    pub(crate) fn new(
+        dispatch: impl Fn(CloudCollaborationRoundCommand) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(dispatch))
+    }
+
+    fn dispatch(&self, command: CloudCollaborationRoundCommand) -> Result<(), String> {
+        (self.0)(command)
+    }
+}
+
+impl fmt::Debug for CloudCollaborationRoundDispatcher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CloudCollaborationRoundDispatcher")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SpaceContextRole {
+    Manager,
+    Executor,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BoardToolCategory {
+    Management,
+    Execution,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub(crate) struct SpaceContextGrant {
+    version: u8,
+    task_id: String,
+    space_id: Option<String>,
+    item_id: Option<String>,
+    device_id: Option<String>,
+    dispatch_id: Option<String>,
+    manager_agent_id: Option<String>,
+    automation_run_id: Option<String>,
+    #[serde(default)]
+    role: Option<SpaceContextRole>,
+    #[serde(default)]
+    categories: HashSet<BoardToolCategory>,
+    expires_at_unix: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SpaceMcpRequestContext {
+    grant: Option<SpaceContextGrant>,
+    backend_url: Option<String>,
+    auth_token: Option<String>,
+    surface: WeworkMcpSurface,
+    cloud_collaboration_dispatcher: Option<CloudCollaborationRoundDispatcher>,
+    event_sender: Option<tokio::sync::broadcast::Sender<Value>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WeworkMcpSurface {
+    #[default]
+    ProjectSpace,
+    Notifications,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpaceMcpClientConfig {
+    pub(crate) url: String,
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) context_bound: bool,
+}
+
+impl SpaceMcpRequestContext {
+    pub(crate) fn new(
+        grant: Option<SpaceContextGrant>,
+        backend_url: Option<String>,
+        auth_token: Option<String>,
+    ) -> Self {
+        Self {
+            grant,
+            backend_url,
+            auth_token,
+            surface: WeworkMcpSurface::ProjectSpace,
+            cloud_collaboration_dispatcher: None,
+            event_sender: None,
+        }
+    }
+
+    pub(crate) fn notifications(backend_url: Option<String>, auth_token: Option<String>) -> Self {
+        Self {
+            grant: None,
+            backend_url,
+            auth_token,
+            surface: WeworkMcpSurface::Notifications,
+            cloud_collaboration_dispatcher: None,
+            event_sender: None,
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::new(
+            current_space_context_grant(),
+            non_empty_env("WEWORK_SPACE_BACKEND_URL"),
+            non_empty_env("WEWORK_SPACE_AUTH_TOKEN"),
+        )
+    }
+
+    fn grant(&self) -> Option<&SpaceContextGrant> {
+        self.grant.as_ref()
+    }
+
+    pub(crate) fn surface(&self) -> WeworkMcpSurface {
+        self.surface
+    }
+
+    fn server_name(&self) -> &'static str {
+        match self.surface {
+            WeworkMcpSurface::ProjectSpace => SPACE_MCP_SERVER_NAME,
+            WeworkMcpSurface::Notifications => NOTIFICATIONS_MCP_SERVER_NAME,
+        }
+    }
+
+    pub(crate) fn set_cloud_collaboration_dispatcher(
+        &mut self,
+        dispatcher: Option<CloudCollaborationRoundDispatcher>,
+    ) {
+        self.cloud_collaboration_dispatcher = dispatcher;
+    }
+
+    pub(crate) fn set_event_sender(
+        &mut self,
+        sender: Option<tokio::sync::broadcast::Sender<Value>>,
+    ) {
+        self.event_sender = sender;
+    }
+}
+
+pub(crate) fn space_mcp_client_config(
+    request: &ExecutionRequest,
+) -> Result<SpaceMcpClientConfig, String> {
+    let grant = encoded_space_context_grant(request);
+    let context = SpaceMcpRequestContext::new(
+        grant.as_deref().and_then(decode_space_context_grant),
+        request
+            .backend_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| env::var("WEGENT_BACKEND_URL").ok())
+            .filter(|value| !value.trim().is_empty()),
+        request
+            .auth_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| env::var("WEGENT_AUTH_TOKEN").ok())
+            .filter(|value| !value.trim().is_empty()),
+    );
+    let registered = super::mcp_http::register_space_mcp_context(context)?;
+    Ok(SpaceMcpClientConfig {
+        url: registered.endpoint.url,
+        headers: BTreeMap::from([
+            (
+                "Authorization".to_owned(),
+                format!("Bearer {}", registered.endpoint.token),
+            ),
+            ("X-Wework-Mcp-Context".to_owned(), registered.context_handle),
+        ]),
+        context_bound: grant.is_some(),
+    })
+}
+
+pub(crate) fn notifications_mcp_client_config(
+    request: &ExecutionRequest,
+) -> Result<Option<SpaceMcpClientConfig>, String> {
+    let Some(backend_url) = request
+        .backend_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(auth_token) = request
+        .auth_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let registered =
+        super::mcp_http::register_space_mcp_context(SpaceMcpRequestContext::notifications(
+            Some(backend_url.to_owned()),
+            Some(auth_token.to_owned()),
+        ))?;
+    let base_url = registered.endpoint.url.trim_end_matches("/mcp");
+    Ok(Some(SpaceMcpClientConfig {
+        url: format!("{base_url}/notifications/mcp"),
+        headers: BTreeMap::from([
+            (
+                "Authorization".to_owned(),
+                format!("Bearer {}", registered.endpoint.token),
+            ),
+            ("X-Wework-Mcp-Context".to_owned(), registered.context_handle),
+        ]),
+        context_bound: false,
+    }))
+}
+
+pub fn is_space_mcp_command() -> bool {
+    env::args().nth(1).as_deref() == Some("space-mcp-server")
+}
+
+pub fn encoded_space_context_grant(request: &ExecutionRequest) -> Option<String> {
+    let origin = request.extra.get("origin").and_then(Value::as_object);
+    let role = origin.and_then(|origin| {
+        origin
+            .get("dispatchRole")
+            .or_else(|| origin.get("dispatch_role"))
+            .and_then(Value::as_str)
+            .and_then(space_context_role)
+    });
+    let categories = role
+        .map(role_categories)
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .collect();
+    let space_id = request
+        .extra
+        .get("cloudProjectId")
+        .or_else(|| request.extra.get("cloud_project_id"))
+        .and_then(id_value)
+        .or_else(|| {
+            origin
+                .and_then(|value| {
+                    value
+                        .get("cloudProjectId")
+                        .or_else(|| value.get("cloud_project_id"))
+                })
+                .and_then(id_value)
+        })
+        .filter(|value| !value.is_empty());
+    let item_id = origin
+        .and_then(|value| {
+            value
+                .get("loopItemId")
+                .or_else(|| value.get("loop_item_id"))
+        })
+        .and_then(id_value)
+        .filter(|value| !value.is_empty());
+    let execution_device_id = request
+        .extra
+        .get("executionDeviceId")
+        .or_else(|| request.extra.get("execution_device_id"))
+        .and_then(id_value)
+        .filter(|value| !value.is_empty());
+    let prompt_has_cloud_ref = prompt_references_cloud_projects(&request.prompt);
+    if role == Some(SpaceContextRole::Executor) && (space_id.is_none() || item_id.is_none()) {
+        return None;
+    }
+    log_executor_event(
+        "space capability context decision",
+        &[
+            ("task_id", request.task_id.clone()),
+            ("space_id", space_id.as_deref().unwrap_or("").to_owned()),
+            ("item_id", item_id.as_deref().unwrap_or("").to_owned()),
+            (
+                "origin_type",
+                origin
+                    .and_then(|value| value.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            ),
+            ("prompt_has_cloud_ref", prompt_has_cloud_ref.to_string()),
+            (
+                "shell_type",
+                request.resolved_shell_type().unwrap_or_default(),
+            ),
+        ],
+    );
+    if space_id.is_none() && !prompt_has_cloud_ref {
+        return None;
+    }
+    let grant = SpaceContextGrant {
+        version: 1,
+        task_id: request.task_id.clone(),
+        space_id,
+        item_id,
+        device_id: execution_device_id
+            .or_else(|| request.device_id.clone().filter(|value| !value.is_empty())),
+        dispatch_id: origin
+            .and_then(|origin| {
+                origin
+                    .get("dispatchId")
+                    .or_else(|| origin.get("dispatch_id"))
+            })
+            .and_then(id_value)
+            .filter(|value| !value.is_empty()),
+        manager_agent_id: origin
+            .and_then(|origin| {
+                origin
+                    .get("managerAgentId")
+                    .or_else(|| origin.get("manager_agent_id"))
+            })
+            .and_then(id_value)
+            .filter(|value| !value.is_empty()),
+        automation_run_id: None,
+        role,
+        categories,
+        expires_at_unix: Local::now().timestamp() + SPACE_CONTEXT_GRANT_TTL_SECONDS,
+    };
+    let encoded = serde_json::to_vec(&grant)
+        .ok()
+        .map(|bytes| STANDARD.encode(bytes))?;
+    log_executor_event(
+        "space capability context prepared",
+        &[
+            ("task_id", request.task_id.clone()),
+            ("grant_version", grant.version.to_string()),
+        ],
+    );
+    Some(encoded)
+}
+
+fn space_context_role(value: &str) -> Option<SpaceContextRole> {
+    match value.trim() {
+        "manager" | "leader" | "manager_review" => Some(SpaceContextRole::Manager),
+        "executor" | "member" | "worker" => Some(SpaceContextRole::Executor),
+        _ => None,
+    }
+}
+
+fn role_categories(role: SpaceContextRole) -> &'static [BoardToolCategory] {
+    match role {
+        SpaceContextRole::Manager => &[BoardToolCategory::Management, BoardToolCategory::Execution],
+        SpaceContextRole::Executor => &[BoardToolCategory::Execution],
+    }
+}
+
+fn prompt_references_cloud_projects(prompt: &Value) -> bool {
+    match prompt {
+        Value::String(text) => text.contains("cloud://projects"),
+        Value::Array(blocks) => blocks.iter().any(|block| match block {
+            Value::String(text) => text.contains("cloud://projects"),
+            Value::Object(object) => object
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("cloud://projects")),
+            _ => false,
+        }),
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("cloud://projects")),
+        _ => false,
+    }
+}
+
+fn id_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+pub async fn run() -> Result<(), String> {
+    let runtime = TaskRuntime::from_env().map_err(|error| error.to_string())?;
+    let context = SpaceMcpRequestContext::from_env();
+    let grant = context.grant();
+    write_space_mcp_log(&format!(
+        "[wework-space-mcp] lifecycle=start version={} pid={} grant_version={} manager_mode={} space_id_present={} item_id_present={} backend_url_present={} auth_token_present={}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        grant.as_ref().map_or(0, |grant| grant.version),
+        is_manager_context(grant),
+        grant.as_ref().is_some_and(|grant| grant.space_id.is_some()),
+        grant.as_ref().is_some_and(|grant| grant.item_id.is_some()),
+        env_value_present("WEWORK_SPACE_BACKEND_URL"),
+        env_value_present("WEWORK_SPACE_AUTH_TOKEN"),
+    ));
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    let mut request_count = 0_u64;
+    while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        request_count += 1;
+        let response = match serde_json::from_str::<Value>(&line) {
+            Ok(request) => {
+                let method = request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>");
+                let tool = request
+                    .pointer("/params/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                write_space_mcp_log(&format!(
+                    "[wework-space-mcp] request={} stage=received method={} tool={}",
+                    request_count, method, tool,
+                ));
+                handle_request_with_context(&runtime, &request, &context).await
+            }
+            Err(error) => {
+                write_space_mcp_log(&format!(
+                    "[wework-space-mcp] request={} stage=parse_failed error={}",
+                    request_count, error,
+                ));
+                Some(error_response(Value::Null, -32700, &error.to_string()))
+            }
+        };
+        if let Some(response) = response {
+            let mut encoded = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+            encoded.push(b'\n');
+            stdout
+                .write_all(&encoded)
+                .await
+                .map_err(|error| error.to_string())?;
+            stdout.flush().await.map_err(|error| error.to_string())?;
+        }
+    }
+    write_space_mcp_log(&format!(
+        "[wework-space-mcp] lifecycle=stdin_closed pid={} requests={}",
+        std::process::id(),
+        request_count,
+    ));
+    Ok(())
+}
+
+fn env_value_present(key: &str) -> bool {
+    env::var(key).is_ok_and(|value| !value.trim().is_empty())
+}
+
+pub(crate) async fn handle_request_with_context(
+    runtime: &TaskRuntime,
+    request: &Value,
+    context: &SpaceMcpRequestContext,
+) -> Option<Value> {
+    let id = request.get("id").cloned();
+    match request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "notifications/initialized" => None,
+        "initialize" => id.map(|id| {
+            let protocol_version = request
+                .pointer("/params/protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("2025-06-18");
+            result_response(
+                id,
+                json!({
+                    "protocolVersion": protocol_version,
+                    "capabilities": {"tools": {"listChanged": false}},
+                    "serverInfo": {
+                        "name": context.server_name(),
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+        }),
+        "ping" => id.map(|id| result_response(id, json!({}))),
+        "tools/list" => id.map(|id| {
+            let tools = visible_tools(runtime, context);
+            let names = tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(",");
+            write_space_mcp_log(&format!(
+                "[wework-space-mcp] stage=tools_list manager_mode={} tool_count={} tools={}",
+                is_manager_context(context.grant()),
+                tools.len(),
+                names,
+            ));
+            result_response(id, json!({"tools": tools}))
+        }),
+        "tools/call" => {
+            let id = id?;
+            let name = request.pointer("/params/name").and_then(Value::as_str)?;
+            let arguments = request
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let argument_keys = arguments
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_default();
+            write_space_mcp_log(&format!(
+                "[wework-space-mcp] stage=tool_call tool={} argument_keys={}",
+                name, argument_keys,
+            ));
+            Some(result_response(
+                id,
+                call_tool_with_context(runtime, name, arguments, context).await,
+            ))
+        }
+        method => id.map(|id| error_response(id, -32601, &format!("Unknown method: {method}"))),
+    }
+}
+
+fn write_space_mcp_log(message: &str) {
+    eprintln!("{message}");
+    let path = space_mcp_log_path();
+    let result = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        writeln!(file, "{timestamp} {message}")?;
+        file.flush()
+    })();
+    if let Err(error) = result {
+        if !SPACE_MCP_LOG_WRITE_ERROR_REPORTED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[wework-space-mcp] lifecycle=file_log_error pid={} path={} error={error}",
+                std::process::id(),
+                path.display(),
+            );
+        }
+    }
+}
+
+fn space_mcp_log_path() -> PathBuf {
+    non_empty_env("WEGENT_EXECUTOR_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::config::paths::executor_home().join("logs"))
+        .join(SPACE_MCP_LOG_FILE)
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn current_space_context_grant() -> Option<SpaceContextGrant> {
+    #[cfg(not(test))]
+    {
+        ACTIVE_SPACE_CONTEXT_GRANT
+            .get_or_init(read_initial_space_context_grant)
+            .clone()
+    }
+    #[cfg(test)]
+    read_initial_space_context_grant()
+}
+
+fn read_initial_space_context_grant() -> Option<SpaceContextGrant> {
+    let encoded = non_empty_env(SPACE_CONTEXT_GRANT_ENV)?;
+    decode_space_context_grant(&encoded)
+}
+
+pub(crate) fn decode_space_context_grant(encoded: &str) -> Option<SpaceContextGrant> {
+    let decoded = STANDARD.decode(encoded).ok()?;
+    let grant = serde_json::from_slice::<SpaceContextGrant>(&decoded).ok()?;
+    (grant.version == 1 && grant.expires_at_unix >= Local::now().timestamp()).then_some(grant)
+}
+
+fn context_scope_error(grant: &SpaceContextGrant, arguments: &Value) -> Option<String> {
+    // Personal task context supplies defaults; only dispatch roles have delegated scope.
+    let role = grant.role?;
+    if let Some(requested_space_id) = arguments.get("space_id").and_then(Value::as_str) {
+        if grant.space_id.as_deref().is_some_and(|space_id| {
+            !requested_space_id.trim().is_empty() && requested_space_id != space_id
+        }) {
+            return Some("The requested project space is outside this Agent session".to_owned());
+        }
+    }
+    if role == SpaceContextRole::Executor {
+        if let Some(requested_item_id) = arguments.get("item_id").and_then(Value::as_str) {
+            if grant.item_id.as_deref().is_some_and(|item_id| {
+                !requested_item_id.trim().is_empty() && requested_item_id != item_id
+            }) {
+                return Some("The requested board item is outside this Agent session".to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn delivery_address(
+    grant: Option<&SpaceContextGrant>,
+) -> Result<RuntimeTaskAddress, super::TaskRuntimeError> {
+    let grant = grant.ok_or_else(|| {
+        super::TaskRuntimeError::Invalid(
+            "Delivery writes require an Issue-bound Agent session".to_owned(),
+        )
+    })?;
+    let device_id = grant
+        .device_id
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            super::TaskRuntimeError::Invalid(
+                "Delivery writes require a bound Runtime device".to_owned(),
+            )
+        })?;
+    if grant.task_id.is_empty() {
+        return Err(super::TaskRuntimeError::Invalid(
+            "Delivery writes require a bound Runtime task".to_owned(),
+        ));
+    }
+    Ok(RuntimeTaskAddress {
+        device_id,
+        task_id: grant.task_id.clone(),
+        task_title: None,
+        backend_task_id: None,
+        model_selection: None,
+        execution_context: None,
+        workflow_node_id: None,
+    })
+}
+
+fn delivery_scope_error(
+    delivery: &Value,
+    address: &RuntimeTaskAddress,
+    item_id: &str,
+) -> Option<String> {
+    if delivery.get("loop_item_id").and_then(Value::as_str) != Some(item_id) {
+        return Some("The requested Delivery is outside this Agent session".to_owned());
+    }
+    if delivery.get("status").and_then(Value::as_str) != Some("draft") {
+        return Some("Only a Delivery draft can be changed".to_owned());
+    }
+    let Some(source) = delivery.get("source_task_snapshot") else {
+        return Some("The requested Delivery is not bound to a Runtime task".to_owned());
+    };
+    let source_device = source
+        .get("deviceId")
+        .or_else(|| source.get("device_id"))
+        .and_then(Value::as_str);
+    let source_task = source
+        .get("taskId")
+        .or_else(|| source.get("task_id"))
+        .and_then(Value::as_str);
+    if source_device != Some(address.device_id.as_str())
+        || source_task != Some(address.task_id.as_str())
+    {
+        return Some("The requested Delivery belongs to another Runtime task".to_owned());
+    }
+    None
+}
+
+fn delivery_requirements(item: &Value, workflow_node_id: Option<&str>) -> Value {
+    let workflow = item
+        .get("workflow")
+        .or_else(|| item.pointer("/metadata/workflow"));
+    let node = workflow_node_id.and_then(|node_id| {
+        workflow
+            .and_then(|value| value.get("nodes"))
+            .and_then(Value::as_array)
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|node| node.get("id").and_then(Value::as_str) == Some(node_id))
+            })
+    });
+    json!({
+        "workflow_node_id": workflow_node_id,
+        "workflow_node": node,
+        "required_deliverables": node
+            .and_then(|value| value.get("required_deliverables"))
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+        "delivery_ids": node
+            .and_then(|value| value.get("delivery_ids"))
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    })
+}
+
+fn local_workflow_stage_context(item: &Value, workflow_node_id: Option<&str>) -> Value {
+    let workflow = item
+        .get("workflow")
+        .or_else(|| item.pointer("/metadata/workflow"));
+    let nodes = workflow
+        .and_then(|value| value.get("nodes"))
+        .and_then(Value::as_array);
+    let target = workflow_node_id.and_then(|node_id| {
+        nodes.and_then(|values| {
+            values
+                .iter()
+                .find(|node| node.get("id").and_then(Value::as_str) == Some(node_id))
+        })
+    });
+    let dependency_ids = target
+        .and_then(|value| value.get("depends_on"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let dependencies = dependency_ids
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|dependency_id| {
+            nodes.and_then(|values| {
+                values
+                    .iter()
+                    .find(|node| node.get("id").and_then(Value::as_str) == Some(dependency_id))
+            })
+        })
+        .map(|node| {
+            json!({
+                "stage_id": node.get("id"),
+                "stage_name": node.get("name"),
+                "status": node.get("status"),
+                "delivery_ids": node.get("delivery_ids").cloned().unwrap_or_else(|| json!([])),
+                "selected_sources": target
+                    .and_then(|value| value.get("dependency_context"))
+                    .and_then(|value| value.get(node.get("id").and_then(Value::as_str).unwrap_or_default()))
+                    .cloned()
+                    .unwrap_or_else(|| json!(["final_result", "deliveries"])),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "version": 1,
+        "issue": {
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "description": item.get("description"),
+            "status": item.get("status"),
+        },
+        "target_stage": target,
+        "dependencies": dependencies,
+    })
+}
+
+fn selected_local_delivery_chat(
+    runtime: &TaskRuntime,
+    project_id: &str,
+    item_id: &str,
+    arguments: &Value,
+) -> Result<Option<Value>, super::TaskRuntimeError> {
+    let explicit = arguments.get("chat").filter(|value| !value.is_null());
+    let selection = arguments
+        .get("chat_selection")
+        .filter(|value| !value.is_null());
+    if explicit.is_some() && selection.is_some() {
+        return Err(super::TaskRuntimeError::Invalid(
+            "chat and chat_selection are mutually exclusive".to_owned(),
+        ));
+    }
+    let Some(selection) = selection else {
+        return Ok(explicit.cloned());
+    };
+    let mode = selection
+        .get("mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            super::TaskRuntimeError::Invalid("chat_selection.mode is required".to_owned())
+        })?;
+    let mut comments = runtime.list_comments(project_id, item_id, 0)?;
+    match mode {
+        "all" => {}
+        "latest" => {
+            let count = selection
+                .get("count")
+                .and_then(Value::as_u64)
+                .filter(|count| (1..=500).contains(count))
+                .ok_or_else(|| {
+                    super::TaskRuntimeError::Invalid(
+                        "chat_selection.count must be between 1 and 500".to_owned(),
+                    )
+                })? as usize;
+            if comments.len() > count {
+                comments.drain(..comments.len() - count);
+            }
+        }
+        "message_ids" => {
+            let ids = selection
+                .get("message_ids")
+                .and_then(Value::as_array)
+                .filter(|ids| !ids.is_empty() && ids.len() <= 500)
+                .ok_or_else(|| {
+                    super::TaskRuntimeError::Invalid(
+                        "chat_selection.message_ids must contain 1 to 500 IDs".to_owned(),
+                    )
+                })?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                        super::TaskRuntimeError::Invalid(
+                            "chat_selection.message_ids must contain strings".to_owned(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let available = comments
+                .iter()
+                .map(|comment| comment.message_id.as_str())
+                .collect::<HashSet<_>>();
+            if ids.iter().any(|id| !available.contains(id.as_str())) {
+                return Err(super::TaskRuntimeError::Invalid(
+                    "One or more selected chat messages do not exist on this Issue".to_owned(),
+                ));
+            }
+            comments.retain(|comment| ids.contains(&comment.message_id));
+        }
+        _ => {
+            return Err(super::TaskRuntimeError::Invalid(
+                "chat_selection.mode must be all, latest, or message_ids".to_owned(),
+            ));
+        }
+    }
+    Ok(Some(json!({
+        "selection": selection,
+        "messages": comments,
+    })))
+}
+
+async fn call_tool_with_context(
+    runtime: &TaskRuntime,
+    name: &str,
+    arguments: Value,
+    context: &SpaceMcpRequestContext,
+) -> Value {
+    if context.surface == WeworkMcpSurface::Notifications && name != "send_notification" {
+        return text_result(
+            format!("Unknown {NOTIFICATIONS_MCP_SERVER_NAME} tool: {name}"),
+            true,
+        );
+    }
+    call_tool_with_runtime_context(runtime, name, arguments, context).await
+}
+
+#[cfg(test)]
+async fn call_tool(runtime: &TaskRuntime, name: &str, arguments: Value) -> Value {
+    let context = SpaceMcpRequestContext::from_env();
+    call_tool_with_context(runtime, name, arguments, &context).await
+}
+
+#[cfg(test)]
+async fn call_tool_with_grant(
+    runtime: &TaskRuntime,
+    name: &str,
+    arguments: Value,
+    grant: Option<SpaceContextGrant>,
+) -> Value {
+    let context = SpaceMcpRequestContext::new(
+        grant,
+        non_empty_env("WEWORK_SPACE_BACKEND_URL"),
+        non_empty_env("WEWORK_SPACE_AUTH_TOKEN"),
+    );
+    call_tool_with_runtime_context(runtime, name, arguments, &context).await
+}
+
+async fn call_tool_with_runtime_context(
+    runtime: &TaskRuntime,
+    name: &str,
+    mut arguments: Value,
+    context: &SpaceMcpRequestContext,
+) -> Value {
+    let grant = context.grant.as_ref();
+    let backend_url = context.backend_url.as_deref();
+    let auth_token = context.auth_token.as_deref();
+    if is_role_bound(grant) && board_tool_category(name).is_none() {
+        return text_result(
+            format!("The current dispatch role cannot call wework_space tool: {name}"),
+            true,
+        );
+    }
+    if let Some(category) = board_tool_category(name) {
+        if !grant_allows(grant, category) {
+            return text_result(
+                format!("The current dispatch role cannot call wework_space tool: {name}"),
+                true,
+            );
+        }
+    } else if is_role_bound(grant) {
+        return text_result(
+            format!("The current dispatch role cannot call wework_space tool: {name}"),
+            true,
+        );
+    }
+    if let Some(error) = grant
+        .as_ref()
+        .and_then(|grant| context_scope_error(grant, &arguments))
+    {
+        return text_result(error, true);
+    }
+    let default_project_id = grant
+        .as_ref()
+        .and_then(|grant| grant.space_id.clone())
+        .filter(|project_id| {
+            name != "send_notification" || !is_locally_routed_project(runtime, project_id, name)
+        });
+    let default_item_id = grant
+        .as_ref()
+        .and_then(|grant| grant.item_id.clone())
+        .filter(|_| name != "send_notification" || default_project_id.is_some());
+    if let Some(object) = arguments.as_object_mut() {
+        if !object.contains_key("space_id") {
+            if let Some(project_id) = default_project_id.as_deref() {
+                object.insert("space_id".to_owned(), json!(project_id));
+            }
+        }
+        if !object.contains_key("item_id") {
+            if let Some(item_id) = default_item_id.as_deref() {
+                object.insert("item_id".to_owned(), json!(item_id));
+            }
+        }
+    }
+    if name == "get_current_context" && (default_project_id.is_none() || default_item_id.is_none())
+    {
+        return text_result(
+            json!({
+                "bound": false,
+                "space_id": default_project_id,
+                "item_id": default_item_id,
+            })
+            .to_string(),
+            false,
+        );
+    }
+    let requested_project_id = arguments
+        .get("space_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| default_project_id.clone());
+    let is_locally_routed = requested_project_id
+        .as_deref()
+        .is_some_and(|project_id| is_locally_routed_project(runtime, project_id, name));
+    if name == "list_spaces" {
+        let local_projects = match runtime.list_projects().and_then(|mut projects| {
+            projects.retain(|project| project.metadata["project_store"] != "backend");
+            serde_json::to_value(projects).map_err(invalid_json)
+        }) {
+            Ok(Value::Array(projects)) => projects,
+            Ok(_) => Vec::new(),
+            Err(error) => return text_result(error.to_string(), true),
+        };
+        let Some((backend_url, auth_token)) = backend_url.zip(auth_token) else {
+            return text_result(Value::Array(local_projects).to_string(), false);
+        };
+        let backend_context = BackendToolContext {
+            backend_url,
+            auth_token,
+            project_id: "",
+            grant,
+            collaboration_dispatcher: context.cloud_collaboration_dispatcher.as_ref(),
+        };
+        return match call_backend_tool(&backend_context, name, &arguments).await {
+            Ok(Value::Array(mut cloud_projects)) => {
+                cloud_projects.extend(local_projects);
+                text_result(Value::Array(cloud_projects).to_string(), false)
+            }
+            Ok(value) => text_result(value.to_string(), false),
+            Err(error) => text_result(error, true),
+        };
+    }
+    let should_use_backend = backend_url.is_some()
+        && auth_token.is_some()
+        && (matches!(name, "create_space" | "send_notification")
+            || (requested_project_id.is_some() && !is_locally_routed));
+    if should_use_backend {
+        let project_id = requested_project_id.as_deref().unwrap_or_default();
+        let backend_context = BackendToolContext {
+            backend_url: backend_url.unwrap_or_default(),
+            auth_token: auth_token.unwrap_or_default(),
+            project_id,
+            grant,
+            collaboration_dispatcher: context.cloud_collaboration_dispatcher.as_ref(),
+        };
+        return match call_backend_tool(&backend_context, name, &arguments).await {
+            Ok(value) => text_result(value.to_string(), false),
+            Err(error) => text_result(error, true),
+        };
+    }
+    if name == "send_notification" {
+        return text_result(
+            "DIDA Work notifications require an authenticated Backend connection".to_owned(),
+            true,
+        );
+    }
+    if requested_project_id.is_some() && !is_locally_routed {
+        return text_result(
+            "The current project space requires the DIDA Work Backend connection. Retry through wework_space after the connection is restored; do not use git or provider APIs."
+                .to_owned(),
+            true,
+        );
+    }
+    let result = match name {
+        "list_spaces" => unreachable!("list_spaces is handled before tool routing"),
+        "update_issue_status" => local_update_issue_status(runtime, &arguments, grant).await,
+        "submit_workflow_plan" => {
+            let manager_task_id = manager_runtime_task_id(grant);
+            let plan = arguments.get("plan").ok_or_else(|| {
+                super::TaskRuntimeError::Invalid("workflow plan is required".to_owned())
+            });
+            match (manager_task_id, plan) {
+                (Ok(manager_task_id), Ok(plan)) => {
+                    let receipt = runtime.submit_collaboration_round(manager_task_id, plan);
+                    if let Ok(receipt) = &receipt {
+                        emit_local_assignment_notifications(runtime, context, receipt);
+                    }
+                    receipt
+                }
+                (Err(error), _) => Err(super::TaskRuntimeError::Invalid(error)),
+                (_, Err(error)) => Err(error),
+            }
+        }
+        "get_current_context" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let task_id = string_argument(&arguments, "item_id");
+            match (project_id, task_id) {
+                (Ok(project_id), Ok(task_id)) => runtime
+                    .get_task(project_id, task_id)
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(invalid_json))
+                    .map(|item| {
+                        json!({
+                            "space_id": project_id,
+                            "item_id": task_id,
+                            "item": item,
+                        })
+                    }),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        "create_space" => parse(arguments)
+            .and_then(|input: ProjectCreate| runtime.create_project(input))
+            .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+        "update_space" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let input = parse(
+                arguments
+                    .get("project")
+                    .cloned()
+                    .unwrap_or_else(|| arguments.clone()),
+            );
+            match (project_id, input) {
+                (Ok(project_id), Ok(input)) => runtime
+                    .update_project(project_id, input)
+                    .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        "list_board_items" => match string_argument(&arguments, "space_id") {
+            Ok(project_id) => runtime
+                .list_tasks(project_id)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+            Err(error) => Err(error),
+        },
+        "search_board_items" => {
+            let requested_space_id = arguments
+                .get("space_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            match parse::<TaskSearch>(arguments) {
+                Ok(mut input) => {
+                    input.project_id = requested_space_id.or_else(|| default_project_id.clone());
+                    runtime
+                        .search_tasks(input)
+                        .await
+                        .and_then(|value| serde_json::to_value(value).map_err(invalid_json))
+                }
+                Err(error) => Err(error),
+            }
+        }
+        "get_board_item" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let task_id = string_argument(&arguments, "item_id");
+            match (project_id, task_id) {
+                (Ok(project_id), Ok(task_id)) => runtime
+                    .get_task(project_id, task_id)
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        "get_assignment_candidates" => {
+            let project_id = string_argument(&arguments, "space_id");
+            match (project_id, runtime.list_projects()) {
+                (Ok(project_id), Ok(projects)) => projects
+                    .into_iter()
+                    .find(|project| project.id == project_id)
+                    .ok_or(super::TaskRuntimeError::ProjectNotFound)
+                    .and_then(|project| {
+                        runtime.list_chat_agents(project_id).map(|agents| {
+                            let groups = project.metadata["collaboration_groups"]
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default();
+                            let mut member_ids = HashSet::new();
+                            let members = groups
+                                .iter()
+                                .flat_map(|group| {
+                                    group
+                                        .get("members")
+                                        .and_then(Value::as_array)
+                                        .into_iter()
+                                        .flatten()
+                                })
+                                .filter(|member| {
+                                    member.get("kind").and_then(Value::as_str) == Some("human")
+                                })
+                                .filter_map(|member| {
+                                    let id = member.get("id")?.as_str()?.trim();
+                                    if id.is_empty() || !member_ids.insert(id.to_owned()) {
+                                        return None;
+                                    }
+                                    Some(json!({
+                                        "id": id,
+                                        "name": member.get("name").and_then(Value::as_str).unwrap_or(id),
+                                        "role": member.get("role").and_then(Value::as_str).unwrap_or("member"),
+                                        "capability": member.get("responsibility").or_else(|| member.get("capability")).and_then(Value::as_str).unwrap_or_default(),
+                                    }))
+                                })
+                                .collect::<Vec<_>>();
+                            json!({
+                                "members": members,
+                                "robots": agents.into_iter().filter(|agent| agent.status == "active").map(|agent| json!({
+                                    "id": agent.id,
+                                    "name": agent.display_name,
+                                    "capability": agent.capability_description,
+                                    "models": agent.allowed_models,
+                                })).collect::<Vec<_>>(),
+                                "groups": groups.into_iter().map(|group| json!({
+                                    "id": group["id"],
+                                    "name": group["name"],
+                                    "capability": group["description"],
+                                })).collect::<Vec<_>>(),
+                            })
+                        })
+                    }),
+                (Err(error), _) => Err(error),
+                (_, Err(error)) => Err(error),
+            }
+        }
+        "assign_board_item" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let task_id = string_argument(&arguments, "item_id");
+            let kind = string_argument(&arguments, "assignee_type");
+            let target = string_argument(&arguments, "assignee_id");
+            match (project_id, task_id, kind, target) {
+                (Ok(project_id), Ok(task_id), Ok(kind), Ok(target)) => {
+                    match runtime.get_task(project_id, task_id).await {
+                        Ok(current) => {
+                            let update = match kind {
+                                "agent" => Ok(super::TaskUpdate {
+                                    version: current.version,
+                                    assignee_agent_id: Some(Some(target.into())),
+                                    ..super::TaskUpdate::default()
+                                }),
+                                "user" => target
+                                    .parse::<i64>()
+                                    .map(|id| super::TaskUpdate {
+                                        version: current.version,
+                                        assignee_user_id: Some(Some(id)),
+                                        ..super::TaskUpdate::default()
+                                    })
+                                    .map_err(|_| {
+                                        super::TaskRuntimeError::Invalid("invalid assignee".into())
+                                    }),
+                                "group" => Ok(super::TaskUpdate {
+                                    version: current.version,
+                                    assignee_group_id: Some(Some(target.into())),
+                                    ..super::TaskUpdate::default()
+                                }),
+                                _ => Err(super::TaskRuntimeError::Invalid(
+                                    "unsupported assignee".into(),
+                                )),
+                            };
+                            match update {
+                                Ok(update) => runtime
+                                    .update_task(project_id, task_id, update)
+                                    .await
+                                    .and_then(|item| {
+                                        serde_json::to_value(item).map_err(invalid_json)
+                                    }),
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                (Err(error), _, _, _)
+                | (_, Err(error), _, _)
+                | (_, _, Err(error), _)
+                | (_, _, _, Err(error)) => Err(error),
+            }
+        }
+        "create_board_item" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let raw = arguments
+                .get("item")
+                .cloned()
+                .unwrap_or_else(|| arguments.clone());
+            let input = parse(raw);
+            match (project_id, input) {
+                (Ok(project_id), Ok(input)) => runtime
+                    .create_task(project_id, input)
+                    .await
+                    .and_then(|item| serde_json::to_value(item).map_err(invalid_json)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        "update_board_item" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let task_id = string_argument(&arguments, "item_id");
+            let raw = arguments
+                .get("item")
+                .cloned()
+                .unwrap_or_else(|| arguments.clone());
+            let input = parse(raw);
+            match (project_id, task_id, input) {
+                (Ok(project_id), Ok(task_id), Ok(input)) => runtime
+                    .update_task(project_id, task_id, input)
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "list_board_item_comments" => comments::list(runtime, &arguments).await,
+        "add_board_item_comment" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let task_id = string_argument(&arguments, "item_id");
+            let body = string_argument(&arguments, "body");
+            match (project_id, task_id, body) {
+                (Ok(project_id), Ok(task_id), Ok(body)) => runtime
+                    .add_comment(project_id, task_id, body)
+                    .await
+                    .and_then(|comment| serde_json::to_value(comment).map_err(invalid_json)),
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "list_item_attachments" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let task_id = string_argument(&arguments, "item_id");
+            match (project_id, task_id) {
+                (Ok(project_id), Ok(task_id)) => runtime
+                    .list_task_attachments(project_id, task_id)
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        "upload_item_attachment" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let task_id = string_argument(&arguments, "item_id");
+            let file_path = string_argument(&arguments, "file_path");
+            match (project_id, task_id, file_path) {
+                (Ok(project_id), Ok(task_id), Ok(file_path)) => {
+                    let input = binary_input_from_path(&arguments, file_path);
+                    match input {
+                        Ok(input) => runtime
+                            .add_task_attachment(project_id, task_id, input)
+                            .await
+                            .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                        Err(error) => Err(error),
+                    }
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "read_item_attachment" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let task_id = string_argument(&arguments, "item_id");
+            let attachment_id = string_argument(&arguments, "attachment_id");
+            match (project_id, task_id, attachment_id) {
+                (Ok(project_id), Ok(task_id), Ok(attachment_id)) => runtime
+                    .task_attachment_path(project_id, task_id, attachment_id)
+                    .await
+                    .and_then(|path| copy_attachment_if_requested(&arguments, &path))
+                    .map(|path| json!({"path": path})),
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "delete_item_attachment" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let task_id = string_argument(&arguments, "item_id");
+            let attachment_id = string_argument(&arguments, "attachment_id");
+            match (project_id, task_id, attachment_id) {
+                (Ok(project_id), Ok(task_id), Ok(attachment_id)) => runtime
+                    .delete_task_attachment(project_id, task_id, attachment_id)
+                    .await
+                    .map(|_| json!({"deleted": true})),
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "get_delivery_requirements" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let item_id = string_argument(&arguments, "item_id");
+            let address = delivery_address(grant);
+            match (project_id, item_id, address) {
+                (Ok(project_id), Ok(item_id), Ok(address)) => {
+                    match runtime.find_task_binding(&address.device_id, &address.task_id) {
+                        Ok(binding)
+                            if binding.cloud_project_id == project_id
+                                && binding.loop_item_id.as_deref() == Some(item_id) =>
+                        {
+                            runtime
+                                .get_task(project_id, item_id)
+                                .await
+                                .and_then(|item| serde_json::to_value(item).map_err(invalid_json))
+                                .map(|item| {
+                                    delivery_requirements(
+                                        &item,
+                                        binding.workflow_node_id.as_deref(),
+                                    )
+                                })
+                        }
+                        Ok(_) => Err(super::TaskRuntimeError::Invalid(
+                            "The current Runtime task is not bound to this Issue".to_owned(),
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "get_workflow_stage_context" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let item_id = string_argument(&arguments, "item_id");
+            let address = delivery_address(grant);
+            match (project_id, item_id, address) {
+                (Ok(project_id), Ok(item_id), Ok(address)) => {
+                    match runtime.find_task_binding(&address.device_id, &address.task_id) {
+                        Ok(binding)
+                            if binding.loop_item_id.as_deref() == Some(item_id)
+                                && binding.cloud_project_id == project_id =>
+                        {
+                            runtime
+                                .get_task(project_id, item_id)
+                                .await
+                                .and_then(|item| serde_json::to_value(item).map_err(invalid_json))
+                                .map(|item| {
+                                    binding.workflow_stage_input.clone().unwrap_or_else(|| {
+                                        local_workflow_stage_context(
+                                            &item,
+                                            binding.workflow_node_id.as_deref(),
+                                        )
+                                    })
+                                })
+                        }
+                        Ok(_) => Err(super::TaskRuntimeError::Invalid(
+                            "The current Runtime task is not bound to this Issue".to_owned(),
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "create_delivery" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let item_id = string_argument(&arguments, "item_id");
+            let address = delivery_address(grant);
+            match (project_id, item_id, address) {
+                (Ok(project_id), Ok(item_id), Ok(address)) => {
+                    match selected_local_delivery_chat(runtime, project_id, item_id, &arguments) {
+                        Ok(chat) => runtime
+                            .create_delivery(
+                                project_id,
+                                item_id,
+                                DeliveryCreate {
+                                    markdown: arguments
+                                        .get("markdown")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    chat,
+                                    source_task: Some(address),
+                                },
+                            )
+                            .await
+                            .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                        Err(error) => Err(error),
+                    }
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "upload_delivery_asset" => {
+            let item_id = string_argument(&arguments, "item_id");
+            let delivery_id = string_argument(&arguments, "delivery_id");
+            let file_path = string_argument(&arguments, "file_path");
+            let address = delivery_address(grant);
+            match (item_id, delivery_id, file_path, address) {
+                (Ok(item_id), Ok(delivery_id), Ok(file_path), Ok(address)) => {
+                    let relative_path = arguments
+                        .get("relative_path")
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            Path::new(file_path)
+                                .file_name()
+                                .and_then(|value| value.to_str())
+                        })
+                        .ok_or_else(|| {
+                            super::TaskRuntimeError::Invalid("relative_path is required".to_owned())
+                        });
+                    let relative_path = match relative_path {
+                        Ok(value) => value,
+                        Err(error) => return text_result(error.to_string(), true),
+                    };
+                    runtime.delivery_detail(delivery_id).and_then(|delivery| {
+                        let serialized = serde_json::to_value(&delivery).map_err(invalid_json)?;
+                        if let Some(error) = delivery_scope_error(&serialized, &address, item_id) {
+                            return Err(super::TaskRuntimeError::Invalid(error));
+                        }
+                        runtime
+                            .add_delivery_asset(
+                                delivery_id,
+                                relative_path,
+                                binary_input_from_path(&arguments, file_path)?,
+                            )
+                            .and_then(|value| serde_json::to_value(value).map_err(invalid_json))
+                    })
+                }
+                (Err(error), _, _, _)
+                | (_, Err(error), _, _)
+                | (_, _, Err(error), _)
+                | (_, _, _, Err(error)) => Err(error),
+            }
+        }
+        "list_deliveries" => match string_argument(&arguments, "item_id") {
+            Ok(item_id) => runtime
+                .list_deliveries(item_id)
+                .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+            Err(error) => Err(error),
+        },
+        "read_delivery" => {
+            let item_id = string_argument(&arguments, "item_id");
+            let delivery_id = string_argument(&arguments, "delivery_id");
+            match (item_id, delivery_id) {
+                (Ok(item_id), Ok(delivery_id)) => {
+                    runtime.delivery_detail(delivery_id).and_then(|delivery| {
+                        if delivery.delivery.loop_item_id != item_id {
+                            return Err(super::TaskRuntimeError::Invalid(
+                                "The requested Delivery is outside this Agent session".to_owned(),
+                            ));
+                        }
+                        serde_json::to_value(delivery).map_err(invalid_json)
+                    })
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        "download_delivery_asset" => {
+            let item_id = string_argument(&arguments, "item_id");
+            let delivery_id = string_argument(&arguments, "delivery_id");
+            let asset_id = string_argument(&arguments, "asset_id");
+            match (item_id, delivery_id, asset_id) {
+                (Ok(item_id), Ok(delivery_id), Ok(asset_id)) => {
+                    runtime.delivery_detail(delivery_id).and_then(|delivery| {
+                        if delivery.delivery.loop_item_id != item_id
+                            || !delivery
+                                .delivery
+                                .assets
+                                .iter()
+                                .any(|asset| asset.id == asset_id)
+                        {
+                            return Err(super::TaskRuntimeError::Invalid(
+                                "The requested Delivery asset is outside this Agent session"
+                                    .to_owned(),
+                            ));
+                        }
+                        runtime
+                            .delivery_asset_path(asset_id)
+                            .and_then(|path| copy_attachment_if_requested(&arguments, &path))
+                            .map(|path| json!({"path": path}))
+                    })
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "finalize_delivery" | "discard_delivery_draft" => {
+            let item_id = string_argument(&arguments, "item_id");
+            let delivery_id = string_argument(&arguments, "delivery_id");
+            let address = delivery_address(grant);
+            match (item_id, delivery_id, address) {
+                (Ok(item_id), Ok(delivery_id), Ok(address)) => {
+                    runtime.delivery_detail(delivery_id).and_then(|delivery| {
+                        let serialized = serde_json::to_value(&delivery).map_err(invalid_json)?;
+                        if let Some(error) = delivery_scope_error(&serialized, &address, item_id) {
+                            return Err(super::TaskRuntimeError::Invalid(error));
+                        }
+                        if name == "finalize_delivery" {
+                            let input = super::DeliveryFinalize {
+                                fulfillments: arguments
+                                    .get("fulfillments")
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            };
+                            runtime
+                                .finalize_delivery(item_id, delivery_id, input)
+                                .and_then(|value| serde_json::to_value(value).map_err(invalid_json))
+                        } else {
+                            runtime.discard_delivery(delivery_id)?;
+                            Ok(json!({"discarded": true}))
+                        }
+                    })
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "reorder_board_items" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let input = parse(
+                arguments
+                    .get("reorder")
+                    .cloned()
+                    .unwrap_or_else(|| arguments.clone()),
+            );
+            match (project_id, input) {
+                (Ok(project_id), Ok(input)) => runtime
+                    .reorder_tasks(project_id, input)
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        "describe_space_table" => match string_argument(&arguments, "space_id") {
+            Ok(project_id) => runtime
+                .aitable_describe(project_id)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+            Err(error) => Err(error),
+        },
+        "list_table_records" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let query = arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let cursor = arguments
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let limit = arguments
+                .get("limit")
+                .and_then(Value::as_i64)
+                .unwrap_or(100);
+            match project_id {
+                Ok(project_id) => runtime
+                    .aitable_list_records(
+                        project_id,
+                        query.as_deref(),
+                        limit,
+                        cursor.as_deref(),
+                        None,
+                    )
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                Err(error) => Err(error),
+            }
+        }
+        "create_table_record" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let cells = cells_argument(&arguments);
+            match (project_id, cells) {
+                (Ok(project_id), Ok(cells)) => runtime
+                    .aitable_create_record(project_id, cells)
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        "update_table_record" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let record_id = string_argument(&arguments, "record_id");
+            let cells = cells_argument(&arguments);
+            match (project_id, record_id, cells) {
+                (Ok(project_id), Ok(record_id), Ok(cells)) => runtime
+                    .aitable_update_record(project_id, record_id, cells)
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "delete_table_record" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let record_id = string_argument(&arguments, "record_id");
+            match (project_id, record_id) {
+                (Ok(project_id), Ok(record_id)) => runtime
+                    .aitable_delete_record(project_id, record_id)
+                    .await
+                    .map(|_| json!({"deleted": true})),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        "create_table_field" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let name = string_argument(&arguments, "name");
+            let field_type = string_argument(&arguments, "field_type");
+            let property = arguments
+                .get("config")
+                .or_else(|| arguments.get("property"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match (project_id, name, field_type) {
+                (Ok(project_id), Ok(name), Ok(field_type)) => runtime
+                    .aitable_create_field(project_id, name, field_type, property)
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "update_table_field" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let field_id = string_argument(&arguments, "field_id");
+            let payload = arguments
+                .get("field")
+                .or_else(|| arguments.get("config"))
+                .cloned()
+                .unwrap_or_else(|| arguments.clone());
+            let payload = payload.as_object().cloned().map(|mut map| {
+                map.remove("space_id");
+                map.remove("field_id");
+                if let Some(config) = map.remove("config") {
+                    map.insert("property".to_owned(), config);
+                }
+                map
+            });
+            match (project_id, field_id, payload) {
+                (Ok(project_id), Ok(field_id), Some(payload)) => runtime
+                    .aitable_update_field(project_id, field_id, payload)
+                    .await
+                    .and_then(|value| serde_json::to_value(value).map_err(invalid_json)),
+                (Err(error), _, _) | (_, Err(error), _) => Err(error),
+                (_, _, None) => Err(super::TaskRuntimeError::Invalid(
+                    "field update payload must be an object".to_owned(),
+                )),
+            }
+        }
+        "delete_table_field" => {
+            let project_id = string_argument(&arguments, "space_id");
+            let field_id = string_argument(&arguments, "field_id");
+            match (project_id, field_id) {
+                (Ok(project_id), Ok(field_id)) => runtime
+                    .aitable_delete_field(project_id, field_id)
+                    .await
+                    .map(|_| json!({"deleted": true})),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        _ => return text_result(format!("Unknown wework_space tool: {name}"), true),
+    };
+    match result {
+        Ok(mut value) => {
+            if let Some(project_id) = requested_project_id.as_deref() {
+                if is_dingtalk_project(runtime, project_id)
+                    && is_dingtalk_read_tool(name)
+                    && primary_document_read_failed(&value)
+                {
+                    if let Some(item_id) = default_item_id.as_deref() {
+                        if let Ok(fallback) = runtime.dws_read_fallback(project_id, item_id) {
+                            value["bundled_dws_fallback"] = fallback;
+                        }
+                    }
+                }
+            }
+            text_result(value.to_string(), false)
+        }
+        Err(error) => {
+            let fallback = requested_project_id
+                .as_deref()
+                .filter(|project_id| {
+                    is_dingtalk_project(runtime, project_id) && is_dingtalk_read_tool(name)
+                })
+                .and_then(|project_id| {
+                    default_item_id.as_deref().and_then(|item_id| {
+                        runtime
+                            .dws_read_fallback(project_id, item_id)
+                            .ok()
+                            .map(|fallback| {
+                                json!({
+                                    "provider_error": error.to_string(),
+                                    "bundled_dws_fallback": fallback,
+                                })
+                            })
+                    })
+                });
+            match fallback {
+                Some(value) => text_result(value.to_string(), false),
+                None => text_result(error.to_string(), true),
+            }
+        }
+    }
+}
+
+async fn local_update_issue_status(
+    runtime: &TaskRuntime,
+    arguments: &Value,
+    grant: Option<&SpaceContextGrant>,
+) -> Result<Value, super::TaskRuntimeError> {
+    let manager_runtime_task_id =
+        manager_runtime_task_id(grant).map_err(super::TaskRuntimeError::Invalid)?;
+    let project_id = string_argument(arguments, "space_id")?;
+    let issue_id = string_argument(arguments, "item_id")?;
+    let payload = normalize_issue_status_decision(arguments, grant)
+        .map_err(super::TaskRuntimeError::Invalid)?;
+    let status = string_argument(&payload, "target_status")?.to_owned();
+    let current = runtime.get_task(project_id, issue_id).await?;
+    let updated = runtime
+        .update_task(
+            project_id,
+            issue_id,
+            TaskUpdate {
+                version: current.version,
+                status: Some(status.clone()),
+                ..TaskUpdate::default()
+            },
+        )
+        .await?;
+    if let Some(comment) = payload
+        .get("comment")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let manager = runtime
+            .execution_by_runtime_task_id(manager_runtime_task_id)?
+            .ok_or_else(|| {
+                super::TaskRuntimeError::Invalid(
+                    "Collaboration manager execution is unavailable".to_owned(),
+                )
+            })?;
+        runtime.create_comment(LocalCommentCreate {
+            project_id: project_id.to_owned(),
+            task_id: issue_id.to_owned(),
+            client_message_id: None,
+            sender_type: "agent".to_owned(),
+            sender_id: manager.agent_id,
+            sender_name: manager.agent_name,
+            content: comment.to_owned(),
+            metadata: json!({
+                "dispatch_role": "manager",
+                "execution_id": manager.id,
+                "runtime_address": {
+                    "deviceId": manager.runtime_device_id,
+                    "taskId": manager_runtime_task_id,
+                },
+                "activity_type": "manager_status_comment",
+                "target_status": status,
+            }),
+            reply_to_message_id: None,
+        })?;
+    }
+    serde_json::to_value(updated).map_err(invalid_json)
+}
+
+fn is_locally_routed_project(runtime: &TaskRuntime, project_id: &str, tool_name: &str) -> bool {
+    let project = runtime
+        .list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|project| project.id == project_id);
+    project.is_some_and(|project| {
+        project.metadata["project_store"].as_str() == Some("local")
+            || (project.metadata["task_provider"].as_str() == Some("dingtalk_aitable")
+                && is_dingtalk_read_tool(tool_name))
+    })
+}
+
+fn is_dingtalk_project(runtime: &TaskRuntime, project_id: &str) -> bool {
+    runtime
+        .list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|project| project.id == project_id)
+        .is_some_and(|project| {
+            project.metadata["task_provider"].as_str() == Some("dingtalk_aitable")
+        })
+}
+
+fn is_dingtalk_read_tool(name: &str) -> bool {
+    matches!(name, "get_current_context" | "get_board_item")
+}
+
+fn primary_document_read_failed(value: &Value) -> bool {
+    value
+        .pointer("/item/metadata/primary_document/error")
+        .or_else(|| value.pointer("/metadata/primary_document/error"))
+        .is_some()
+}
+
+fn manager_dispatch_id(grant: Option<&SpaceContextGrant>) -> Result<&str, String> {
+    let grant = grant.ok_or_else(|| "Collaboration manager context is required".to_owned())?;
+    if grant.role != Some(SpaceContextRole::Manager) {
+        return Err("Collaboration manager context is required".to_owned());
+    }
+    grant
+        .dispatch_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Collaboration manager dispatch identity is missing".to_owned())
+}
+
+fn manager_runtime_task_id(grant: Option<&SpaceContextGrant>) -> Result<&str, String> {
+    manager_dispatch_id(grant)?;
+    grant
+        .map(|grant| grant.task_id.as_str())
+        .filter(|task_id| !task_id.trim().is_empty())
+        .ok_or_else(|| "Collaboration manager Runtime task identity is missing".to_owned())
+}
+
+fn normalize_issue_status_decision(
+    arguments: &Value,
+    grant: Option<&SpaceContextGrant>,
+) -> Result<Value, String> {
+    let status = arguments
+        .get("target_status")
+        .or_else(|| arguments.get("status"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "status is required".to_owned())?;
+    if !matches!(
+        status,
+        "inbox" | "pending" | "in_progress" | "in_review" | "completed"
+    ) {
+        return Err("unsupported Issue status".to_owned());
+    }
+    let reason = arguments
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "reason is required".to_owned())?;
+    Ok(json!({
+        "idempotency_key": arguments
+            .get("idempotency_key")
+            .cloned()
+            .unwrap_or_else(|| json!(grant.map(|value| value.task_id.as_str()).unwrap_or_default())),
+        "target_status": status,
+        "reason": reason,
+        "comment": arguments
+            .get("comment")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    }))
+}
+
+struct BackendToolContext<'a> {
+    backend_url: &'a str,
+    auth_token: &'a str,
+    project_id: &'a str,
+    grant: Option<&'a SpaceContextGrant>,
+    collaboration_dispatcher: Option<&'a CloudCollaborationRoundDispatcher>,
+}
+
+async fn call_backend_tool(
+    context: &BackendToolContext<'_>,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    let base = format!("{}/api/v1", context.backend_url.trim_end_matches('/'));
+    let project_id = context.project_id;
+    let grant = context.grant;
+    let auth_token = context.auth_token;
+    let collaboration_dispatcher = context.collaboration_dispatcher;
+    if name == "update_issue_status" {
+        let grant = grant.ok_or_else(|| "Collaboration manager context is required".to_owned())?;
+        let dispatch_id = manager_dispatch_id(Some(grant))?;
+        let item_id = arguments
+            .get("item_id")
+            .and_then(Value::as_str)
+            .or(grant.item_id.as_deref())
+            .ok_or_else(|| "item_id is required".to_owned())?;
+        let manager_agent_id = grant
+            .manager_agent_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Collaboration manager agent identity is missing".to_owned())?;
+        let decision = normalize_issue_status_decision(arguments, Some(grant))?;
+        let response = client
+            .post(format!(
+                "{base}/cloud-projects/{project_id}/executions/manager-decision"
+            ))
+            .bearer_auth(context.auth_token)
+            .json(&json!({
+                "loop_item_id": item_id,
+                "dispatch_id": dispatch_id,
+                "manager_agent_id": manager_agent_id,
+                "idempotency_key": decision.get("idempotency_key"),
+                "manager_runtime_task_id": grant.task_id,
+                "target_status": decision.get("target_status"),
+                "reason": decision.get("reason"),
+                "comment": decision.get("comment"),
+            }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = backend_json(response).await?;
+        return result
+            .get("item")
+            .cloned()
+            .ok_or_else(|| "Backend manager decision response is missing the Issue".to_owned());
+    }
+    if name == "submit_workflow_plan" {
+        let grant = grant.ok_or_else(|| "Collaboration manager context is required".to_owned())?;
+        let dispatch_id = manager_dispatch_id(Some(grant))?.to_owned();
+        let item_id = grant
+            .item_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Collaboration manager Issue identity is missing".to_owned())?;
+        let manager_agent_id = grant
+            .manager_agent_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Collaboration manager agent identity is missing".to_owned())?;
+        let plan = arguments
+            .get("plan")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| "workflow plan is required".to_owned())?;
+        let round_id = plan
+            .get("round_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "workflow plan round_id is required".to_owned())?;
+        let items = plan
+            .get("items")
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+            .ok_or_else(|| "workflow plan items must not be empty".to_owned())?;
+        let response = backend_json(
+            client
+                .post(format!(
+                    "{base}/cloud-projects/{project_id}/executions/batch"
+                ))
+                .bearer_auth(context.auth_token)
+                .json(&json!({
+                    "loop_item_id": item_id,
+                    "dispatch_id": dispatch_id,
+                    "round_id": round_id,
+                    "manager_runtime_task_id": grant.task_id,
+                    "manager_agent_id": manager_agent_id,
+                    "items": items,
+                }))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+        .await?;
+        let human_receipts = response
+            .get("human_assignments")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut assignments = Vec::with_capacity(items.len());
+        let mut human_assignment_ids = Vec::new();
+        for item in items {
+            let assignee_type = item
+                .get("assignee_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Collaboration assignment assignee_type is required".to_owned())?;
+            let assignment_id = item
+                .get("assignment_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "Collaboration assignment assignment_id is required".to_owned())?;
+            let assignee_id = item
+                .get("assignee_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "Collaboration assignment assignee_id is required".to_owned())?;
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "Collaboration assignment title is required".to_owned())?;
+            let instructions = item
+                .get("instructions")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "Collaboration assignment instructions are required".to_owned())?;
+            let mut assignment = json!({
+                "assignee_type": assignee_type,
+                "assignment_id": assignment_id,
+                "assignee_id": assignee_id,
+                "task_title": title,
+                "instructions": instructions,
+                "model_id": item.get("model_id"),
+                "workflow_stage_id": item.get("workflow_stage_id"),
+            });
+            if assignee_type == "agent" {
+                assignment["agent_id"] = Value::String(assignee_id.to_owned());
+            } else if assignee_type == "human" {
+                let receipt = human_receipts
+                    .iter()
+                    .find(|receipt| {
+                        receipt.get("assignment_id").and_then(Value::as_str) == Some(assignment_id)
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "Backend did not persist human collaboration assignment {assignment_id}"
+                        )
+                    })?;
+                let human_assignment_id = receipt
+                    .get("human_assignment_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "Backend human collaboration assignment {assignment_id} has no identity"
+                        )
+                    })?
+                    .to_owned();
+                human_assignment_ids.push(human_assignment_id);
+                if let (Some(target), Some(receipt)) =
+                    (assignment.as_object_mut(), receipt.as_object())
+                {
+                    target.extend(receipt.clone());
+                }
+            } else {
+                return Err(format!(
+                    "Unsupported collaboration assignee type '{assignee_type}'"
+                ));
+            }
+            assignments.push(assignment);
+        }
+        let agent_assignment_count = assignments
+            .iter()
+            .filter(|assignment| {
+                assignment.get("assignee_type").and_then(Value::as_str) == Some("agent")
+                    && assignment
+                        .get("agent_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+            })
+            .count();
+        if agent_assignment_count + human_assignment_ids.len() != assignments.len() {
+            return Err("Collaboration plan contains an invalid assignment".to_owned());
+        }
+        collaboration_dispatcher
+            .ok_or_else(|| "Executor collaboration coordinator is unavailable".to_owned())?
+            .dispatch(CloudCollaborationRoundCommand {
+                manager_runtime_task_id: grant.task_id.clone(),
+                project_id: project_id.to_owned(),
+                item_id: item_id.to_owned(),
+                dispatch_id: dispatch_id.clone(),
+                round_id: round_id.to_owned(),
+                assignments: assignments.clone(),
+                human_assignment_ids,
+            })?;
+        return Ok(json!({
+            "dispatch_id": dispatch_id,
+            "round_id": round_id,
+            "state": "dispatched",
+            "assignments": assignments,
+            "next_action": "End this manager turn. The Executor will restart the manager after every assignment in this round reaches a terminal state.",
+        }));
+    }
+    let task_id = || {
+        arguments
+            .get("item_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "task_id is required".to_owned())
+    };
+    let request = match name {
+        "send_notification" => client
+            .post(format!("{base}/wework-notifications"))
+            .json(&json!({
+                "project_id": if project_id.is_empty() { None } else {
+                    Some(project_id.parse::<i64>().map_err(|_| "A notification project source must be a Backend project".to_owned())?)
+                },
+                "item_id": arguments.get("item_id"),
+                "recipient_user_id": arguments.get("recipient_user_id"),
+                "title": arguments.get("title"),
+                "body": arguments.get("body"),
+                "url": arguments.get("url"),
+            })),
+        "list_spaces" => client.get(format!("{base}/cloud-projects")),
+        "list_space_files" => {
+            let mut request = client.get(format!("{base}/cloud-projects/{project_id}/files"));
+            if let Some(prefix) = arguments.get("prefix").and_then(Value::as_str) {
+                request = request.query(&[("prefix", prefix)]);
+            }
+            request
+        }
+        "read_space_file" => {
+            let file_id = string_argument(arguments, "file_id").map_err(|e| e.to_string())?;
+            let output_path = attachment_output_path(arguments, file_id)
+                .map_err(|error| error.to_string())?;
+            let access = backend_json(
+                client
+                    .get(format!(
+                        "{base}/cloud-projects/files/{}/access",
+                        encode_segment(file_id)
+                    ))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .await?;
+            download_backend_object(&client, &access, &output_path).await?;
+            return Ok(json!({"path": output_path}));
+        }
+        "list_board_items" => client.get(format!("{base}/cloud-projects/{project_id}/loop-items")),
+        "search_board_items" => {
+            let response = backend_json(
+                client
+                    .get(format!("{base}/cloud-projects/{project_id}/loop-items"))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .await?;
+            return Ok(filter_backend_tasks(response, arguments));
+        }
+        "get_current_context" => {
+            let item_id = task_id()?;
+            let item = backend_json(
+                client
+                    .get(format!("{base}/loop-items/{}", encode_segment(item_id)))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .await?;
+            return Ok(json!({
+                "space_id": project_id,
+                "item_id": item_id,
+                "item": item,
+            }));
+        }
+        "get_board_item" => client.get(format!("{base}/loop-items/{}", encode_segment(task_id()?))),
+        "get_assignment_candidates" => {
+            let members = backend_json(
+                client
+                    .get(format!("{base}/cloud-projects/{project_id}/members"))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .await?;
+            let robots = backend_json(
+                client
+                    .get(format!("{base}/cloud-projects/{project_id}/chat-agents"))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .await?;
+            let teams = backend_json(
+                client
+                    .get(format!(
+                        "{base}/cloud-projects/{project_id}/collaboration-groups"
+                    ))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .await?;
+            return Ok(normalize_assignment_candidates(members, robots, teams));
+        }
+        "assign_board_item" => {
+            let notify = arguments.get("notify_assignee").and_then(Value::as_bool).unwrap_or(true);
+            if let Some(run_id) = grant.and_then(|grant| grant.automation_run_id.as_deref()) {
+                client.post(format!("{base}/cloud-projects/{project_id}/automation-runs/{}/assign", encode_segment(run_id)))
+                    .json(&json!({"assignee_type": arguments.get("assignee_type"), "assignee_id": arguments.get("assignee_id"), "notify_assignee": notify}))
+            } else {
+                let response = client.get(format!("{base}/loop-items/{}", encode_segment(task_id()?)))
+                    .bearer_auth(auth_token).send().await.map_err(|error| error.to_string())?;
+                let item = backend_json(response).await?;
+                client.post(format!("{base}/cloud-projects/{project_id}/loop-items/{}/assign", encode_segment(task_id()?)))
+                    .json(&json!({"version": item.get("version"), "notify_self": true, "assignee_type": arguments.get("assignee_type"), "assignee_id": arguments.get("assignee_id"), "notify_assignee": notify}))
+            }
+        }
+        "create_board_item" => client
+            .post(format!("{base}/cloud-projects/{project_id}/loop-items"))
+            .json(arguments.get("item").unwrap_or(arguments)),
+        "update_board_item" => client
+            .patch(format!("{base}/loop-items/{}", encode_segment(task_id()?)))
+            .json(arguments.get("item").unwrap_or(arguments)),
+        "list_board_item_comments" => client
+            .get(format!(
+                "{base}/cloud-projects/{}/loop-items/{}/activity-comments",
+                encode_segment(project_id),
+                encode_segment(task_id()?)
+            ))
+            .query(&[
+                ("after_sequence", arguments.get("after_sequence").and_then(Value::as_i64).unwrap_or(0)),
+                ("limit", arguments.get("limit").and_then(Value::as_i64).unwrap_or(200)),
+            ]),
+        "add_board_item_comment" => client
+            .post(format!(
+                "{base}/cloud-projects/{}/loop-items/{}/activity-comments",
+                encode_segment(project_id),
+                encode_segment(task_id()?)
+            ))
+            .json(&json!({
+                "body": arguments.get("body").and_then(Value::as_str).unwrap_or_default()
+            })),
+        "list_item_attachments" => client.get(format!(
+            "{base}/loop-items/{}/attachments",
+            encode_segment(task_id()?)
+        )),
+        "get_delivery_requirements" => {
+            let item_id = task_id()?;
+            let address = delivery_address(grant).map_err(|error| error.to_string())?;
+            let item = backend_json(
+                client
+                    .get(format!("{base}/loop-items/{}", encode_segment(item_id)))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .await?;
+            let bindings = backend_json(
+                client
+                    .get(format!("{base}/loop-items/{}/tasks", encode_segment(item_id)))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .await?;
+            let binding = bindings
+                .as_array()
+                .and_then(|bindings| {
+                    bindings.iter().find(|binding| {
+                        binding.get("device_id").and_then(Value::as_str)
+                            == Some(address.device_id.as_str())
+                            && binding.get("task_id").and_then(Value::as_str)
+                                == Some(address.task_id.as_str())
+                    })
+                })
+                .ok_or_else(|| {
+                    "The current Runtime task is not bound to this Issue".to_owned()
+                })?;
+            let node_id = binding
+                .get("workflow_node_id")
+                .and_then(Value::as_str);
+            return Ok(delivery_requirements(&item, node_id));
+        }
+        "get_workflow_stage_context" => {
+            let item_id = task_id()?;
+            let address = delivery_address(grant).map_err(|error| error.to_string())?;
+            let bindings = backend_json(
+                client
+                    .get(format!("{base}/loop-items/{}/tasks", encode_segment(item_id)))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .await?;
+            let node_id = bindings
+                .as_array()
+                .and_then(|bindings| {
+                    bindings.iter().find(|binding| {
+                        binding.get("device_id").and_then(Value::as_str)
+                            == Some(address.device_id.as_str())
+                            && binding.get("task_id").and_then(Value::as_str)
+                                == Some(address.task_id.as_str())
+                    })
+                })
+                .and_then(|binding| binding.get("workflow_node_id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    "The current Runtime task is not bound to a workflow stage".to_owned()
+                })?;
+            return backend_json(
+                client
+                    .get(format!(
+                        "{base}/loop-items/{}/workflow-nodes/{}/input-context",
+                        encode_segment(item_id),
+                        encode_segment(node_id)
+                    ))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .await;
+        }
+        "create_delivery" => {
+            let address = delivery_address(grant).map_err(|error| error.to_string())?;
+            client
+                .post(format!(
+                    "{base}/loop-items/{}/deliveries",
+                    encode_segment(task_id()?)
+                ))
+                .json(&json!({
+                    "markdown": arguments.get("markdown").and_then(Value::as_str).unwrap_or_default(),
+                    "chat": arguments.get("chat").cloned().unwrap_or(Value::Null),
+                    "chat_selection": arguments
+                        .get("chat_selection")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "source_task": {
+                        "deviceId": address.device_id,
+                        "taskId": address.task_id,
+                    }
+                }))
+        }
+        "upload_delivery_asset" => {
+            let item_id = task_id()?;
+            let delivery_id =
+                string_argument(arguments, "delivery_id").map_err(|error| error.to_string())?;
+            let file_path =
+                string_argument(arguments, "file_path").map_err(|error| error.to_string())?;
+            let address = delivery_address(grant).map_err(|error| error.to_string())?;
+            let delivery =
+                backend_delivery_detail(&client, &base, auth_token, delivery_id).await?;
+            if let Some(error) = delivery_scope_error(&delivery, &address, item_id) {
+                return Err(error);
+            }
+            let bytes = fs::read(file_path).map_err(|error| error.to_string())?;
+            let relative_path = arguments
+                .get("relative_path")
+                .and_then(Value::as_str)
+                .or_else(|| Path::new(file_path).file_name().and_then(|value| value.to_str()))
+                .ok_or_else(|| "relative_path is required".to_owned())?;
+            let display_name = arguments
+                .get("display_name")
+                .and_then(Value::as_str)
+                .unwrap_or(relative_path);
+            let mut part = reqwest::multipart::Part::bytes(bytes).file_name(display_name.to_owned());
+            if let Some(content_type) = arguments.get("content_type").and_then(Value::as_str) {
+                part = part.mime_str(content_type).map_err(|error| error.to_string())?;
+            }
+            let response = client
+                .post(format!(
+                    "{base}/deliveries/{}/assets",
+                    encode_segment(delivery_id)
+                ))
+                .bearer_auth(auth_token)
+                .multipart(
+                    reqwest::multipart::Form::new()
+                        .text("relative_path", relative_path.to_owned())
+                        .part("file", part),
+                )
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            return backend_json(response).await;
+        }
+        "list_deliveries" => client.get(format!(
+            "{base}/loop-items/{}/deliveries",
+            encode_segment(task_id()?)
+        )),
+        "read_delivery" => {
+            let delivery_id = string_argument(arguments, "delivery_id")
+                .map_err(|error| error.to_string())?;
+            let delivery =
+                backend_delivery_detail(&client, &base, auth_token, delivery_id).await?;
+            if delivery.get("loop_item_id").and_then(Value::as_str) != Some(task_id()?) {
+                return Err("The requested Delivery is outside this Agent session".to_owned());
+            }
+            return Ok(delivery);
+        }
+        "download_delivery_asset" => {
+            let delivery_id =
+                string_argument(arguments, "delivery_id").map_err(|error| error.to_string())?;
+            let asset_id =
+                string_argument(arguments, "asset_id").map_err(|error| error.to_string())?;
+            let delivery =
+                backend_delivery_detail(&client, &base, auth_token, delivery_id).await?;
+            if delivery.get("loop_item_id").and_then(Value::as_str) != Some(task_id()?)
+                || !delivery
+                    .get("assets")
+                    .and_then(Value::as_array)
+                    .is_some_and(|assets| {
+                        assets
+                            .iter()
+                            .any(|asset| asset.get("id").and_then(Value::as_str) == Some(asset_id))
+                    })
+            {
+                return Err(
+                    "The requested Delivery asset is outside this Agent session".to_owned(),
+                );
+            }
+            let output_path =
+                attachment_output_path(arguments, asset_id).map_err(|error| error.to_string())?;
+            let access = backend_json(
+                client
+                    .get(format!(
+                        "{base}/delivery-assets/{}/access",
+                        encode_segment(asset_id)
+                    ))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .await?;
+            download_backend_object(&client, &access, &output_path).await?;
+            return Ok(json!({"path": output_path}));
+        }
+        "finalize_delivery" | "discard_delivery_draft" => {
+            let item_id = task_id()?;
+            let delivery_id =
+                string_argument(arguments, "delivery_id").map_err(|error| error.to_string())?;
+            let address = delivery_address(grant).map_err(|error| error.to_string())?;
+            let delivery =
+                backend_delivery_detail(&client, &base, auth_token, delivery_id).await?;
+            if let Some(error) = delivery_scope_error(&delivery, &address, item_id) {
+                return Err(error);
+            }
+            let response = if name == "finalize_delivery" {
+                client
+                    .post(format!(
+                        "{base}/deliveries/{}/finalize",
+                        encode_segment(delivery_id)
+                    ))
+                    .json(&json!({
+                        "fulfillments": arguments
+                            .get("fulfillments")
+                            .cloned()
+                            .unwrap_or_else(|| json!([]))
+                    }))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else {
+                client
+                    .delete(format!("{base}/deliveries/{}", encode_segment(delivery_id)))
+                    .bearer_auth(auth_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?
+            };
+            return backend_json(response).await;
+        }
+        "reorder_board_items" => client
+            .post(format!(
+                "{base}/cloud-projects/{project_id}/loop-items/reorder"
+            ))
+            .json(arguments.get("reorder").unwrap_or(arguments)),
+        "create_space" => client
+            .post(format!("{base}/cloud-projects"))
+            .json(arguments),
+        "update_space" => client
+            .patch(format!("{base}/cloud-projects/{project_id}"))
+            .json(arguments.get("project").unwrap_or(arguments)),
+        "describe_space_table" => {
+            client.get(format!("{base}/cloud-projects/{project_id}/aitable/table"))
+        }
+        "list_table_records" => {
+            let mut request = client.get(format!(
+                "{base}/cloud-projects/{project_id}/aitable/records"
+            ));
+            if let Some(query) = arguments.get("query").and_then(Value::as_str) {
+                request = request.query(&[("query", query)]);
+            }
+            if let Some(cursor) = arguments.get("cursor").and_then(Value::as_str) {
+                request = request.query(&[("cursor", cursor)]);
+            }
+            if let Some(limit) = arguments.get("limit").and_then(Value::as_i64) {
+                request = request.query(&[("limit", limit.to_string())]);
+            }
+            return backend_json(request.bearer_auth(auth_token).send().await.map_err(|e| e.to_string())?).await;
+        }
+        "create_table_record" => client
+            .post(format!("{base}/cloud-projects/{project_id}/aitable/records"))
+            .json(&json!({"cells": arguments.get("cells").cloned().unwrap_or_else(|| json!({}))})),
+        "update_table_record" => {
+            let record_id = string_argument(arguments, "record_id").map_err(|e| e.to_string())?;
+            client
+                .patch(format!(
+                    "{base}/cloud-projects/{project_id}/aitable/records/{}",
+                    encode_segment(record_id)
+                ))
+                .json(&json!({"cells": arguments.get("cells").cloned().unwrap_or_else(|| json!({}))}))
+        }
+        "delete_table_record" => {
+            let record_id = string_argument(arguments, "record_id").map_err(|e| e.to_string())?;
+            let response = client
+                .delete(format!(
+                    "{base}/cloud-projects/{project_id}/aitable/records/{}",
+                    encode_segment(record_id)
+                ))
+                .bearer_auth(auth_token)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            return backend_json(response).await;
+        }
+        "create_table_field" => client
+            .post(format!("{base}/cloud-projects/{project_id}/aitable/fields"))
+            .json(&json!({
+                "name": arguments.get("name").and_then(Value::as_str).unwrap_or_default(),
+                "type": arguments.get("field_type").or_else(|| arguments.get("type")).and_then(Value::as_str).unwrap_or_default(),
+                "config": arguments.get("config").cloned().unwrap_or_else(|| json!({})),
+            })),
+        "update_table_field" => {
+            let field_id = string_argument(arguments, "field_id").map_err(|e| e.to_string())?;
+            let mut payload = json!({});
+            if let Some(name) = arguments.get("name").and_then(Value::as_str) {
+                payload["name"] = json!(name);
+            }
+            if let Some(config) = arguments.get("config") {
+                payload["config"] = config.clone();
+            }
+            client
+                .patch(format!(
+                    "{base}/cloud-projects/{project_id}/aitable/fields/{}",
+                    encode_segment(field_id)
+                ))
+                .json(&payload)
+        }
+        "delete_table_field" => {
+            let field_id = string_argument(arguments, "field_id").map_err(|e| e.to_string())?;
+            let response = client
+                .delete(format!(
+                    "{base}/cloud-projects/{project_id}/aitable/fields/{}",
+                    encode_segment(field_id)
+                ))
+                .bearer_auth(auth_token)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            return backend_json(response).await;
+        }
+        "upload_item_attachment" => {
+            let file_path =
+                string_argument(arguments, "file_path").map_err(|error| error.to_string())?;
+            let bytes = fs::read(file_path).map_err(|error| error.to_string())?;
+            let display_name = arguments
+                .get("display_name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    Path::new(&file_path)
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .map(ToOwned::to_owned)
+                })
+                .unwrap_or_else(|| "attachment".to_owned());
+            let response = client
+                .post(format!(
+                    "{base}/loop-items/{}/attachments",
+                    encode_segment(task_id()?)
+                ))
+                .bearer_auth(auth_token)
+                .multipart(reqwest::multipart::Form::new().part(
+                    "file",
+                    reqwest::multipart::Part::bytes(bytes).file_name(display_name),
+                ))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            return backend_json(response).await;
+        }
+        "read_item_attachment" => {
+            let attachment_id =
+                string_argument(arguments, "attachment_id").map_err(|error| error.to_string())?;
+            let output_path = attachment_output_path(arguments, attachment_id)
+                .map_err(|error| error.to_string())?;
+            let response = client
+                .get(format!(
+                    "{base}/loop-item-attachments/{}/content",
+                    encode_segment(attachment_id)
+                ))
+                .bearer_auth(auth_token)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.map_err(|error| error.to_string())?;
+                return Err(format!("Backend request failed ({status}): {body}"));
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            fs::write(&output_path, bytes).map_err(|error| error.to_string())?;
+            return Ok(json!({"path": output_path}));
+        }
+        "delete_item_attachment" => {
+            let attachment_id =
+                string_argument(arguments, "attachment_id").map_err(|error| error.to_string())?;
+            let response = client
+                .delete(format!(
+                    "{base}/loop-item-attachments/{}",
+                    encode_segment(attachment_id)
+                ))
+                .bearer_auth(auth_token)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            return backend_json(response).await;
+        }
+        _ => return Err(format!("Unknown wework_space tool: {name}")),
+    };
+    let response = request
+        .bearer_auth(auth_token)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let value = backend_json(response).await?;
+    if name == "list_spaces" {
+        return Ok(Value::Array(
+            value
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        ));
+    }
+    if name == "list_board_items" || name == "list_deliveries" {
+        return Ok(value.get("items").cloned().unwrap_or_else(|| json!([])));
+    }
+    Ok(value)
+}
+
+async fn download_backend_object(
+    client: &reqwest::Client,
+    access: &Value,
+    output_path: &Path,
+) -> Result<(), String> {
+    let url = access["url"]
+        .as_str()
+        .ok_or_else(|| "Object access URL is missing".to_owned())?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Object read failed ({})", response.status()));
+    }
+    let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(output_path, bytes).map_err(|error| error.to_string())
+}
+
+async fn backend_delivery_detail(
+    client: &reqwest::Client,
+    base: &str,
+    auth_token: &str,
+    delivery_id: &str,
+) -> Result<Value, String> {
+    backend_json(
+        client
+            .get(format!("{base}/deliveries/{}", encode_segment(delivery_id)))
+            .bearer_auth(auth_token)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?,
+    )
+    .await
+}
+
+async fn backend_json(response: reqwest::Response) -> Result<Value, String> {
+    let status = response.status();
+    let text = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("Backend request failed ({status}): {text}"));
+    }
+    if text.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&text).map_err(|error| error.to_string())
+}
+
+fn normalize_assignment_candidates(members: Value, robots: Value, teams: Value) -> Value {
+    let members = members
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|member| {
+            json!({
+                "id": member.get("user_id").cloned().unwrap_or(Value::Null),
+                "name": member.get("user_name").cloned().unwrap_or(Value::Null),
+                "role": member.get("role").cloned().unwrap_or(Value::Null),
+                "capability": member
+                    .get("capability_description")
+                    .cloned()
+                    .unwrap_or_else(|| json!("")),
+            })
+        })
+        .collect::<Vec<_>>();
+    let robots = robots
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|robot| {
+            json!({
+                "id": robot.get("id").cloned().unwrap_or(Value::Null),
+                "name": robot.get("name").cloned().unwrap_or(Value::Null),
+                "capability": robot
+                    .get("capabilityDescription")
+                    .cloned()
+                    .unwrap_or_else(|| json!("")),
+                "models": robot
+                    .get("allowedModels")
+                    .or_else(|| robot.get("allowed_models"))
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            })
+        })
+        .collect::<Vec<_>>();
+    let teams = teams
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|team| {
+            json!({
+                "id": team.get("id").cloned().unwrap_or(Value::Null),
+                "name": team.get("name").cloned().unwrap_or(Value::Null),
+                "capability": team
+                    .get("description")
+                    .cloned()
+                    .unwrap_or_else(|| json!("")),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"members": members, "robots": robots, "groups": teams})
+}
+
+fn filter_backend_tasks(response: Value, arguments: &Value) -> Value {
+    let tasks = response
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let query = arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_lowercase();
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .clamp(1, 200) as usize;
+    Value::Array(
+        tasks
+            .into_iter()
+            .filter(|task| {
+                let text = format!(
+                    "{} {} {} {}",
+                    task["id"].as_str().unwrap_or_default(),
+                    task["title"].as_str().unwrap_or_default(),
+                    task["description"].as_str().unwrap_or_default(),
+                    task["tags"]
+                )
+                .to_lowercase();
+                (query.is_empty() || text.contains(&query))
+                    && matches_filter(task, arguments, "status")
+                    && matches_filter(task, arguments, "priority")
+                    && arguments
+                        .get("tag")
+                        .and_then(Value::as_str)
+                        .map_or(true, |tag| {
+                            task["tags"]
+                                .as_array()
+                                .is_some_and(|tags| tags.iter().any(|value| value == tag))
+                        })
+                    && arguments
+                        .get("creator_user_id")
+                        .and_then(Value::as_i64)
+                        .map_or(true, |id| task["created_by_user_id"] == id)
+                    && matches_filter(task, arguments, "parent_id")
+            })
+            .take(limit)
+            .collect(),
+    )
+}
+
+fn matches_filter(task: &Value, arguments: &Value, key: &str) -> bool {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map_or(true, |value| task[key] == value)
+}
+
+fn encode_segment(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn delivery_fulfillments_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "Typed results bound to required_deliverables by requirement_id. Required when the current stage declares deliverables.",
+        "items": {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "requirement_id": {"type": "string"},
+                        "kind": {"const": "text"},
+                        "text": {"type": "string"}
+                    },
+                    "required": ["requirement_id", "kind", "text"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "requirement_id": {"type": "string"},
+                        "kind": {"const": "file"},
+                        "asset_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+                    },
+                    "required": ["requirement_id", "kind", "asset_ids"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "requirement_id": {"type": "string"},
+                        "kind": {"const": "code_snapshot"},
+                        "asset_id": {"type": "string"},
+                        "changed_files": {"type": "array", "items": {"type": "string"}},
+                        "base_revision": {"type": ["string", "null"]},
+                        "head_revision": {"type": ["string", "null"]},
+                        "sha256": {"type": "string"}
+                    },
+                    "required": ["requirement_id", "kind", "asset_id", "changed_files", "sha256"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "requirement_id": {"type": "string"},
+                        "kind": {"const": "git_branch"},
+                        "remote_url": {"type": "string"},
+                        "branch": {"type": "string"},
+                        "commit_sha": {"type": "string"}
+                    },
+                    "required": ["requirement_id", "kind", "remote_url", "branch", "commit_sha"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "requirement_id": {"type": "string"},
+                        "kind": {"const": "pull_request"},
+                        "provider": {"enum": ["github", "gitlab"]},
+                        "url": {"type": "string"},
+                        "number": {"type": "integer"},
+                        "state": {"const": "draft"},
+                        "head_branch": {"type": "string"},
+                        "base_branch": {"type": "string"},
+                        "head_commit": {"type": "string"}
+                    },
+                    "required": ["requirement_id", "kind", "provider", "url", "number", "head_branch", "base_branch", "head_commit"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "requirement_id": {"type": "string"},
+                        "kind": {"const": "url"},
+                        "url": {"type": "string"},
+                        "title": {"type": "string"}
+                    },
+                    "required": ["requirement_id", "kind", "url"]
+                }
+            ]
+        }
+    })
+}
+
+fn tools() -> Vec<Value> {
+    vec![
+        tool(
+            "submit_workflow_plan",
+            "Dispatch one concurrent collaboration round. Assign each item to a non-leader group agent or human member; the leader only coordinates and cannot execute an item. For an agent with multiple models from get_assignment_candidates, choose one allowed model and set model_id. Agent items start separate Executor runs, while human items wait for delivery. After every item finishes, the Executor starts a fresh manager run with the batch results.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "object",
+                        "properties": {
+                            "round_id": {"type": "string", "minLength": 1},
+                            "summary": {"type": "string"},
+                            "items": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "assignment_id": {"type": "string", "minLength": 1},
+                                        "title": {"type": "string", "minLength": 1},
+                                        "instructions": {"type": "string", "minLength": 1},
+                                        "assignee_type": {"enum": ["agent", "human"]},
+                                        "assignee_id": {"type": "string", "minLength": 1},
+                                        "model_id": {"type": "string", "minLength": 1},
+                                        "workflow_stage_id": {"type": "string", "minLength": 1}
+                                    },
+                                    "required": ["assignment_id", "title", "instructions", "assignee_type", "assignee_id"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["round_id", "items"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["plan"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "update_issue_status",
+            "Record the collaboration manager's explicit Issue status decision after evaluating the current round results.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "idempotency_key": {"type": "string", "minLength": 1},
+                    "status": {"enum": ["inbox", "pending", "in_progress", "in_review", "completed"]},
+                    "reason": {"type": "string", "minLength": 1},
+                    "comment": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Optional comment shown in the Issue activity as the manager's explanation to collaborators."
+                    }
+                },
+                "required": ["status", "reason"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "list_spaces",
+            "List DIDA Work project spaces available to the current user",
+            json!({"type": "object", "properties": {}}),
+        ),
+        tool(
+            "get_current_context",
+            "Get the project space and board item bound to this conversation, including the Issue description",
+            json!({"type": "object", "properties": {}}),
+        ),
+        tool(
+            "create_space",
+            "Create a DIDA Work project space",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "project_key": {"type": "string"},
+                    "description": {"type": "string"}
+                },
+                "required": ["name"]
+            }),
+        ),
+        tool(
+            "update_space",
+            "Update a DIDA Work project space",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "project": {
+                        "type": "object",
+                        "properties": {
+                            "version": {"type": "integer"},
+                            "name": {"type": "string"},
+                            "description": {"type": "string"},
+                            "tags": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": ["version"]
+                    }
+                },
+                "required": ["space_id", "project"]
+            }),
+        ),
+        tool(
+            "list_board_items",
+            "List board items in a project space",
+            json!({
+                "type": "object",
+                "properties": {"space_id": {"type": "string"}},
+                "required": ["space_id"]
+            }),
+        ),
+        tool(
+            "list_space_files",
+            "List files and folders in a DIDA Work project space",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "prefix": {"type": "string"}
+                },
+                "required": ["space_id"]
+            }),
+        ),
+        tool(
+            "read_space_file",
+            "Read a project-space file into the runtime and return its local path",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "file_id": {"type": "string"},
+                    "output_path": {"type": "string"}
+                },
+                "required": ["space_id", "file_id"]
+            }),
+        ),
+        tool(
+            "search_board_items",
+            "Search board items across one project or all configured projects using text and structured filters",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Matches task id, title, description, or tags"},
+                    "space_id": {"type": "string"},
+                    "status": {"enum": ["inbox", "pending", "in_progress", "in_review", "completed"]},
+                    "priority": {"enum": ["none", "low", "medium", "high", "urgent"]},
+                    "tag": {"type": "string"},
+                    "creator_user_id": {"type": "integer"},
+                    "parent_id": {"type": "string"},
+                    "has_children": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+                }
+            }),
+        ),
+        tool(
+            "create_board_item",
+            "Create an item on a project-space board",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item": {"type": "object"}
+                },
+                "required": ["space_id", "item"]
+            }),
+        ),
+        tool(
+            "get_board_item",
+            "Get one board item in a project space",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"}
+                },
+                "required": ["space_id", "item_id"]
+            }),
+        ),
+        tool(
+            "send_notification",
+            "Send a persistent DIDA Work notification; no project or Issue is required to notify yourself. Connected IM sessions also receive it. Omit recipient_user_id to notify the current user. space_id and item_id are optional source links; another recipient requires a shared Backend project. Optional url sets the click destination independently of source: wework://boards opens the board homepage; wework://boards/{id}, wework://boards/{id}/issues/{item}, and wework://tasks/{device}/{task} are also supported. Navigation happens only when clicked; do not use browser open to implement a notification click action. Use for user-requested notifications and automation conditions. Human assignments already notify by default; do not send duplicates.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "recipient_user_id": {"type": "integer", "minimum": 1},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "body": {"type": "string", "minLength": 1, "maxLength": 10000},
+                    "url": {"type": "string", "maxLength": 2048, "description": "Optional click destination, e.g. wework://boards for the board homepage"}
+                },
+                "required": ["title", "body"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "get_assignment_candidates",
+            "List assignable project members, robots, and collaboration groups with their capability descriptions",
+            json!({
+                "type": "object",
+                "properties": {"space_id": {"type": "string"}},
+                "required": ["space_id"]
+            }),
+        ),
+        tool(
+            "assign_board_item",
+            "Assign a board item directly to one project member, robot, or collaboration group. Use assignee_type=group for a collaboration group; never substitute its leader or a member. Human assignees are notified by default; do not send a duplicate notification.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "assignee_type": {"enum": ["user", "agent", "group"]},
+                    "assignee_id": {"type": "string"},
+                    "notify_assignee": {"type": "boolean", "default": true}
+                },
+                "required": ["space_id", "item_id", "assignee_type", "assignee_id"]
+            }),
+        ),
+        tool(
+            "update_board_item",
+            "Update an item on a project-space board",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "item": {"type": "object"}
+                },
+                "required": ["space_id", "item_id", "item"]
+            }),
+        ),
+        tool(
+            "list_board_item_comments",
+            "Read the latest DIDA Work Issue activity comments (oldest first), including previous feedback and PR links. Use after_sequence to page forward; limit defaults to 200 (max 500).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "after_sequence": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500}
+                },
+                "required": ["space_id", "item_id"]
+            }),
+        ),
+        tool(
+            "add_board_item_comment",
+            "Add a visible comment to the DIDA Work Issue activity",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "body": {"type": "string"}
+                },
+                "required": ["space_id", "item_id", "body"]
+            }),
+        ),
+        tool(
+            "list_item_attachments",
+            "List attachments of a board item. Use read_item_attachment to inspect contents.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"}
+                },
+                "required": ["space_id", "item_id"]
+            }),
+        ),
+        tool(
+            "upload_item_attachment",
+            "Upload a local file as a board-item attachment",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "display_name": {"type": "string"},
+                    "content_type": {"type": "string"}
+                },
+                "required": ["space_id", "item_id", "file_path"]
+            }),
+        ),
+        tool(
+            "read_item_attachment",
+            "Read a board-item attachment and return its local path for inspection.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "attachment_id": {"type": "string"},
+                    "output_path": {"type": "string"}
+                },
+                "required": ["space_id", "item_id", "attachment_id"]
+            }),
+        ),
+        tool(
+            "delete_item_attachment",
+            "Delete a board-item attachment from its project-space storage.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "attachment_id": {"type": "string"}
+                },
+                "required": ["space_id", "item_id", "attachment_id"]
+            }),
+        ),
+        tool(
+            "get_delivery_requirements",
+            "Get the current workflow stage and its required and submitted deliverables",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"}
+                },
+                "required": ["space_id", "item_id"]
+            }),
+        ),
+        tool(
+            "get_workflow_stage_context",
+            "Get the immutable upstream context selected for the current workflow stage",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"}
+                },
+                "required": ["space_id", "item_id"]
+            }),
+        ),
+        tool(
+            "create_delivery",
+            "Create a Delivery draft bound to the current Runtime task and workflow stage",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "markdown": {"type": "string"},
+                    "chat": {
+                        "type": ["object", "null"],
+                        "description": "Optional structured chat snapshot to preserve with the Delivery"
+                    },
+                    "chat_selection": {
+                        "type": ["object", "null"],
+                        "description": "Server-resolved Issue chat selection: all, latest N, or explicit message IDs",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["all", "latest", "message_ids"]
+                            },
+                            "count": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 500
+                            },
+                            "message_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 1,
+                                "maxItems": 500
+                            }
+                        },
+                        "required": ["mode"]
+                    }
+                },
+                "required": ["space_id", "item_id"]
+            }),
+        ),
+        tool(
+            "upload_delivery_asset",
+            "Upload a local file into a Delivery draft",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "delivery_id": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "relative_path": {"type": "string"},
+                    "display_name": {"type": "string"},
+                    "content_type": {"type": "string"}
+                },
+                "required": ["space_id", "item_id", "delivery_id", "file_path"]
+            }),
+        ),
+        tool(
+            "list_deliveries",
+            "List deliveries associated with a board item",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"}
+                },
+                "required": ["space_id", "item_id"]
+            }),
+        ),
+        tool(
+            "read_delivery",
+            "Read a Delivery, its Markdown handoff, structured chat snapshot, and asset list",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "delivery_id": {"type": "string"}
+                },
+                "required": ["space_id", "item_id", "delivery_id"]
+            }),
+        ),
+        tool(
+            "download_delivery_asset",
+            "Download a Delivery asset into the Runtime workspace and return its local path",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "delivery_id": {"type": "string"},
+                    "asset_id": {"type": "string"},
+                    "output_path": {"type": "string"}
+                },
+                "required": ["space_id", "item_id", "delivery_id", "asset_id"]
+            }),
+        ),
+        tool(
+            "finalize_delivery",
+            "Finalize the current Runtime task's Delivery draft with typed requirement fulfillments",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "delivery_id": {"type": "string"},
+                    "fulfillments": delivery_fulfillments_schema()
+                },
+                "required": ["space_id", "item_id", "delivery_id"]
+            }),
+        ),
+        tool(
+            "discard_delivery_draft",
+            "Discard the current Runtime task's unfinished Delivery draft",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "delivery_id": {"type": "string"}
+                },
+                "required": ["space_id", "item_id", "delivery_id"]
+            }),
+        ),
+        tool(
+            "reorder_board_items",
+            "Persist the order of board items in one board lane",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "reorder": {
+                        "type": "object",
+                        "properties": {
+                            "parent_id": {"type": ["string", "null"]},
+                            "status": {"type": "string"},
+                            "item_ids": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            }
+                        },
+                        "required": ["status", "item_ids"]
+                    }
+                },
+                "required": ["space_id", "reorder"]
+            }),
+        ),
+        tool(
+            "describe_space_table",
+            "Describe a project-space table: base, tables, and the dynamic field schema",
+            json!({
+                "type": "object",
+                "properties": {"space_id": {"type": "string"}},
+                "required": ["space_id"]
+            }),
+        ),
+        tool(
+            "list_table_records",
+            "Query project-space table records with optional full-text keyword and cursor pagination",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "cursor": {"type": "string"}
+                },
+                "required": ["space_id"]
+            }),
+        ),
+        tool(
+            "create_table_record",
+            "Create an project-space table record. cells keys must be fieldIds, only provided cells are written",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "cells": {"type": "object", "description": "Map of fieldId to cell value"}
+                },
+                "required": ["space_id", "cells"]
+            }),
+        ),
+        tool(
+            "update_table_record",
+            "Patch an project-space table record cell-by-cell. Only the provided fieldIds are modified",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "record_id": {"type": "string"},
+                    "cells": {"type": "object", "description": "Map of fieldId to cell value"}
+                },
+                "required": ["space_id", "record_id", "cells"]
+            }),
+        ),
+        tool(
+            "delete_table_record",
+            "Delete an project-space table record (irreversible)",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "record_id": {"type": "string"}
+                },
+                "required": ["space_id", "record_id"]
+            }),
+        ),
+        tool(
+            "create_table_field",
+            "Add a field (column) to an project-space table",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "field_type": {"type": "string", "description": "project-space table field type such as text, number, singleSelect, multipleSelect, date, user, checkbox, url"},
+                    "config": {"type": "object", "description": "Field property/options configuration"}
+                },
+                "required": ["space_id", "name", "field_type"]
+            }),
+        ),
+        tool(
+            "update_table_field",
+            "Rename or reconfigure an project-space table field. Field type cannot be changed; options are fully replaced",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "field_id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "config": {"type": "object"}
+                },
+                "required": ["space_id", "field_id"]
+            }),
+        ),
+        tool(
+            "delete_table_field",
+            "Delete an project-space table field and clear its values in every record (irreversible)",
+            json!({
+                "type": "object",
+                "properties": {
+                    "space_id": {"type": "string"},
+                    "field_id": {"type": "string"}
+                },
+                "required": ["space_id", "field_id"]
+            }),
+        ),
+    ]
+}
+
+fn visible_tools(runtime: &TaskRuntime, context: &SpaceMcpRequestContext) -> Vec<Value> {
+    if context.surface == WeworkMcpSurface::Notifications {
+        return tools()
+            .into_iter()
+            .filter(|tool| tool["name"] == "send_notification")
+            .collect();
+    }
+    if is_manager_context(context.grant()) {
+        return tools()
+            .into_iter()
+            .filter(|tool| {
+                tool["name"]
+                    .as_str()
+                    .and_then(board_tool_category)
+                    .is_some_and(|category| grant_allows(context.grant(), category))
+            })
+            .collect();
+    }
+    if is_executor_context(context.grant()) {
+        return tools()
+            .into_iter()
+            .filter(|tool| {
+                tool["name"]
+                    .as_str()
+                    .and_then(board_tool_category)
+                    .is_some_and(|category| grant_allows(context.grant(), category))
+            })
+            .collect();
+    }
+    tools_for_bound_project(
+        runtime,
+        context.grant().and_then(|grant| grant.space_id.as_deref()),
+    )
+}
+
+fn is_role_bound(grant: Option<&SpaceContextGrant>) -> bool {
+    grant.is_some_and(|grant| grant.role.is_some())
+}
+
+fn is_manager_context(grant: Option<&SpaceContextGrant>) -> bool {
+    grant.is_some_and(|grant| grant.role == Some(SpaceContextRole::Manager))
+}
+
+fn is_executor_context(grant: Option<&SpaceContextGrant>) -> bool {
+    grant.is_some_and(|grant| grant.role == Some(SpaceContextRole::Executor))
+}
+
+fn grant_allows(grant: Option<&SpaceContextGrant>, category: BoardToolCategory) -> bool {
+    grant.map_or(true, |grant| {
+        grant.categories.is_empty() || grant.categories.contains(&category)
+    })
+}
+
+fn board_tool_category(name: &str) -> Option<BoardToolCategory> {
+    match name {
+        "create_space"
+        | "update_space"
+        | "create_board_item"
+        | "send_notification"
+        | "get_assignment_candidates"
+        | "assign_board_item"
+        | "update_board_item"
+        | "submit_workflow_plan"
+        | "update_issue_status"
+        | "reorder_board_items" => Some(BoardToolCategory::Management),
+        "list_spaces"
+        | "get_current_context"
+        | "list_board_items"
+        | "list_space_files"
+        | "read_space_file"
+        | "search_board_items"
+        | "get_board_item"
+        | "list_board_item_comments"
+        | "add_board_item_comment"
+        | "list_item_attachments"
+        | "upload_item_attachment"
+        | "read_item_attachment"
+        | "delete_item_attachment"
+        | "get_delivery_requirements"
+        | "get_workflow_stage_context"
+        | "create_delivery"
+        | "upload_delivery_asset"
+        | "list_deliveries"
+        | "read_delivery"
+        | "download_delivery_asset"
+        | "finalize_delivery"
+        | "discard_delivery_draft"
+        | "describe_space_table"
+        | "list_table_records"
+        | "create_table_record"
+        | "update_table_record"
+        | "delete_table_record"
+        | "create_table_field"
+        | "update_table_field"
+        | "delete_table_field" => Some(BoardToolCategory::Execution),
+        _ => None,
+    }
+}
+
+fn tools_for_bound_project(runtime: &TaskRuntime, project_id: Option<&str>) -> Vec<Value> {
+    let _ = (runtime, project_id);
+    tools()
+}
+
+fn tool(name: &str, description: &str, input_schema: Value) -> Value {
+    json!({"name": name, "description": description, "inputSchema": input_schema})
+}
+
+fn parse<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, super::TaskRuntimeError> {
+    serde_json::from_value(value)
+        .map_err(|error| super::TaskRuntimeError::Invalid(error.to_string()))
+}
+
+fn string_argument<'a>(value: &'a Value, key: &str) -> Result<&'a str, super::TaskRuntimeError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| super::TaskRuntimeError::Invalid(format!("{key} is required")))
+}
+
+fn cells_argument(
+    value: &Value,
+) -> Result<serde_json::Map<String, Value>, super::TaskRuntimeError> {
+    value
+        .get("cells")
+        .and_then(Value::as_object)
+        .cloned()
+        .filter(|cells| !cells.is_empty())
+        .ok_or_else(|| super::TaskRuntimeError::Invalid("cells must not be empty".to_owned()))
+}
+
+fn binary_input_from_path(
+    arguments: &Value,
+    file_path: &str,
+) -> Result<BinaryInput, super::TaskRuntimeError> {
+    let bytes = fs::read(file_path).map_err(|error| {
+        super::TaskRuntimeError::Invalid(format!("cannot read attachment file: {error}"))
+    })?;
+    let display_name = arguments
+        .get("display_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            Path::new(file_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .ok_or_else(|| {
+            super::TaskRuntimeError::Invalid("attachment display_name is required".to_owned())
+        })?;
+    Ok(BinaryInput {
+        display_name,
+        content_type: arguments
+            .get("content_type")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned),
+        base64: STANDARD.encode(bytes),
+    })
+}
+
+fn copy_attachment_if_requested(
+    arguments: &Value,
+    source_path: &str,
+) -> Result<String, super::TaskRuntimeError> {
+    let Some(output_path) = arguments
+        .get("output_path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(source_path.to_owned());
+    };
+    if let Some(parent) = Path::new(output_path).parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            super::TaskRuntimeError::Invalid(format!(
+                "cannot create attachment output directory: {error}"
+            ))
+        })?;
+    }
+    fs::copy(source_path, output_path).map_err(|error| {
+        super::TaskRuntimeError::Invalid(format!("cannot copy attachment file: {error}"))
+    })?;
+    Ok(output_path.to_owned())
+}
+
+fn attachment_output_path(
+    arguments: &Value,
+    attachment_id: &str,
+) -> Result<PathBuf, super::TaskRuntimeError> {
+    if let Some(output_path) = arguments
+        .get("output_path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(PathBuf::from(output_path));
+    }
+    let file_name = Path::new(attachment_id)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("attachment");
+    Ok(env::temp_dir()
+        .join("wegent-task-attachments")
+        .join(file_name))
+}
+
+fn invalid_json(error: serde_json::Error) -> super::TaskRuntimeError {
+    super::TaskRuntimeError::Invalid(error.to_string())
+}
+
+fn text_result(text: String, is_error: bool) -> Value {
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "isError": is_error
+    })
+}
+
+fn result_response(id: Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn error_response(id: Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task_runtime::{
+        ChatAgentCreate, LocalExecutionClaim, LocalTaskStore, ProjectDescriptor, ProjectStoreKind,
+        ProjectUpdate, TaskCreate, TaskProviderKind,
+    };
+
+    fn decode_grant(request: &ExecutionRequest) -> SpaceContextGrant {
+        let encoded = encoded_space_context_grant(request).expect("space context grant");
+        let decoded = STANDARD.decode(encoded).expect("base64 grant");
+        serde_json::from_slice(&decoded).expect("JSON grant")
+    }
+
+    fn role_grant(role: SpaceContextRole) -> SpaceContextGrant {
+        SpaceContextGrant {
+            role: Some(role),
+            categories: role_categories(role).iter().copied().collect(),
+            ..SpaceContextGrant::default()
+        }
+    }
+
+    #[test]
+    fn leaves_space_context_unbound_without_project_context() {
+        let request = ExecutionRequest::default();
+
+        assert!(encoded_space_context_grant(&request).is_none());
+    }
+
+    #[test]
+    fn binds_issue_dispatch_executor_with_execution_tools_only() {
+        let mut request = ExecutionRequest::default();
+        request
+            .extra
+            .insert("cloudProjectId".to_owned(), json!("cloud-42"));
+        request.extra.insert(
+            "origin".to_owned(),
+            json!({
+                "type": "issue_dispatch",
+                "dispatch_id": "dispatch-1",
+                "dispatch_role": "executor",
+                "loopItemId": "ISSUE-1"
+            }),
+        );
+
+        let grant = decode_grant(&request);
+        assert_eq!(grant.space_id.as_deref(), Some("cloud-42"));
+        assert_eq!(grant.item_id.as_deref(), Some("ISSUE-1"));
+        assert_eq!(grant.dispatch_id.as_deref(), Some("dispatch-1"));
+        assert_eq!(grant.role, Some(SpaceContextRole::Executor));
+        assert_eq!(
+            grant.categories,
+            HashSet::from([BoardToolCategory::Execution])
+        );
+    }
+
+    #[test]
+    fn binds_project_context_for_assigned_board_robot() {
+        let mut request = ExecutionRequest::default();
+        request
+            .extra
+            .insert("cloudProjectId".to_owned(), json!("cloud-42"));
+        request.extra.insert(
+            "origin".to_owned(),
+            json!({"type": "board_task", "run_id": "run-1"}),
+        );
+
+        let grant = decode_grant(&request);
+
+        assert_eq!(grant.version, 1);
+        assert_eq!(grant.space_id.as_deref(), Some("cloud-42"));
+        assert_eq!(grant.item_id, None);
+        assert_eq!(grant.automation_run_id, None);
+        assert_eq!(grant.role, None);
+        assert!(grant.categories.is_empty());
+        assert!(grant.expires_at_unix > Local::now().timestamp());
+    }
+
+    #[test]
+    fn binds_issue_context_from_origin() {
+        let mut request = ExecutionRequest {
+            task_id: "runtime-7".to_owned(),
+            device_id: Some("device-3".to_owned()),
+            ..ExecutionRequest::default()
+        };
+        request.extra.insert(
+            "origin".to_owned(),
+            json!({
+                "type": "board_task",
+                "cloudProjectId": "cloud-42",
+                "loopItemId": "ISSUE-7"
+            }),
+        );
+
+        let grant = decode_grant(&request);
+
+        assert_eq!(grant.space_id.as_deref(), Some("cloud-42"));
+        assert_eq!(grant.item_id.as_deref(), Some("ISSUE-7"));
+        assert_eq!(grant.task_id, "runtime-7");
+        assert_eq!(grant.device_id.as_deref(), Some("device-3"));
+    }
+
+    #[test]
+    fn binds_issue_context_to_the_logical_execution_device() {
+        let mut request = ExecutionRequest {
+            task_id: "runtime-7".to_owned(),
+            device_id: Some("physical-device".to_owned()),
+            ..ExecutionRequest::default()
+        };
+        request
+            .extra
+            .insert("cloudProjectId".to_owned(), json!("cloud-42"));
+        request
+            .extra
+            .insert("execution_device_id".to_owned(), json!("logical-device"));
+
+        let grant = decode_grant(&request);
+
+        assert_eq!(grant.device_id.as_deref(), Some("logical-device"));
+    }
+
+    #[test]
+    fn binds_collaboration_manager_with_management_and_execution_tools() {
+        let mut request = ExecutionRequest::default();
+        request
+            .extra
+            .insert("cloudProjectId".to_owned(), json!("cloud-42"));
+        request.extra.insert(
+            "origin".to_owned(),
+            json!({
+                "type": "issue_dispatch",
+                "dispatchId": "dispatch-2",
+                "dispatchRole": "manager",
+                "loopItemId": "ISSUE-2"
+            }),
+        );
+
+        let grant = decode_grant(&request);
+
+        assert_eq!(grant.dispatch_id.as_deref(), Some("dispatch-2"));
+        assert_eq!(grant.role, Some(SpaceContextRole::Manager));
+        assert!(grant.categories.contains(&BoardToolCategory::Management));
+        assert!(grant.categories.contains(&BoardToolCategory::Execution));
+    }
+
+    #[test]
+    fn creates_unbound_context_grant_for_explicit_cloud_reference() {
+        let request = ExecutionRequest {
+            prompt: json!("请查看 [任务:T-1](cloud://projects/cloud-42/todos/T-1)"),
+            ..ExecutionRequest::default()
+        };
+
+        let grant = decode_grant(&request);
+
+        assert_eq!(grant.space_id, None);
+        assert_eq!(grant.item_id, None);
+    }
+
+    #[test]
+    fn leaves_space_context_unbound_when_prompt_has_no_project_reference() {
+        let request = ExecutionRequest {
+            prompt: json!("帮我看一下这个仓库的代码"),
+            ..ExecutionRequest::default()
+        };
+
+        assert!(encoded_space_context_grant(&request).is_none());
+    }
+
+    #[test]
+    fn creates_context_grant_for_array_prompt_cloud_reference() {
+        let request = ExecutionRequest {
+            prompt: json!([{"type": "text", "text": "参考 [整个空间](cloud://projects/proj-7)"}]),
+            ..ExecutionRequest::default()
+        };
+
+        assert!(encoded_space_context_grant(&request).is_some());
+    }
+
+    #[test]
+    fn preserves_numeric_project_identity_in_grant() {
+        let mut request = ExecutionRequest::default();
+        request
+            .extra
+            .insert("cloudProjectId".to_owned(), json!(9001));
+
+        assert_eq!(decode_grant(&request).space_id.as_deref(), Some("9001"));
+    }
+
+    #[test]
+    fn personal_issue_context_allows_explicit_project_and_issue_targets() {
+        let grant = SpaceContextGrant {
+            version: 1,
+            task_id: "task-1".to_owned(),
+            space_id: Some("space-1".to_owned()),
+            item_id: Some("item-1".to_owned()),
+            device_id: Some("device-1".to_owned()),
+            dispatch_id: None,
+            manager_agent_id: None,
+            automation_run_id: None,
+            role: None,
+            categories: HashSet::new(),
+            expires_at_unix: Local::now().timestamp() + 60,
+        };
+
+        assert!(
+            context_scope_error(&grant, &json!({"space_id": "space-2", "item_id": "item-1"}))
+                .is_none()
+        );
+        assert!(
+            context_scope_error(&grant, &json!({"space_id": "space-2", "item_id": "item-2"}))
+                .is_none()
+        );
+        assert!(
+            context_scope_error(&grant, &json!({"space_id": "space-1", "item_id": "item-2"}))
+                .is_none()
+        );
+        assert!(
+            context_scope_error(&grant, &json!({"space_id": "space-1", "item_id": "item-1"}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn manager_can_manage_child_items_inside_the_bound_project() {
+        let grant = SpaceContextGrant {
+            version: 1,
+            task_id: "manager-task-1".to_owned(),
+            space_id: Some("space-1".to_owned()),
+            item_id: Some("ISSUE-1".to_owned()),
+            device_id: Some("device-1".to_owned()),
+            dispatch_id: Some("dispatch-1".to_owned()),
+            manager_agent_id: Some("manager-agent-1".to_owned()),
+            automation_run_id: None,
+            role: Some(SpaceContextRole::Manager),
+            categories: HashSet::from([
+                BoardToolCategory::Management,
+                BoardToolCategory::Execution,
+            ]),
+            expires_at_unix: Local::now().timestamp() + 60,
+        };
+
+        assert!(context_scope_error(
+            &grant,
+            &json!({"space_id": "space-1", "item_id": "ISSUE-2"})
+        )
+        .is_none());
+        assert!(context_scope_error(&grant, &json!({"space_id": "space-2"})).is_some());
+    }
+
+    #[test]
+    fn rejects_expired_context_grant() {
+        let grant = SpaceContextGrant {
+            version: 1,
+            task_id: "task-1".to_owned(),
+            space_id: Some("space-1".to_owned()),
+            item_id: Some("item-1".to_owned()),
+            device_id: Some("device-1".to_owned()),
+            dispatch_id: None,
+            manager_agent_id: None,
+            automation_run_id: None,
+            role: None,
+            categories: HashSet::new(),
+            expires_at_unix: Local::now().timestamp() - 1,
+        };
+        let encoded = STANDARD.encode(serde_json::to_vec(&grant).unwrap());
+
+        assert!(decode_space_context_grant(&encoded).is_none());
+    }
+
+    #[test]
+    fn identifies_local_projects_before_selecting_the_backend_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalTaskStore::open(directory.path().join("tasks.sqlite")).unwrap();
+        let project = store
+            .create_project(ProjectCreate {
+                name: "Offline project".to_owned(),
+                project_key: Some("OFFLINE".to_owned()),
+                description: String::new(),
+                task_provider: TaskProviderKind::Local,
+                provider_config: json!({}),
+            })
+            .unwrap();
+        let runtime = TaskRuntime::new(store).unwrap();
+
+        assert!(is_locally_routed_project(
+            &runtime,
+            &project.id,
+            "list_board_items"
+        ));
+        assert!(!is_locally_routed_project(
+            &runtime,
+            "cloud-project",
+            "list_board_items"
+        ));
+    }
+
+    #[tokio::test]
+    async fn keeps_project_space_reads_visible_for_bound_dingtalk_issues() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalTaskStore::open(directory.path().join("tasks.sqlite")).unwrap();
+        store
+            .configure_external_project(ProjectDescriptor {
+                id: "cloud-aitable".to_owned(),
+                public_id: None,
+                project_key: "AITABLE".to_owned(),
+                name: "DingTalk table".to_owned(),
+                description: String::new(),
+                project_store: ProjectStoreKind::Backend,
+                task_provider: TaskProviderKind::DingtalkAitable,
+                provider_config: json!({
+                    "base_id": "base-1",
+                    "table_id": "table-1",
+                    "board_mapping": {
+                        "title_field_id": "fld-title",
+                        "status_field_id": "fld-status"
+                    }
+                }),
+                version: 1,
+            })
+            .unwrap();
+        let runtime = TaskRuntime::new(store).unwrap();
+
+        let names = tools_for_bound_project(&runtime, Some("cloud-aitable"))
+            .into_iter()
+            .filter_map(|tool| tool["name"].as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+
+        for tool_name in [
+            "get_current_context",
+            "get_board_item",
+            "list_board_items",
+            "search_board_items",
+            "list_item_attachments",
+            "read_item_attachment",
+            "describe_space_table",
+            "list_table_records",
+            "create_table_record",
+            "update_table_record",
+        ] {
+            assert!(names.iter().any(|name| name == tool_name));
+        }
+        assert!(names.iter().any(|name| name == "list_space_files"));
+        assert!(names.iter().any(|name| name == "list_deliveries"));
+        assert!(is_locally_routed_project(
+            &runtime,
+            "cloud-aitable",
+            "get_current_context"
+        ));
+        assert!(!is_locally_routed_project(
+            &runtime,
+            "cloud-aitable",
+            "list_space_files"
+        ));
+    }
+
+    #[test]
+    fn exposes_task_attachment_tools() {
+        let names = tools()
+            .into_iter()
+            .filter_map(|tool| tool["name"].as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+
+        for name in [
+            "list_item_attachments",
+            "upload_item_attachment",
+            "read_item_attachment",
+            "delete_item_attachment",
+        ] {
+            assert!(names.iter().any(|candidate| candidate == name));
+        }
+    }
+
+    #[test]
+    fn exposes_complete_delivery_lifecycle_tools() {
+        let delivery_tools = tools();
+        let names = delivery_tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+
+        for name in [
+            "get_delivery_requirements",
+            "create_delivery",
+            "upload_delivery_asset",
+            "list_deliveries",
+            "read_delivery",
+            "download_delivery_asset",
+            "finalize_delivery",
+            "discard_delivery_draft",
+        ] {
+            assert!(names.iter().any(|candidate| candidate == name));
+        }
+        let create = delivery_tools
+            .iter()
+            .find(|tool| tool["name"] == "create_delivery")
+            .unwrap();
+        assert_eq!(
+            create["inputSchema"]["properties"]["chat"]["type"],
+            json!(["object", "null"])
+        );
+        let finalize = delivery_tools
+            .iter()
+            .find(|tool| tool["name"] == "finalize_delivery")
+            .unwrap();
+        assert_eq!(
+            finalize["inputSchema"]["properties"]["fulfillments"]["type"],
+            "array"
+        );
+        assert_eq!(
+            finalize["inputSchema"]["properties"]["fulfillments"]["items"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            6
+        );
+        assert_eq!(
+            finalize["inputSchema"]["properties"]["fulfillments"]["items"]["oneOf"][4]
+                ["properties"]["provider"]["enum"],
+            json!(["github", "gitlab"])
+        );
+    }
+
+    #[test]
+    fn exposes_bound_current_context_tool() {
+        let current_context = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "get_current_context")
+            .expect("get_current_context tool");
+
+        assert_eq!(
+            current_context["inputSchema"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn exposes_task_search_tool() {
+        let search = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "search_board_items")
+            .expect("search_board_items tool");
+
+        assert_eq!(
+            search["inputSchema"]["properties"]["status"]["enum"],
+            json!(["inbox", "pending", "in_progress", "in_review", "completed"])
+        );
+        assert_eq!(
+            search["inputSchema"]["properties"]["creator_user_id"]["type"],
+            "integer"
+        );
+    }
+
+    #[test]
+    fn backend_task_search_filters_by_parent_id() {
+        let response = json!({
+            "items": [
+                {"id": "parent", "parent_id": null},
+                {"id": "matching-child", "parent_id": "requested-parent"},
+                {"id": "other-child", "parent_id": "other-parent"}
+            ]
+        });
+
+        let result = filter_backend_tasks(
+            response,
+            &json!({"parent_id": "requested-parent", "limit": 50}),
+        );
+
+        assert_eq!(
+            result,
+            json!([{"id": "matching-child", "parent_id": "requested-parent"}])
+        );
+    }
+
+    #[test]
+    fn exposes_only_wework_space_business_vocabulary() {
+        let exposed_tools = tools();
+        let assign = exposed_tools
+            .iter()
+            .find(|tool| tool["name"] == "assign_board_item")
+            .expect("assign_board_item tool");
+        assert_eq!(
+            assign["inputSchema"]["properties"]["assignee_type"]["enum"],
+            json!(["user", "agent", "group"])
+        );
+        for exposed_tool in &exposed_tools {
+            let public_surface = format!(
+                "{} {}",
+                exposed_tool["name"].as_str().unwrap_or_default(),
+                exposed_tool["description"].as_str().unwrap_or_default()
+            )
+            .to_lowercase();
+            for forbidden in [
+                "wegent_tasks",
+                "wegent_delivery",
+                "github",
+                "gitlab",
+                "todo",
+                "report_automation_bug",
+            ] {
+                assert!(
+                    !public_surface.contains(forbidden),
+                    "found {forbidden} in tool surface {public_surface}"
+                );
+            }
+            let input_properties = exposed_tool["inputSchema"]["properties"]
+                .as_object()
+                .expect("tool input properties");
+            for forbidden in ["project_id", "task_id"] {
+                assert!(
+                    !input_properties.contains_key(forbidden),
+                    "found {forbidden} in {} input",
+                    exposed_tool["name"]
+                );
+            }
+        }
+        let serialized = serde_json::to_string(&exposed_tools)
+            .unwrap()
+            .to_lowercase();
+        for required in [
+            "list_spaces",
+            "get_board_item",
+            "get_assignment_candidates",
+            "assign_board_item",
+            "list_item_attachments",
+            "read_item_attachment",
+            "list_space_files",
+            "list_deliveries",
+        ] {
+            assert!(serialized.contains(required), "missing {required}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_notifications_through_the_authenticated_backend() {
+        use axum::{extract::Json, http::HeaderMap, routing::post, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/api/v1/wework-notifications",
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer unit-token");
+                Json(body)
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend_url = format!("http://{address}");
+        let context = BackendToolContext {
+            backend_url: &backend_url,
+            auth_token: "unit-token",
+            project_id: "12",
+            grant: None,
+            collaboration_dispatcher: None,
+        };
+        let result = call_backend_tool(
+            &context,
+            "send_notification",
+            &json!({"title": "Review", "body": "Review failed", "item_id": "ISSUE-1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["project_id"], 12);
+        assert_eq!(result["item_id"], "ISSUE-1");
+        assert_eq!(result["recipient_user_id"], Value::Null);
+        assert_eq!(result["body"], "Review failed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gets_assignment_candidates_through_the_authenticated_backend() {
+        use axum::{extract::Path, http::HeaderMap, routing::get, Json, Router};
+
+        async fn candidates(Path(kind): Path<String>, headers: HeaderMap) -> Json<Value> {
+            assert_eq!(headers.get("authorization").unwrap(), "Bearer unit-token");
+            Json(match kind.as_str() {
+                "members" => json!([{
+                    "user_id": 7,
+                    "user_name": "Alice",
+                    "role": "Developer",
+                    "capability_description": "Frontend implementation"
+                }]),
+                "chat-agents" => json!([{
+                    "id": "agent-9",
+                    "name": "Review bot",
+                    "capabilityDescription": "Code review and release checks"
+                }]),
+                "collaboration-groups" => json!({
+                    "items": [{
+                        "id": "group-3",
+                        "name": "Release group",
+                        "description": "Coordinates release work"
+                    }]
+                }),
+                _ => panic!("unexpected candidate kind: {kind}"),
+            })
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/api/v1/cloud-projects/12/{kind}", get(candidates));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend_url = format!("http://{address}");
+        let context = BackendToolContext {
+            backend_url: &backend_url,
+            auth_token: "unit-token",
+            project_id: "12",
+            grant: None,
+            collaboration_dispatcher: None,
+        };
+        let result = call_backend_tool(&context, "get_assignment_candidates", &json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["members"][0]["id"], 7);
+        assert_eq!(result["robots"][0]["id"], "agent-9");
+        assert_eq!(result["groups"][0]["id"], "group-3");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_manager_status_update_persists_one_manager_decision() {
+        use axum::{extract::Json, http::HeaderMap, routing::post, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/api/v1/cloud-projects/12/executions/manager-decision",
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer task-token");
+                assert_eq!(
+                    body,
+                    json!({
+                        "loop_item_id": "ISSUE-1",
+                        "dispatch_id": "dispatch-1",
+                        "manager_agent_id": "manager-agent",
+                        "idempotency_key": "decision-1",
+                        "manager_runtime_task_id": "manager-task",
+                        "target_status": "in_review",
+                        "reason": "Evidence is ready",
+                        "comment": "Please confirm the completed work",
+                    })
+                );
+                Json(json!({
+                    "item": {
+                        "id": "ISSUE-1",
+                        "version": 8,
+                        "status": "in_review"
+                    },
+                    "comment": {
+                        "content": "Please confirm the completed work"
+                    }
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let grant = SpaceContextGrant {
+            task_id: "manager-task".to_owned(),
+            space_id: Some("12".to_owned()),
+            item_id: Some("ISSUE-1".to_owned()),
+            dispatch_id: Some("dispatch-1".to_owned()),
+            manager_agent_id: Some("manager-agent".to_owned()),
+            ..role_grant(SpaceContextRole::Manager)
+        };
+
+        let backend_url = format!("http://{address}");
+        let context = BackendToolContext {
+            backend_url: &backend_url,
+            auth_token: "task-token",
+            project_id: "12",
+            grant: Some(&grant),
+            collaboration_dispatcher: None,
+        };
+        let decision = call_backend_tool(
+            &context,
+            "update_issue_status",
+            &json!({
+                "status": "in_review",
+                "reason": "Evidence is ready",
+                "comment": "Please confirm the completed work",
+                "idempotency_key": "decision-1",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decision["status"], "in_review");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_manager_plan_hands_the_round_to_the_executor_coordinator() {
+        use axum::{extract::Json, http::HeaderMap, routing::post, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/api/v1/cloud-projects/12/executions/batch",
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer task-token");
+                assert_eq!(body["loop_item_id"], "ISSUE-1");
+                assert_eq!(body["dispatch_id"], "dispatch-1");
+                assert_eq!(body["round_id"], "round-1");
+                assert_eq!(body["manager_runtime_task_id"], "manager-task");
+                assert_eq!(body["manager_agent_id"], "manager-agent");
+                assert_eq!(
+                    body["items"][0],
+                    json!({
+                        "assignment_id": "collect",
+                        "title": "Collect evidence",
+                        "assignee_type": "agent",
+                        "assignee_id": "collector",
+                        "instructions": "Collect evidence",
+                        "model_id": "deep-model",
+                        "workflow_stage_id": "investigate"
+                    })
+                );
+                Json(json!({
+                    "human_assignments": [
+                        {
+                            "assignment_id": "review",
+                            "human_assignment_id": "human-assignment-1"
+                        }
+                    ]
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = dispatched.clone();
+        let dispatcher = CloudCollaborationRoundDispatcher::new(move |command| {
+            observed.lock().unwrap().push(command);
+            Ok(())
+        });
+        let grant = SpaceContextGrant {
+            task_id: "manager-task".to_owned(),
+            space_id: Some("12".to_owned()),
+            item_id: Some("ISSUE-1".to_owned()),
+            dispatch_id: Some("dispatch-1".to_owned()),
+            manager_agent_id: Some("manager-agent".to_owned()),
+            ..role_grant(SpaceContextRole::Manager)
+        };
+        let plan = json!({
+            "plan": {
+                "round_id": "round-1",
+                "items": [
+                    {
+                        "assignment_id": "collect",
+                        "title": "Collect evidence",
+                        "assignee_type": "agent",
+                        "assignee_id": "collector",
+                        "instructions": "Collect evidence",
+                        "model_id": "deep-model",
+                        "workflow_stage_id": "investigate"
+                    },
+                    {
+                        "assignment_id": "review",
+                        "title": "Review evidence",
+                        "assignee_type": "human",
+                        "assignee_id": "reviewer",
+                        "instructions": "Review evidence"
+                    }
+                ]
+            }
+        });
+
+        let backend_url = format!("http://{address}");
+        let context = BackendToolContext {
+            backend_url: &backend_url,
+            auth_token: "task-token",
+            project_id: "12",
+            grant: Some(&grant),
+            collaboration_dispatcher: Some(&dispatcher),
+        };
+        let result = call_backend_tool(&context, "submit_workflow_plan", &plan)
+            .await
+            .unwrap();
+
+        assert_eq!(result["state"], "dispatched");
+        let commands = dispatched.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].manager_runtime_task_id, "manager-task");
+        assert_eq!(commands[0].round_id, "round-1");
+        assert_eq!(commands[0].assignments.len(), 2);
+        assert_eq!(commands[0].assignments[0]["agent_id"], "collector");
+        assert_eq!(commands[0].assignments[0]["task_title"], "Collect evidence");
+        assert_eq!(
+            commands[0].assignments[0]["instructions"],
+            "Collect evidence"
+        );
+        assert_eq!(
+            commands[0].assignments[0]["workflow_stage_id"],
+            "investigate"
+        );
+        assert_eq!(commands[0].assignments[0]["model_id"], "deep-model");
+        assert_eq!(commands[0].human_assignment_ids, vec!["human-assignment-1"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn routes_notifications_independently_of_project_context() {
+        use axum::{extract::Json, http::HeaderMap, routing::post, Router};
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalTaskStore::open(directory.path().join("tasks.sqlite")).unwrap();
+        let local = store
+            .create_project(ProjectCreate {
+                name: "Local".to_owned(),
+                project_key: Some("LOCAL".to_owned()),
+                description: String::new(),
+                task_provider: TaskProviderKind::Local,
+                provider_config: json!({}),
+            })
+            .unwrap();
+        let runtime = TaskRuntime::new(store).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/api/v1/wework-notifications",
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer unit-token");
+                Json(body)
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for project_id in [None, Some(local.id), Some("12".to_owned())] {
+            let expected_project = if project_id.as_deref() == Some("12") {
+                json!(12)
+            } else {
+                Value::Null
+            };
+            let grant = project_id.map(|id| SpaceContextGrant {
+                version: 1,
+                task_id: "task-1".to_owned(),
+                space_id: Some(id),
+                item_id: Some("ISSUE-1".to_owned()),
+                device_id: None,
+                dispatch_id: None,
+                manager_agent_id: None,
+                automation_run_id: None,
+                role: None,
+                categories: HashSet::new(),
+                expires_at_unix: Local::now().timestamp() + 60,
+            });
+            let context = SpaceMcpRequestContext::new(
+                grant,
+                Some(url.clone()),
+                Some("unit-token".to_owned()),
+            );
+            let result = call_tool_with_runtime_context(
+                &runtime,
+                "send_notification",
+                json!({"title": "Greeting", "body": "你好", "url": "wework://boards"}),
+                &context,
+            )
+            .await;
+            assert_eq!(result["isError"], false, "{result}");
+            let sent: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(sent["project_id"], expected_project);
+            assert_eq!(sent["url"], "wework://boards");
+            assert_eq!(
+                sent["item_id"],
+                if expected_project.is_null() {
+                    Value::Null
+                } else {
+                    json!("ISSUE-1")
+                }
+            );
+            assert_eq!(sent["body"], "你好");
+        }
+        for (backend, token) in [(None, Some("unit-token")), (Some(url.as_str()), None)] {
+            let context = SpaceMcpRequestContext::new(
+                None,
+                backend.map(ToOwned::to_owned),
+                token.map(ToOwned::to_owned),
+            );
+            let result = call_tool_with_runtime_context(
+                &runtime,
+                "send_notification",
+                json!({"title": "Greeting", "body": "Hello"}),
+                &context,
+            )
+            .await;
+            assert_eq!(result["isError"], true);
+            assert!(result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("authenticated Backend connection"));
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn every_board_tool_has_exactly_one_role_category() {
+        for tool in tools() {
+            let name = tool["name"].as_str().expect("tool name");
+            assert!(
+                board_tool_category(name).is_some(),
+                "missing role category for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_tool_categories_match_management_and_execution_responsibilities() {
+        let grant = SpaceContextGrant {
+            space_id: Some("space-1".to_owned()),
+            item_id: Some("ISSUE-1".to_owned()),
+            ..role_grant(SpaceContextRole::Executor)
+        };
+        for name in [
+            "get_current_context",
+            "get_board_item",
+            "list_item_attachments",
+            "upload_item_attachment",
+            "read_item_attachment",
+            "add_board_item_comment",
+            "create_delivery",
+            "finalize_delivery",
+            "create_table_record",
+        ] {
+            assert_eq!(
+                board_tool_category(name),
+                Some(BoardToolCategory::Execution),
+                "{name}"
+            );
+        }
+        for name in [
+            "assign_board_item",
+            "get_assignment_candidates",
+            "create_board_item",
+            "update_board_item",
+            "submit_workflow_plan",
+            "update_issue_status",
+            "update_space",
+            "reorder_board_items",
+        ] {
+            assert_eq!(
+                board_tool_category(name),
+                Some(BoardToolCategory::Management),
+                "{name}"
+            );
+        }
+        assert!(context_scope_error(&grant, &json!({"space_id": "space-2"})).is_some());
+        assert!(context_scope_error(&grant, &json!({"item_id": "ISSUE-2"})).is_some());
+    }
+
+    #[tokio::test]
+    async fn dispatch_executor_tool_list_and_call_share_the_same_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalTaskStore::open(directory.path().join("tasks.sqlite")).unwrap();
+        let runtime = TaskRuntime::new(store).unwrap();
+        let grant = SpaceContextGrant {
+            space_id: Some("space-1".to_owned()),
+            item_id: Some("ISSUE-1".to_owned()),
+            dispatch_id: Some("dispatch-1".to_owned()),
+            ..role_grant(SpaceContextRole::Executor)
+        };
+        let context = SpaceMcpRequestContext::new(Some(grant.clone()), None, None);
+        let visible = visible_tools(&runtime, &context);
+        let names = visible
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"get_current_context"));
+        assert!(names.contains(&"upload_item_attachment"));
+        assert!(!names.contains(&"assign_board_item"));
+        assert!(!names.contains(&"update_board_item"));
+        assert!(!names.contains(&"update_issue_status"));
+
+        let denied = call_tool_with_grant(
+            &runtime,
+            "assign_board_item",
+            json!({"space_id": "space-1", "item_id": "ISSUE-1"}),
+            Some(grant),
+        )
+        .await;
+        assert_eq!(denied["isError"], true);
+        assert!(denied["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cannot call wework_space tool"));
+    }
+
+    #[tokio::test]
+    async fn local_collaboration_manager_updates_issue_explicitly() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalTaskStore::open(directory.path().join("tasks.sqlite")).unwrap();
+        let project = store
+            .create_project(ProjectCreate {
+                name: "Local dispatch".to_owned(),
+                project_key: Some("LOCAL".to_owned()),
+                description: String::new(),
+                task_provider: TaskProviderKind::Local,
+                provider_config: json!({}),
+            })
+            .unwrap();
+        let manager = store
+            .create_chat_agent(
+                &project.id,
+                ChatAgentCreate {
+                    execution_policy: None,
+                    model_policy: None,
+                    name: "manager".to_owned(),
+                    display_name: Some("Issue manager".to_owned()),
+                    namespace: None,
+                    runtime: "codex".to_owned(),
+                    model: None,
+                    model_type: None,
+                    model_namespace: None,
+                    allowed_models: Some(Vec::new()),
+                    capability_description: None,
+                    capability_mode: Some("follow_device".to_owned()),
+                    system_prompt: None,
+                    visibility: Some("creator_admin".to_owned()),
+                    execution_environment: Some("local".to_owned()),
+                    execution_mode: Some("auto".to_owned()),
+                    execution_device_id: Some("local-device".to_owned()),
+                    max_concurrent_executions: 1,
+                    workspace_policy: "project".to_owned(),
+                    local_project_id: None,
+                    created_by_user_id: Some(7),
+                    plugins: Vec::new(),
+                    additional_skills: Vec::new(),
+                    mcp_servers: json!({}),
+                },
+            )
+            .unwrap();
+        let project = store
+            .update_project(
+                &project.id,
+                ProjectUpdate {
+                    version: project.version,
+                    collaboration_groups: Some(json!([{
+                        "id": "group-1",
+                        "name": "Review group",
+                        "leader": {
+                            "kind": "agent",
+                            "id": manager.id,
+                        },
+                        "members": [],
+                    }])),
+                    ..ProjectUpdate::default()
+                },
+            )
+            .unwrap();
+        let runtime = TaskRuntime::new(store).unwrap();
+        let issue = runtime
+            .create_task(
+                &project.id,
+                TaskCreate {
+                    title: "Investigate load".to_owned(),
+                    description: String::new(),
+                    status: "in_progress".to_owned(),
+                    priority: "none".to_owned(),
+                    parent_id: None,
+                    tags: Vec::new(),
+                    assignee_user_id: None,
+                    assignee_agent_id: None,
+                    assignee_group_id: None,
+                    workflow: None,
+                },
+            )
+            .await
+            .unwrap();
+        let issue = runtime
+            .update_task(
+                &project.id,
+                &issue.id,
+                TaskUpdate {
+                    version: issue.version,
+                    assignee_group_id: Some(Some("group-1".to_owned())),
+                    ..TaskUpdate::default()
+                },
+            )
+            .await
+            .unwrap();
+        let manager_execution = runtime
+            .claim_next_local_execution(LocalExecutionClaim {
+                execution_device_id: Some("local-device".to_owned()),
+                runtime_instance_id: "runtime-1".to_owned(),
+                device_capacity: 1,
+                runtime_active: 0,
+                runtime_active_task_ids: Vec::new(),
+                lease_seconds: 300,
+            })
+            .unwrap()
+            .expect("manager execution must be queued");
+        let grant = SpaceContextGrant {
+            task_id: manager_execution
+                .runtime_task_id
+                .clone()
+                .expect("manager Runtime task id"),
+            space_id: Some(project.id.clone()),
+            item_id: Some(issue.id.clone()),
+            dispatch_id: Some("dispatch-local".to_owned()),
+            expires_at_unix: Local::now().timestamp() + 60,
+            ..role_grant(SpaceContextRole::Manager)
+        };
+
+        let updated = call_tool_with_grant(
+            &runtime,
+            "update_issue_status",
+            json!({
+                "status": "in_review",
+                "reason": "The round produced evidence",
+                "comment": "执行结果已满足验收条件，请确认。"
+            }),
+            Some(grant),
+        )
+        .await;
+        assert_eq!(updated["isError"], false, "{updated}");
+        assert_eq!(
+            runtime
+                .get_task(&project.id, &issue.id)
+                .await
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("in_review")
+        );
+        let comments = runtime.list_comments(&project.id, &issue.id, 0).unwrap();
+        let decision = comments
+            .iter()
+            .find(|comment| comment.metadata["activity_type"] == "manager_status_comment")
+            .expect("manager decision comment");
+        assert_eq!(decision.sender_id, manager.id);
+        assert_eq!(decision.sender_name, "Issue manager");
+        assert_eq!(decision.content, "执行结果已满足验收条件，请确认。");
+        assert_eq!(decision.metadata["target_status"], "in_review");
+    }
+
+    #[test]
+    fn collaboration_manager_receives_management_and_execution_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalTaskStore::open(directory.path().join("tasks.sqlite")).unwrap();
+        let runtime = TaskRuntime::new(store).unwrap();
+        let context = SpaceMcpRequestContext::new(
+            Some(SpaceContextGrant {
+                space_id: Some("space-1".to_owned()),
+                item_id: Some("ISSUE-1".to_owned()),
+                dispatch_id: Some("dispatch-1".to_owned()),
+                ..role_grant(SpaceContextRole::Manager)
+            }),
+            None,
+            None,
+        );
+        let visible = visible_tools(&runtime, &context);
+        let names = visible
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names.len(), tools().len());
+        assert!(names.contains(&"update_board_item"));
+        assert!(names.contains(&"update_issue_status"));
+        assert!(names.contains(&"upload_item_attachment"));
+        assert!(names.contains(&"read_space_file"));
+    }
+
+    #[test]
+    fn normalizes_assignment_candidates_to_one_capability_contract() {
+        let result = normalize_assignment_candidates(
+            json!([{
+                "user_id": 7,
+                "user_name": "Alice",
+                "role": "Developer",
+                "capability_description": "Frontend implementation"
+            }]),
+            json!([{
+                "id": "agent-9",
+                "name": "Review bot",
+                "capabilityDescription": "Code review and release checks",
+                "allowedModels": [{
+                    "name": "fast-model",
+                    "type": "runtime",
+                    "namespace": "default"
+                }]
+            }]),
+            json!({
+                "items": [{
+                    "id": "group-3",
+                    "name": "Release group",
+                    "description": "Coordinates release work"
+                }]
+            }),
+        );
+
+        assert_eq!(
+            result,
+            json!({
+                "members": [{
+                    "id": 7,
+                    "name": "Alice",
+                    "role": "Developer",
+                    "capability": "Frontend implementation"
+                }],
+                "robots": [{
+                    "id": "agent-9",
+                    "name": "Review bot",
+                    "capability": "Code review and release checks",
+                    "models": [{
+                        "name": "fast-model",
+                        "type": "runtime",
+                        "namespace": "default"
+                    }]
+                }],
+                "groups": [{
+                    "id": "group-3",
+                    "name": "Release group",
+                    "capability": "Coordinates release work"
+                }]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn searches_todos_by_text_and_structured_filters() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalTaskStore::open(directory.path().join("tasks.sqlite")).unwrap();
+        let project = store
+            .create_project(ProjectCreate {
+                name: "Search project".to_owned(),
+                project_key: Some("SEARCH".to_owned()),
+                description: String::new(),
+                task_provider: TaskProviderKind::Local,
+                provider_config: json!({}),
+            })
+            .unwrap();
+        store
+            .create_task(
+                &project.id,
+                TaskCreate {
+                    title: "Fix OAuth callback".to_owned(),
+                    description: "Login fails after redirect".to_owned(),
+                    status: "in_progress".to_owned(),
+                    priority: "high".to_owned(),
+                    parent_id: None,
+                    tags: vec!["bug".to_owned()],
+                    assignee_user_id: None,
+                    assignee_agent_id: None,
+                    assignee_group_id: None,
+                    workflow: None,
+                },
+            )
+            .unwrap();
+        store
+            .create_task(
+                &project.id,
+                TaskCreate {
+                    title: "Write deployment guide".to_owned(),
+                    description: String::new(),
+                    status: "pending".to_owned(),
+                    priority: "none".to_owned(),
+                    parent_id: None,
+                    tags: vec!["docs".to_owned()],
+                    assignee_user_id: None,
+                    assignee_agent_id: None,
+                    assignee_group_id: None,
+                    workflow: None,
+                },
+            )
+            .unwrap();
+        let runtime = TaskRuntime::new(store).unwrap();
+
+        let result = call_tool(
+            &runtime,
+            "search_board_items",
+            json!({
+                "space_id": project.id,
+                "query": "oauth",
+                "status": "in_progress",
+                "tag": "bug"
+            }),
+        )
+        .await;
+        assert_eq!(result["isError"], false);
+        let tasks: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(tasks.as_array().unwrap().len(), 1);
+        assert_eq!(tasks[0]["title"], "Fix OAuth callback");
+    }
+
+    #[tokio::test]
+    async fn search_board_items_honors_the_requested_space() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalTaskStore::open(directory.path().join("tasks.sqlite")).unwrap();
+        let first = store
+            .create_project(ProjectCreate {
+                name: "First".to_owned(),
+                project_key: Some("FIRST".to_owned()),
+                description: String::new(),
+                task_provider: TaskProviderKind::Local,
+                provider_config: json!({}),
+            })
+            .unwrap();
+        let second = store
+            .create_project(ProjectCreate {
+                name: "Second".to_owned(),
+                project_key: Some("SECOND".to_owned()),
+                description: String::new(),
+                task_provider: TaskProviderKind::Local,
+                provider_config: json!({}),
+            })
+            .unwrap();
+        for (project_id, title) in [
+            (&first.id, "First feedback"),
+            (&second.id, "Second feedback"),
+        ] {
+            store
+                .create_task(
+                    project_id,
+                    TaskCreate {
+                        title: title.to_owned(),
+                        description: String::new(),
+                        status: "inbox".to_owned(),
+                        priority: "none".to_owned(),
+                        parent_id: None,
+                        tags: vec!["feedback".to_owned()],
+                        assignee_user_id: None,
+                        assignee_agent_id: None,
+                        assignee_group_id: None,
+                        workflow: None,
+                    },
+                )
+                .unwrap();
+        }
+        let runtime = TaskRuntime::new(store).unwrap();
+
+        let result = call_tool(
+            &runtime,
+            "search_board_items",
+            json!({"space_id": second.id, "query": "feedback"}),
+        )
+        .await;
+        let items: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+
+        assert_eq!(items.as_array().unwrap().len(), 1);
+        assert_eq!(items[0]["title"], "Second feedback");
+    }
+
+    #[tokio::test]
+    async fn task_attachment_tools_upload_list_download_and_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalTaskStore::open(directory.path().join("tasks.sqlite")).unwrap();
+        let project = store
+            .create_project(ProjectCreate {
+                name: "Local attachments".to_owned(),
+                project_key: Some("LOCAL".to_owned()),
+                description: String::new(),
+                task_provider: TaskProviderKind::Local,
+                provider_config: json!({}),
+            })
+            .unwrap();
+        let task = store
+            .create_task(
+                &project.id,
+                TaskCreate {
+                    title: "Inspect attachment".to_owned(),
+                    description: String::new(),
+                    status: "pending".to_owned(),
+                    priority: "none".to_owned(),
+                    parent_id: None,
+                    tags: vec![],
+                    assignee_user_id: None,
+                    assignee_agent_id: None,
+                    assignee_group_id: None,
+                    workflow: None,
+                },
+            )
+            .unwrap();
+        let runtime = TaskRuntime::new(store).unwrap();
+        let source = directory.path().join("source.txt");
+        fs::write(&source, "attachment content").unwrap();
+
+        let upload = call_tool(
+            &runtime,
+            "upload_item_attachment",
+            json!({
+                "space_id": project.id,
+                "item_id": task.id,
+                "file_path": source,
+                "content_type": "text/plain"
+            }),
+        )
+        .await;
+        assert_eq!(upload["isError"], false);
+        let attachment: Value =
+            serde_json::from_str(upload["content"][0]["text"].as_str().unwrap()).unwrap();
+        let attachment_id = attachment["id"].as_str().unwrap();
+
+        let list = call_tool(
+            &runtime,
+            "list_item_attachments",
+            json!({"space_id": project.id, "item_id": task.id}),
+        )
+        .await;
+        let listed: Value =
+            serde_json::from_str(list["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        let output = directory.path().join("downloaded.txt");
+        let download = call_tool(
+            &runtime,
+            "read_item_attachment",
+            json!({
+                "space_id": project.id,
+                "item_id": task.id,
+                "attachment_id": attachment_id,
+                "output_path": output
+            }),
+        )
+        .await;
+        assert_eq!(download["isError"], false);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("downloaded.txt")).unwrap(),
+            "attachment content"
+        );
+
+        let deleted = call_tool(
+            &runtime,
+            "delete_item_attachment",
+            json!({
+                "space_id": project.id,
+                "item_id": task.id,
+                "attachment_id": attachment_id
+            }),
+        )
+        .await;
+        assert_eq!(deleted["isError"], false);
+        assert!(runtime
+            .list_task_attachments(&project.id, &task.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}

@@ -1,0 +1,465 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Unified subscription executor.
+
+This module provides a unified execution path for subscription tasks,
+using the ExecutionDispatcher to handle different shell types:
+- Chat Shell -> SSE mode (synchronous execution)
+- ClaudeCode/Agno/Dify -> HTTP+Callback mode (asynchronous execution)
+- INPROCESS mode (standalone mode) -> synchronous execution
+
+TaskCompletedEvent is published by StatusUpdatingEmitter for unified handling
+across all execution modes.
+"""
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any, List, Optional
+
+from sqlalchemy.orm import make_transient
+
+from app.db.session import get_db_session
+from app.models.kind import Kind
+from app.models.subtask import Subtask
+from app.models.task import TaskResource
+from app.models.user import User
+from app.stores.tasks import subtask_store, task_store
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SubscriptionExecutionData:
+    """Data container for subscription execution.
+
+    Contains all necessary data for executing a subscription task.
+    This is extracted from ORM objects to be thread-safe.
+    """
+
+    # IDs
+    subscription_id: int
+    execution_id: int
+    task_id: int
+    subtask_id: int
+    user_id: int
+    team_id: int
+    user_subtask_id: Optional[int]
+    device_id: Optional[str]
+
+    # Execution data
+    prompt: str
+    model_override_name: Optional[str]
+
+    # Settings
+    preserve_history: bool
+    history_message_count: int
+
+    # Subscription info for notifications
+    subscription_name: str
+    subscription_display_name: str
+    team_display_name: str
+    trigger_type: str
+    trigger_reason: str
+
+    # Default values must come last
+    is_subscription: bool = True
+    # Skills to preload for this subscription execution
+    preload_skills: List[dict] = field(default_factory=list)
+
+
+@dataclass
+class _SubscriptionExecutionObjects:
+    """ORM objects needed only while building an execution request."""
+
+    task: TaskResource
+    assistant_subtask: Subtask
+    team: Kind
+    user: User
+
+
+async def execute_subscription_unified(
+    execution_data: SubscriptionExecutionData,
+) -> None:
+    """Execute subscription task using unified dispatcher.
+
+    This function uses the ExecutionDispatcher to automatically select
+    the appropriate communication mode based on shell_type:
+    - Chat Shell -> SSE mode (synchronous, waits for completion)
+    - ClaudeCode/Agno/Dify -> HTTP+Callback mode (asynchronous)
+
+    Both modes publish TaskCompletedEvent for unified handling by
+    SubscriptionTaskCompletionHandler.
+
+    Args:
+        execution_data: Subscription execution data
+    """
+    from app.services.execution import CommunicationMode, ExecutionRouter
+    from shared.telemetry.context import get_request_id, set_request_context
+
+    current_request_id = get_request_id()
+    request_id = (
+        current_request_id
+        if current_request_id
+        else f"sub-unified-{execution_data.subscription_id}-{execution_data.execution_id}"
+    )
+    set_request_context(request_id)
+
+    logger.info(
+        f"[execute_subscription_unified] Starting execution: "
+        f"subscription_id={execution_data.subscription_id}, "
+        f"execution_id={execution_data.execution_id}, "
+        f"task_id={execution_data.task_id}, request_id={request_id}"
+    )
+
+    request = await _build_subscription_execution_request(execution_data)
+    if not request:
+        return
+
+    # Determine communication mode
+    router = ExecutionRouter()
+    task_device_id = execution_data.device_id
+    target = router.route(request, device_id=task_device_id)
+
+    logger.info(
+        f"[execute_subscription_unified] Routing result: "
+        f"mode={target.mode.value}, url={target.url}, device_id={task_device_id}"
+    )
+
+    if target.mode == CommunicationMode.SSE:
+        # SSE mode (Chat Shell) - synchronous execution
+        await _execute_sse_sync(
+            request=request,
+            execution_data=execution_data,
+        )
+    else:
+        # HTTP+Callback mode (ClaudeCode/Agno/Dify) - asynchronous execution
+        # Task completion will be handled by /internal/callback publishing TaskCompletedEvent
+        await _execute_http_callback(
+            request=request,
+            execution_data=execution_data,
+        )
+
+
+async def _build_subscription_execution_request(
+    execution_data: SubscriptionExecutionData,
+) -> Optional[Any]:
+    """Build the dispatch request using a short-lived ORM session."""
+    from app.services.chat.trigger.unified import build_execution_request
+
+    with get_db_session() as db:
+        try:
+            objects = _load_subscription_execution_objects(db, execution_data)
+            if not objects:
+                return None
+            _detach_subscription_execution_objects(db, objects)
+        finally:
+            db.rollback()
+
+    return await build_execution_request(
+        task=objects.task,
+        assistant_subtask=objects.assistant_subtask,
+        team=objects.team,
+        user=objects.user,
+        message=execution_data.prompt,
+        device_id=execution_data.device_id,
+        payload=None,
+        user_subtask_id=execution_data.user_subtask_id,
+        history_limit=(
+            execution_data.history_message_count
+            if execution_data.preserve_history
+            else None
+        ),
+        is_subscription=True,
+        enable_tools=True,
+        enable_deep_thinking=True,
+        preload_skills=(
+            execution_data.preload_skills if execution_data.preload_skills else None
+        ),
+    )
+
+
+def _detach_subscription_execution_objects(
+    db: Any,
+    objects: _SubscriptionExecutionObjects,
+) -> None:
+    """Detach loaded ORM objects before closing the loader session."""
+    for obj in (objects.task, objects.assistant_subtask, objects.team, objects.user):
+        if hasattr(obj, "_sa_instance_state"):
+            db.refresh(obj)
+            make_transient(obj)
+
+
+def _load_subscription_execution_objects(
+    db: Any,
+    execution_data: SubscriptionExecutionData,
+) -> Optional[_SubscriptionExecutionObjects]:
+    """Load ORM objects required to build the subscription execution request."""
+    task = task_store.get_by_id(db, task_id=execution_data.task_id)
+    if task and task.kind != "Task":
+        task = None
+    assistant_subtask = subtask_store.get_basic_by_id(
+        db,
+        subtask_id=execution_data.subtask_id,
+    )
+    team = (
+        db.query(Kind)
+        .filter(Kind.id == execution_data.team_id, Kind.kind == "Team")
+        .first()
+    )
+    user = db.query(User).filter(User.id == execution_data.user_id).first()
+
+    missing = []
+    if not task:
+        missing.append(f"task={execution_data.task_id}")
+    if not assistant_subtask:
+        missing.append(f"assistant_subtask={execution_data.subtask_id}")
+    if not team:
+        missing.append(f"team={execution_data.team_id}")
+    if not user:
+        missing.append(f"user={execution_data.user_id}")
+    if missing:
+        logger.error(
+            "[execute_subscription_unified] Missing execution objects: %s",
+            ", ".join(missing),
+        )
+        return None
+
+    return _SubscriptionExecutionObjects(
+        task=task,
+        assistant_subtask=assistant_subtask,
+        team=team,
+        user=user,
+    )
+
+
+async def _execute_sse_sync(
+    request: Any,
+    execution_data: SubscriptionExecutionData,
+) -> None:
+    """Execute subscription via SSE mode (synchronous).
+
+    Waits for the AI response to complete. TaskCompletedEvent is published
+    by StatusUpdatingEmitter for unified handling.
+
+    Args:
+        request: ExecutionRequest
+        execution_data: Subscription execution data
+    """
+    import asyncio
+    import threading
+
+    from app.services.execution import execution_dispatcher
+    from app.services.execution.emitters import SSEResultEmitter
+
+    logger.info(
+        f"[_execute_sse_sync] Starting SSE sync execution: "
+        f"execution_id={execution_data.execution_id}, "
+        f"thread={threading.current_thread().name}, "
+        f"is_daemon={threading.current_thread().daemon}"
+    )
+
+    try:
+        # Create SSEResultEmitter for collecting response
+        emitter = SSEResultEmitter(
+            task_id=execution_data.task_id,
+            subtask_id=execution_data.subtask_id,
+        )
+
+        logger.info(
+            f"[_execute_sse_sync] Created SSEResultEmitter, starting dispatch: "
+            f"execution_id={execution_data.execution_id}"
+        )
+
+        # Start dispatch task (runs concurrently)
+        dispatch_task = asyncio.create_task(
+            execution_dispatcher.dispatch(request, emitter=emitter)
+        )
+
+        logger.info(
+            f"[_execute_sse_sync] Dispatch task created, waiting for emitter.collect(): "
+            f"execution_id={execution_data.execution_id}"
+        )
+
+        # Collect all content from emitter
+        accumulated_content, final_event = await emitter.collect()
+
+        # Wait for dispatch task to complete
+        try:
+            await dispatch_task
+        except Exception:
+            pass  # Error already handled via emitter
+
+        logger.info(
+            f"[_execute_sse_sync] SSE sync completed: "
+            f"execution_id={execution_data.execution_id}, "
+            f"content_length={len(accumulated_content)}"
+        )
+
+        # TaskCompletedEvent is published by StatusUpdatingEmitter
+
+    except Exception as e:
+        logger.error(
+            f"[_execute_sse_sync] SSE sync failed: "
+            f"execution_id={execution_data.execution_id}, error={e}",
+            exc_info=True,
+        )
+        # TaskCompletedEvent with FAILED status is published by StatusUpdatingEmitter
+
+
+async def _execute_http_callback(
+    request: Any,
+    execution_data: SubscriptionExecutionData,
+) -> None:
+    """Execute subscription via HTTP+Callback mode (asynchronous).
+
+    Dispatches the task and waits for completion. TaskCompletedEvent is published
+    by StatusUpdatingEmitter for unified handling across all execution modes.
+
+    Note: This function runs in a background thread (APScheduler), so we use
+    SSEResultEmitter instead of the default WebSocket emitter chain to avoid
+    event loop conflicts with the main thread's Socket.IO/Redis connections.
+
+    Args:
+        request: ExecutionRequest
+        execution_data: Subscription execution data
+    """
+    import asyncio
+
+    from app.services.execution import execution_dispatcher
+    from app.services.execution.emitters import SSEResultEmitter
+
+    logger.info(
+        f"[_execute_http_callback] Starting HTTP+Callback execution: "
+        f"execution_id={execution_data.execution_id}, "
+        f"device_id={execution_data.device_id}"
+    )
+
+    # Use SSEResultEmitter to avoid WebSocket/Socket.IO cross-thread issues
+    # SSEResultEmitter is thread-safe and doesn't depend on the main event loop
+    emitter = SSEResultEmitter(
+        task_id=execution_data.task_id,
+        subtask_id=execution_data.subtask_id,
+    )
+
+    try:
+        # Dispatch task with our thread-safe emitter
+        # TaskCompletedEvent is published by StatusUpdatingEmitter
+        dispatch_task = asyncio.create_task(
+            execution_dispatcher.dispatch(
+                request,
+                device_id=execution_data.device_id,
+                emitter=emitter,
+            )
+        )
+
+        # Wait for completion and collect results
+        accumulated_content, final_event = await emitter.collect()
+
+        # Wait for dispatch task to complete
+        try:
+            await dispatch_task
+        except Exception:
+            pass  # Error already handled via emitter
+
+        logger.info(
+            f"[_execute_http_callback] HTTP+Callback completed: "
+            f"execution_id={execution_data.execution_id}, "
+            f"content_length={len(accumulated_content)}"
+        )
+
+        logger.info(
+            f"[_execute_http_callback] Task dispatched: "
+            f"execution_id={execution_data.execution_id}, "
+            f"task_id={execution_data.task_id}"
+        )
+
+        # TaskCompletedEvent is published by StatusUpdatingEmitter
+
+    except Exception as e:
+        logger.error(
+            f"[_execute_http_callback] Dispatch failed: "
+            f"execution_id={execution_data.execution_id}, error={e}",
+            exc_info=True,
+        )
+        # TaskCompletedEvent with FAILED status is published by StatusUpdatingEmitter
+
+
+def extract_subscription_execution_data(
+    ctx: Any,
+    task: TaskResource,
+    assistant_subtask: Subtask,
+    user_subtask: Optional[Subtask],
+) -> SubscriptionExecutionData:
+    """Extract subscription execution data from context.
+
+    This function extracts all necessary data from ORM objects
+    into a thread-safe data container.
+
+    Args:
+        ctx: SubscriptionExecutionContext
+        task: Task resource
+        assistant_subtask: Assistant subtask
+        user_subtask: User subtask (optional)
+
+    Returns:
+        SubscriptionExecutionData
+    """
+    from app.schemas.kind import Team
+
+    # Extract model override from Subscription CRD's modelRef if specified
+    model_override_name = None
+    if ctx.subscription_crd.spec.modelRef:
+        model_override_name = ctx.subscription_crd.spec.modelRef.name
+
+    # Extract team display name from Team CRD
+    team_display_name = ctx.team.name
+    try:
+        team_crd = Team.model_validate(ctx.team.json)
+        if team_crd.spec and team_crd.spec.displayName:
+            team_display_name = team_crd.spec.displayName
+    except Exception:
+        pass  # Use team name as fallback
+
+    # Extract skills from subscription CRD's skillRefs
+    # Convert to the format expected by build_execution_request: [{"name": "skill1", "namespace": "default", "is_public": false}]
+    preload_skills: List[dict] = []
+    if ctx.subscription_crd.spec.skillRefs:
+        for skill_ref in ctx.subscription_crd.spec.skillRefs:
+            preload_skills.append(
+                {
+                    "name": skill_ref.name,
+                    "namespace": skill_ref.namespace,
+                    "is_public": skill_ref.is_public,
+                }
+            )
+        logger.info(
+            f"[extract_subscription_execution_data] Extracted {len(preload_skills)} skills "
+            f"from subscription: {[s['name'] for s in preload_skills]}"
+        )
+
+    return SubscriptionExecutionData(
+        subscription_id=ctx.subscription.id,
+        execution_id=ctx.execution.id,
+        task_id=task.id,
+        subtask_id=assistant_subtask.id,
+        user_id=ctx.user.id,
+        team_id=ctx.team.id,
+        user_subtask_id=user_subtask.id if user_subtask else None,
+        device_id=task.json.get("spec", {}).get("device_id"),
+        prompt=ctx.execution.prompt or "",
+        model_override_name=model_override_name,
+        preserve_history=ctx.preserve_history,
+        history_message_count=ctx.history_message_count,
+        is_subscription=True,
+        subscription_name=ctx.subscription.name,
+        subscription_display_name=(
+            ctx.subscription_crd.spec.displayName or ctx.subscription.name
+        ),
+        team_display_name=team_display_name,
+        trigger_type=ctx.trigger_type,
+        trigger_reason=ctx.execution.trigger_reason or "",
+        preload_skills=preload_skills,
+    )

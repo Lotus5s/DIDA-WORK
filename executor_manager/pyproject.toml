@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "executor-manager"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10,<=3.13"
+dependencies = [
+    "anyio>=4.5",
+    "apscheduler==3.10.4",
+    "cryptography>=42.0.4",
+    "fastapi==0.121.2",
+    "httpcore>=1.0.9",
+    "httpx[socks]>=0.27.0",
+    "socksio>=1.0.0",  # Explicit dependency for SOCKS proxy support
+    "jinja2>=3.1.6",
+    "kubernetes==29.0.0",
+    "pydantic>=2.12.5",
+    "pyjwt==2.8.0",
+    "pytz==2024.1",
+    "pyyaml==6.0.1",
+    "redis==8.1.0",
+    "requests==2.31.0",
+    "requests-oauthlib==2.0.0",
+    "starlette>=0.49.1",
+    "uvicorn==0.38.0",
+    "watchfiles>=1.0.0",  # Required for uvicorn --reload-exclude to work
+    "websocket-client>=1.9.0",
+    
+    # Shared module - use editable install for auto-update
+    "wegent-shared",
+
+    # OpenTelemetry core packages
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp>=1.27.0",
+
+    # OpenTelemetry instrumentation packages
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+    "opentelemetry-instrumentation-httpx>=0.48b0",
+    "opentelemetry-instrumentation-requests>=0.48b0",
+    "opentelemetry-instrumentation-system-metrics>=0.48b0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.1",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
+    "pytest-mock>=3.15.1",
+    "pytest-httpx>=0.36.0",
+]
+
+[tool.setuptools]
+packages = ["executor_manager", "executor_manager.clients", "executor_manager.config", "executor_manager.executors", "executor_manager.executors.docker", "executor_manager.github", "executor_manager.models", "executor_manager.routers", "executor_manager.schemas", "executor_manager.services", "executor_manager.services.sandbox", "executor_manager.tasks", "executor_manager.utils"]
+
+[tool.setuptools.package-dir]
+executor_manager = "."
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.eggs
+  | \.git
+  | \.mypy_cache
+  | \.venv
+  | venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 88
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+skip = [".venv", "venv"]
+skip_gitignore = true
+known_first_party = ["clients", "common", "config", "executors", "github", "models", "routers", "scheduler", "services", "tasks", "utils", "shared"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.uv.sources]
+# Use editable install for shared module - changes to shared/ will be reflected immediately
+wegent-shared = { path = "../shared", editable = true }

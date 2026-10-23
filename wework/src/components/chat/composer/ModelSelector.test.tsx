@@ -1,0 +1,722 @@
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import type { UnifiedModel } from '@/types/api'
+
+const isMobileMock = vi.hoisted(() => vi.fn())
+vi.mock('@/hooks/useIsMobile', () => ({
+  useIsMobile: isMobileMock,
+}))
+
+const configuredKeybindingMock = vi.hoisted(() => vi.fn())
+vi.mock('@/hooks/useConfiguredKeybinding', () => ({
+  useConfiguredKeybinding: configuredKeybindingMock,
+}))
+
+const navigateToMock = vi.hoisted(() => vi.fn())
+vi.mock('@/lib/navigation', () => ({
+  navigateTo: navigateToMock,
+}))
+
+const embeddedBrowserOcclusionMock = vi.hoisted(() => vi.fn())
+vi.mock('@/hooks/useEmbeddedBrowserOcclusion', () => ({
+  useEmbeddedBrowserOcclusion: embeddedBrowserOcclusionMock,
+}))
+
+const modelExecutionMock = vi.hoisted(() => ({
+  supportsResponsesApi: vi.fn().mockReturnValue(false),
+}))
+vi.mock('@/features/cloud-connection/modelExecution', () => modelExecutionMock)
+
+vi.mock('@/hooks/useTranslation', () => ({
+  useTranslation: () => ({
+    t: (key: string, fallback?: string) => fallback ?? key,
+  }),
+}))
+
+import { ModelSelector } from './ModelSelector'
+import { useWorkbenchModels } from '@/features/workbench/useWorkbenchModels'
+import { getDesktopModelSelectorCollisionPadding } from '@wegent/collaboration/controls/model-selector-layout'
+
+const SHELL_LEFT = 800
+const WINDOW_INNER_WIDTH = 1200
+const WINDOW_INNER_HEIGHT = 900
+
+function createShellElement(options?: { hidden?: boolean; left?: number }): HTMLDivElement {
+  const shell = document.createElement('div')
+  shell.id = 'right-workspace-panel-shell'
+  shell.setAttribute('data-testid', 'right-workspace-panel-shell')
+  if (options?.hidden) {
+    shell.setAttribute('aria-hidden', 'true')
+  } else {
+    shell.setAttribute('aria-hidden', 'false')
+  }
+  const shellLeft = options?.left ?? SHELL_LEFT
+  shell.getBoundingClientRect = () =>
+    ({
+      top: 0,
+      left: options?.hidden ? WINDOW_INNER_WIDTH : shellLeft,
+      right: WINDOW_INNER_WIDTH,
+      bottom: WINDOW_INNER_HEIGHT,
+      width: options?.hidden ? 0 : WINDOW_INNER_WIDTH - shellLeft,
+      height: WINDOW_INNER_HEIGHT,
+      x: options?.hidden ? WINDOW_INNER_WIDTH : shellLeft,
+      y: 0,
+      toJSON: () => {},
+    }) as DOMRect
+  document.body.appendChild(shell)
+  return shell
+}
+
+function setButtonRect(button: HTMLElement, right = 850) {
+  const left = right - 240
+  button.getBoundingClientRect = () =>
+    ({
+      top: 500,
+      left,
+      right,
+      bottom: 540,
+      width: 240,
+      height: 40,
+      x: left,
+      y: 500,
+      toJSON: () => {},
+    }) as DOMRect
+}
+
+const SAMPLE_MODEL: UnifiedModel = {
+  name: 'gpt-5.5',
+  modelId: 'gpt-5.5',
+  displayName: 'GPT 5.5',
+  type: 'runtime',
+  provider: 'local',
+  config: {
+    codexProviderId: 'openai',
+    weworkModelKind: 'codex-official',
+    ui: { family: 'codex-official', controls: ['speed'] },
+  },
+}
+
+const SECOND_FAMILY_MODEL: UnifiedModel = {
+  name: 'claude-sonnet',
+  modelId: 'claude-sonnet',
+  displayName: 'Claude Sonnet',
+  type: 'runtime',
+  provider: 'cloud',
+  config: {
+    ui: { family: 'claude' },
+  },
+}
+
+const CUSTOM_MODEL: UnifiedModel = {
+  name: 'custom-model',
+  modelId: 'custom-model',
+  displayName: 'Custom Model',
+  type: 'runtime',
+  provider: 'local',
+  config: {
+    ui: { family: 'custom' },
+  },
+}
+
+describe('ModelSelector desktop layout', () => {
+  const originalInnerWidth = window.innerWidth
+  const originalInnerHeight = window.innerHeight
+
+  beforeEach(() => {
+    isMobileMock.mockReturnValue(false)
+    configuredKeybindingMock.mockReturnValue(null)
+    navigateToMock.mockReset()
+    embeddedBrowserOcclusionMock.mockClear()
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: WINDOW_INNER_WIDTH,
+    })
+    Object.defineProperty(window, 'innerHeight', {
+      configurable: true,
+      value: WINDOW_INNER_HEIGHT,
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    document.querySelectorAll('#right-workspace-panel-shell').forEach(shell => shell.remove())
+    vi.restoreAllMocks()
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: originalInnerWidth,
+    })
+    Object.defineProperty(window, 'innerHeight', {
+      configurable: true,
+      value: originalInnerHeight,
+    })
+  })
+
+  test('keeps the hidden width measurement inside the toolbar bounds', () => {
+    render(
+      <ModelSelector
+        models={[SAMPLE_MODEL]}
+        selectedModel={SAMPLE_MODEL}
+        selectedModelOptions={{}}
+        disabled={false}
+        onSelectModel={vi.fn()}
+        onSelectModelOption={vi.fn()}
+      />
+    )
+
+    expect(screen.getByTestId('model-selector-button')).toHaveClass('text-sm', 'font-normal')
+    expect(screen.getByTestId('model-selector-button')).toHaveAttribute(
+      'data-model-provider-id',
+      'openai'
+    )
+    expect(screen.getByTestId('model-selector-width-measure')).toHaveClass(
+      'left-0',
+      'top-0',
+      'text-sm',
+      'font-normal'
+    )
+  })
+
+  test('asks the user to select a model instead of displaying a default model', () => {
+    render(
+      <ModelSelector
+        models={[SAMPLE_MODEL]}
+        selectedModel={null}
+        selectedModelOptions={{}}
+        disabled={false}
+        onSelectModel={vi.fn()}
+        onSelectModelOption={vi.fn()}
+      />
+    )
+
+    expect(screen.getByTestId('model-selector-button')).toHaveTextContent('Select model')
+    expect(screen.getByTestId('model-selector-button')).not.toHaveTextContent('默认')
+  })
+
+  test('positions the menu to the left of the right workspace panel shell', async () => {
+    createShellElement()
+
+    render(
+      <ModelSelector
+        models={[SAMPLE_MODEL]}
+        selectedModel={SAMPLE_MODEL}
+        selectedModelOptions={{}}
+        disabled={false}
+        onSelectModel={vi.fn()}
+        onSelectModelOption={vi.fn()}
+      />
+    )
+
+    const button = screen.getByTestId('model-selector-button')
+    setButtonRect(button)
+    fireEvent.click(button)
+
+    const menu = await waitFor(() => screen.getByTestId('model-selector-menu'))
+    const wrapper = menu.parentElement
+    expect(wrapper).not.toBeNull()
+    const left = parseInt(wrapper!.style.left, 10)
+    expect(left).toBeLessThanOrEqual(SHELL_LEFT - 16)
+  })
+
+  test('keeps a menu opened inside the right workspace panel over the panel', async () => {
+    const shell = createShellElement()
+
+    render(
+      <ModelSelector
+        models={[SAMPLE_MODEL]}
+        selectedModel={SAMPLE_MODEL}
+        selectedModelOptions={{}}
+        disabled={false}
+        onSelectModel={vi.fn()}
+        onSelectModelOption={vi.fn()}
+      />,
+      { container: shell }
+    )
+
+    const button = screen.getByTestId('model-selector-button')
+    setButtonRect(button, WINDOW_INNER_WIDTH - 20)
+    fireEvent.click(button)
+
+    const menu = await waitFor(() => screen.getByTestId('model-selector-menu'))
+    const wrapper = menu.parentElement
+    expect(wrapper).not.toBeNull()
+    const left = parseInt(wrapper!.style.left, 10)
+    expect(left).toBeGreaterThanOrEqual(SHELL_LEFT)
+  })
+
+  test('shows the selected model source in the compact slider panel', async () => {
+    createShellElement({ hidden: true })
+
+    render(
+      <ModelSelector
+        models={[SAMPLE_MODEL]}
+        selectedModel={SAMPLE_MODEL}
+        selectedModelOptions={{}}
+        disabled={false}
+        onSelectModel={vi.fn()}
+        onSelectModelOption={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+    expect(await screen.findByTestId('model-simple-source')).toHaveTextContent('本机 ChatGPT 账户')
+    fireEvent.click(await screen.findByTestId('model-advanced-toggle'))
+
+    expect(await screen.findByTestId(`model-option-${SAMPLE_MODEL.name}`)).toHaveAttribute(
+      'data-model-provider-id',
+      'openai'
+    )
+    expect(screen.queryByTestId('model-selector-family-submenu')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('model-family-codex-official')).not.toBeInTheDocument()
+  })
+
+  test('opens model options directly when the selected model has no configurable slider', async () => {
+    createShellElement({ hidden: true })
+
+    render(
+      <ModelSelector
+        models={[SECOND_FAMILY_MODEL]}
+        selectedModel={SECOND_FAMILY_MODEL}
+        selectedModelOptions={{}}
+        disabled={false}
+        onSelectModel={vi.fn()}
+        onSelectModelOption={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+
+    expect(
+      await screen.findByTestId(`model-option-${SECOND_FAMILY_MODEL.name}`)
+    ).toBeInTheDocument()
+    expect(screen.queryByTestId('model-simple-header')).not.toBeInTheDocument()
+  })
+
+  test('opens setup destinations from the empty model menu', async () => {
+    createShellElement({ hidden: true })
+
+    render(
+      <ModelSelector
+        models={[]}
+        selectedModel={null}
+        selectedModelOptions={{}}
+        disabled={false}
+        onSelectModel={vi.fn()}
+        onSelectModelOption={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+    expect(await screen.findByTestId('model-selector-empty-state')).toHaveTextContent(
+      'Add a custom model, or sign in to Wegent to sync cloud models.'
+    )
+
+    fireEvent.click(screen.getByTestId('model-selector-add-custom-model'))
+    expect(navigateToMock).toHaveBeenCalledWith('/settings/personal/models')
+    expect(screen.queryByTestId('model-selector-menu')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+    fireEvent.click(await screen.findByTestId('model-selector-login-cloud'))
+    expect(navigateToMock).toHaveBeenCalledWith('/settings/connections')
+    expect(screen.queryByTestId('model-selector-menu')).not.toBeInTheDocument()
+  })
+
+  test('shows models from every family in the second-level menu', async () => {
+    createShellElement({ hidden: true })
+
+    render(
+      <ModelSelector
+        models={[SAMPLE_MODEL, SECOND_FAMILY_MODEL, CUSTOM_MODEL]}
+        selectedModel={SAMPLE_MODEL}
+        selectedModelOptions={{}}
+        disabled={false}
+        onSelectModel={vi.fn()}
+        onSelectModelOption={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+    fireEvent.click(await screen.findByTestId('model-advanced-toggle'))
+
+    const menu = await screen.findByTestId('model-selector-menu')
+    expect(menu).toHaveTextContent('本机 ChatGPT 账户')
+    expect(menu).toHaveTextContent('云端模型')
+    expect(menu).toHaveTextContent('自定义模型')
+    expect(menu).toHaveTextContent('Claude')
+    const localSource = screen.getByTestId('model-source-local-chatgpt')
+    const cloudSource = screen.getByTestId('model-source-cloud')
+    const customSource = screen.getByTestId('model-source-custom')
+    const cloudFamily = screen.getByTestId('model-group-claude')
+    const customFamily = screen.getByTestId('model-group-custom')
+    expect(localSource.parentElement).toBe(cloudSource.parentElement)
+    expect(cloudSource).toContainElement(cloudFamily)
+    expect(customSource).toContainElement(customFamily)
+    expect(localSource).not.toContainElement(cloudFamily)
+    expect(localSource.compareDocumentPosition(cloudSource)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(cloudSource.compareDocumentPosition(customSource)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(screen.getByTestId(`model-option-${SECOND_FAMILY_MODEL.name}`)).toBeInTheDocument()
+    expect(screen.getByTestId(`model-option-${SAMPLE_MODEL.name}`)).toBeInTheDocument()
+    expect(screen.getByTestId(`model-option-${CUSTOM_MODEL.name}`)).toBeInTheDocument()
+  })
+
+  test('closes the picker when model selection is deferred to a confirmation dialog', async () => {
+    createShellElement({ hidden: true })
+    const onSelectModel = vi.fn().mockReturnValue(false)
+    const onOpenChange = vi.fn()
+
+    render(
+      <ModelSelector
+        models={[SAMPLE_MODEL]}
+        selectedModel={SAMPLE_MODEL}
+        selectedModelOptions={{}}
+        disabled={false}
+        onSelectModel={onSelectModel}
+        onSelectModelOption={vi.fn()}
+        onOpenChange={onOpenChange}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+    fireEvent.click(await screen.findByTestId('model-advanced-toggle'))
+    fireEvent.click(await screen.findByTestId(`model-option-${SAMPLE_MODEL.name}`))
+
+    expect(onSelectModel).toHaveBeenCalledWith(SAMPLE_MODEL)
+    expect(screen.queryByTestId('model-selector-menu')).not.toBeInTheDocument()
+    await waitFor(() => expect(onOpenChange).toHaveBeenLastCalledWith(false, 'selection'))
+    expect(embeddedBrowserOcclusionMock).toHaveBeenLastCalledWith('model-selector-flyout', false)
+  })
+
+  test('refreshes on each opening and keeps the menu and selection after a failed refresh', async () => {
+    const addedModel = { ...SAMPLE_MODEL, name: 'new-cloud-model', displayName: 'New cloud model' }
+    const api = {
+      listModels: vi
+        .fn()
+        .mockResolvedValueOnce({ data: [SAMPLE_MODEL] })
+        .mockRejectedValueOnce(new Error('offline'))
+        .mockResolvedValue({ data: [SAMPLE_MODEL, addedModel] }),
+    }
+    function ComposerModelMenu() {
+      const selection = useWorkbenchModels({
+        api,
+        locked: false,
+        selectionConfig: { modelName: SAMPLE_MODEL.name, modelType: SAMPLE_MODEL.type },
+      })
+      return (
+        <ModelSelector
+          models={selection.models}
+          selectedModel={selection.selectedModel}
+          selectedModelOptions={selection.selectedModelOptions}
+          disabled={false}
+          onSelectModel={selection.setSelectedModel}
+          onSelectModelOption={selection.setSelectedModelOption}
+          onOpenChange={open => {
+            if (open) selection.refreshModels()
+          }}
+        />
+      )
+    }
+    render(<ComposerModelMenu />)
+    await waitFor(() =>
+      expect(screen.getByTestId('model-selector-button')).toHaveTextContent('GPT 5.5')
+    )
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+    await waitFor(() => expect(api.listModels).toHaveBeenCalledTimes(2))
+    expect(screen.getByTestId('model-selector-menu')).toBeInTheDocument()
+    expect(screen.getByTestId('model-selector-button')).toHaveTextContent('Select effort')
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+    expect(screen.queryByTestId('model-selector-menu')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+    fireEvent.click(await screen.findByTestId('model-advanced-toggle'))
+    expect(await screen.findByTestId('model-option-new-cloud-model')).toBeInTheDocument()
+    expect(api.listModels).toHaveBeenCalledTimes(3)
+    expect(screen.getByTestId('model-selector-button')).toHaveTextContent('GPT 5.5')
+  })
+
+  test('uses the available viewport height for a long model list', async () => {
+    createShellElement({ hidden: true })
+    const models = Array.from({ length: 30 }, (_, index) => ({
+      ...SAMPLE_MODEL,
+      name: `gpt-5.5-${index}`,
+      modelId: `gpt-5.5-${index}`,
+      displayName: `GPT 5.5 ${index}`,
+    }))
+
+    render(
+      <ModelSelector
+        models={models}
+        selectedModel={models[0]}
+        selectedModelOptions={{}}
+        disabled={false}
+        onSelectModel={vi.fn()}
+        onSelectModelOption={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+    fireEvent.click(await screen.findByTestId('model-advanced-toggle'))
+
+    const menu = await screen.findByTestId('model-selector-menu')
+    expect(menu.style.maxHeight).toBe('820px')
+    expect(menu.querySelector('[data-model-picker-panel="advanced"]')).toHaveClass('max-h-[316px]')
+  })
+
+  test('uses the Codex flyout viewport contract in a narrow viewport', async () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 500,
+    })
+    createShellElement({ hidden: true })
+    const originalGetBoundingClientRect = HTMLElement.prototype.getBoundingClientRect
+    HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+      const testId = this.getAttribute('data-testid')
+      if (testId === 'model-selector-button') {
+        return {
+          top: 500,
+          left: 230,
+          right: 470,
+          bottom: 540,
+          width: 240,
+          height: 40,
+          x: 230,
+          y: 500,
+          toJSON: () => {},
+        } as DOMRect
+      }
+      if (testId === 'model-selector-menu') {
+        return {
+          top: 300,
+          left: 216,
+          right: 470,
+          bottom: 500,
+          width: 254,
+          height: 200,
+          x: 216,
+          y: 300,
+          toJSON: () => {},
+        } as DOMRect
+      }
+      return originalGetBoundingClientRect.call(this)
+    }
+
+    try {
+      render(
+        <ModelSelector
+          models={[SAMPLE_MODEL]}
+          selectedModel={SAMPLE_MODEL}
+          selectedModelOptions={{}}
+          disabled={false}
+          onSelectModel={vi.fn()}
+          onSelectModelOption={vi.fn()}
+        />
+      )
+
+      fireEvent.click(screen.getByTestId('model-selector-button'))
+      fireEvent.click(await screen.findByTestId('model-advanced-toggle'))
+
+      const menu = await screen.findByTestId('model-selector-menu')
+      await waitFor(() => expect(menu.parentElement).toHaveStyle({ left: '216px' }))
+      expect(menu.parentElement).toHaveClass('w-[254px]')
+      expect(menu.parentElement?.parentElement).toBe(document.body)
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = originalGetBoundingClientRect
+    }
+  })
+
+  test('uses the full viewport for Codex flyouts over a narrow browser split', async () => {
+    createShellElement({ left: 430 })
+
+    expect(getDesktopModelSelectorCollisionPadding()).toEqual({
+      top: 64,
+      right: 16,
+      bottom: 16,
+      left: 16,
+    })
+
+    render(
+      <ModelSelector
+        models={[SAMPLE_MODEL]}
+        selectedModel={SAMPLE_MODEL}
+        selectedModelOptions={{}}
+        disabled={false}
+        onSelectModel={vi.fn()}
+        onSelectModelOption={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+    fireEvent.click(await screen.findByTestId('model-advanced-toggle'))
+
+    const menu = await screen.findByTestId('model-selector-menu')
+    expect(menu.parentElement).toHaveAttribute('data-embedded-browser-occlusion')
+    expect(embeddedBrowserOcclusionMock).toHaveBeenLastCalledWith('model-selector-flyout', true)
+
+    fireEvent.click(screen.getByTestId('model-selector-button'))
+    expect(embeddedBrowserOcclusionMock).toHaveBeenLastCalledWith('model-selector-flyout', false)
+  })
+
+  test('caps the trigger width when maxClosedWidth is provided', () => {
+    createShellElement({ hidden: true })
+
+    const originalGetBoundingClientRect = HTMLElement.prototype.getBoundingClientRect
+    HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+      if (this.getAttribute('data-testid') === 'model-selector-button') {
+        return {
+          top: 500,
+          left: 700,
+          right: 940,
+          bottom: 540,
+          width: 240,
+          height: 40,
+          x: 700,
+          y: 500,
+          toJSON: () => {},
+        } as DOMRect
+      }
+      if (this.getAttribute('aria-hidden') === 'true' && this.tagName === 'SPAN') {
+        return {
+          top: 0,
+          left: 0,
+          right: 300,
+          bottom: 0,
+          width: 300,
+          height: 0,
+          x: 0,
+          y: 0,
+          toJSON: () => {},
+        } as DOMRect
+      }
+      return originalGetBoundingClientRect.call(this)
+    }
+
+    try {
+      render(
+        <ModelSelector
+          models={[SAMPLE_MODEL]}
+          selectedModel={SAMPLE_MODEL}
+          selectedModelOptions={{}}
+          disabled={false}
+          onSelectModel={vi.fn()}
+          onSelectModelOption={vi.fn()}
+          maxClosedWidth={160}
+        />
+      )
+
+      const button = screen.getByTestId('model-selector-button')
+      expect(button.style.getPropertyValue('--model-selector-width')).toBe('160px')
+      expect(button.style.width).toBe('var(--model-selector-width, auto)')
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = originalGetBoundingClientRect
+    }
+  })
+
+  test('keeps the trigger capped when opened with maxClosedWidth', async () => {
+    createShellElement({ hidden: true })
+
+    const originalGetBoundingClientRect = HTMLElement.prototype.getBoundingClientRect
+    HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+      if (this.getAttribute('data-testid') === 'model-selector-button') {
+        return {
+          top: 500,
+          left: 700,
+          right: 940,
+          bottom: 540,
+          width: 240,
+          height: 40,
+          x: 700,
+          y: 500,
+          toJSON: () => {},
+        } as DOMRect
+      }
+      if (this.getAttribute('aria-hidden') === 'true' && this.tagName === 'SPAN') {
+        return {
+          top: 0,
+          left: 0,
+          right: 300,
+          bottom: 0,
+          width: 300,
+          height: 0,
+          x: 0,
+          y: 0,
+          toJSON: () => {},
+        } as DOMRect
+      }
+      return originalGetBoundingClientRect.call(this)
+    }
+
+    try {
+      render(
+        <ModelSelector
+          models={[SAMPLE_MODEL]}
+          selectedModel={SAMPLE_MODEL}
+          selectedModelOptions={{}}
+          disabled={false}
+          onSelectModel={vi.fn()}
+          onSelectModelOption={vi.fn()}
+          maxClosedWidth={160}
+        />
+      )
+
+      const button = screen.getByTestId('model-selector-button')
+      fireEvent.click(button)
+      await waitFor(() => screen.getByTestId('model-selector-menu'))
+
+      expect(button.style.getPropertyValue('--model-selector-width')).toBe('160px')
+      expect(button.style.width).toBe('var(--model-selector-width, auto)')
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = originalGetBoundingClientRect
+    }
+  })
+
+  test('uses the default closed width cap when maxClosedWidth is omitted', () => {
+    createShellElement({ hidden: true })
+
+    const originalGetBoundingClientRect = HTMLElement.prototype.getBoundingClientRect
+    HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+      if (this.getAttribute('data-testid') === 'model-selector-button') {
+        return {
+          top: 500,
+          left: 700,
+          right: 940,
+          bottom: 540,
+          width: 240,
+          height: 40,
+          x: 700,
+          y: 500,
+          toJSON: () => {},
+        } as DOMRect
+      }
+      if (this.getAttribute('aria-hidden') === 'true' && this.tagName === 'SPAN') {
+        return {
+          top: 0,
+          left: 0,
+          right: 300,
+          bottom: 0,
+          width: 300,
+          height: 0,
+          x: 0,
+          y: 0,
+          toJSON: () => {},
+        } as DOMRect
+      }
+      return originalGetBoundingClientRect.call(this)
+    }
+
+    try {
+      render(
+        <ModelSelector
+          models={[SAMPLE_MODEL]}
+          selectedModel={SAMPLE_MODEL}
+          selectedModelOptions={{}}
+          disabled={false}
+          onSelectModel={vi.fn()}
+          onSelectModelOption={vi.fn()}
+        />
+      )
+
+      const button = screen.getByTestId('model-selector-button')
+      expect(button.style.getPropertyValue('--model-selector-width')).toBe('208px')
+      expect(button.style.width).toBe('var(--model-selector-width, auto)')
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = originalGetBoundingClientRect
+    }
+  })
+})

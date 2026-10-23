@@ -1,0 +1,241 @@
+---
+sidebar_position: 32
+---
+
+# 本地优先云端连接
+
+Wework 默认就是一个完整的本地应用。本机 Codex、本地模型配置、本地 executor、本地工作区和本地会话不依赖 Backend 登录或云端设备。云端连接是一个可选能力层：用户在侧栏输入 Backend 地址并完成 WeWork 登录后，服务端模型、云设备和云端 Codex 认证同步会加入同一个工作台。
+
+打包时可通过 `VITE_WEGENT_BACKEND_URL` 设置“连接云端”中的默认 Backend 地址。该值仅用于预填，用户仍可修改；本机已有的连接地址优先于打包默认值。配置该变量后，桌面端左下角账户区在未连接时显示“Wegent 账户 / 未登录”，点击后仍打开完整账户菜单；用户从菜单顶部的“登录 Wegent”进入云端授权。连接成功后，账户区显示云端用户名和邮箱；账户菜单中的“退出登录”只会断开云端连接。
+
+## 状态归属
+
+云端连接状态由 `cloud-connection` 前端层管理，和网页版登录使用的全局 `auth_token` 分开存储。它持久化以下信息：
+
+- 用户输入的 Backend 根地址。
+- 归一化后的 `apiBaseUrl`、`socketBaseUrl` 和 `socketPath`。
+- 云端登录 token、过期时间、云端用户和连接时间。
+- 当前状态：未连接、连接中、已连接、过期或错误。
+
+打包的 Electron 桌面端会把 renderer 的完整 `localStorage` 镜像到应用
+`userData` 目录中的 `renderer-local-storage.json`，并在前端初始化其他服务之前恢复。
+因此 Core DSH 重启后即使随机端口变化导致页面 origin 改变，云端连接、本地模型、
+未发送草稿、布局和其他使用 `localStorage` 的界面偏好仍会保留。主进程串行处理变更，
+通过原子替换写入文件，并在 Unix 系统上使用 `0600` 权限。用户主动断开连接、删除配置
+或清空对应状态时，同样会同步删除持久化副本；不使用 Electron host 的网页版不经过
+这层桌面镜像。主进程还会在加载新的 Core DSH origin 前清理旧 origin 的 Chromium
+`localStorage`：已有权威快照但尚无 origin 记录时执行一次全量迁移清理，之后只精确
+清理上一次记录的 `scheme://host:port`。当前 origin 写入
+`renderer-local-storage-origins.json`，同 origin 的 renderer 重建不会重复清理。
+首次还没有权威快照时保留浏览器存储，避免在建立持久化副本前丢失迁移数据。
+
+用户可以输入 Backend 根地址，也可以直接输入 `/api` 地址。前端会把地址归一化为 HTTP API 地址和 Socket.IO 连接信息。连接时先请求 `/health`，再调用 `/auth/wework/sessions` 创建短生命周期授权会话。Backend 返回完整 `authorize_url`，本地 Wework 在内置授权窗打开该云端授权页，并携带 `poll_token` 轮询会话结果。
+
+桌面端授权窗默认尺寸为 `1000 × 640`，最小尺寸为 `960 × 620`，以完整容纳没有响应式布局的企业登录页。窗口完成定位前保持隐藏，显示后置顶于普通窗口，并在 Wework 主窗口移动或显示器缩放比例变化时重新定位。位置以 Wework 当前显示器的可用区域为边界；macOS 直接使用 AppKit 的统一逻辑桌面坐标，因此在 Retina 与非 Retina 显示器之间移动时不会因物理像素和逻辑像素换算而漂移到屏幕外。
+
+Socket.IO 地址按以下优先级解析：用户在连接窗口显式输入的地址、与当前 Backend 匹配的打包 Socket 地址、Backend `/auth/wework/config` 返回的 `socket_url`、Backend 同源默认地址。Backend 通过 `WEGENT_SOCKET_URL` 声明公开 Socket.IO origin；HTTPS 部署应配置 `wss://` 地址。如果桌面端连接的是本机 loopback Backend，而 Backend 返回的 Socket 地址仅把同一端口和路径换成另一主机名，则桌面端继续使用 loopback 地址；用户显式指定的 Socket 地址和独立端口的部署不受影响。启动时也会按同一优先级刷新并迁移已保存连接。Wework 会把最终解析出的地址通过 Electron IPC 传给本机 executor；executor 使用该地址建立 Backend Socket.IO 连接，而 HTTP API 仍使用 Backend 地址，因此分离部署不需要用户再次手工配置 WSS 地址。
+
+本地 Wework 不渲染云端账号密码表单，也不调用 `/auth/login` 或 `/auth/admin-password/setup`。云端登录、OIDC 和管理员初始化都发生在云端 Wegent Web 授权页中。用户登录后必须明确点击“授权 Wework”，Backend 才会把一次性可领取的云端 JWT 写入授权会话；本地 Wework 领取成功后继续读取 `/users/me` 校验用户并保存云端连接状态。
+
+授权成功页显示 3 秒倒计时，结束后自动关闭页面；授权失败或取消时不启动倒计时。如果浏览器限制自动关闭，页面会提示手动关闭并返回 Wework。
+
+Backend 使用 `WEWORK_AUTHORIZE_BASE_URL` 生成授权页地址；未配置时复用 `FRONTEND_URL`。因此 API/Web 分离部署时必须显式配置 Web 根地址，Wework 客户端只打开 Backend 返回的完整 `authorize_url`，不自行推断网页版地址。
+
+连接底层 Socket.IO 关闭时，本机 executor 会立即清除已连接状态并启动现有重连流程，避免账户操作在等待心跳发现断连期间误以为后端可用。注册过程记录连接关闭代次，使用同一把锁发布就绪状态和处理关闭通知，避免注册完成覆盖刚发生的断连。旧连接的关闭回调不会影响新连接。
+
+插件账户认证进程禁用 Python 字节码写入，避免导入模块时修改经过校验的共享插件包。新发布记录包含归档内的 bytecode 路径。升级前生成的缓存若使包校验失败，会先计算排除候选缓存后的完整哈希，只有它与原始记录一致时才在包发布锁内清理；随后仍完整校验所有文件。归档内的 bytecode 始终受保护；旧记录若无法证明候选文件属于生成缓存，会拒绝校验并保持包原样。不重写校验记录，不忽略仍可能执行的文件。源码改动、特殊文件和缓存内的符号链接仍被拒绝，原始发布包中已校验的字节码保持不变。并发同步和发布共用该锁。包发布、仓库操作和 Agent Home 锁共用生命周期守卫，在所属操作结束时显式解锁，避免并发启动的子进程通过继承文件描述符延长锁寿命。
+
+## 交互入口
+
+桌面侧栏提供两个职责明确的云端入口：
+
+- 工作区入口展示云端连接状态。未连接时显示“连接云端”，登录过期时显示“云端连接已失效”；点击后可重新连接，也可使用“断开连接”清除失败或过期状态并恢复为未连接状态。
+- 左下角账户区始终打开账户菜单，不因登录状态改变点击行为。未登录时菜单顶部展示“登录 Wegent”，设置、检查更新和剩余用量仍然可访问。
+- 已连接时账户区显示云端用户名和邮箱，工作区入口显示云端主机、云端用户和在线云设备数量。
+- 登录过期或连接错误不会阻塞本地功能。
+
+工作区入口中的“云端工作”状态来自团队、设备和云端任务列表的完整后台探测，而不是已缓存的历史数据。第一次探测期间显示“同步中”；第一次探测完成后，后续刷新期间继续显示最近一次“可用”“无设备”或“不可用”结论，直到本次完整探测结束。只要任一云端读取失败，最新结论就是“不可用”，即使界面仍使用最后一次成功快照保留历史设备或任务数据。重叠刷新会取消旧请求并由最新的一次完整探测接管，不能只刷新设备或回退成历史“可用”状态。
+
+设置页按能力分组：
+
+- 默认功能：本机 Codex、本地模型配置、本地 executor、本地工作区和本地会话。
+- 连接云端后：服务端模型、云设备、云端 Codex `auth.json` 同步、代理和远程设备管理。
+
+“模型”是本地模型和 Codex `auth.json` 的统一入口。本地模型配置始终可用；云端 Codex 认证同步、上传、导入和代理开关都必须通过云端连接访问。未连接时页面只展示本机 auth 状态和云端能力说明，不会把本机状态误写入服务端。
+
+## 服务合并
+
+工作台服务由三层组成：
+
+1. `createLocalAppServices()` 提供本地 IPC、本机设备、本地运行时任务、本机 Codex 模型和用户配置的本地模型。
+2. `createBackendWorkbenchServices()` 封装 Backend HTTP、Socket.IO、模型、设备和运行时任务 API。
+3. `createHybridWorkbenchServices()` 在云端已连接时合并本地和云端服务。
+
+未连接时，Wework 继续只使用本地服务。已连接时，模型、设备和 runtime work 列表合并展示；执行和流式订阅按设备或来源路由到本地 IPC 或 Backend relay。
+
+输入框的新会话偏好也遵循连接状态归属。未连接时，模型、推理强度、协作模式以及每个项目的本地工作区/工作树模式写入 Wework 本机用户配置；连接云端后，这些选择通过 Backend 用户 API 写入当前云端账号，重启后从同一账号恢复。Backend 使用 `wework_new_chat_model_selection` 保存模型及其 `options`，使用 `wework_project_work_preferences` 按 `project:<id>` 保存 `executionMode` 和 `worktreeBranch`。混合服务不得继续把已连接账号的偏好写入本机用户存储，否则当前窗口虽然会显示新选择，重启后仍会回到云端账号中的旧值或默认值。
+
+## 云端 Runtime IPC 中继
+
+Wework 云端 runtime 执行使用和本地模式一致的 app IPC 协议。前端连接 Backend 的 `/wework-runtime` Socket.IO namespace，把 `runtime.*` 请求包装成 `{ id, method, params, device_id }` 帧；Backend 只负责鉴权、校验在线设备和转发到对应 executor，不把这条链路翻译成 `chat:*` 事件。
+
+云端 executor 仍连接 Backend 的 `/local-executor` namespace。executor 内部复用本地 `RuntimeWorkRpcHandler` 执行 `runtime.tasks.create`、`runtime.tasks.send`、`runtime.tasks.list`、`runtime.tasks.transcript` 等方法，并把 Responses API 风格的 app IPC event 通过 `runtime:event` 透传回 `/wework-runtime`。Wework 前端复用本地流式事件 mapper 消费这些事件，因此本地模式和云端模式在 runtime 执行流程上保持一致。
+
+`device.execute_command` 的中继超时必须使用请求中的 `timeout_seconds`，并在前端确认等待上增加固定宽限时间。普通 runtime 请求继续使用默认 75 秒。这样 Git Clone 等长命令不会被外层 IPC 在命令自身超时之前提前判定失败，同时仍受 executor 的 600 秒上限约束。
+
+多实例 Backend 通过 Socket.IO Redis manager 把 RPC 转发到持有 executor 连接的 worker。Redis 中带 `socket_id` 的设备在线记录是转发入口；不能用当前 worker 的进程内连接表预判 executor 已断线，否则会把连接在其他 worker 上的设备误标为离线。
+
+## 云端终端兼容与发布
+
+终端通过 `/terminal` → Backend → `/local-executor` 转发；协议以 attach 成功响应为准，不通过设备能力字段重复声明。
+
+| 新建会话组合                                           | 协议 |
+| ------------------------------------------------------ | ---- |
+| Wework、Backend、Executor 均为新版，且 Backend 开启 v2 | v2   |
+| 任一端为旧版，或 Backend 关闭 v2                       | v1   |
+
+- attach 请求或成功响应缺少 `protocol_version` 代表 v1；v2 请求必须带合法 `consumer_id` 和非负 `last_acked_sequence`。首次 attach 固定会话协议，重连不能自动切换版本。
+- v2 在 `xterm.write` callback 后累计 ACK，Executor 据此释放有界回放；旧 consumer 的 ACK 和控制请求不能影响新 consumer。
+- v1 不带 consumer/sequence，也不发送消费 ACK；新版 Executor 在 Backend 确认接收后释放 v1 回放，不保证断线无损补发、去重或端到端背压。新版 Wework 队列超限会明确报错并关闭终端。
+- Backend 重启后的重新 attach 不等于 Executor 重启恢复；PTY 和回放只在 Executor 内存中，Executor 重启会丢失它们。
+
+多副本发布与回滚：
+
+1. 保存 Backend、Executor、Wework 的可回滚产物。新 Backend 显式设置 `TERMINAL_PROTOCOL_V2_ENABLED=false`，再滚动替换所有副本；该开关默认 **true**，不能直接用默认配置混合发布。
+2. 全部 Backend 支持双协议后，排空受影响设备的活跃终端，再分批升级 Executor。
+3. 完成[终端压测与兼容验收](wework-performance-diagnostics.md#云端终端压测与验收)，再为全部 Backend 开启 v2，并灰度发布 Wework。开关只影响新会话协商，旧端继续使用 v1。
+4. 回滚先关闭 v2 新会话协商、排空已有 v2 终端，再降级 Executor/Backend；关闭开关不能把已有 v2 会话透明降为 v1，必要时重新创建终端。
+
+Redis key、session JSON 不变，无 SQL migration，无需扫描或清空 Redis。旧 Backend 不发布缓存失效事件；混合发布窗口的授权重校验最长 5 秒，不保证旧副本撤销立即传播。
+
+维护入口（仓库相对路径）：
+
+- 握手与转发：`backend/app/services/device/terminal_protocol.py`、`backend/app/api/ws/terminal_namespace.py`、`backend/app/api/ws/device_namespace.py`。
+- 路由与授权：`backend/app/services/device/terminal_session_service.py`。
+- PTY、回放与流控：`executor/src/local/pty.rs`、`executor/src/local/session/terminal.rs`、`executor/src/local/backend/{handlers,terminal_relay}.rs`。
+- 显示与消费 ACK：`wework/src/components/layout/workspace-panels/RemoteTerminal.tsx`、`wework/src/lib/remote-terminal-socket.ts`。
+
+### 开源源码参考
+
+以下固定 commit 仅作为机制参考，不代表复制实现或这些项目采用同一套完整协议；v1/v2 兼容是 Wegent 自身的适配。
+
+- VS Code：[输出微批](https://github.com/microsoft/vscode/blob/85ce8ef0824ac5afb363e3fa3483ada007791785/src/vs/platform/terminal/common/terminalDataBuffering.ts)、[PTY 水位](https://github.com/microsoft/vscode/blob/85ce8ef0824ac5afb363e3fa3483ada007791785/src/vs/platform/terminal/node/terminalProcess.ts)、[终端写入与确认](https://github.com/microsoft/vscode/blob/85ce8ef0824ac5afb363e3fa3483ada007791785/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts)。
+- xterm.js：[写入 callback 边界](https://github.com/xtermjs/xterm.js/blob/c58ea3637f3968e0e6e79cd92cf9aace7ef89ee2/src/common/input/WriteBuffer.ts)、[流控指南](https://xtermjs.org/docs/guides/flowcontrol/)。
+- ttyd：[PTY 事件驱动](https://github.com/tsl0922/ttyd/blob/2922cb89f518bae4d0fcf4d757a7419638fc71fc/src/pty.c)、[pause/resume 协议](https://github.com/tsl0922/ttyd/blob/2922cb89f518bae4d0fcf4d757a7419638fc71fc/src/protocol.c)。
+- Coder：[重连会话](https://github.com/coder/coder/blob/80de54591580c888e750e5f6847e8327ba23a50b/agent/reconnectingpty/server.go)、[有界缓冲](https://github.com/coder/coder/blob/80de54591580c888e750e5f6847e8327ba23a50b/agent/reconnectingpty/buffered.go)、[代理](https://github.com/coder/coder/blob/80de54591580c888e750e5f6847e8327ba23a50b/coderd/workspaceapps/proxy.go)与[鉴权](https://github.com/coder/coder/blob/80de54591580c888e750e5f6847e8327ba23a50b/coderd/workspaceapps/token.go)。
+- ShellHub：[控制连接与数据转发](https://github.com/shellhub-io/shellhub/blob/ef2e2056e0ae4e575b60b79d5fde0365799b2a1c/pkg/revdial/revdial.go)。
+
+## 本机 executor 生命周期
+
+打包 release 版 Wework 必须和本机 executor 保持一对一活跃配套。release app 启动时只允许一个活跃 Wework 实例；重复启动会聚焦已有窗口。app 直接启动并管理 executor 子进程，通过 stdin/stdout JSONL 通道通信，不使用共享 socket、TCP 地址文件或进程发现。
+
+debug 构建不启用单实例策略。开发时可以同时启动多个 Wework debug 实例；每个实例只持有自己子进程的 stdio，不存在端点覆盖或误连其他 executor 的情况。不同实例是否共享持久化任务目录仍由 Executor Home 隔离配置决定，与 IPC 通道无关。
+
+关闭到托盘只销毁当前 WebView，Wework 主进程、executor 和 Codex app-server 继续运行。窗口重建后，`runtime.tasks.transcript` 返回的 `running` 字段用于恢复任务运行态；该字段只以 executor 进程内的活动任务或 Codex app-server 的实时线程状态为依据，不能从历史 transcript 中残留的 `streaming` 消息推断。完整退出或异常退出后，新 executor 不保留旧进程的活动状态，因此旧消息不会把已经中断的任务重新标记为运行中。
+
+## 本机 CLI 入口
+
+macOS 桌面版 Wework 启动时会安装用户级 `wework` launcher 到 `~/.local/bin/wework`。该文件由 Wework 生成和维护，不是指向构建产物或 app resource 的符号链接，因此 debug target 清理、release app 更新或 bundle 路径变化后不会形成断链。若该路径已经存在且不是 Wework 管理的 launcher，Wework 不会覆盖它，而是写入明确的日志告警。
+
+用户可以在终端执行：
+
+```bash
+wework
+wework .
+wework /path/to/project
+wework desktop instances
+wework desktop inspect --project .
+```
+
+`wework` 和 `wework .` 会把当前目录解析为绝对路径，并请求 Wework 打开该目录作为本机 workspace。release 构建通过 macOS app single-instance 机制把请求转发给已有窗口；debug 构建仍允许多实例，CLI 会启动当前 debug executable 并携带 `--open-workspace <path>` 参数。
+
+`desktop` 是同一个 `wework` CLI 的实例控制子命令，不会再安装或注入另一个同名命令。
+Wework 管理的 Agent 环境和 macOS 用户级入口使用同一套分发规则，因此
+`wework <目录>` 始终打开 workspace，而 `wework desktop ...` 始终操作已运行实例。
+
+## 模型身份与执行传输
+
+任务输入框始终显示模型选择框，包括首次加载、目录刷新失败、没有可用模型、
+云端模型下线或本地配置删除后的任务恢复。模型不可用时禁止发送，但仍可打开
+选择框、添加本地模型或连接云端；手动选择可用模型后，可在原任务继续追问。
+不得把发送所需的模型就绪条件用于隐藏选择框，也不得擅自替换任务原有模型。
+桌面和紧凑输入布局遵循相同规则。`task-model-deletion` 桌面 E2E 检查点覆盖
+本地配置删除后重新进入任务、云端模型删除后冷启动，以及更换模型继续原会话。
+
+模型在 UI、任务状态和执行请求中始终使用同一份规范身份：`name`、`type`、`namespace` 和 `resourceUserId`。前端不得为了区分本机与远程执行而添加 `local:`、`cloud:` 前缀，也不得在模型配置中保存额外的 transport source。模型目录合并时，如果 Backend 合成的 runtime Codex 模型与 Executor 实时目录具有相同 `modelId`，保留 Executor 实时模型。
+
+模型选择器的本地目录和云端目录互相独立。本地目录依赖本机 Executor 状态和桌面偏好，这些前置条件失败时只能降级为“仅本地自定义模型”，不得让整个列表失败，也不得阻止云端目录加载；云端目录必须在同一个 `listModels` 调用里独立发起。内容无法解析的桌面偏好文件会先隔离为 `app-preferences.json.corrupt-<时间戳>`，然后按默认值继续；读权限、文件占用之类的操作性错误不会被隔离，仍按错误上报。因此一个坏文件只会丢掉被隔离的偏好，不会让用户永久看不到任何模型。
+
+目标设备只决定传输方式：本机设备通过 IPC 调用 Executor，远程设备通过 WebSocket relay 调用 Executor。两条路径都使用相同的 `runtime.tasks.*` 协议和模型选择。公共、个人和组模型的资源身份会随请求传给 Executor，由同一个模型网关解析。用户配置的本地模型使用 `local-model:<config-id>`；选择云端或远程设备时，Wework 会在发送前按需同步该模型的 Codex 能力目录，并把任务所需的模型连接配置直接交给目标 Executor。
+
+本机 Codex 模型目录只跟随当前 Codex 配置中的 active provider。executor 通过 Codex app-server 读取一次 `config/read` 获取当前 `model_provider` 和展示名，再调用一次 `model/list` 获取该 provider 对应的模型列表。即使 `config.toml` 中配置了多个 `[model_providers.*]`，Wework 也不把它们枚举成多个并列模型组，因为 Codex 的 `model/list` 不提供按 provider 查询的稳定协议。需要在 Wework 中展示多个模型接口时，应使用下方的本地模型配置。
+
+## 本地模型配置
+
+本地模型配置（包括 API Key）仅存储在 Wework 的浏览器本机存储中，不作为 Model CRD 写入 Backend，也不会成为账号级持久化配置或参与云端同步。Wework 运行时不访问桌面系统凭据库；如果旧版本只把某个 API Key 保存在系统凭据库中，升级后需要在“设置 → 模型”中重新填写该 API Key。配置字段包括：
+
+- 显示名。
+- 模型 ID。
+- 上游接口格式：OpenAI Responses、OpenAI Chat Completions 或 Anthropic Messages。
+- 模型基础 URL 和请求路径。默认路径随接口格式分别为 `/responses`、`/chat/completions` 和 `/v1/messages`，特殊服务商可使用自己的路径。
+- 工具模式：`custom`、`function` 或 `shell`。原生支持 Responses custom tools 的模型使用 `custom`；Chat/Anthropic 转换使用 `function`；会拒绝 freeform custom tools 的原生 Responses 模型使用 `shell`。
+- 可选 API Key。
+- 可选上下文窗口大小。
+- 启用状态和更新时间。
+
+API Key 留空时，本地 runtime 会向 Codex provider 配置传入 `dummy` bearer token，用于支持无鉴权的本地 OpenAI-compatible 服务。本地模型配置和内置本机 Codex 模型都会以 `UnifiedModel(type: "runtime")` 进入现有模型选择器。
+
+“测试连接”会强制模型调用一个确定性的能力探针工具，只有模型返回对应 tool call 才通过；普通文本回复不能证明模型具备 Agent 工具能力。`custom` Responses 模式使用 Codex 的 `apply_patch` custom tool 名称和 grammar 完成探针，`function` 模式使用普通函数探针。OpenAI Responses 探针使用 `stream: true` 并从 SSE 事件读取工具调用，与 Codex 实际执行路径一致，也能兼容非流式响应中 `output` 为空的提供方。执行任务时，executor 会为该自定义模型生成显式 Codex model catalog：`custom` 和 `function` 模式发布 `apply_patch`，`shell` 模式仅发布 shell 编辑工具。
+
+DeepSeek V4-Flash 和 V4-Pro 是内置 provider profile：上游地址为 `https://api.deepseek.com/responses`，模型目录 ID 分别为 `wework-deepseek-v4-flash` 和 `wework-deepseek-v4-pro`，上下文窗口均为 1,048,576 tokens，推理等级支持 `low`、`high`、`max` 且默认使用 `high`。模型目录开启并行工具、multi-agent v2 和 Web Search，只声明文本输入，不声明图片生成。Wework 从 DeepSeek `/models` 发现模型后只保留当前 Codex profile 支持的 `deepseek-v4-flash` 和 `deepseek-v4-pro`；旧版由该 profile 管理的 Chat Completions 配置会在读取时迁移到 Responses API、`custom` 工具模式和实时搜索。
+
+在云端或远程设备中首次选择本地模型，或者本地模型配置发生变化后再次使用时，Wework 会在真正创建或继续任务之前显示确认框。用户确认后，Wework 将当前本地自定义模型目录写入目标 Executor，使用 `ifIdle` 语义重启该设备维护的 persistent Codex app-server，并通过 `model/list` 校验目标模型已经加载；校验成功后才继续发送当前消息。同一设备和同一配置版本在当前 Wework 会话内只需要确认一次。
+
+如果目标 Codex 存在运行中任务或待处理请求，Wework 不会强制重启，也不会清空当前输入，而是提示用户等待任务结束后重试。用户取消确认时同样不会创建乐观任务或发送消息。模型 API Key 和连接地址只随已确认的执行请求及目录准备操作发送到所选目标 Executor，不会写入 Backend 模型资源。
+
+上下文窗口大小只接受正整数。前端保存后会进入本地模型的 `config.model_context_window`，本地 IPC 创建 Codex 任务时继续写入 `model_config.model_context_window`，executor 再转为 Codex 启动配置中的 `model_context_window` 覆盖项。Wework 的背景信息窗口也必须使用当前任务自己的 `modelSelection` 解析对应模型配置，避免 Codex 对未知模型使用默认模型目录上限时把用户配置的窗口显示成默认值。
+
+新建 runtime task 时，模型选择必须作为任务状态的一部分写入 `runtimeHandle.modelSelection`，并同时保存在 optimistic task summary 中。`runtime.tasks.create` 响应也要返回同一个 runtime handle。这样在任务列表刷新尚未带回新任务、但流式上下文统计已经到达时，前端仍然能从当前任务地址读取确定的模型选择，而不是从全局“当前选中模型”推断。
+
+## 代理配置边界
+
+“代理”页面分别管理本地设备代理和云端设备代理，二者不能互相复用：
+
+- 本地设备代理存储在 Wework 本机浏览器存储中，只影响当前 Wework App 通过本机 executor 创建的新 Codex 任务。它不会写入 Backend，不会同步到云端设备，也不会修改系统代理或用户 shell 环境。
+- 云端设备代理存储在云端账号配置中，只影响云端 executor 上的 Codex 任务。本地设备不会使用该地址。
+
+本地设备代理保存后不会立即中断正在运行的 Codex 任务。界面会提示用户手动重启 Codex；用户确认后，Wework 只重启当前 App 本机 executor 内维护的 persistent Codex app-server，不会终止机器上其他 Codex 进程。新 Codex app-server 启动时会获得代理相关环境变量，后续新对话会使用该代理。
+
+本地代理配置显式区分三种模式：`system` 跟随系统代理，`direct` 强制直连，`custom` 使用 Wework 保存的代理 URL。旧版已保存 URL 的配置读取为 `custom`，未配置的设备读取为 `system`。`direct` 模式不会调用 Electron 的系统代理解析器，并向 Codex 运行时传入空代理。
+
+`system` 模式会通过 Electron 按实际目标 URL 解析系统代理（包括 PAC），不缓存全局代理地址。例如，PAC 可要求 ChatGPT 走代理、Wegent 内网模型网关直连；不能把 ChatGPT 的解析结果复用到内网请求。创建任务、续聊和切换模型时重新解析。设置页分别展示已保存的模式和实际连接结果；当系统没有为当前地址使用代理时，显示“直连（系统未使用代理）”。云端执行请求不使用本机的 PAC。
+
+Codex Responses 兼容模型可能通过 executor 内置的 `codex responses proxy` 转发到上游模型服务。云端模型网关、本地自定义模型及独立 harness 都根据各自的请求地址选择代理；Codex `config.toml` 自定义 provider 的地址通过 `config/read` 读取。视觉辅助模型独立解析自己的目标地址，明确的 `DIRECT` 不得继承主模型代理。Codex 官方账号连接仍在启动时按 ChatGPT 地址配置进程代理，因此更改它的代理后仍需要重启 Codex。日志不输出代理凭据。
+
+## 本机认证状态
+
+本机 Codex `auth.json` 状态通过 executor 的只读 `runtime_auth_status` 命令读取。命令只返回：
+
+- 是否存在。
+- 目标路径。
+- 更新时间。
+- 文件大小。
+- SHA-256 摘要。
+
+它不会返回明文内容。Wework 也不会默认上传本机认证文件。只有用户在已连接云端的“模型”页面显式上传或从在线设备导入后，认证内容才进入服务端加密存储和设备同步流程。
+
+Wework 的 Codex 剩余额度展示以本机 Codex 账号为准。Electron 主进程通过受认证的本地 executor IPC 调用 `runtime.codex.rate_limits.read`，读取 Codex app-server 的 `account/rateLimits/read` 快照，并展示 5 小时和 7 天窗口的剩余百分比。主进程还通过 `runtime.tasks.list` 统计运行中的本地任务，并通过 `executor.backend.quota` 使用 executor 已持有的云端连接读取云端额度；认证令牌不会暴露给主进程。系统托盘每 60 秒刷新一次，并在任务开始或结束时立即刷新，因此主窗口关闭到托盘后仍能持续更新任务数和额度。
+
+macOS 托盘需要同时显示 Logo、运行状态和最多两行额度文字。Electron 主进程应直接合成 RGBA template 位图，再交给原生托盘显示；不要依赖 `nativeImage` 对 SVG 文本或 Data URL 的栅格化，因为该路径可能只保留文字宽度而丢失实际字形像素。
+
+## 断开连接
+
+断开云端连接只清除云端连接存储，不影响：
+
+- 本地会话。
+- 已打开的本地工作区。
+- 本机 Codex 模型。
+- 本地模型配置。
+- 本机 executor。
+
+断开后，云设备、服务端模型、代理和云端认证同步回到不可用或连接入口状态。

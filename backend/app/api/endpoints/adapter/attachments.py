@@ -1,0 +1,1239 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Attachment API endpoints for file upload and management.
+
+Uses the unified context service for managing attachments as subtask contexts.
+"""
+
+import asyncio
+import logging
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+from urllib.parse import quote
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import RedirectResponse, StreamingResponse
+from jose import JWTError, jwt
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from app.api.dependencies import get_db
+from app.core import security
+from app.core.config import settings
+from app.db.session import SessionLocal
+from app.models.subtask_context import ContextType
+from app.models.task import TaskResource
+from app.models.user import User
+from app.schemas.subtask_context import (
+    AttachmentDetailResponse,
+    AttachmentPreviewResponse,
+    AttachmentResponse,
+    TruncationInfo,
+)
+from app.services.attachment.external_storage import (
+    ExternalAttachmentPlayback,
+    resolve_external_attachment_playback,
+)
+from app.services.attachment.parser import DocumentParseError, DocumentParser
+from app.services.attachment.public_link import (
+    InvalidPublicAttachmentToken,
+    generate_public_attachment_token,
+    verify_public_attachment_token,
+)
+from app.services.auth.task_token import extract_token_from_header, verify_task_token
+from app.services.context import context_service
+from app.services.context.context_service import NotFoundException
+from app.services.knowledge.attachment_download_policy import (
+    AttachmentAccessPurpose,
+    require_attachment_download_allowed,
+)
+from app.services.knowledge.document_download_policy import (
+    DocumentDownloadDisabledError,
+)
+from app.services.shared_task import shared_task_service
+from app.services.web_scraper.security import (
+    WebScraperSecurityError,
+    WebScraperUrlGuard,
+)
+from app.stores.tasks import subtask_store, task_store
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_subtask_id_from_task_token(authorization: str) -> int:
+    """Extract subtask_id from task token in Authorization header.
+
+    Returns subtask_id if the token is a valid task token, 0 otherwise.
+    """
+    if not authorization:
+        return 0
+    token = extract_token_from_header(authorization)
+    if not token:
+        return 0
+    token_info = verify_task_token(token)
+    if token_info and token_info.subtask_id > 0:
+        return token_info.subtask_id
+    return 0
+
+
+router = APIRouter()
+
+ATTACHMENT_PREVIEW_TEXT_LIMIT = 4000
+REMOTE_MEDIA_TIMEOUT = 120.0
+REMOTE_MEDIA_CHUNK_SIZE = 1024 * 1024
+ATTACHMENT_STREAM_CHUNK_SIZE = 1024 * 1024
+DOWNLOAD_TOKEN_EXPIRE_SECONDS = 300
+DOWNLOAD_TOKEN_SCOPE = "attachment_download"
+
+
+@dataclass(frozen=True)
+class AttachmentDownloadToken:
+    """The authenticated user and signed purpose of a browser file token."""
+
+    user: User
+    purpose: AttachmentAccessPurpose
+
+
+def _build_content_disposition(filename: str, disposition: str = "attachment") -> str:
+    """
+    Build Content-Disposition header value with proper filename encoding.
+
+    For ASCII filenames, use: filename="name.ext"
+    For non-ASCII filenames, use: filename*=UTF-8''encoded_name
+
+    This ensures compatibility with both old and new browsers.
+    """
+    try:
+        filename.encode("latin-1")
+    except UnicodeEncodeError:
+        # Non-ASCII filename: use RFC 5987 encoding
+        encoded = quote(filename)
+        return f"{disposition}; filename*=UTF-8''{encoded}"
+
+    # ASCII filename: use simple quoted string
+    escaped = filename.replace("\\", "\\\\").replace('"', '\\"')
+    return f'{disposition}; filename="{escaped}"'
+
+
+async def _stream_remote_media(
+    url: str,
+    filename: str,
+    default_media_type: str,
+    range_header: Optional[str] = None,
+    disposition: str = "attachment",
+) -> StreamingResponse:
+    """Proxy remote media without buffering the complete file in memory."""
+    import httpx
+
+    try:
+        WebScraperUrlGuard().validate_initial_url(url)
+    except WebScraperSecurityError as exc:
+        raise HTTPException(status_code=502, detail="Invalid remote media URL") from exc
+
+    client = httpx.AsyncClient(timeout=REMOTE_MEDIA_TIMEOUT)
+    request_headers = {"Range": range_header} if range_header else {}
+    stream_context = client.stream("GET", url, headers=request_headers)
+    try:
+        response = await stream_context.__aenter__()
+        response.raise_for_status()
+    except Exception as exc:
+        with suppress(Exception):
+            await stream_context.__aexit__(type(exc), exc, exc.__traceback__)
+        await client.aclose()
+        raise
+
+    async def iter_bytes():
+        try:
+            async for chunk in response.aiter_bytes(chunk_size=REMOTE_MEDIA_CHUNK_SIZE):
+                if chunk:
+                    yield chunk
+        finally:
+            await stream_context.__aexit__(None, None, None)
+            await client.aclose()
+
+    headers = {
+        "Content-Disposition": _build_content_disposition(filename, disposition),
+        "Referrer-Policy": "no-referrer",
+        "X-Accel-Buffering": "no",
+    }
+    for source_header, target_header in (
+        ("content-length", "Content-Length"),
+        ("content-range", "Content-Range"),
+        ("accept-ranges", "Accept-Ranges"),
+    ):
+        value = response.headers.get(source_header)
+        if value:
+            headers[target_header] = value
+    headers.setdefault("Accept-Ranges", "bytes")
+
+    return StreamingResponse(
+        iter_bytes(),
+        media_type=response.headers.get("content-type", default_media_type),
+        headers=headers,
+        status_code=response.status_code,
+    )
+
+
+async def _stream_external_attachment(
+    context,
+    *,
+    range_header: Optional[str] = None,
+    disposition: str = "attachment",
+) -> Optional[StreamingResponse]:
+    """Resolve and stream externally stored media when an adapter handles it."""
+    playback = await _resolve_attachment_playback(context)
+    if playback is None:
+        return None
+    return await _stream_remote_media(
+        playback.url,
+        context.original_filename,
+        default_media_type=playback.media_type,
+        range_header=range_header,
+        disposition=disposition,
+    )
+
+
+def _load_stored_attachment_binary_data(attachment_id: int) -> Optional[bytes]:
+    """Load attachment bytes with a session owned by the current worker thread."""
+    with SessionLocal() as db:
+        context = context_service.get_context_optional(
+            db=db,
+            context_id=attachment_id,
+        )
+        if context is None:
+            return None
+        return context_service.get_attachment_binary_data(db=db, context=context)
+
+
+async def _stream_stored_attachment(
+    context, *, disposition: str = "attachment"
+) -> StreamingResponse:
+    """Read blocking storage off the event loop and stream bounded chunks."""
+    attachment_id = context.id
+    filename = context.original_filename
+    media_type = context.mime_type or "application/octet-stream"
+    storage_backend = context.storage_backend
+    storage_key = context.storage_key
+
+    try:
+        binary_data = await asyncio.to_thread(
+            _load_stored_attachment_binary_data,
+            attachment_id,
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to retrieve binary data for attachment %s",
+            attachment_id,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve attachment data",
+        ) from exc
+
+    if binary_data is None:
+        logger.error(
+            "Failed to retrieve binary data for attachment %s, "
+            "storage_backend=%s, storage_key=%s",
+            attachment_id,
+            storage_backend,
+            storage_key,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve attachment data",
+        )
+
+    async def iter_bytes():
+        for offset in range(0, len(binary_data), ATTACHMENT_STREAM_CHUNK_SIZE):
+            yield binary_data[offset : offset + ATTACHMENT_STREAM_CHUNK_SIZE]
+            await asyncio.sleep(0)
+
+    return StreamingResponse(
+        iter_bytes(),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": _build_content_disposition(filename, disposition),
+            "Content-Length": str(len(binary_data)),
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _resolve_attachment_playback(
+    context,
+) -> Optional[ExternalAttachmentPlayback]:
+    """Resolve fresh playback metadata through a registered storage adapter."""
+    type_data = context.type_data if isinstance(context.type_data, dict) else {}
+    try:
+        return await asyncio.to_thread(
+            resolve_external_attachment_playback,
+            type_data=type_data,
+            user_id=context.user_id,
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to resolve external attachment playback: attachment_id=%s",
+            context.id,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="External media playback URL is unavailable",
+        ) from exc
+
+
+def _create_download_token(
+    attachment_id: int,
+    user: User,
+    purpose: AttachmentAccessPurpose = "download",
+) -> str:
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=DOWNLOAD_TOKEN_EXPIRE_SECONDS
+    )
+    return jwt.encode(
+        {
+            "scope": DOWNLOAD_TOKEN_SCOPE,
+            "attachment_id": attachment_id,
+            "user_id": user.id,
+            "sub": user.user_name,
+            "purpose": purpose,
+            "exp": expires_at,
+        },
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
+
+
+def _resolve_user_from_download_token(
+    db: Session,
+    attachment_id: int,
+    download_token: str,
+) -> AttachmentDownloadToken:
+    try:
+        payload = jwt.decode(
+            download_token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+        )
+    except JWTError as exc:
+        logger.warning(
+            "Invalid attachment download token: attachment_id=%s reason=%s",
+            attachment_id,
+            exc.__class__.__name__,
+        )
+        raise HTTPException(status_code=401, detail="Invalid download token")
+
+    purpose = payload.get("purpose", "download")
+    if (
+        payload.get("scope") != DOWNLOAD_TOKEN_SCOPE
+        or payload.get("attachment_id") != attachment_id
+        or purpose not in {"download", "playback"}
+    ):
+        raise HTTPException(status_code=401, detail="Invalid download token")
+
+    user = (
+        db.query(User)
+        .filter(
+            User.id == payload.get("user_id"),
+            User.user_name == payload.get("sub"),
+            User.is_active == True,
+        )
+        .first()
+    )
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid download token")
+    return AttachmentDownloadToken(user=user, purpose=purpose)
+
+
+def _require_attachment_download_allowed(
+    db: Session,
+    context,
+    purpose: AttachmentAccessPurpose,
+) -> None:
+    """Reject protected KB originals while leaving non-KB attachments unchanged."""
+    try:
+        require_attachment_download_allowed(
+            db,
+            attachment_id=context.id,
+            mime_type=getattr(context, "mime_type", None),
+            purpose=purpose,
+        )
+    except DocumentDownloadDisabledError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+
+
+def _check_knowledge_base_access(
+    db: Session, attachment_id: int, user_id: int
+) -> bool | None:
+    """Check if a user has access to a knowledge base that contains this attachment.
+
+    This is used for attachments that are part of knowledge base documents
+    (subtask_id=0) rather than task attachments.
+
+    Args:
+        db: Database session
+        attachment_id: The attachment ID to check
+        user_id: User ID to check access for
+
+    Returns:
+        - True: if kb_doc exists and user has access to the knowledge base
+        - False: if kb_doc exists but user is denied access (hard deny)
+        - None: if no kb_doc found (not a KB attachment, should try other checks)
+    """
+    from app.models.knowledge import KnowledgeDocument
+    from app.services.knowledge import KnowledgeService
+
+    # Find knowledge base documents that reference this attachment
+    kb_doc = (
+        db.query(KnowledgeDocument)
+        .filter(
+            KnowledgeDocument.attachment_id == attachment_id,
+        )
+        .first()
+    )
+
+    if kb_doc:
+        # Check if user has access to this knowledge base
+        _, has_access = KnowledgeService.get_knowledge_base(
+            db=db,
+            knowledge_base_id=kb_doc.kind_id,
+            user_id=user_id,
+        )
+        return has_access
+
+    return None
+
+
+def _ensure_attachment_access(db: Session, context, current_user: User) -> None:
+    """Ensure current user has access to the attachment context."""
+    # Check access permission:
+    # 1. User is the uploader
+    # 2. User is the task owner (via subtask linkage)
+    # 3. User is a member of the task that contains this attachment
+    # 4. User has access to the knowledge base containing this attachment
+    has_access = context.user_id == current_user.id
+
+    if not has_access:
+        task_id = None
+
+        if context.subtask_id > 0:
+            # Linked attachment: find task via subtask
+            subtask = subtask_store.get_by_id(db, subtask_id=context.subtask_id)
+            if subtask:
+                task_id = subtask.task_id
+        else:
+            # Unlinked attachment (subtask_id=0): check if it's part of a knowledge base
+            # This handles knowledge base document attachments
+            kb_access = _check_knowledge_base_access(db, context.id, current_user.id)
+
+            if kb_access is True:
+                # Attachment is in a knowledge base and user has access
+                has_access = True
+            elif kb_access is False:
+                # Attachment is in a knowledge base but user is DENIED access
+                # This is a hard deny - do NOT fall back to task checks
+                has_access = False
+            else:
+                # kb_access is None: not a KB attachment, try task-based fallback
+                # This handles executor-uploaded files that weren't linked
+                # to a subtask at upload time (legacy data).
+                subtasks = subtask_store.list_by_user(
+                    db,
+                    user_id=context.user_id,
+                    limit=1,
+                )
+                subtask = subtasks[0] if subtasks else None
+                if subtask:
+                    task_id = subtask.task_id
+
+        if task_id:
+            has_access = _check_task_access(db, task_id, current_user.id)
+
+    if not has_access:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+
+def _check_task_access(db: Session, task_id: int, user_id: int) -> bool:
+    """Check if a user has access to a task (as owner or member)."""
+    from app.models.resource_member import MemberStatus, ResourceMember
+    from app.models.share_link import ResourceType
+
+    # Check if user is the task owner
+    task = task_store.get_by_id(db, task_id=task_id)
+    if task and task.kind == "Task" and task.user_id == user_id:
+        return True
+
+    # Check if user is a task member
+    task_member = (
+        db.query(ResourceMember)
+        .filter(
+            ResourceMember.resource_type == ResourceType.TASK,
+            ResourceMember.resource_id == task_id,
+            ResourceMember.entity_type == "user",
+            ResourceMember.entity_id == str(user_id),
+            ResourceMember.status == MemberStatus.APPROVED,
+        )
+        .first()
+    )
+    return task_member is not None
+
+
+def _get_attachment_context(db: Session, attachment_id: int, current_user: User):
+    context = context_service.get_context_optional(
+        db=db,
+        context_id=attachment_id,
+    )
+
+    if context is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    # Verify it's an attachment type
+    if context.context_type != ContextType.ATTACHMENT.value:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    _ensure_attachment_access(db, context, current_user)
+    return context
+
+
+def _build_attachment_response(
+    context,
+    truncation_info: Optional[TruncationInfo],
+) -> AttachmentResponse:
+    response_truncation_info = None
+    if truncation_info and truncation_info.is_truncated:
+        response_truncation_info = TruncationInfo(
+            is_truncated=True,
+            original_length=truncation_info.original_length,
+            truncated_length=truncation_info.truncated_length,
+            truncation_message_key="content_truncated",
+        )
+
+    return AttachmentResponse.from_context(context, response_truncation_info)
+
+
+def _validate_share_token_access(
+    db: Session, attachment_id: int, share_token: str
+) -> bool:
+    """
+    Validate that a share_token has access to a specific attachment.
+
+    This validates that:
+    1. The share_token is valid and decrypts to user_id#task_id
+    2. The attachment belongs to a subtask of the task in the token
+    3. The task owner matches the user_id in the token
+
+    Args:
+        db: Database session
+        attachment_id: The attachment ID to check access for
+        share_token: The encrypted share token
+
+    Returns:
+        True if access is granted, False otherwise
+    """
+    # Decode share token to get task info
+    share_info = shared_task_service.decode_share_token(share_token, db)
+    if not share_info:
+        return False
+
+    # Get the context (attachment)
+    context = context_service.get_context_optional(
+        db=db,
+        context_id=attachment_id,
+    )
+    if context is None:
+        return False
+
+    # Verify it's an attachment type
+    if context.context_type != ContextType.ATTACHMENT.value:
+        return False
+
+    # Get the subtask that this attachment belongs to
+    if context.subtask_id <= 0:
+        # Attachment not linked to a subtask
+        # For unlinked attachments, verify the attachment owner matches the task owner
+        if context.user_id == share_info.user_id:
+            return True
+        else:
+            logger.warning(
+                f"[_validate_share_token_access] Ownership mismatch: context.user_id={context.user_id}, "
+                f"share_info.user_id={share_info.user_id}"
+            )
+            return False
+
+    subtask = subtask_store.get_by_id(db, subtask_id=context.subtask_id)
+    if not subtask:
+        return False
+
+    # Verify the subtask belongs to the task in the token
+    if subtask.task_id != share_info.task_id:
+        return False
+
+    # Verify the task owner matches the user_id in the token
+    task = task_store.get_owned_task_by_state(
+        db,
+        task_id=share_info.task_id,
+        user_id=share_info.user_id,
+        state=TaskResource.STATE_ACTIVE,
+    )
+    if not task:
+        return False
+
+    return True
+
+
+@router.post("/upload", response_model=AttachmentResponse)
+async def upload_attachment(
+    file: UploadFile = File(...),
+    overwrite_attachment_id: Optional[int] = None,
+    storage_purpose: str = "default",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user_jwt_apikey_tasktoken),
+    authorization: str = Header(default=""),
+):
+    """
+    Upload a document file for chat attachment.
+
+    Supported file types:
+    - PDF (.pdf)
+    - Word (.doc, .docx)
+    - PowerPoint (.ppt, .pptx)
+    - Excel (.xls, .xlsx, .csv)
+    - XMind (.xmind)
+    - Plain text (.txt)
+    - Markdown (.md)
+    - Images (.jpg, .jpeg, .png, .gif, .bmp, .webp)
+
+    Limits:
+    - Maximum file size: 100 MB
+    - Maximum extracted text: 1,500,000 characters (auto-truncated if exceeded)
+
+    Returns:
+        Attachment details including ID, processing status, and truncation info
+
+    Optional:
+        overwrite_attachment_id: Existing attachment ID to overwrite in-place
+    """
+    # Extract subtask_id from task token (for executor-uploaded attachments)
+    subtask_id = _extract_subtask_id_from_task_token(authorization)
+
+    logger.info(
+        f"[attachments.py] upload_attachment: user_id={current_user.id}, "
+        f"filename={file.filename}, subtask_id={subtask_id}, "
+        f"storage_purpose={storage_purpose}"
+    )
+
+    if storage_purpose not in {"default", "video_reference"}:
+        raise HTTPException(status_code=400, detail="Invalid storage_purpose")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
+
+    # Read file content
+    try:
+        binary_data = await file.read()
+    except Exception as e:
+        logger.error(f"Error reading uploaded file: {e}")
+        raise HTTPException(
+            status_code=400, detail="Failed to read uploaded file"
+        ) from e
+
+    # Validate file size before processing
+    if not DocumentParser.validate_file_size(len(binary_data)):
+        max_size_mb = DocumentParser.get_max_file_size() / (1024 * 1024)
+        raise HTTPException(
+            status_code=400,
+            detail=f"File size exceeds maximum limit ({max_size_mb} MB)",
+        )
+
+    try:
+        if overwrite_attachment_id is not None:
+            if overwrite_attachment_id <= 0:
+                raise HTTPException(
+                    status_code=400, detail="overwrite_attachment_id must be positive"
+                )
+            context, truncation_info = context_service.overwrite_attachment(
+                db=db,
+                context_id=overwrite_attachment_id,
+                user_id=current_user.id,
+                filename=file.filename,
+                binary_data=binary_data,
+            )
+        else:
+            context, truncation_info = context_service.upload_attachment(
+                db=db,
+                user_id=current_user.id,
+                filename=file.filename,
+                binary_data=binary_data,
+                subtask_id=subtask_id,
+                storage_purpose=storage_purpose,
+            )
+
+        return _build_attachment_response(context, truncation_info)
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except NotFoundException as e:
+        raise HTTPException(status_code=404, detail="Attachment not found") from e
+    except DocumentParseError as e:
+        # Return error with error_code for i18n mapping
+        error_code = getattr(e, "error_code", None)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": str(e),
+                "error_code": error_code,
+            },
+        ) from e
+    except Exception as e:
+        logger.error(f"Error uploading attachment: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="Failed to upload attachment"
+        ) from e
+
+
+class AttachmentPlaybackResponse(BaseModel):
+    """Fresh browser playback information for a media attachment."""
+
+    playback_url: str
+    cover_url: Optional[str] = None
+
+
+@router.get("/{attachment_id}", response_model=AttachmentDetailResponse)
+async def get_attachment(
+    attachment_id: int,
+    share_token: Optional[str] = Query(
+        None, description="Share token for public access"
+    ),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(security.get_current_user_optional),
+):
+    """
+    Get attachment details by ID.
+
+    Supports two authentication methods:
+    1. JWT token (for logged-in users)
+    2. Share token (for public shared task viewers)
+
+    Returns:
+        Attachment details including status and metadata
+    """
+
+    context = None
+
+    # Method 1: Share token authentication (no login required)
+    if share_token:
+        has_access = _validate_share_token_access(db, attachment_id, share_token)
+        if has_access:
+            # Get context for share token access
+            context = context_service.get_context_optional(
+                db=db,
+                context_id=attachment_id,
+            )
+            if context is None:
+                raise HTTPException(status_code=404, detail="Attachment not found")
+        else:
+            raise HTTPException(status_code=403, detail="Share token access denied")
+    # Method 2: JWT token authentication (existing logic)
+    elif current_user:
+        context = _get_attachment_context(db, attachment_id, current_user)
+    else:
+        # No authentication provided
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    return AttachmentDetailResponse.from_context(context)
+
+
+def _attachment_cover_url(context) -> Optional[str]:
+    """Return a persisted cover URL when the attachment already has one."""
+    type_data = context.type_data if isinstance(context.type_data, dict) else {}
+    video_metadata = type_data.get("video_metadata")
+    if isinstance(video_metadata, dict) and video_metadata.get("cover_url"):
+        return str(video_metadata["cover_url"])
+    cover_url = type_data.get("cover_url")
+    return str(cover_url) if cover_url else None
+
+
+@router.get(
+    "/{attachment_id}/playback",
+    response_model=AttachmentPlaybackResponse,
+)
+async def get_attachment_playback(
+    attachment_id: int,
+    share_token: Optional[str] = Query(
+        None, description="Share token for public access"
+    ),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(security.get_current_user_optional),
+) -> AttachmentPlaybackResponse:
+    """Return a fresh direct or proxied URL for browser media playback."""
+    if share_token:
+        if not _validate_share_token_access(db, attachment_id, share_token):
+            raise HTTPException(status_code=403, detail="Share token access denied")
+        context = context_service.get_context_optional(
+            db=db,
+            context_id=attachment_id,
+        )
+        if context is None:
+            raise HTTPException(status_code=404, detail="Attachment not found")
+    elif current_user:
+        context = _get_attachment_context(db, attachment_id, current_user)
+    else:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    _require_attachment_download_allowed(db, context, "playback")
+
+    external_playback = await _resolve_attachment_playback(context)
+    if external_playback and external_playback.delivery_mode == "direct":
+        return AttachmentPlaybackResponse(
+            playback_url=external_playback.url,
+            cover_url=external_playback.cover_url or _attachment_cover_url(context),
+        )
+
+    proxy_url = context_service.build_attachment_url(attachment_id)
+    if share_token:
+        proxy_url = f"{proxy_url}?share_token={quote(share_token, safe='')}"
+    else:
+        proxy_url = (
+            f"{proxy_url}?download_token="
+            f"{quote(_create_download_token(attachment_id, current_user, 'playback'), safe='')}"
+        )
+    return AttachmentPlaybackResponse(
+        playback_url=proxy_url,
+        cover_url=(
+            external_playback.cover_url
+            if external_playback and external_playback.cover_url
+            else _attachment_cover_url(context)
+        ),
+    )
+
+
+@router.get("/{attachment_id}/preview", response_model=AttachmentPreviewResponse)
+async def get_attachment_preview(
+    attachment_id: int,
+    share_token: Optional[str] = Query(
+        None, description="Share token for public access"
+    ),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(security.get_current_user_optional),
+):
+    """
+    Get attachment preview content.
+
+    Supports two authentication methods:
+    1. JWT token (for logged-in users)
+    2. Share token (for public shared task viewers)
+
+    Returns:
+        Attachment metadata and preview snippet (if available).
+    """
+    has_access = False
+
+    # Method 1: Share token authentication (no login required)
+    if share_token:
+        has_access = _validate_share_token_access(db, attachment_id, share_token)
+        if has_access:
+            # Get context for share token access
+            context = context_service.get_context_optional(
+                db=db,
+                context_id=attachment_id,
+            )
+            if context is None:
+                raise HTTPException(status_code=404, detail="Attachment not found")
+        else:
+            raise HTTPException(status_code=403, detail="Share token access denied")
+    # Method 2: JWT token authentication (existing logic)
+    elif current_user:
+        context = _get_attachment_context(db, attachment_id, current_user)
+        has_access = True
+    else:
+        # No authentication provided
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    preview_type = "none"
+    preview_text = None
+
+    if context_service.is_image_context(context):
+        preview_type = "image"
+    elif context.extracted_text:
+        preview_type = "text"
+        # Check if it's an HTML file - return full content for HTML to enable proper preview
+        type_data = context.type_data or {}
+        mime_type = type_data.get("mime_type", "")
+        file_extension = type_data.get("file_extension", "").lower().lstrip(".")
+        is_html = mime_type == "text/html" or file_extension in ["html", "htm"]
+
+        if is_html:
+            # Return full HTML content without truncation
+            preview_text = context.extracted_text
+        else:
+            # Truncate non-HTML content for preview
+            preview_text = context.extracted_text[:ATTACHMENT_PREVIEW_TEXT_LIMIT]
+
+    download_url = context_service.build_attachment_url(attachment_id)
+
+    return AttachmentPreviewResponse.from_context(
+        context=context,
+        preview_type=preview_type,
+        preview_text=preview_text,
+        download_url=download_url,
+    )
+
+
+@router.get("/{attachment_id}/download")
+async def download_attachment(
+    attachment_id: int,
+    request: Request,
+    share_token: Optional[str] = Query(
+        None, description="Share token for public access"
+    ),
+    download_token: Optional[str] = Query(
+        None, description="Short-lived token for browser-native download"
+    ),
+    range_header: Optional[str] = Header(None, alias="Range"),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(security.get_current_user_optional),
+):
+    """
+    Download the original file.
+
+    Supports three authentication methods:
+    1. JWT token (for logged-in users)
+    2. Share token (for public shared task viewers)
+    3. Browser redirect (no auth) -> Login page -> Auto download after login
+
+    Returns:
+        File binary data with appropriate content type
+    """
+    has_access = False
+    context = None
+
+    # Method 1: Short-lived token used by browser-native downloads.
+    if download_token:
+        token_context = _resolve_user_from_download_token(
+            db, attachment_id, download_token
+        )
+        current_user = token_context.user
+        context = _get_attachment_context(db, attachment_id, current_user)
+        download_purpose = token_context.purpose
+        has_access = True
+
+    # Method 2: Share token authentication (no login required)
+    elif share_token:
+        has_access = _validate_share_token_access(db, attachment_id, share_token)
+        if has_access:
+            # Get context for share token access
+            context = context_service.get_context_optional(
+                db=db,
+                context_id=attachment_id,
+            )
+            if context is None:
+                raise HTTPException(status_code=404, detail="Attachment not found")
+        download_purpose = "share"
+
+    # Method 3: JWT token authentication (existing logic)
+    elif current_user:
+        context = _get_attachment_context(db, attachment_id, current_user)
+        download_purpose = "download"
+        has_access = True
+
+    # Method 4: No authentication - redirect to login for browser access
+    else:
+        # Check if it's a browser request (accepts HTML)
+        accept_header = request.headers.get("Accept", "")
+        is_browser = "text/html" in accept_header
+
+        if is_browser:
+            # Browser access - redirect to frontend login page
+            from app.core.config import settings
+
+            current_url = str(request.url)
+            login_url = f"{settings.FRONTEND_URL}/login?redirect={quote(current_url)}"
+            return RedirectResponse(url=login_url, status_code=302)
+        else:
+            # API/fetch call - return 401
+            raise HTTPException(status_code=401, detail="Authentication required")
+
+    if not has_access:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    _require_attachment_download_allowed(db, context, download_purpose)
+
+    external_response = await _stream_external_attachment(
+        context,
+        range_header=range_header,
+        disposition="inline" if download_purpose == "playback" else "attachment",
+    )
+    if external_response is not None:
+        return external_response
+
+    # Generated videos are streamed through the backend so the browser receives
+    # attachment headers without the service buffering the complete file.
+    if context.type_data and isinstance(context.type_data, dict):
+        video_metadata = context.type_data.get("video_metadata")
+        if video_metadata and isinstance(video_metadata, dict):
+            video_url = video_metadata.get("video_url")
+            if video_url:
+                logger.info(
+                    "Streaming remote video attachment: attachment_id=%s",
+                    attachment_id,
+                )
+                return await _stream_remote_media(
+                    video_url,
+                    context.original_filename,
+                    default_media_type=context.mime_type or "video/mp4",
+                    range_header=range_header,
+                    disposition=(
+                        "inline" if download_purpose == "playback" else "attachment"
+                    ),
+                )
+
+    return await _stream_stored_attachment(
+        context,
+        disposition="inline" if download_purpose == "playback" else "attachment",
+    )
+
+
+@router.post("/{attachment_id}/download-token")
+async def create_attachment_download_token(
+    attachment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """Create a short-lived token for browser-native attachment downloads."""
+    context = _get_attachment_context(db, attachment_id, current_user)
+    _require_attachment_download_allowed(db, context, "download")
+    return {
+        "download_token": _create_download_token(attachment_id, current_user),
+        "expires_in": DOWNLOAD_TOKEN_EXPIRE_SECONDS,
+    }
+
+
+@router.delete("/{attachment_id}")
+async def delete_attachment(
+    attachment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """
+    Delete an attachment.
+
+    Only attachments that are not linked to a subtask can be deleted.
+
+    Returns:
+        Success message
+    """
+    context = context_service.get_context_optional(
+        db=db,
+        context_id=attachment_id,
+        user_id=current_user.id,
+    )
+
+    if context is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    # Verify it's an attachment type
+    if context.context_type != ContextType.ATTACHMENT.value:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    # subtask_id == 0 means unlinked, > 0 means linked to a subtask
+    if context.subtask_id > 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete attachment that is linked to a message",
+        )
+
+    success = context_service.delete_context(
+        db=db,
+        context_id=attachment_id,
+        user_id=current_user.id,
+    )
+
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete attachment")
+
+    return {"message": "Attachment deleted successfully"}
+
+
+@router.get("/subtask/{subtask_id}", response_model=Optional[AttachmentDetailResponse])
+async def get_attachment_by_subtask(
+    subtask_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """
+    Get attachment by subtask ID.
+
+    Returns:
+        Attachment details or null if no attachment exists
+    """
+    context = context_service.get_attachment_by_subtask(
+        db=db,
+        subtask_id=subtask_id,
+    )
+
+    if context is None:
+        return None
+
+    # Verify access: uploader, task owner, or task member
+    has_access = context.user_id == current_user.id
+    if not has_access:
+        subtask = subtask_store.get_by_id(db, subtask_id=subtask_id)
+        if subtask:
+            has_access = _check_task_access(db, subtask.task_id, current_user.id)
+
+    if not has_access:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    return AttachmentDetailResponse.from_context(context)
+
+
+class PublicShareLinkResponse(BaseModel):
+    """Response for public share link generation."""
+
+    share_url: str
+    expires_at: str
+
+
+def _generate_public_share_token(attachment_id: int, expires_in_days: int = 7) -> str:
+    """Backward-compatible wrapper for public attachment share tokens."""
+    return generate_public_attachment_token(
+        attachment_id,
+        timedelta(days=expires_in_days),
+    )
+
+
+def _verify_public_share_token(token: str) -> dict:
+    """Backward-compatible wrapper for public attachment token verification."""
+    try:
+        return verify_public_attachment_token(token)
+    except InvalidPublicAttachmentToken as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid or expired share link",
+        ) from exc
+
+
+@router.post("/{attachment_id}/public-share", response_model=PublicShareLinkResponse)
+async def create_public_share_link(
+    attachment_id: int,
+    expires_in_days: int = Query(default=7, ge=1, le=3650),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """
+    Generate a public share link for an attachment.
+
+    This link can be shared with anyone who has the signed URL.
+
+    The generated token contains a random nonce to prevent enumeration attacks,
+    making it impossible to guess other valid tokens even if attachment IDs are known.
+
+    Args:
+        attachment_id: ID of the attachment to share
+        expires_in_days: Link expiration time in days (1-3650, default: 7)
+
+    Returns:
+        Public share URL and expiration time
+    """
+    # Get the attachment context
+    context = context_service.get_context_optional(
+        db=db,
+        context_id=attachment_id,
+    )
+
+    if context is None or context.context_type != ContextType.ATTACHMENT.value:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    # Only the attachment owner (uploader) can create public share links
+    if context.user_id != current_user.id:
+        raise HTTPException(
+            status_code=403, detail="Only the attachment owner can create share links"
+        )
+
+    _require_attachment_download_allowed(db, context, "share")
+
+    # Generate public share token
+    token = _generate_public_share_token(attachment_id, expires_in_days)
+
+    # Build share URL
+    from app.core.config import settings
+
+    base_url = settings.FRONTEND_URL.rstrip("/")
+    share_url = f"{base_url}/download/shared?token={token}"
+
+    expires_at = datetime.now(timezone.utc) + timedelta(days=expires_in_days)
+
+    logger.info(
+        f"[PublicShare] User {current_user.id} created public share link "
+        f"for attachment {attachment_id}, expires at {expires_at}"
+    )
+
+    return PublicShareLinkResponse(
+        share_url=share_url, expires_at=expires_at.isoformat()
+    )
+
+
+@router.get("/download/shared")
+async def public_download_attachment(
+    token: str = Query(..., description="Public share token"),
+    range_header: Optional[str] = Header(None, alias="Range"),
+    db: Session = Depends(get_db),
+):
+    """
+    Download an attachment using a public share token.
+
+    Anyone with a valid signed token can download the attachment. The token is
+    scoped to one attachment and expires automatically.
+
+    Args:
+        token: Public share token generated by /{id}/public-share endpoint
+
+    Returns:
+        File binary data with appropriate content type
+    """
+    # Verify the share token
+    try:
+        token_data = _verify_public_share_token(token)
+        attachment_id = token_data["attachment_id"]
+    except HTTPException:
+        raise HTTPException(status_code=403, detail="Invalid or expired share link")
+
+    # Get the attachment (no permission check - token is sufficient)
+    context = context_service.get_context_optional(db=db, context_id=attachment_id)
+
+    if context is None or context.context_type != ContextType.ATTACHMENT.value:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    _require_attachment_download_allowed(db, context, "share")
+
+    external_response = await _stream_external_attachment(
+        context,
+        range_header=range_header,
+    )
+    if external_response is not None:
+        return external_response
+
+    logger.info(
+        "[PublicDownload] Streaming attachment %s via signed public link",
+        attachment_id,
+    )
+
+    return await _stream_stored_attachment(context)

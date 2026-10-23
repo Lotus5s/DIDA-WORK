@@ -1,0 +1,357 @@
+{
+  "title": "Settings",
+  "sections": {
+    "general": "General",
+    "appearance": "Appearance",
+    "language": "Language",
+    "account": "Account",
+    "privacy": "Privacy",
+    "advanced": "Advanced"
+  },
+  "general": {
+    "auto_save": "Auto Save",
+    "notifications": "Notifications",
+    "sound": "Sound Effects",
+    "keyboard_shortcuts": "Keyboard Shortcuts"
+  },
+  "appearance": {
+    "theme": "Theme",
+    "dark_mode": "Dark Mode",
+    "light_mode": "Light Mode",
+    "auto_mode": "Auto (System)",
+    "font_size": "Font Size",
+    "font_family": "Font Family"
+  },
+  "language": {
+    "current": "Current Language",
+    "select": "Select Language",
+    "auto_detect": "Auto Detect",
+    "restart_required": "Restart required to apply language changes"
+  },
+  "account": {
+    "profile": "Profile",
+    "email": "Email",
+    "password": "Password",
+    "change_password": "Change Password",
+    "logout": "Logout",
+    "delete_account": "Delete Account"
+  },
+  "privacy": {
+    "data_collection": "Data Collection",
+    "analytics": "Analytics",
+    "crash_reports": "Crash Reports",
+    "usage_statistics": "Usage Statistics"
+  },
+  "advanced": {
+    "developer_mode": "Developer Mode",
+    "debug_logs": "Debug Logs",
+    "reset_settings": "Reset Settings",
+    "export_settings": "Export Settings",
+    "import_settings": "Import Settings"
+  },
+  "actions": {
+    "save_changes": "Save Changes",
+    "discard_changes": "Discard Changes",
+    "reset_to_default": "Reset to Default"
+  },
+  "resourceGuide": {
+    "title": "Agent management moved to Resource Library",
+    "description": "Agents, models, executors, skills, and retrievers are now managed in Resource Library.",
+    "action": "Go to Resource Library"
+  },
+  "navigation": {
+    "team": "Team",
+    "models": "Models",
+    "shells": "Shells",
+    "skills": "Skills",
+    "retrievers": "Retrievers",
+    "integrations": "Integrations",
+    "apiKeys": "Developer Credentials",
+    "groupManager": "Group Manager",
+    "personalResources": "Personal Resources",
+    "groupResources": "Group Resources",
+    "scopeLabel": "Current Scope",
+    "personalResourcesDescription": "Managing agents, models, executors, skills, and retrievers owned by you.",
+    "groupResourcesDescription": "Select a group to manage shared resources in that group.",
+    "groupResourcesDescriptionWithName": "Managing shared resources in \"{{groupName}}\".",
+    "groupManagerDescription": "Manage groups, members, and permissions."
+  },
+  "developer_credentials": {
+    "api_keys": "API Keys",
+    "oauth_apps": "OAuth Apps"
+  },
+  "oauth_clients": {
+    "title": "OAuth Apps",
+    "description": "Create and manage external applications you develop. Each app receives its own client_id and requests user consent for identity access.",
+    "admin_title": "OAuth App Governance",
+    "admin_description": "Review OAuth apps created by all developers and disable or delete them when necessary.",
+    "create": "Create OAuth App",
+    "create_title": "Create OAuth App",
+    "edit_title": "Edit OAuth App",
+    "dialog_description": "Desktop, mobile, and public plugins use PKCE. Choose a server application only when it can securely store a client secret.",
+    "empty": "No OAuth Apps",
+    "name": "Application Name",
+    "type": "Application Type",
+    "confidential": "Server application",
+    "public": "Desktop or mobile application (recommended)",
+    "confidential_label": "Server application",
+    "public_label": "Desktop or mobile application",
+    "redirect_uris": "Redirect URIs (one per line)",
+    "description_label": "Description",
+    "owner": "Developer",
+    "client_id": "Client ID",
+    "edit": "Edit",
+    "rotate": "Rotate Secret",
+    "secret_title": "Save Client Credentials",
+    "secret_warning": "The client secret is shown only once. Rotating it revokes every refresh token for this app.",
+    "public_credential_note": "Public clients do not use a client secret. Copy and save the Client ID.",
+    "create_success": "OAuth App created",
+    "update_success": "OAuth App updated",
+    "delete_success": "OAuth App deleted",
+    "copy_success": "Copied",
+    "delete_title": "Delete OAuth App",
+    "delete_description": "Delete “{{name}}”? Every refresh token for this app will be revoked immediately.",
+    "errors": {
+      "load_failed": "Failed to load OAuth Apps",
+      "save_failed": "Failed to save OAuth App",
+      "toggle_failed": "Failed to change OAuth App status",
+      "rotate_failed": "Failed to rotate client secret",
+      "delete_failed": "Failed to delete OAuth App",
+      "copy_failed": "Failed to copy",
+      "required": "Enter a name and at least one redirect URI"
+    }
+  },
+  "skills": {
+    "libraryTitle": "Skill Library",
+    "libraryDescription": "Upload and manage skills. Skills can be auto-enabled for your conversations or bound to agents as built-in capabilities.",
+    "myLibraryTitle": "My Skills",
+    "myLibraryDescription": "Manage skills you created and currently auto-enable.",
+    "groupLibraryTitle": "Group Skills",
+    "groupLibraryDescription": "Manage skills created and maintained by this group. Skills added from the marketplace are shown separately above.",
+    "defaultEnabled": {
+      "title": "Auto-Enabled Skills",
+      "description": "These skills automatically take effect in all your conversations. You can add exceptions for modes or agents.",
+      "add": "Add",
+      "settings": "Manage",
+      "summaryCount": "{{count}} enabled",
+      "overflowCount": "+{{count}}",
+      "addDialogTitle": "Add Auto-Enabled Skill",
+      "addDialogDescription": "Choose from all skills available to you and enable them automatically.",
+      "emptyTitle": "No auto-enabled skills yet",
+      "emptyDescription": "Set a skill to auto-enable from the Skill Library, and it will be added to your conversations automatically.",
+      "noAvailableToAdd": "No skills are available to add."
+    },
+    "availability": {
+      "inMyDefault": "Auto-Enabled",
+      "notInMyDefault": "Not Auto-Enabled",
+      "addToMyDefault": "Auto-Enable",
+      "removeFromMyDefault": "Stop Auto-Enabling",
+      "addSuccess": "Skill will auto-enable",
+      "removeSuccess": "Skill will no longer auto-enable",
+      "removeExternalSuccess": "Auto-enable stopped. You can add this skill again from Discover.",
+      "updateFailed": "Failed to update auto-enabled skills",
+      "groupScopeHint": "Only affects you. Other group members are unchanged."
+    },
+    "autoSettings": {
+      "title": "Auto-Enable Settings",
+      "description": "Manage exception scenarios by Skill.",
+      "back": "Back to Skill Library",
+      "allConversations": "Auto-enabled in all conversations",
+      "exceptionCount": "{{count}} exceptions",
+      "noExceptions": "No exceptions",
+      "skillColumn": "Skill",
+      "modeColumn": "Enabled Modes",
+      "agentColumn": "Enabled Agents",
+      "exceptionColumn": "Exceptions",
+      "actionColumn": "Action",
+      "configure": "Configure",
+      "configureSkill": "Configure {{name}}",
+      "allModesEnabled": "All modes",
+      "enabledModeCount": "{{enabled}}/{{total}} modes enabled",
+      "allAgentsEnabled": "All agents",
+      "enabledAgentCount": "{{enabled}}/{{total}} agents enabled",
+      "noAgentsAvailable": "No agents available",
+      "modeExceptions": "Enabled modes",
+      "agentExceptions": "Enabled agents",
+      "drawerDescription": "These exceptions only affect your own automatic Skill settings.",
+      "defaultScopeTitle": "Auto-enabled by default",
+      "defaultScopeDescription": "Enabled for every mode and agent by default. Unchecked items become exceptions.",
+      "forcePreload": "Force Activate",
+      "forcePreloadDescription": "When enabled, this Skill is injected into context directly instead of waiting for on-demand loading.",
+      "forcePreloadDisabled": "On demand",
+      "modeEnableLabel": "Enable {{mode}} mode",
+      "agentEnableLabel": "Enable {{name}}",
+      "agentGroupEnableLabel": "Enable all {{group}}",
+      "agentGroups": {
+        "personal": "My Agents",
+        "group": "Team Agents",
+        "system": "System Agents"
+      },
+      "emptyAgentGroup": "No agents",
+      "clearExceptions": "Enable All",
+      "save": "Save Settings",
+      "saveSuccess": "Auto-enable settings saved",
+      "saveFailed": "Failed to save auto-enable settings",
+      "modes": {
+        "chat": "Chat",
+        "code": "Code",
+        "knowledge": "Knowledge",
+        "task": "Task",
+        "video": "Video",
+        "image": "Image"
+      }
+    },
+    "source": {
+      "personal": "My Skill",
+      "group": "Team Skill",
+      "system": "System Skill",
+      "library": "Library Skill"
+    }
+  },
+  "bot": {
+    "secondary_llm_model_placeholder": "Select an LLM model",
+    "allowed_models": {
+      "label": "Restrict Available Models",
+      "description": "When enabled, users can only select from the models listed below",
+      "placeholder": "Select allowed models",
+      "empty": "No restriction, all models allowed"
+    },
+    "errors": {
+      "default_model_required_when_restrict": "A default model must be selected when model restriction is enabled",
+      "default_model_must_be_in_allowed": "The default model must be in the allowed models list",
+      "video_model_required": "Please select a video model",
+      "secondary_llm_model_required": "Please select an LLM model for planning"
+    }
+  },
+  "team": {
+    "list": {
+      "filterDevice": "Device",
+      "runOnDevice": "Run on Device"
+    },
+    "quick_phrases": {
+      "label": "Quick phrases",
+      "description": "Shown above the chat input for quick insertion.",
+      "placeholder": "Example: Help me create a product roadmap PPT",
+      "add": "Add phrase"
+    },
+    "input_placeholder": {
+      "label": "Input placeholder",
+      "description": "Uses the current device and language first, then the generic value, and finally the system default.",
+      "default_summary": "Use the system default placeholder",
+      "custom_summary": "Custom placeholder configured",
+      "generic": "Generic fallback",
+      "desktop": "Desktop",
+      "mobile": "Mobile",
+      "zh": "Chinese",
+      "en": "English",
+      "zh_placeholder": "Chinese placeholder",
+      "en_placeholder": "English placeholder"
+    },
+    "simple": {
+      "description": "Set a name, use case, and capabilities to create a ready-to-use agent.",
+      "display_name_placeholder": "For example: Product analysis assistant",
+      "optional": "Optional",
+      "prompt_label": "System prompt",
+      "prompt_placeholder": "For example: You are a product analysis assistant who reviews requirements, identifies risks, and recommends next steps.",
+      "prompt_help": "Describe its role, tasks, constraints, and response style.",
+      "advanced_title": "Advanced configuration",
+      "advanced_description": "Collaboration mode, entry points, and interaction settings",
+      "agent_description_label": "Agent description",
+      "agent_description_placeholder": "Briefly describe this agent",
+      "name_required": "Enter an agent name",
+      "non_solo_notice": "This agent uses an advanced collaboration mode, so the full configuration is shown.",
+      "sections": {
+        "basic": "Basic information",
+        "model": "Model",
+        "prompt": "Prompt",
+        "capability": "Capabilities",
+        "execution": "Mode settings",
+        "advanced": "More settings"
+      },
+      "core": {
+        "model_description": "Uses the system default when unset; choose one only when needed.",
+        "video_model_label": "Video model",
+        "secondary_llm_model_label": "LLM model",
+        "secondary_llm_model_description": "Choose the text model that understands requests and invokes the video workflow.",
+        "video_model_description": "Choose the video model passed to the production workflow.",
+        "prompt_description": "Defines the agent role, goals, and response style.",
+        "skills_description": "Add common skills so the agent can call tools when needed.",
+        "knowledge_description": "New chats start with these knowledge bases; more can still be added in chat.",
+        "mcp_description": "Connect external MCP services to add tool capabilities."
+      },
+      "capability": {
+        "base_title": "Use shared base capabilities",
+        "base_description": "Reuse the system agent's general skills, tools, and plugins. This increases context and tool-call usage.",
+        "enabled": "Enabled",
+        "disabled": "Disabled",
+        "additional_title": "Additional capabilities",
+        "additional_summary": "{{count}} added · Skills, knowledge bases, MCP"
+      },
+      "execution": {
+        "bind_mode_description": "Controls which entry points and task types can use this agent.",
+        "requires_workspace_title": "Bind coding repository",
+        "requires_workspace_description": "When enabled, a repository must be selected before using coding capabilities."
+      },
+      "bind_mode": {
+        "advanced_title": "Available entry points",
+        "available_modules": "Entry points",
+        "automatic": "Default entry points",
+        "selected": "Custom entry points",
+        "automatic_hint": "By default, the agent appears in entry points suited to its use case. After a manual selection, it is available only in the selected entry points.",
+        "summary_separator": ", ",
+        "more_modes": "More modes",
+        "collapse_more_modes": "Collapse more modes",
+        "chat": {
+          "title": "Chat",
+          "description": "Use for Q&A, document discussion, and ongoing conversation."
+        },
+        "code": {
+          "title": "Code",
+          "description": "Use for development, fixes, and reviews inside a code repository."
+        },
+        "task": {
+          "title": "Device",
+          "description": "Use for tasks that need a local device or execution environment."
+        },
+        "video": {
+          "title": "Video",
+          "description": "Use for video generation and video creation tasks."
+        },
+        "image": {
+          "title": "Image",
+          "description": "Use for image generation and image creation tasks."
+        }
+      },
+      "executor": {
+        "title": "Use case",
+        "required": "Choose an agent use case",
+        "requires_coding_agent_hint": "Code and device modes require an execution engine.",
+        "custom_shell_placeholder": "Choose a custom runtime",
+        "no_custom_shells": "No custom runtimes available",
+        "manage_custom_shells_hint": "Add custom runtimes in Resource Library - Executors.",
+        "simple": {
+          "title": "Everyday questions",
+          "description": "Best for Q&A, writing, and knowledge lookup."
+        },
+        "complex": {
+          "title": "Coding and complex tasks",
+          "description": "Best for coding, file operations, and multi-step tasks."
+        },
+        "coding_runtime_label": "Execution engine",
+        "coding_runtime_description": "Choose an execution engine that matches the model.",
+        "codex": {
+          "title": "Codex",
+          "description": "Best suited for OpenAI models."
+        },
+        "claude_code": {
+          "title": "Claude Code",
+          "description": "Best suited for Anthropic models."
+        },
+        "custom": {
+          "title": "Advanced custom",
+          "description": "Use a runtime you created for specialized needs."
+        }
+      }
+    }
+  }
+}

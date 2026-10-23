@@ -1,0 +1,345 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import React, { useState, useMemo } from 'react'
+import { Check, ChevronDown, ChevronRight, LayoutGrid, Lock, Settings, Star, X } from 'lucide-react'
+import { useRouter } from 'next/navigation'
+import { useTranslation } from '@/hooks/useTranslation'
+import { cn } from '@/lib/utils'
+import { paths } from '@/config/paths'
+import { Drawer, DrawerContent, DrawerTrigger } from '@/components/ui/drawer'
+import { TeamIconDisplay } from '@/features/settings/components/teams/TeamIconDisplay'
+import { Tag } from '@/components/ui/tag'
+import type { Team } from '@/types/api'
+import { isNamespaceAuthorizedTeam } from '@/utils/team-permissions'
+import SystemTeamTag from './SystemTeamTag'
+import { useTeamFavorites } from './useTeamFavorites'
+import { getRecentTeams } from './team-selector-utils'
+import type { TeamModeFilter } from './team-selector-utils'
+import { useRecentTeams } from './useRecentTeams'
+
+interface MobileTeamSelectorProps {
+  selectedTeam: Team | null
+  teams: Team[]
+  onTeamSelect: (team: Team) => void
+  disabled: boolean
+  isLoading?: boolean
+  // Optional: custom trigger button text (e.g., "更多" instead of team name)
+  triggerText?: string
+  // Optional: hide team icon in trigger button
+  hideTriggerIcon?: boolean
+  currentMode?: TeamModeFilter
+  triggerVariant?: 'compact' | 'settings-row'
+  onClear?: () => void
+  showClearButton?: boolean
+}
+
+const getTeamDisplayName = (team: Team) => team.displayName?.trim() || team.name
+
+/**
+ * Mobile Team Selector - iOS Style
+ * Bottom sheet with native iOS design patterns
+ */
+export default function MobileTeamSelector({
+  selectedTeam,
+  teams,
+  onTeamSelect,
+  disabled,
+  isLoading,
+  triggerText,
+  hideTriggerIcon = false,
+  currentMode = 'chat',
+  triggerVariant = 'compact',
+  onClear,
+  showClearButton = false,
+}: MobileTeamSelectorProps) {
+  const { t } = useTranslation()
+  const router = useRouter()
+
+  const [isOpen, setIsOpen] = useState(false)
+  const {
+    favoriteTeamIdSet,
+    favoriteUpdatingTeamId,
+    handleToggleFavorite,
+    quickAccessMetaLoaded,
+    systemRecommendedTeamIdSet,
+  } = useTeamFavorites()
+  const { recentTeamIds, refreshRecentTeams } = useRecentTeams(currentMode)
+
+  const recentTeams = useMemo(() => getRecentTeams(teams, recentTeamIds), [recentTeamIds, teams])
+
+  const handleTeamSelect = (team: Team) => {
+    onTeamSelect(team)
+    setIsOpen(false)
+  }
+
+  const handleOpenChange = (open: boolean) => {
+    setIsOpen(open)
+    if (open) {
+      void refreshRecentTeams()
+    }
+  }
+
+  const isDisabled = disabled || isLoading || teams.length === 0
+  const selectedTeamDisplayName = selectedTeam
+    ? getTeamDisplayName(selectedTeam)
+    : t('common:teams.select_team')
+  const canClearSelection = Boolean(
+    triggerVariant === 'compact' && selectedTeam && showClearButton && onClear
+  )
+
+  if (teams.length === 0) return null
+
+  return (
+    <Drawer open={isOpen} onOpenChange={handleOpenChange}>
+      <div className="relative flex min-w-0 w-full">
+        <DrawerTrigger asChild>
+          <button
+            type="button"
+            disabled={isDisabled}
+            data-testid="mobile-team-selector-trigger"
+            className={cn(
+              'flex w-full items-center min-w-0 max-w-full text-left transition-colors overflow-hidden',
+              triggerVariant === 'settings-row'
+                ? 'min-h-14 gap-3 px-3 py-2.5 hover:bg-hover active:bg-hover'
+                : 'h-11 rounded-xl border border-border bg-base py-2 pl-3 text-text-primary',
+              triggerVariant === 'compact' && (canClearSelection ? 'pr-11' : 'pr-3'),
+              isLoading ? 'animate-pulse' : '',
+              'focus:outline-none focus:ring-0',
+              'active:opacity-70',
+              'disabled:cursor-not-allowed disabled:opacity-60',
+              triggerVariant === 'compact' && (triggerText ? 'gap-1' : 'gap-2')
+            )}
+          >
+            {triggerVariant === 'settings-row' ? (
+              selectedTeam ? (
+                <TeamIconDisplay
+                  iconId={selectedTeam.icon}
+                  size="sm"
+                  className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl bg-surface text-text-muted"
+                />
+              ) : (
+                <span className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl bg-surface text-text-muted">
+                  <LayoutGrid className="h-5 w-5" aria-hidden="true" />
+                </span>
+              )
+            ) : (
+              !hideTriggerIcon &&
+              selectedTeam &&
+              !triggerText && (
+                <TeamIconDisplay
+                  iconId={selectedTeam?.icon}
+                  size="xs"
+                  className="text-text-muted flex-shrink-0"
+                />
+              )
+            )}
+            {triggerVariant === 'settings-row' ? (
+              <>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium text-text-primary">
+                    {t('common:teamSelector.agent_label')}
+                  </span>
+                  <span className="mt-0.5 block truncate text-xs text-text-muted">
+                    {selectedTeamDisplayName}
+                  </span>
+                </span>
+                {isDisabled ? (
+                  <Lock className="h-4 w-4 shrink-0 text-text-muted" aria-hidden="true" />
+                ) : (
+                  <ChevronRight className="h-4 w-4 shrink-0 text-text-muted" aria-hidden="true" />
+                )}
+              </>
+            ) : (
+              <>
+                <span className="flex-1 truncate text-xs min-w-0">
+                  {triggerText || selectedTeamDisplayName || t('common:teams.select_team')}
+                </span>
+                {triggerText && (
+                  <ChevronDown className="w-2.5 h-2.5 text-text-muted flex-shrink-0" />
+                )}
+              </>
+            )}
+          </button>
+        </DrawerTrigger>
+        {canClearSelection && (
+          <button
+            type="button"
+            data-testid="mobile-team-selector-clear"
+            aria-label={t('common:teams.clear_selection')}
+            title={t('common:teams.clear_selection')}
+            onClick={onClear}
+            disabled={isDisabled}
+            className="group absolute right-0 top-0 z-10 flex h-11 w-11 items-center justify-center text-text-muted transition-colors hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <span className="flex h-6 w-6 items-center justify-center rounded-full transition-colors group-hover:bg-hover group-active:bg-hover">
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
+            </span>
+          </button>
+        )}
+      </div>
+
+      <DrawerContent className="max-h-[85vh] bg-[#f2f2f7] dark:bg-[#1c1c1e]" showHandle={false}>
+        {/* iOS-style drag handle */}
+        <div className="flex justify-center pt-2 pb-3">
+          <div className="w-9 h-1 rounded-full bg-[#3c3c43]/30 dark:bg-[#5c5c5e]" />
+        </div>
+
+        {/* Team list - iOS grouped style */}
+        <div className="flex-1 max-h-[50vh] overflow-y-auto px-4 pb-4">
+          <div className="px-1 pb-2 text-xs font-medium text-[#8e8e93]">
+            {t('common:teams.recently_used')}
+          </div>
+          {recentTeams.length === 0 ? (
+            <div className="rounded-xl bg-white dark:bg-[#2c2c2e] p-4 text-center text-sm text-[#8e8e93]">
+              {isLoading
+                ? t('common:loading', '加载中...')
+                : t('common:teams.no_match', '暂无匹配的智能体')}
+            </div>
+          ) : (
+            <div className="rounded-xl bg-white dark:bg-[#2c2c2e] overflow-hidden">
+              {/* Team items */}
+              {recentTeams.map((team, index) => {
+                const displayName = getTeamDisplayName(team)
+                const isSelected = selectedTeam?.id === team.id
+                const isSystemTeam = team.user_id === 0
+                const isNamespaceAuthorized = isNamespaceAuthorizedTeam(team)
+                const isSharedTeam =
+                  team.share_status === 2 && team.user?.user_name && !isNamespaceAuthorized
+                const isGroupTeam = team.namespace && team.namespace !== 'default'
+                const isLast = index === recentTeams.length - 1
+
+                return (
+                  <div
+                    key={team.id}
+                    onClick={() => handleTeamSelect(team)}
+                    className={cn(
+                      'w-full flex items-center justify-between px-4 py-3',
+                      'text-left active:bg-[#d1d1d6] dark:active:bg-[#3a3a3c]',
+                      !isLast && 'border-b border-[#c6c6c8] dark:border-[#38383a]'
+                    )}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={event => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        handleTeamSelect(team)
+                      }
+                    }}
+                  >
+                    <div className="flex items-center gap-2.5 flex-1 min-w-0">
+                      <TeamIconDisplay
+                        iconId={team.icon}
+                        size="sm"
+                        className="flex-shrink-0 text-text-muted"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-[15px] text-text-primary truncate flex-1 min-w-0">
+                            {displayName}
+                          </span>
+                          {isSystemTeam && (
+                            <SystemTeamTag className="text-[11px] py-0 px-1.5 flex-shrink-0" />
+                          )}
+                          {isGroupTeam && (
+                            <Tag
+                              className="text-[11px] !m-0 flex-shrink-0 py-0 px-1.5 max-w-[120px] truncate"
+                              variant="info"
+                              title={team.namespace}
+                            >
+                              {team.namespace}
+                            </Tag>
+                          )}
+                        </div>
+                        {isSharedTeam && (
+                          <div className="text-[13px] text-[#8e8e93] mt-0.5 truncate">
+                            {t('common:teams.shared_by', { author: team.user?.user_name })}
+                          </div>
+                        )}
+                        {isNamespaceAuthorized && team.namespace && (
+                          <div className="text-[13px] text-[#8e8e93] mt-0.5 truncate">
+                            {t('common:teams.authorized_from_group', {
+                              group: team.namespace,
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="ml-3 flex items-center gap-2">
+                      {quickAccessMetaLoaded && !systemRecommendedTeamIdSet.has(team.id) && (
+                        <button
+                          type="button"
+                          data-testid={`mobile-favorite-team-button-${team.id}`}
+                          aria-label={
+                            favoriteTeamIdSet.has(team.id)
+                              ? t('common:teams.remove_from_quick_access')
+                              : t('common:teams.add_to_quick_access')
+                          }
+                          title={
+                            favoriteTeamIdSet.has(team.id)
+                              ? t('common:teams.remove_from_quick_access')
+                              : t('common:teams.add_to_quick_access')
+                          }
+                          disabled={favoriteUpdatingTeamId === team.id}
+                          onClick={event => handleToggleFavorite(event, team)}
+                          className={cn(
+                            'h-8 w-8 rounded-full inline-flex items-center justify-center',
+                            'text-[#8e8e93] active:bg-[#d1d1d6] dark:active:bg-[#3a3a3c]',
+                            'disabled:pointer-events-none disabled:opacity-50',
+                            favoriteTeamIdSet.has(team.id) && 'text-[#007aff]'
+                          )}
+                        >
+                          <Star
+                            className={cn(
+                              'h-4 w-4',
+                              favoriteTeamIdSet.has(team.id) && 'fill-current'
+                            )}
+                            aria-hidden="true"
+                          />
+                        </button>
+                      )}
+                      {isSelected && <Check className="h-5 w-5 text-[#007aff] flex-shrink-0" />}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Footer actions */}
+        <div className="px-4 pb-4 pt-2">
+          <div className="flex items-center justify-between gap-4">
+            <button
+              type="button"
+              onClick={() => {
+                setIsOpen(false)
+                router.push(paths.settings.team.getHref())
+              }}
+              data-testid="mobile-team-selector-settings"
+              className="flex items-center gap-1.5 text-[#007aff] active:opacity-70"
+            >
+              <Settings className="h-4 w-4" />
+              <span className="text-[13px]">{t('common:teams.manage', '管理')}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setIsOpen(false)
+                router.push(`${paths.resourceLibrary.getHref()}?tab=mine&type=agent&from=chat`)
+              }}
+              data-testid="mobile-team-selector-use-more-agents"
+              className="flex items-center gap-1.5 text-[#007aff] active:opacity-70"
+            >
+              <LayoutGrid className="h-4 w-4" />
+              <span className="text-[13px]">{t('common:teams.use_more_agents')}</span>
+            </button>
+          </div>
+        </div>
+      </DrawerContent>
+    </Drawer>
+  )
+}

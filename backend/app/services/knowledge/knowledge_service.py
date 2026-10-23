@@ -1,0 +1,3729 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Knowledge base and document service using kinds table.
+"""
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from sqlalchemy import and_, case, func, or_
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
+
+from app.core.exceptions import ValidationException
+from app.models.kind import Kind
+from app.models.knowledge import (
+    ContentOrigin,
+    DocumentIndexStatus,
+    DocumentSourceType,
+    DocumentStatus,
+    KnowledgeDocument,
+    KnowledgeDocumentExternalSource,
+    KnowledgeFolder,
+)
+from app.models.knowledge_artifact import KnowledgeArtifactRecord
+from app.models.namespace import Namespace
+from app.models.resource_member import (
+    APPROVED_MEMBER_STATUS_VALUES,
+    KNOWLEDGE_BASE_RESOURCE_TYPE_VALUES,
+)
+from app.models.user import User
+from app.schemas.base_role import BaseRole, has_permission
+from app.schemas.kind import KnowledgeBase as KnowledgeBaseCRD
+from app.schemas.kind import KnowledgeBaseSpec, ObjectMeta
+from app.schemas.knowledge import (
+    AccessibleKnowledgeBase,
+    AccessibleKnowledgeResponse,
+    AllGroupedKnowledgeResponse,
+    AllGroupedOrganization,
+    AllGroupedPersonal,
+    AllGroupedSummary,
+    AllGroupedTeamGroup,
+    BatchOperationResult,
+    KnowledgeBaseCreate,
+    KnowledgeBaseResponse,
+    KnowledgeBaseType,
+    KnowledgeBaseUpdate,
+    KnowledgeBaseWithGroupInfo,
+    KnowledgeDocumentCreate,
+    KnowledgeDocumentUpdate,
+    ResourceScope,
+    TeamKnowledgeGroup,
+    TransferDocumentsResponse,
+)
+from app.schemas.namespace import GroupLevel, GroupRole
+from app.services.group_permission import (
+    get_effective_role_in_group,
+    get_effective_roles_in_groups,
+    get_user_groups,
+    get_view_role_in_group,
+)
+from app.services.knowledge.content_scope import (
+    assert_user_content_is_mutable,
+    wiki_pages,
+)
+from app.services.knowledge.external_document_identity import WIKI_PROVIDER_ID
+from app.services.knowledge.folder_policy import assert_document_can_be_placed_in_folder
+from app.services.knowledge.knowledge_access_policy import (
+    can_directly_access_knowledge_base as evaluate_direct_knowledge_base_access,
+)
+from app.services.knowledge.knowledge_access_policy import (
+    get_user_knowledge_base_permission,
+    meets_direct_access_requirement,
+)
+from app.services.knowledge.knowledge_visibility_query import (
+    apply_direct_access_filter,
+    build_direct_access_permission_context,
+    build_direct_access_query_context,
+    build_knowledge_base_visibility_query,
+    collect_entity_authorized_kbs,
+    filter_directly_accessible_knowledge_bases,
+    knowledge_base_json_text,
+)
+from app.services.knowledge.namespace_utils import is_organization_namespace
+from app.services.knowledge.permission_policy import (
+    can_create_namespace_knowledge_base,
+    can_manage_accessible_knowledge_base,
+    can_manage_accessible_knowledge_base_documents,
+    can_manage_accessible_knowledge_document,
+)
+from shared.knowledge_module import normalize_document_extension
+
+batch_logger = logging.getLogger(__name__)
+
+
+class KnowledgeDocumentScopeValidationError(ValueError):
+    """Raised when a requested document scope is inaccessible or unusable."""
+
+    def __init__(self, message: str, *, knowledge_base_not_found: bool = False) -> None:
+        super().__init__(message)
+        self.knowledge_base_not_found = knowledge_base_not_found
+
+
+def _build_attachment_filename(name: str, file_extension: str) -> str:
+    """Build a stable attachment filename from document metadata."""
+    normalized_extension = (file_extension or "").strip().lstrip(".")
+    if not normalized_extension:
+        return name
+
+    suffix = f".{normalized_extension}"
+    if name.lower().endswith(suffix.lower()):
+        return name
+    return f"{name}{suffix}"
+
+
+def _to_json_dict(value: Any) -> Optional[dict[str, Any]]:
+    """Convert model-like values to plain JSON dictionaries for CRD persistence."""
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return dict(value)
+
+
+def _get_rag_gateway():
+    """Load the RAG gateway lazily to avoid import-time coupling."""
+    from app.services.rag.gateway_factory import get_rag_gateway
+
+    return get_rag_gateway()
+
+
+def _run_async_in_new_loop(coro):
+    """Execute a coroutine in a dedicated event loop for sync call sites."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            pending = asyncio.all_tasks(loop)
+            current_task = asyncio.current_task(loop=loop)
+            pending = {task for task in pending if task is not current_task}
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            loop.run_until_complete(loop.shutdown_asyncgens())
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+@dataclass
+class DocumentDeleteResult:
+    """Result of a document deletion operation.
+
+    Contains information needed to trigger KB summary updates after deletion.
+    """
+
+    success: bool
+    kb_id: Optional[int] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class BatchDeleteResult:
+    """Result of a batch document deletion operation.
+
+    Contains the standard batch operation result plus additional info
+    for triggering KB summary updates.
+    """
+
+    result: BatchOperationResult
+    kb_ids: list[int]  # Unique KB IDs from successfully deleted documents
+
+
+@dataclass
+class ActiveDocumentTextStats:
+    """Aggregated stats for active documents in a knowledge base."""
+
+    file_size_total: int
+    text_length_total: int
+    active_document_count: int
+
+
+@dataclass(frozen=True)
+class ExternalKnowledgeBaseListFilters:
+    """Normalized filters for external knowledge base listing."""
+
+    scope: ResourceScope
+    group_name: str | None = None
+    keyword: str | None = None
+    owner_user_ids: tuple[int, ...] = ()
+    offset: int = 0
+    limit: int = 50
+
+
+class KnowledgeService:
+    """Service for managing knowledge bases and documents using kinds table."""
+
+    @staticmethod
+    def _get_user_or_raise(db: Session, user_id: int) -> User:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise ValueError("User not found")
+        return user
+
+    @staticmethod
+    def _get_knowledge_base_record(
+        db: Session, knowledge_base_id: int
+    ) -> Optional[Kind]:
+        return (
+            db.query(Kind)
+            .filter(
+                Kind.id == knowledge_base_id,
+                Kind.kind == "KnowledgeBase",
+                Kind.is_active == True,
+            )
+            .first()
+        )
+
+    @staticmethod
+    def _has_namespaced_admin_access(db: Session, user: User, kb: Kind) -> bool:
+        return user.role == "admin" and is_organization_namespace(db, kb.namespace)
+
+    # ============== Knowledge Base Operations ==============
+
+    @staticmethod
+    def create_knowledge_base(
+        db: Session,
+        user_id: int,
+        data: KnowledgeBaseCreate,
+    ) -> int:
+        """
+        Create a new knowledge base.
+
+        Args:
+            db: Database session
+            user_id: Creator user ID
+            data: Knowledge base creation data
+
+        Returns:
+            Created KnowledgeBase ID
+
+        Raises:
+            ValueError: If validation fails or permission denied
+        """
+        from datetime import datetime
+
+        user = KnowledgeService._get_user_or_raise(db, user_id)
+        if not can_create_namespace_knowledge_base(db, user, data.namespace):
+            raise ValueError(
+                "You do not have permission to create a knowledge base in this namespace"
+            )
+
+        # Generate unique name for the Kind record
+        kb_name = f"kb-{user_id}-{data.namespace}-{data.name}"
+
+        # Check duplicate by Kind.name (unique identifier)
+        existing_by_name = (
+            db.query(Kind)
+            .filter(
+                Kind.kind == "KnowledgeBase",
+                Kind.user_id == user_id,
+                Kind.namespace == data.namespace,
+                Kind.name == kb_name,
+                Kind.is_active == True,
+            )
+            .first()
+        )
+
+        if existing_by_name:
+            # Named for the check that fired. The two below say the same sentence
+            # otherwise, so an "already exists" gave no way to tell which of them
+            # matched -- or, when neither had, that the message came from somewhere
+            # else entirely.
+            raise ValueError(
+                f"Knowledge base with name '{data.name}' already exists "
+                f"(kind {kb_name})"
+            )
+
+        # Also check by display name in spec to prevent duplicates
+        existing_by_display = (
+            db.query(Kind)
+            .filter(
+                Kind.kind == "KnowledgeBase",
+                Kind.user_id == user_id,
+                Kind.namespace == data.namespace,
+                Kind.is_active == True,
+            )
+            .all()
+        )
+
+        for kb in existing_by_display:
+            kb_spec = kb.json.get("spec", {})
+            if kb_spec.get("name") == data.name:
+                raise ValueError(
+                    f"Knowledge base with name '{data.name}' already exists "
+                    f"(knowledge base {kb.id})"
+                )
+
+        # Build CRD structure
+        spec_kwargs = {
+            "name": data.name,
+            "description": data.description or "",
+            "directAccessRequirement": data.direct_access_requirement,
+            # A code wiki is fixed here; there is deliberately no code path that turns
+            # an existing knowledge base into one, or out of one.
+            "kbType": KnowledgeBaseType(
+                data.kb_type or KnowledgeBaseType.NOTEBOOK
+            ).value,
+            "retrievalConfig": _to_json_dict(data.retrieval_config),
+            "dingtalkAutoSyncEnabled": data.dingtalk_auto_sync_enabled,
+            "summaryEnabled": data.summary_enabled,
+        }
+        if data.allow_document_download is not None:
+            spec_kwargs["allowDocumentDownload"] = data.allow_document_download
+        # A code wiki records the repository it is generated from, and the language
+        # its pages are written in. Both are omitted entirely when absent rather than
+        # stored empty: absent means "fall back to the deployment default", which is
+        # also what every wiki created before these fields existed does.
+        if data.source:
+            spec_kwargs["source"] = data.source
+        if data.language:
+            spec_kwargs["language"] = data.language
+        if data.show_generation_task:
+            spec_kwargs["showGenerationTask"] = True
+        if data.generation_strategy:
+            spec_kwargs["generationStrategy"] = data.generation_strategy
+
+        # Add summaryModelRef if provided
+        if data.summary_model_ref:
+            spec_kwargs["summaryModelRef"] = data.summary_model_ref
+
+        # Add executionModelRef if provided
+        if data.execution_model_ref:
+            spec_kwargs["executionModelRef"] = data.execution_model_ref
+
+        # Add guidedQuestions if provided
+        if data.guided_questions:
+            spec_kwargs["guidedQuestions"] = data.guided_questions
+
+        kb_crd = KnowledgeBaseCRD(
+            apiVersion="agent.wecode.io/v1",
+            kind="KnowledgeBase",
+            metadata=ObjectMeta(
+                name=kb_name,
+                namespace=data.namespace,
+            ),
+            spec=KnowledgeBaseSpec(**spec_kwargs),
+        )
+
+        # Build resource data
+        resource_data = kb_crd.model_dump()
+        if data.allow_document_download is None:
+            # The download policy treats an absent setting as allowed.
+            resource_data["spec"].pop("allowDocumentDownload", None)
+        if "status" not in resource_data or resource_data["status"] is None:
+            resource_data["status"] = {"state": "Available"}
+
+        # Multimodal analysis config: KnowledgeBaseSpec does not declare these
+        # fields (it ignores extras), so write them into the spec dict AFTER
+        # model_dump. enabled defaults to False when unset; blank/whitespace
+        # prompts normalize to None (system default).
+        if data.multimodal_analysis_enabled is not None:
+            resource_data.setdefault("spec", {})[
+                "multimodalAnalysisEnabled"
+            ] = data.multimodal_analysis_enabled
+        if data.multimodal_analysis_model_ref:
+            resource_data.setdefault("spec", {})[
+                "multimodalAnalysisModelRef"
+            ] = data.multimodal_analysis_model_ref
+        if data.multimodal_analysis_video_prompt is not None:
+            resource_data.setdefault("spec", {})["multimodalAnalysisVideoPrompt"] = (
+                data.multimodal_analysis_video_prompt.strip() or None
+            )
+        if data.multimodal_analysis_image_prompt is not None:
+            resource_data.setdefault("spec", {})["multimodalAnalysisImagePrompt"] = (
+                data.multimodal_analysis_image_prompt.strip() or None
+            )
+
+        # Create Kind record directly using the passed db session
+        db_resource = Kind(
+            user_id=user_id,
+            kind="KnowledgeBase",
+            name=kb_name,
+            namespace=data.namespace,
+            json=resource_data,
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+
+        db.add(db_resource)
+        db.flush()  # Flush to get the ID without committing
+
+        return db_resource.id
+
+    @staticmethod
+    def get_knowledge_base(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+    ) -> tuple[Optional[Kind], bool]:
+        """
+        Get a knowledge base by ID with permission check.
+
+        Args:
+            db: Database session
+            knowledge_base_id: Knowledge base ID
+            user_id: Requesting user ID
+
+        Returns:
+            Tuple of (Kind, has_access):
+            - Kind: The knowledge base Kind if found, None otherwise
+            - has_access: True if user has access to the knowledge base, False otherwise
+        """
+
+        kb = KnowledgeService._get_knowledge_base_record(db, knowledge_base_id)
+
+        if not kb:
+            return None, False
+
+        permission = get_user_knowledge_base_permission(
+            db,
+            knowledge_base_id,
+            user_id,
+            kb=kb,
+        )
+        return kb, meets_direct_access_requirement(kb=kb, permission=permission)
+
+    @staticmethod
+    def resolve_usable_document_ids(
+        db: Session,
+        *,
+        knowledge_base_id: int,
+        user_id: int,
+        document_ids: list[int],
+    ) -> list[int]:
+        """Validate one ordered, indexed document scope in an accessible KB."""
+        knowledge_base, has_access = KnowledgeService.get_knowledge_base(
+            db,
+            knowledge_base_id,
+            user_id,
+        )
+        if knowledge_base is None or not has_access:
+            raise KnowledgeDocumentScopeValidationError(
+                "Knowledge base not found",
+                knowledge_base_not_found=True,
+            )
+
+        if any(
+            isinstance(document_id, bool)
+            or not isinstance(document_id, int)
+            or document_id <= 0
+            for document_id in document_ids
+        ) or len(set(document_ids)) != len(document_ids):
+            raise KnowledgeDocumentScopeValidationError(
+                "Selected document IDs must be unique positive integers"
+            )
+
+        found_ids = {
+            row[0]
+            for row in (
+                db.query(KnowledgeDocument.id)
+                .filter(
+                    KnowledgeDocument.kind_id == knowledge_base_id,
+                    KnowledgeDocument.id.in_(document_ids),
+                    KnowledgeDocument.is_active.is_(True),
+                    KnowledgeDocument.index_status == DocumentIndexStatus.SUCCESS,
+                )
+                .all()
+            )
+        }
+        if found_ids != set(document_ids):
+            raise KnowledgeDocumentScopeValidationError(
+                "Selected documents must belong to the knowledge base and be indexed"
+            )
+        return document_ids
+
+    @staticmethod
+    def can_directly_access_knowledge_base(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+        *,
+        kb: Kind | None = None,
+    ) -> bool:
+        """Return whether the user may discover or directly use the KB."""
+        return evaluate_direct_knowledge_base_access(
+            db,
+            knowledge_base_id,
+            user_id,
+            kb=kb,
+        )
+
+    @staticmethod
+    def resolve_task_id_for_user_subtask(
+        db: Session,
+        user_subtask_id: int | None,
+    ) -> int | None:
+        """Resolve the task a user subtask belongs to, for task-scoped reads."""
+        if user_subtask_id is None:
+            return None
+        from app.stores.tasks import subtask_store
+
+        subtask = subtask_store.get_basic_by_id(db, subtask_id=user_subtask_id)
+        return int(subtask.task_id) if subtask is not None else None
+
+    @staticmethod
+    def resolve_read_user_for_knowledge_base(
+        db: Session,
+        *,
+        user_id: int,
+        task_id: int | None,
+        knowledge_base_id: int,
+    ) -> User | None:
+        """Resolve the user whose permissions and runtime identity apply."""
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            return None
+        if task_id is None or KnowledgeService.can_directly_access_knowledge_base(
+            db,
+            knowledge_base_id,
+            user.id,
+        ):
+            return user
+
+        from app.services.chat.task_default_knowledge_bases import (
+            resolve_task_default_knowledge_base_read_user_id,
+        )
+
+        access_user_id = resolve_task_default_knowledge_base_read_user_id(
+            db,
+            task_id,
+            user.id,
+            knowledge_base_id,
+        )
+        if access_user_id is None:
+            return user
+        return (
+            db.query(User)
+            .filter(User.id == access_user_id, User.is_active.is_(True))
+            .first()
+        )
+
+    @staticmethod
+    def list_knowledge_bases(
+        db: Session,
+        user_id: int,
+        scope: ResourceScope = ResourceScope.ALL,
+        group_name: Optional[str] = None,
+    ) -> list[Kind]:
+        """
+        List knowledge bases based on scope.
+
+        Args:
+            db: Database session
+            user_id: Requesting user ID
+            scope: Resource scope (personal, group, all)
+            group_name: Group name (required when scope is GROUP)
+
+        Returns:
+            List of accessible knowledge bases
+        """
+        if scope == ResourceScope.PERSONAL:
+            from app.models.resource_member import ResourceMember
+
+            # Get knowledge bases with explicit approved permission (shared to user)
+            shared_permissions = (
+                db.query(ResourceMember.resource_id)
+                .filter(
+                    ResourceMember.resource_type.in_(
+                        KNOWLEDGE_BASE_RESOURCE_TYPE_VALUES
+                    ),
+                    ResourceMember.entity_type == "user",
+                    ResourceMember.entity_id == str(user_id),
+                    ResourceMember.status.in_(APPROVED_MEMBER_STATUS_VALUES),
+                )
+                .all()
+            )
+            shared_kb_ids = [p.resource_id for p in shared_permissions]
+
+            # Include KBs accessible via entity-type bindings (namespace / external resolvers)
+            accessible_groups = get_user_groups(db, user_id)
+            entity_result = collect_entity_authorized_kbs(
+                db, user_id, accessible_groups
+            )
+            entity_kb_ids = {kb.id for kb in entity_result.entity_kbs}
+            shared_kb_ids = list(set(shared_kb_ids) | entity_kb_ids)
+
+            # Single query to get personal and explicitly shared knowledge bases
+            # Personal: user_id matches and namespace is "default"
+            # Shared: id is in shared_kb_ids
+            all_kbs = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "KnowledgeBase",
+                    Kind.is_active == True,
+                    ((Kind.user_id == user_id) & (Kind.namespace == "default"))
+                    | (Kind.id.in_(shared_kb_ids) if shared_kb_ids else False),
+                )
+                .all()
+            )
+
+            # Separate into personal and shared for sorting
+            personal = [
+                kb
+                for kb in all_kbs
+                if kb.user_id == user_id and kb.namespace == "default"
+            ]
+            other = [kb for kb in all_kbs if kb not in personal]
+
+            # Combine and sort by updated_at
+            all_kbs = personal + other
+            all_kbs.sort(key=lambda kb: kb.updated_at, reverse=True)
+            return filter_directly_accessible_knowledge_bases(db, all_kbs, user_id)
+
+        elif scope == ResourceScope.GROUP:
+            if not group_name:
+                raise ValueError("group_name is required when scope is GROUP")
+
+            # Check user has access to this group
+            role = get_effective_role_in_group(db, user_id, group_name)
+            if role is None:
+                return []
+
+            # KBs belonging to this group (native group KBs only)
+            # Entity-authorized KBs are shown in personal shared_with_me instead
+            group_kbs = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "KnowledgeBase",
+                    Kind.namespace == group_name,
+                    Kind.is_active == True,
+                )
+                .order_by(Kind.updated_at.desc())
+                .all()
+            )
+            return filter_directly_accessible_knowledge_bases(db, group_kbs, user_id)
+
+        elif scope == ResourceScope.ORGANIZATION:
+            # Organization knowledge bases are visible to all users
+            # Query knowledge bases in namespaces with level='organization'
+            organization_kbs = (
+                db.query(Kind)
+                .join(Namespace, Kind.namespace == Namespace.name)
+                .filter(
+                    Kind.kind == "KnowledgeBase",
+                    Kind.is_active == True,
+                    Namespace.level == GroupLevel.organization.value,
+                    Namespace.is_active == True,
+                )
+                .order_by(Kind.updated_at.desc())
+                .all()
+            )
+            return filter_directly_accessible_knowledge_bases(
+                db, organization_kbs, user_id
+            )
+
+        else:  # ALL
+            from app.models.resource_member import ResourceMember
+
+            # Get team knowledge bases from accessible groups
+            accessible_groups = get_user_groups(db, user_id)
+
+            # Get knowledge bases with explicit approved permission (shared to user)
+            shared_permissions = (
+                db.query(ResourceMember.resource_id)
+                .filter(
+                    ResourceMember.resource_type.in_(
+                        KNOWLEDGE_BASE_RESOURCE_TYPE_VALUES
+                    ),
+                    ResourceMember.entity_type == "user",
+                    ResourceMember.entity_id == str(user_id),
+                    ResourceMember.status.in_(APPROVED_MEMBER_STATUS_VALUES),
+                )
+                .all()
+            )
+            shared_kb_ids = [p.resource_id for p in shared_permissions]
+
+            # Collect all entity-authorized KBs (namespace + external resolvers)
+            # via the unified helper to avoid duplicating entity resolution logic.
+            entity_result = collect_entity_authorized_kbs(
+                db, user_id, accessible_groups
+            )
+            entity_kb_ids = {kb.id for kb in entity_result.entity_kbs}
+            shared_kb_ids = list(set(shared_kb_ids) | entity_kb_ids)
+
+            # Get organization-level namespace names
+            org_namespaces = (
+                db.query(Namespace.name)
+                .filter(
+                    Namespace.level == GroupLevel.organization.value,
+                    Namespace.is_active == True,
+                )
+                .all()
+            )
+            org_namespace_names = [n[0] for n in org_namespaces]
+
+            # Single query to get personal, team, organization, and shared knowledge bases
+            # Personal: user_id matches and namespace is "default"
+            # Team: namespace is in accessible_groups
+            # Organization: namespace has level='organization'
+            # Shared: id is in shared_kb_ids
+            query = db.query(Kind).filter(
+                Kind.kind == "KnowledgeBase",
+                Kind.is_active == True,
+            )
+
+            conditions = [(Kind.user_id == user_id) & (Kind.namespace == "default")]
+
+            if accessible_groups:
+                conditions.append(Kind.namespace.in_(accessible_groups))
+
+            if org_namespace_names:
+                conditions.append(Kind.namespace.in_(org_namespace_names))
+
+            if shared_kb_ids:
+                conditions.append(Kind.id.in_(shared_kb_ids))
+
+            if conditions:
+                from sqlalchemy import or_
+
+                query = query.filter(or_(*conditions))
+
+            all_kbs = query.all()
+
+            # Separate into personal, team, organization, and shared
+            personal = [
+                kb
+                for kb in all_kbs
+                if kb.user_id == user_id and kb.namespace == "default"
+            ]
+            team = [
+                kb
+                for kb in all_kbs
+                if kb.namespace in accessible_groups
+                and kb.namespace not in org_namespace_names
+            ]
+            organization = [kb for kb in all_kbs if kb.namespace in org_namespace_names]
+            # Shared/bound KBs are those not in personal, team, or organization
+            other = [
+                kb
+                for kb in all_kbs
+                if kb not in personal and kb not in team and kb not in organization
+            ]
+
+            return filter_directly_accessible_knowledge_bases(
+                db,
+                personal + team + organization + other,
+                user_id,
+            )
+
+    @staticmethod
+    def list_knowledge_bases_paginated(
+        db: Session,
+        user_id: int,
+        scope: ResourceScope = ResourceScope.ALL,
+        group_name: Optional[str] = None,
+        *,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[Kind], int]:
+        """List accessible knowledge bases with SQL-level pagination."""
+        permission_context = build_direct_access_query_context(db, user_id)
+        query = build_knowledge_base_visibility_query(
+            db,
+            user_id=user_id,
+            scope=scope,
+            group_name=group_name,
+            permission_context=permission_context,
+        )
+        if query is None:
+            return [], 0
+
+        query = apply_direct_access_filter(
+            db,
+            query,
+            user_id,
+            permission_context,
+        )
+        total = query.order_by(None).count()
+
+        if scope == ResourceScope.ALL:
+            accessible_groups = permission_context.accessible_groups
+            organization_names = permission_context.organization_names
+            team_names = [
+                name for name in accessible_groups if name not in organization_names
+            ]
+            category_order = case(
+                (
+                    and_(Kind.user_id == user_id, Kind.namespace == "default"),
+                    0,
+                ),
+                (Kind.namespace.in_(team_names), 1) if team_names else (False, 1),
+                (
+                    (
+                        Kind.namespace.in_(organization_names),
+                        2,
+                    )
+                    if organization_names
+                    else (False, 2)
+                ),
+                else_=3,
+            )
+            query = query.order_by(
+                category_order,
+                Kind.updated_at.desc(),
+                Kind.id.desc(),
+            )
+        else:
+            query = query.order_by(Kind.updated_at.desc(), Kind.id.desc())
+
+        return query.offset(offset).limit(limit).all(), total
+
+    @staticmethod
+    def list_external_knowledge_bases(
+        db: Session,
+        *,
+        user_id: int,
+        filters: ExternalKnowledgeBaseListFilters,
+    ) -> tuple[list[Kind], int]:
+        """List externally visible knowledge bases with SQL filtering and paging."""
+        permission_context = build_direct_access_query_context(db, user_id)
+        query = build_knowledge_base_visibility_query(
+            db,
+            user_id=user_id,
+            scope=filters.scope,
+            group_name=filters.group_name,
+            permission_context=permission_context,
+        )
+
+        if query is None:
+            return [], 0
+
+        if filters.owner_user_ids:
+            query = query.filter(Kind.user_id.in_(filters.owner_user_ids))
+
+        if filters.keyword:
+            keyword_pattern = f"%{_escape_sql_like(filters.keyword.lower())}%"
+            name_text = knowledge_base_json_text(db, "$.spec.name")
+            description_text = knowledge_base_json_text(db, "$.spec.description")
+            query = query.filter(
+                or_(
+                    func.lower(name_text).like(keyword_pattern, escape="\\"),
+                    func.lower(description_text).like(keyword_pattern, escape="\\"),
+                )
+            )
+
+        query = apply_direct_access_filter(
+            db,
+            query,
+            user_id,
+            permission_context,
+        )
+
+        total = query.order_by(None).count()
+        knowledge_bases = (
+            query.order_by(Kind.created_at.desc(), Kind.id.desc())
+            .offset(filters.offset)
+            .limit(filters.limit)
+            .all()
+        )
+        return knowledge_bases, total
+
+    @staticmethod
+    def update_knowledge_base(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+        data: KnowledgeBaseUpdate,
+        multimodal_update_fields: Optional[dict[str, Any]] = None,
+    ) -> Optional[Kind]:
+        """
+        Update a knowledge base.
+
+        Args:
+            db: Database session
+            knowledge_base_id: Knowledge base ID
+            user_id: Requesting user ID
+            data: Update data
+            multimodal_update_fields: Explicitly-set multimodal spec fields (only
+                keys the client sent are present; a ``None`` value means clear).
+                When None the multimodal spec is left untouched.
+
+        Returns:
+            Updated Kind if successful, None otherwise
+
+        Raises:
+            ValueError: If validation fails or permission denied
+        """
+        kb, has_access = KnowledgeService.get_knowledge_base(
+            db, knowledge_base_id, user_id
+        )
+        if not kb or not has_access:
+            return None
+
+        if not KnowledgeService.can_manage_knowledge_base(
+            db, knowledge_base_id, user_id
+        ):
+            raise ValueError("You do not have permission to manage this knowledge base")
+
+        # Get current spec
+        kb_json = kb.json
+        spec = kb_json.get("spec", {})
+
+        # Check duplicate name if name is being changed
+        if data.name and data.name != spec.get("name"):
+            existing = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "KnowledgeBase",
+                    Kind.user_id == kb.user_id,
+                    Kind.namespace == kb.namespace,
+                    Kind.is_active == True,
+                    Kind.id != knowledge_base_id,
+                )
+                .all()
+            )
+
+            for existing_kb in existing:
+                existing_spec = existing_kb.json.get("spec", {})
+                if existing_spec.get("name") == data.name:
+                    raise ValueError(
+                        f"Knowledge base with name '{data.name}' already exists"
+                    )
+
+            spec["name"] = data.name
+
+        if data.description is not None:
+            spec["description"] = data.description
+
+        if data.direct_access_requirement is not None:
+            spec["directAccessRequirement"] = data.direct_access_requirement
+
+        if "allow_document_download" in data.model_fields_set:
+            if data.allow_document_download is None:
+                spec.pop("allowDocumentDownload", None)
+            else:
+                spec["allowDocumentDownload"] = data.allow_document_download
+
+        # Update retrieval config if provided (only allowed fields)
+        if data.retrieval_config is not None:
+            current_retrieval_config = spec.get("retrievalConfig", {})
+            if current_retrieval_config:
+                # Only update allowed fields, keep retriever and embedding_config unchanged
+                if data.retrieval_config.retrieval_mode is not None:
+                    current_retrieval_config["retrieval_mode"] = (
+                        data.retrieval_config.retrieval_mode
+                    )
+                if data.retrieval_config.top_k is not None:
+                    current_retrieval_config["top_k"] = data.retrieval_config.top_k
+                if data.retrieval_config.score_threshold is not None:
+                    current_retrieval_config["score_threshold"] = (
+                        data.retrieval_config.score_threshold
+                    )
+                if data.retrieval_config.hybrid_weights is not None:
+                    current_retrieval_config["hybrid_weights"] = (
+                        data.retrieval_config.hybrid_weights.model_dump()
+                    )
+                spec["retrievalConfig"] = current_retrieval_config
+
+        if data.dingtalk_auto_sync_enabled is not None:
+            spec["dingtalkAutoSyncEnabled"] = data.dingtalk_auto_sync_enabled
+
+        # Update summary_enabled if provided
+        if data.summary_enabled is not None:
+            spec["summaryEnabled"] = data.summary_enabled
+
+        # Update summary_model_ref if explicitly provided (including null to clear)
+        # Use model_fields_set to detect if the field was explicitly passed
+        if "summary_model_ref" in data.model_fields_set:
+            spec["summaryModelRef"] = data.summary_model_ref
+
+        # Update execution_model_ref if explicitly provided (including null to clear)
+        if "execution_model_ref" in data.model_fields_set:
+            spec["executionModelRef"] = data.execution_model_ref
+
+        # Update guided_questions if explicitly provided (including null to clear)
+        if "guided_questions" in data.model_fields_set:
+            spec["guidedQuestions"] = data.guided_questions
+
+        # Only meaningful for a code wiki; harmless on anything else, and refusing
+        # it by type here would put a second copy of "what is a code wiki" in the
+        # update path.
+        if data.show_generation_task is not None:
+            spec["showGenerationTask"] = data.show_generation_task
+
+        if "generation_strategy" in data.model_fields_set:
+            spec["generationStrategy"] = data.generation_strategy
+
+        # Update call limit configuration if provided
+        if data.max_calls_per_conversation is not None:
+            spec["maxCallsPerConversation"] = data.max_calls_per_conversation
+
+        if data.exempt_calls_before_check is not None:
+            spec["exemptCallsBeforeCheck"] = data.exempt_calls_before_check
+
+        # Validate call limits: exempt < max (additional backend validation)
+        max_calls = spec.get("maxCallsPerConversation", 10)
+        exempt_calls = spec.get("exemptCallsBeforeCheck", 5)
+        if exempt_calls >= max_calls:
+            raise ValidationException(
+                f"exemptCallsBeforeCheck ({exempt_calls}) must be less than "
+                f"maxCallsPerConversation ({max_calls})"
+            )
+
+        # Multimodal spec fields: only keys the client explicitly sent are
+        # present (None = clear). Mirrors the summary_model_ref / guided_questions
+        # explicit-set handling above.
+        if multimodal_update_fields:
+            if "multimodal_analysis_enabled" in multimodal_update_fields:
+                spec["multimodalAnalysisEnabled"] = multimodal_update_fields[
+                    "multimodal_analysis_enabled"
+                ]
+            if "multimodal_analysis_model_ref" in multimodal_update_fields:
+                spec["multimodalAnalysisModelRef"] = multimodal_update_fields[
+                    "multimodal_analysis_model_ref"
+                ]
+            if "multimodal_analysis_video_prompt" in multimodal_update_fields:
+                v = multimodal_update_fields["multimodal_analysis_video_prompt"]
+                spec["multimodalAnalysisVideoPrompt"] = (
+                    v.strip() if v else None
+                ) or None
+            if "multimodal_analysis_image_prompt" in multimodal_update_fields:
+                v = multimodal_update_fields["multimodal_analysis_image_prompt"]
+                spec["multimodalAnalysisImagePrompt"] = (
+                    v.strip() if v else None
+                ) or None
+
+        kb_json["spec"] = spec
+        kb.json = kb_json
+        # Mark JSON field as modified so SQLAlchemy detects the change
+        flag_modified(kb, "json")
+
+        db.commit()
+        db.refresh(kb)
+        return kb
+
+    @staticmethod
+    def delete_knowledge_base(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+    ) -> bool:
+        """
+        Delete a knowledge base.
+
+        Args:
+            db: Database session
+            knowledge_base_id: Knowledge base ID
+            user_id: Requesting user ID
+
+        Returns:
+            True if deleted, False if not found
+
+        Raises:
+            ValueError: If permission denied, a non-generated document would be lost,
+                or the code wiki still has a generation in progress
+        """
+        from app.services.share import knowledge_share_service
+
+        kb, has_access = KnowledgeService.get_knowledge_base(
+            db, knowledge_base_id, user_id
+        )
+        if not kb or not has_access:
+            return False
+        if not KnowledgeService.can_manage_knowledge_base(
+            db, knowledge_base_id, user_id
+        ):
+            raise ValueError("You do not have permission to manage this knowledge base")
+
+        kb = KnowledgeService._lock_active_knowledge_base(db, kb)
+        if not kb:
+            return False
+
+        documents = (
+            db.query(KnowledgeDocument)
+            .filter(KnowledgeDocument.kind_id == knowledge_base_id)
+            .all()
+        )
+        is_code_wiki = KnowledgeService._validate_code_wiki_deletion(db, kb, documents)
+        if documents and not is_code_wiki:
+            raise ValueError(
+                f"Cannot delete knowledge base with {len(documents)} document(s). "
+                "Please delete all documents first."
+            )
+
+        attachment_refs = {
+            (attachment_id, document.user_id)
+            for document in documents
+            for attachment_id in (
+                document.attachment_id,
+                document.converted_attachment_id,
+            )
+            if attachment_id
+        }
+        purge_spec = KnowledgeService._build_code_wiki_purge_spec(
+            db, kb, user_id, documents
+        )
+        # Reference-mode purge needs the KB record before deletion commits.
+        # Keep the records intact when the runtime cannot complete the purge.
+        if purge_spec is not None:
+            purge_result = _run_async_in_new_loop(
+                _get_rag_gateway().purge_knowledge_index(purge_spec, db=db)
+            )
+            if (purge_result or {}).get("status") not in {"success", "deleted"}:
+                raise RuntimeError("Code Wiki remote purge did not complete")
+
+        for document in documents:
+            db.delete(document)
+
+        # Delete all folders belonging to this knowledge base to prevent orphaned records.
+        # Folders have no FK constraint on kind_id, so they must be cleaned up explicitly.
+        db.query(KnowledgeFolder).filter(
+            KnowledgeFolder.kind_id == knowledge_base_id
+        ).delete(synchronize_session=False)
+
+        # Delete Artifacts in the same transaction as their owning knowledge base.
+        db.query(KnowledgeArtifactRecord).filter(
+            KnowledgeArtifactRecord.knowledge_base_id == knowledge_base_id
+        ).delete(synchronize_session=False)
+
+        # A code wiki's registry row, for the same reason as the folders above: its
+        # kind_id is a plain column, so deleting the knowledge base leaves it behind
+        # and the cascade that would have taken every version and page of content
+        # never fires. Harmless for any other kind, which has no such row.
+        from app.services.knowledge.code_wiki.registry import forget_repository
+
+        forget_repository(db, knowledge_base_id)
+
+        # The scheduler projection belongs to the wiki. It is deliberately removed
+        # in the same transaction so no due worker can observe an orphaned plan.
+        from app.models.subscription import BackgroundExecution
+        from app.services.knowledge.code_wiki.scheduled_update import (
+            scheduled_update_for,
+        )
+
+        scheduled_update = scheduled_update_for(db, kb)
+        if scheduled_update is not None:
+            db.query(BackgroundExecution).filter(
+                BackgroundExecution.subscription_id == scheduled_update.id
+            ).delete(synchronize_session=False)
+            db.delete(scheduled_update)
+
+        # Delete all members for this KB
+        knowledge_share_service.delete_members_for_kb(db, knowledge_base_id)
+
+        # Physically delete the knowledge base
+        db.delete(kb)
+        db.commit()
+        KnowledgeService._cleanup_deleted_code_wiki_resources(db, attachment_refs)
+        return True
+
+    @staticmethod
+    def _lock_active_knowledge_base(
+        db: Session, knowledge_base: Kind
+    ) -> Optional[Kind]:
+        """Lock an active KB so document writes and deletion serialize."""
+        return (
+            db.query(Kind)
+            .filter(
+                Kind.id == knowledge_base.id,
+                Kind.kind == "KnowledgeBase",
+                Kind.namespace == knowledge_base.namespace,
+                Kind.name == knowledge_base.name,
+                Kind.user_id == knowledge_base.user_id,
+                Kind.is_active.is_(True),
+            )
+            .populate_existing()
+            .with_for_update()
+            .first()
+        )
+
+    @staticmethod
+    def _validate_code_wiki_deletion(
+        db: Session, knowledge_base: Kind, documents: list[KnowledgeDocument]
+    ) -> bool:
+        """Ensure a Code Wiki has no live run or user-owned documents."""
+        spec = (knowledge_base.json or {}).get("spec", {})
+        is_code_wiki = spec.get("kbType") == KnowledgeBaseType.CODE_WIKI.value
+        if not is_code_wiki:
+            return False
+
+        from app.models.wiki import WikiGeneration, WikiGenerationStatus
+
+        in_flight = (
+            db.query(WikiGeneration.id)
+            .filter(
+                WikiGeneration.kind_id == knowledge_base.id,
+                WikiGeneration.status.in_(
+                    [WikiGenerationStatus.PENDING, WikiGenerationStatus.RUNNING]
+                ),
+            )
+            .first()
+        )
+        if in_flight:
+            raise ValueError(
+                "Cannot delete code wiki while a generation is in progress"
+            )
+
+        if any(
+            not KnowledgeService._is_generated_code_wiki_document(document)
+            for document in documents
+        ):
+            raise ValueError(
+                "Cannot delete Code Wiki because it contains manually added "
+                "documents. Remove or move them first."
+            )
+        return True
+
+    @staticmethod
+    def _build_code_wiki_purge_spec(
+        db: Session,
+        knowledge_base: Kind,
+        user_id: int,
+        documents: list[KnowledgeDocument],
+    ) -> Optional[Any]:
+        """Build the RAG cleanup request before deleting generated pages."""
+        spec = (knowledge_base.json or {}).get("spec", {})
+        if not spec.get("retrievalConfig"):
+            return None
+
+        from app.services.rag.runtime_resolver import RagRuntimeResolver
+
+        return RagRuntimeResolver().build_public_purge_index_runtime_spec(
+            db=db,
+            knowledge_base_id=knowledge_base.id,
+            user_id=user_id,
+        )
+
+    @staticmethod
+    def _cleanup_deleted_code_wiki_resources(
+        db: Session,
+        attachment_refs: set[tuple[int, int]],
+    ) -> None:
+        """Clean external resources after the Code Wiki database deletion commits."""
+        if not attachment_refs:
+            return
+
+        from app.services.context import context_service
+
+        for attachment_id, owner_id in attachment_refs:
+            try:
+                context_service.delete_context(
+                    db=db,
+                    context_id=attachment_id,
+                    user_id=owner_id,
+                )
+            except Exception as exc:
+                batch_logger.error(
+                    "Failed to delete generated attachment %s: %s",
+                    attachment_id,
+                    exc,
+                    exc_info=True,
+                )
+
+    @staticmethod
+    def _is_generated_code_wiki_document(document: KnowledgeDocument) -> bool:
+        """Whether deletion may remove this Code Wiki document automatically."""
+        return document.origin == ContentOrigin.GENERATED.value
+
+    @staticmethod
+    def update_knowledge_base_type(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+        new_type: str,
+    ) -> Optional[Kind]:
+        """
+        Update the knowledge base default opening view.
+
+        Args:
+            db: Database session
+            knowledge_base_id: Knowledge base ID
+            user_id: Requesting user ID
+            new_type: New default view value ('notebook' or 'classic')
+
+        Returns:
+            Updated Kind if successful, None if not found
+
+        Raises:
+            ValueError: If validation fails or permission denied
+        """
+        kb, has_access = KnowledgeService.get_knowledge_base(
+            db, knowledge_base_id, user_id
+        )
+        if not kb or not has_access:
+            return None
+
+        if not KnowledgeService.can_manage_knowledge_base(
+            db, knowledge_base_id, user_id
+        ):
+            raise ValueError("You do not have permission to manage this knowledge base")
+
+        # Validate new_type
+        if new_type not in ("notebook", "classic"):
+            raise ValueError("kb_type must be 'notebook' or 'classic'")
+
+        # Get current default view
+        kb_json = kb.json
+        spec = kb_json.get("spec", {})
+
+        current_type = spec.get("kbType", KnowledgeBaseType.NOTEBOOK.value)
+
+        # A code wiki is a repository binding, not a view preference, so the toggle does
+        # not apply. Rejecting it here also keeps this endpoint from being used to
+        # reinterpret a code wiki as an ordinary knowledge base, which would orphan its
+        # repository and version history.
+        if current_type == KnowledgeBaseType.CODE_WIKI.value:
+            raise ValueError("Cannot change the opening view of a code wiki")
+
+        # If same type, return current kb
+        if current_type == new_type:
+            return kb
+
+        # Update the default opening view. This does not change KB capabilities.
+        spec["kbType"] = new_type
+        kb_json["spec"] = spec
+        kb.json = kb_json
+        # Mark JSON field as modified so SQLAlchemy detects the change
+        flag_modified(kb, "json")
+
+        db.commit()
+        db.refresh(kb)
+        return kb
+
+    @staticmethod
+    def get_document_count(
+        db: Session,
+        knowledge_base_id: int,
+    ) -> int:
+        """
+        Get the total document count for a knowledge base (all documents).
+
+        Args:
+            db: Database session
+            knowledge_base_id: Knowledge base ID
+
+        Returns:
+            Number of documents in the knowledge base
+        """
+        from sqlalchemy import func
+
+        return (
+            db.query(func.count(KnowledgeDocument.id))
+            .filter(
+                KnowledgeDocument.kind_id == knowledge_base_id,
+            )
+            .scalar()
+            or 0
+        )
+
+    @staticmethod
+    def get_document_counts(
+        db: Session,
+        knowledge_base_ids: list[int],
+    ) -> dict[int, int]:
+        """Get total document counts for multiple knowledge bases in one query."""
+        from sqlalchemy import func
+
+        if not knowledge_base_ids:
+            return {}
+
+        results = (
+            db.query(
+                KnowledgeDocument.kind_id,
+                func.count(KnowledgeDocument.id).label("count"),
+            )
+            .filter(KnowledgeDocument.kind_id.in_(knowledge_base_ids))
+            .group_by(KnowledgeDocument.kind_id)
+            .all()
+        )
+
+        return {kb_id: count for kb_id, count in results}
+
+    @staticmethod
+    def _update_document_count_cache(
+        db: Session,
+        knowledge_base_id: int,
+    ) -> None:
+        """
+        Update the cached document_count in knowledge base spec.
+
+        This method queries the actual document count from the database
+        and updates the spec.document_count field to keep it in sync.
+        Called after document creation/deletion.
+
+        Args:
+            db: Database session
+            knowledge_base_id: Knowledge base ID
+        """
+        kb = (
+            db.query(Kind)
+            .filter(
+                Kind.id == knowledge_base_id,
+                Kind.kind == "KnowledgeBase",
+            )
+            .first()
+        )
+
+        if kb:
+            # Query actual document count from database
+            actual_count = KnowledgeService.get_document_count(db, knowledge_base_id)
+
+            kb_json = kb.json
+            spec = kb_json.get("spec", {})
+            spec["document_count"] = actual_count
+            kb_json["spec"] = spec
+            kb.json = kb_json
+            flag_modified(kb, "json")
+
+    @staticmethod
+    def get_active_document_count(
+        db: Session,
+        knowledge_base_id: int,
+    ) -> int:
+        """
+        Get the active document count for a knowledge base.
+        Only counts documents that are indexed (is_active=True).
+        Used for AI chat integration to show available documents.
+
+        Note: The status field is reserved for future use and not currently checked.
+
+        Args:
+            db: Database session
+            knowledge_base_id: Knowledge base ID
+
+        Returns:
+            Number of active documents in the knowledge base
+        """
+        from sqlalchemy import func
+
+        return (
+            db.query(func.count(KnowledgeDocument.id))
+            .filter(
+                KnowledgeDocument.kind_id == knowledge_base_id,
+                KnowledgeDocument.is_active == True,
+            )
+            .scalar()
+            or 0
+        )
+
+    @staticmethod
+    def get_active_document_counts(
+        db: Session,
+        knowledge_base_ids: list[int],
+    ) -> dict[int, int]:
+        """
+        Get active document counts for multiple knowledge bases in a single query.
+
+        Args:
+            db: Database session
+            knowledge_base_ids: List of knowledge base IDs
+
+        Returns:
+            Dict mapping kb_id -> active document count
+        """
+        from sqlalchemy import func
+
+        if not knowledge_base_ids:
+            return {}
+
+        results = (
+            db.query(
+                KnowledgeDocument.kind_id,
+                func.count(KnowledgeDocument.id).label("count"),
+            )
+            .filter(
+                KnowledgeDocument.kind_id.in_(knowledge_base_ids),
+                KnowledgeDocument.is_active == True,
+            )
+            .group_by(KnowledgeDocument.kind_id)
+            .all()
+        )
+
+        return {kb_id: count for kb_id, count in results}
+
+    @staticmethod
+    def get_document_prompt_stats(
+        db: Session,
+        knowledge_base_ids: list[int],
+    ) -> dict[int, dict[str, int]]:
+        """Get prompt-oriented document stats for multiple knowledge bases."""
+        if not knowledge_base_ids:
+            return {}
+
+        spreadsheet_exts = ["csv", "xls", "xlsx"]
+
+        results = (
+            db.query(
+                KnowledgeDocument.kind_id,
+                func.count(KnowledgeDocument.id).label("total_count"),
+                func.sum(case((KnowledgeDocument.is_active == True, 1), else_=0)).label(
+                    "searchable_count"
+                ),
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                KnowledgeDocument.is_active == True,
+                                func.lower(KnowledgeDocument.file_extension).in_(
+                                    spreadsheet_exts
+                                ),
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("spreadsheet_count"),
+            )
+            .filter(KnowledgeDocument.kind_id.in_(knowledge_base_ids))
+            .group_by(KnowledgeDocument.kind_id)
+            .all()
+        )
+
+        return {
+            kb_id: {
+                "total_document_count": int(total_count or 0),
+                "searchable_document_count": int(searchable_count or 0),
+                "spreadsheet_document_count": int(spreadsheet_count or 0),
+            }
+            for kb_id, total_count, searchable_count, spreadsheet_count in results
+        }
+
+    @staticmethod
+    def resolve_document_ids_by_names(
+        db: Session,
+        knowledge_base_ids: list[int],
+        document_names: list[str],
+    ) -> list[int]:
+        """Resolve exact document names within the provided knowledge-base scope."""
+        if not knowledge_base_ids or not document_names:
+            return []
+
+        normalized_names = [
+            name.strip() for name in document_names if name and name.strip()
+        ]
+        if not normalized_names:
+            return []
+
+        rows = (
+            db.query(KnowledgeDocument.id)
+            .filter(
+                KnowledgeDocument.kind_id.in_(knowledge_base_ids),
+                KnowledgeDocument.name.in_(normalized_names),
+                KnowledgeDocument.is_active == True,
+            )
+            .all()
+        )
+        return [row.id for row in rows]
+
+    @staticmethod
+    def get_active_document_text_length_stats(
+        db: Session,
+        knowledge_base_id: int,
+    ) -> "ActiveDocumentTextStats":
+        """
+        Get aggregated active document stats with extracted text length.
+
+        Returns total extracted text length (SubtaskContext.text_length),
+        total raw file size, and active document count using a single query.
+        """
+        from app.models.subtask_context import SubtaskContext
+
+        file_size_total, text_length_total, active_document_count = (
+            db.query(
+                func.coalesce(func.sum(KnowledgeDocument.file_size), 0),
+                func.coalesce(func.sum(SubtaskContext.text_length), 0),
+                func.count(KnowledgeDocument.id),
+            )
+            .outerjoin(
+                SubtaskContext,
+                KnowledgeDocument.attachment_id == SubtaskContext.id,
+            )
+            .filter(
+                KnowledgeDocument.kind_id == knowledge_base_id,
+                KnowledgeDocument.is_active == True,
+                KnowledgeDocument.status == DocumentStatus.ENABLED,
+            )
+            .one()
+        )
+
+        return ActiveDocumentTextStats(
+            file_size_total=int(file_size_total or 0),
+            text_length_total=int(text_length_total or 0),
+            active_document_count=int(active_document_count or 0),
+        )
+
+    # ============== Knowledge Document Operations ==============
+
+    @staticmethod
+    def create_document(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+        data: KnowledgeDocumentCreate,
+    ) -> KnowledgeDocument:
+        """
+        Create a new document in a knowledge base.
+
+        Args:
+            db: Database session
+            knowledge_base_id: Knowledge base ID
+            user_id: Uploader user ID
+            data: Document creation data
+
+        Returns:
+            Created KnowledgeDocument
+
+        Raises:
+            ValueError: If validation fails or permission denied
+        """
+        # First, query the KB directly without permission check to determine namespace
+        kb = (
+            db.query(Kind)
+            .filter(
+                Kind.id == knowledge_base_id,
+                Kind.kind == "KnowledgeBase",
+                Kind.is_active == True,
+            )
+            .first()
+        )
+
+        if not kb:
+            raise ValueError("Knowledge base not found or access denied")
+
+        if not KnowledgeService.can_manage_knowledge_base_documents(
+            db, knowledge_base_id, user_id
+        ):
+            raise ValueError(
+                "You do not have permission to add documents to this knowledge base"
+            )
+
+        kb = KnowledgeService._lock_active_knowledge_base(db, kb)
+        if not kb:
+            raise ValueError("Knowledge base not found or access denied")
+
+        validated_folder_id = data.folder_id
+
+        # Validate that the folder belongs to this knowledge base (if a non-root folder is specified)
+        if data.folder_id and data.folder_id != 0:
+            target_folder = assert_document_can_be_placed_in_folder(
+                db,
+                knowledge_base_id,
+                data.folder_id,
+                content_origin=ContentOrigin.USER,
+            )
+            validated_folder_id = target_folder.id
+
+        # Persist the optional per-document multimodal analysis prompt override
+        # into source_config under the same key the reindex path and re-analyze
+        # dialog read. Blank clears the override (inherit KB default); None
+        # leaves source_config untouched (no multimodal override requested).
+        source_config = dict(data.source_config) if data.source_config else {}
+        prompt_override = getattr(data, "multimodal_analysis_prompt", None)
+        if prompt_override is not None:
+            prompt_text = prompt_override.strip()
+            if prompt_text:
+                source_config["multimodal_analysis_prompt"] = prompt_text
+            else:
+                source_config.pop("multimodal_analysis_prompt", None)
+
+        document = KnowledgeDocument(
+            kind_id=knowledge_base_id,
+            attachment_id=data.attachment_id if data.attachment_id is not None else 0,
+            name=data.name,
+            file_extension=data.file_extension,
+            file_size=data.file_size,
+            user_id=user_id,
+            folder_id=validated_folder_id,
+            splitter_config=(
+                data.splitter_config.model_dump(exclude_none=True)
+                if data.splitter_config
+                else {}
+            ),  # Save splitter_config with default {}
+            source_type=data.source_type.value if data.source_type else "file",
+            source_config=source_config,
+            origin=ContentOrigin.USER.value,
+        )
+        db.add(document)
+        db.flush()  # Flush to persist document before counting
+
+        # Update cached document count in knowledge base spec
+        KnowledgeService._update_document_count_cache(db, knowledge_base_id)
+
+        db.commit()
+        db.refresh(document)
+        return document
+
+    @staticmethod
+    def create_external_document(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+        *,
+        name: str,
+        external_provider: str,
+        external_resource_id: str,
+        folder_id: int,
+        external_meta: dict[str, Any],
+    ) -> KnowledgeDocument:
+        """
+        Create the placeholder row for an imported external document.
+
+        The placeholder carries the external identity, target folder and the
+        QUEUED import status; a background task later fetches the body, creates
+        the attachment and reuses the regular indexing state machine.
+
+        The caller (the external import service) is responsible for KB access
+        and manage-permission validation; this method only locks the KB row so
+        creation serializes with deletion.
+
+        Raises:
+            ValueError: If the external identity is missing or the KB is inactive
+            IntegrityError: On a concurrent duplicate external identity
+        """
+        if not external_provider or not external_resource_id:
+            raise ValueError("External provider and resource ID are required")
+
+        kb = (
+            db.query(Kind)
+            .filter(
+                Kind.id == knowledge_base_id,
+                Kind.kind == "KnowledgeBase",
+                Kind.is_active == True,  # noqa: E712
+            )
+            .with_for_update()
+            .first()
+        )
+
+        if not kb:
+            raise ValueError("Knowledge base not found or access denied")
+
+        validated_folder_id = folder_id
+        if folder_id:
+            target_folder = assert_document_can_be_placed_in_folder(
+                db,
+                knowledge_base_id,
+                folder_id,
+                content_origin=ContentOrigin.USER,
+            )
+            validated_folder_id = target_folder.id
+
+        document = KnowledgeDocument(
+            kind_id=knowledge_base_id,
+            attachment_id=0,
+            name=name,
+            file_extension="md",
+            file_size=0,
+            user_id=user_id,
+            folder_id=validated_folder_id,
+            status=DocumentStatus.DISABLED,
+            is_active=False,
+            index_status=DocumentIndexStatus.QUEUED,
+            source_type=DocumentSourceType.EXTERNAL.value,
+            source_config={"external": dict(external_meta)},
+            external_source=KnowledgeDocumentExternalSource(
+                kind_id=knowledge_base_id,
+                external_provider=external_provider,
+                external_resource_id=external_resource_id,
+            ),
+            origin=ContentOrigin.USER.value,
+        )
+        try:
+            db.add(document)
+            db.flush()
+            KnowledgeService._update_document_count_cache(db, knowledge_base_id)
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise
+        db.refresh(document)
+        return document
+
+    @staticmethod
+    def get_document(
+        db: Session,
+        document_id: int,
+        user_id: int,
+    ) -> Optional[KnowledgeDocument]:
+        """
+        Get a document by ID with permission check.
+
+        Args:
+            db: Database session
+            document_id: Document ID
+            user_id: Requesting user ID
+
+        Returns:
+            KnowledgeDocument if found and accessible, None otherwise
+        """
+        doc = (
+            db.query(KnowledgeDocument)
+            .filter(
+                KnowledgeDocument.id == document_id,
+            )
+            .first()
+        )
+
+        if not doc:
+            return None
+
+        # Check access via knowledge base
+        kb, has_access = KnowledgeService.get_knowledge_base(db, doc.kind_id, user_id)
+        if not kb or not has_access:
+            return None
+
+        return doc
+
+    @staticmethod
+    def list_documents(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+        folder_id: int | None = None,
+        content_origin: str | None = None,
+    ) -> list[KnowledgeDocument]:
+        """
+        List documents in a knowledge base.
+
+        Args:
+            db: Database session
+            knowledge_base_id: Knowledge base ID
+            user_id: Requesting user ID
+            folder_id: Optional folder ID to filter by (None = all documents)
+
+        Returns:
+            List of documents
+        """
+        # Check access to knowledge base
+        kb, has_access = KnowledgeService.get_knowledge_base(
+            db, knowledge_base_id, user_id
+        )
+        if not kb or not has_access:
+            return []
+
+        # Scoped to browsable pages: code targets are retrieval artifacts and must
+        # never surface in a listing. See content_scope.
+        query = wiki_pages(
+            db.query(KnowledgeDocument).filter(
+                KnowledgeDocument.kind_id == knowledge_base_id,
+            )
+        )
+
+        if folder_id is not None:
+            query = query.filter(KnowledgeDocument.folder_id == folder_id)
+
+        if content_origin is not None:
+            query = query.filter(KnowledgeDocument.origin == content_origin)
+
+        return query.order_by(KnowledgeDocument.created_at.desc()).all()
+
+    @staticmethod
+    def list_documents_paginated(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+        folder_id: int | None = None,
+        *,
+        offset: int = 0,
+        limit: int = 50,
+        include_subfolders: bool = False,
+        keyword: str | None = None,
+        sort_by: str = "createdAt",
+        sort_order: str = "desc",
+        content_origin: str | None = None,
+    ) -> tuple[list[KnowledgeDocument], int]:
+        """List documents with offset/limit pagination."""
+        kb, has_access = KnowledgeService.get_knowledge_base(
+            db, knowledge_base_id, user_id
+        )
+        if not kb or not has_access:
+            return [], 0
+
+        # Scoped to browsable pages; see list_documents.
+        query = wiki_pages(
+            db.query(KnowledgeDocument).filter(
+                KnowledgeDocument.kind_id == knowledge_base_id,
+            )
+        )
+
+        if folder_id is not None:
+            if folder_id > 0:
+                folder = (
+                    db.query(KnowledgeFolder)
+                    .filter(
+                        KnowledgeFolder.id == folder_id,
+                        KnowledgeFolder.kind_id == knowledge_base_id,
+                    )
+                    .first()
+                )
+                if folder is None:
+                    raise ValueError("Folder not found in this knowledge base")
+
+            if include_subfolders:
+                folder_rows = (
+                    db.query(KnowledgeFolder.id, KnowledgeFolder.parent_id)
+                    .filter(KnowledgeFolder.kind_id == knowledge_base_id)
+                    .all()
+                )
+                children_by_parent: dict[int, list[int]] = {}
+                for child_id, parent_id in folder_rows:
+                    children_by_parent.setdefault(parent_id, []).append(child_id)
+
+                folder_ids: set[int] = set()
+                stack = [folder_id]
+                while stack:
+                    current_id = stack.pop()
+                    if current_id in folder_ids:
+                        continue
+                    folder_ids.add(current_id)
+                    stack.extend(children_by_parent.get(current_id, []))
+
+                folder_ids.add(folder_id)
+                query = query.filter(KnowledgeDocument.folder_id.in_(folder_ids))
+            else:
+                query = query.filter(KnowledgeDocument.folder_id == folder_id)
+
+        if keyword:
+            keyword = keyword.strip()
+            if keyword:
+                keyword_pattern = f"%{_escape_sql_like(keyword)}%"
+                query = query.filter(
+                    KnowledgeDocument.name.ilike(keyword_pattern, escape="\\")
+                )
+
+        if content_origin is not None:
+            query = query.filter(KnowledgeDocument.origin == content_origin)
+
+        sort_columns = {
+            "name": KnowledgeDocument.name,
+            "size": KnowledgeDocument.file_size,
+            "createdAt": KnowledgeDocument.created_at,
+            "updatedAt": KnowledgeDocument.updated_at,
+        }
+        sort_column = sort_columns.get(sort_by, KnowledgeDocument.created_at)
+        ordered_column = (
+            sort_column.asc() if sort_order == "asc" else sort_column.desc()
+        )
+
+        total = query.count()
+        items = (
+            query.order_by(ordered_column, KnowledgeDocument.id.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return items, total
+
+    @staticmethod
+    def _assert_can_manage_document(
+        db: Session,
+        kb: Kind,
+        document: KnowledgeDocument,
+        user_id: int,
+    ) -> None:
+        """Ensure the user can manage the target document."""
+        kb_id = getattr(kb, "id", None)
+        if kb_id is None:
+            kb_owner_id = getattr(kb, "user_id", None)
+            if kb.namespace == "default" and kb_owner_id in (None, user_id):
+                return
+            if document.user_id == user_id:
+                return
+            raise ValueError(
+                "You do not have permission to manage this document in this knowledge base"
+            )
+
+        if not KnowledgeService.can_manage_knowledge_document(
+            db, kb_id, user_id, document.user_id
+        ):
+            raise ValueError(
+                "You do not have permission to manage this document in this knowledge base"
+            )
+
+    @staticmethod
+    def update_document(
+        db: Session,
+        document_id: int,
+        user_id: int,
+        data: KnowledgeDocumentUpdate,
+    ) -> Optional[KnowledgeDocument]:
+        """
+        Update a document (enable/disable status).
+
+        Args:
+            db: Database session
+            document_id: Document ID
+            user_id: Requesting user ID
+            data: Update data
+
+        Returns:
+            Updated KnowledgeDocument if successful, None otherwise
+
+        Raises:
+            ValueError: If permission denied
+        """
+        doc = KnowledgeService.get_document(db, document_id, user_id)
+        if not doc:
+            return None
+
+        assert_user_content_is_mutable(getattr(doc, "origin", ContentOrigin.USER.value))
+
+        # Check permission for knowledge base
+        kb = (
+            db.query(Kind)
+            .filter(Kind.id == doc.kind_id, Kind.kind == "KnowledgeBase")
+            .first()
+        )
+        if not kb:
+            raise ValueError("Knowledge base not found for document")
+        KnowledgeService._assert_can_manage_document(db, kb, doc, user_id)
+
+        if data.name is not None:
+            from app.services.knowledge.external_sync_providers import (
+                is_synchronized_external_document,
+            )
+
+            if (
+                doc.external_provider == WIKI_PROVIDER_ID
+                and is_synchronized_external_document(doc)
+                and data.name != doc.name
+            ):
+                raise ValueError(
+                    "Synchronized Wiki document names are managed by the source"
+                )
+            doc.name = data.name
+
+        if data.status is not None:
+            if (
+                data.status == DocumentStatus.ENABLED
+                and doc.source_type == DocumentSourceType.EXTERNAL.value
+                and (
+                    doc.attachment_id == 0
+                    or (
+                        doc.index_status == DocumentIndexStatus.FAILED
+                        and not doc.is_active
+                    )
+                )
+            ):
+                # External import placeholders and failed imports have no
+                # usable content; they cannot be enabled until a background
+                # import completes successfully. A previously successful
+                # document whose later re-index failed keeps valid content.
+                raise ValueError("Document content is not ready and cannot be enabled")
+            doc.status = DocumentStatus(data.status.value)
+
+        if data.splitter_config is not None:
+            doc.splitter_config = data.splitter_config.model_dump(exclude_none=True)
+
+        db.commit()
+        db.refresh(doc)
+        return doc
+
+    @staticmethod
+    def _lock_document_row(
+        db: Session, document_id: int
+    ) -> Optional[KnowledgeDocument]:
+        """Re-read one document under a row lock.
+
+        ``populate_existing`` refreshes any already cached instance, so the
+        caller never keeps working with a stale generation or status while the
+        lock is meant to serialize it with indexing.
+        """
+        return (
+            db.query(KnowledgeDocument)
+            .filter(KnowledgeDocument.id == document_id)
+            .populate_existing()
+            .with_for_update()
+            .first()
+        )
+
+    @staticmethod
+    def delete_document(
+        db: Session,
+        document_id: int,
+        user_id: int,
+    ) -> DocumentDeleteResult:
+        """
+        Physically delete a document, its RAG index, and associated attachment.
+
+        Args:
+            db: Database session
+            document_id: Document ID
+            user_id: Requesting user ID
+
+        Returns:
+            DocumentDeleteResult with success status and kb_id for summary updates
+
+        Raises:
+            ValueError: If permission denied
+            RemoteRagGatewayError: If the remote index removal fails; the
+                document is kept so the caller can retry.
+        """
+        logger = logging.getLogger(__name__)
+
+        from app.services.knowledge.attachment_cleanup import (
+            delete_attachment_best_effort,
+        )
+        from app.services.knowledge.index_runtime import get_kb_index_info_by_record
+
+        rag_gateway = _get_rag_gateway()
+
+        doc = KnowledgeService.get_document(db, document_id, user_id)
+        if not doc:
+            return DocumentDeleteResult(success=False, kb_id=None)
+
+        assert_user_content_is_mutable(getattr(doc, "origin", ContentOrigin.USER.value))
+
+        # Check permission for knowledge base
+        kb = (
+            db.query(Kind)
+            .filter(Kind.id == doc.kind_id, Kind.kind == "KnowledgeBase")
+            .first()
+        )
+        if not kb:
+            return DocumentDeleteResult(
+                success=False, kb_id=None, error="Knowledge base not found for document"
+            )
+        KnowledgeService._assert_can_manage_document(db, kb, doc, user_id)
+
+        # Hold the document row until the removal is committed. Indexing reads and
+        # updates this same row, so the lock closes the window where an in-flight
+        # write could still finalize successfully between the index removal and
+        # the row deletion: a starting task blocks and then finds no row, and a
+        # finishing task blocks and then matches nothing, which routes it into the
+        # existing late-index compensation.
+        locked_doc = KnowledgeService._lock_document_row(db, document_id)
+        if locked_doc is None:
+            return DocumentDeleteResult(success=False, kb_id=None)
+        doc = locked_doc
+
+        # Store document_id (used as doc_ref in RAG), kind_id, and attachment_id before deletion for cleanup
+        doc_ref = str(doc.id)  # document_id is used as doc_ref in RAG indexing
+        kind_id = doc.kind_id
+        attachment_id = doc.attachment_id
+        # Capture converted attachment ID before deleting the document row
+        converted_attachment_id = getattr(doc, "converted_attachment_id", None)
+        retry_orphan_cleanup = (
+            getattr(doc, "external_provider", None) == WIKI_PROVIDER_ID
+        )
+        # Use document owner's user_id for context deletion, since delete_context
+        # enforces ownership filtering. A non-owner requester (e.g., admin/group
+        # manager) would cause the deletion to silently fail and leave orphaned records.
+        context_owner_user_id = doc.user_id
+
+        # Delete the RAG index first, while the document still identifies the
+        # reference to remove. The row is the only thing that says which chunks
+        # belonged to this document, so deleting it first and then swallowing a
+        # remote failure would orphan the old references. A remote failure
+        # propagates: the document survives and the caller can retry.
+        spec = kb.json.get("spec", {})
+        retrieval_config = spec.get("retrievalConfig")
+
+        if retrieval_config:
+            retriever_name = retrieval_config.get("retriever_name")
+
+            if retriever_name:
+                kb_info = get_kb_index_info_by_record(
+                    db=db,
+                    knowledge_base=kb,
+                    current_user_id=user_id,
+                )
+
+                from app.services.rag.runtime_resolver import RagRuntimeResolver
+
+                try:
+                    delete_runtime_spec = (
+                        RagRuntimeResolver().build_delete_runtime_spec(
+                            db=db,
+                            knowledge_base_id=kind_id,
+                            document_ref=doc_ref,
+                            index_owner_user_id=kb_info.index_owner_user_id,
+                        )
+                    )
+                except ValueError as exc:
+                    # An unusable retrieval configuration is a server-side
+                    # failure, not an access problem: keep the document and
+                    # do not let it read as a permission error.
+                    raise RuntimeError(
+                        f"Cannot resolve the index removal for document "
+                        f"{doc_ref}: {exc}"
+                    ) from exc
+                result = _run_async_in_new_loop(
+                    rag_gateway.delete_document_index(delete_runtime_spec, db=db)
+                )
+                delete_status = result.get("status")
+                if delete_status in {"success", "deleted"}:
+                    logger.info(
+                        "Deleted RAG index for doc_ref '%s' in knowledge base %s "
+                        "(index_owner_user_id=%s, status=%s, deleted_chunks=%s, "
+                        "deleted_parent_nodes=%s, index_name=%s)",
+                        doc_ref,
+                        kind_id,
+                        kb_info.index_owner_user_id,
+                        delete_status,
+                        result.get("deleted_chunks"),
+                        result.get("deleted_parent_nodes"),
+                        result.get("index_name"),
+                    )
+                else:
+                    # A concrete data plane either removes the chunks or
+                    # raises. Anything else must not read as a successful
+                    # removal, so keep the document and surface it.
+                    raise RuntimeError(
+                        f"RAG index removal for doc_ref '{doc_ref}' in "
+                        f"knowledge base {kind_id} reported "
+                        f"{result.get('reason', delete_status or 'unknown')}"
+                    )
+
+        # Physically delete document from database
+        db.delete(doc)
+
+        # Update cached document count in knowledge base spec
+        KnowledgeService._update_document_count_cache(db, kind_id)
+
+        db.commit()
+
+        # Delete associated attachment (context) if exists
+        if attachment_id:
+            delete_attachment_best_effort(
+                db=db,
+                owner_user_id=context_owner_user_id,
+                attachment_id=attachment_id,
+                retry_orphan_cleanup=retry_orphan_cleanup,
+            )
+
+        # Delete converted attachment if exists
+        if converted_attachment_id:
+            delete_attachment_best_effort(
+                db=db,
+                owner_user_id=context_owner_user_id,
+                attachment_id=converted_attachment_id,
+                retry_orphan_cleanup=retry_orphan_cleanup,
+            )
+
+        return DocumentDeleteResult(success=True, kb_id=kind_id)
+
+    @staticmethod
+    def update_document_content(
+        db: Session,
+        document_id: int,
+        content: str,
+        user_id: int,
+    ) -> Optional[KnowledgeDocument]:
+        """
+        Update document content for TEXT type documents.
+
+        Overwrites the underlying attachment so binary storage, extracted text,
+        and downstream indexing all observe the same content. RAG re-indexing
+        should be handled separately by the API endpoint.
+
+        Args:
+            db: Database session
+            document_id: Document ID
+            content: New Markdown content
+            user_id: Requesting user ID
+
+        Returns:
+            Updated KnowledgeDocument if successful, None if not found
+
+        Raises:
+            ValueError: If document is not TEXT type or permission denied
+        """
+        from app.models.subtask_context import SubtaskContext
+        from app.services.context import context_service
+
+        doc = KnowledgeService.get_document(db, document_id, user_id)
+        if not doc:
+            return None
+
+        assert_user_content_is_mutable(getattr(doc, "origin", ContentOrigin.USER.value))
+
+        # Externally imported bodies are read-only: the provider owns the
+        # content. A fresh copy requires delete followed by import.
+        # Renaming, moving and deleting stay available through their own flows.
+        if doc.source_type == DocumentSourceType.EXTERNAL.value:
+            raise ValueError(
+                "Externally imported document content is read-only; "
+                "delete it and import a fresh copy"
+            )
+
+        # Verify document is editable (TEXT type or plain text files)
+        editable_extensions = [
+            "adoc",
+            "asciidoc",
+            "asm",
+            "bat",
+            "c",
+            "cc",
+            "cpp",
+            "css",
+            "csv",
+            "conf",
+            "config",
+            "dart",
+            "env",
+            "go",
+            "gradle",
+            "groovy",
+            "h",
+            "html",
+            "ini",
+            "java",
+            "js",
+            "json",
+            "jsx",
+            "kotlin",
+            "less",
+            "license",
+            "log",
+            "lua",
+            "markdown",
+            "md",
+            "mjs",
+            "php",
+            "pl",
+            "properties",
+            "ps1",
+            "py",
+            "rb",
+            "readme",
+            "rst",
+            "rust",
+            "sass",
+            "scala",
+            "scss",
+            "sh",
+            "sql",
+            "srt",
+            "styl",
+            "svg",
+            "swift",
+            "textile",
+            "toml",
+            "ts",
+            "tsx",
+            "tsv",
+            "txt",
+            "vue",
+            "wiki",
+            "xml",
+            "yaml",
+            "yml",
+        ]
+        is_text_type = doc.source_type == "text"
+        is_editable_file = (
+            doc.source_type == "file"
+            and normalize_document_extension(doc.file_extension) in editable_extensions
+        )
+        if not (is_text_type or is_editable_file):
+            raise ValueError(
+                "Only TEXT type documents or plain text files (txt, md) can be edited"
+            )
+
+        kb = (
+            db.query(Kind)
+            .filter(Kind.id == doc.kind_id, Kind.kind == "KnowledgeBase")
+            .first()
+        )
+        if not kb:
+            raise ValueError("Knowledge base not found for document")
+        KnowledgeService._assert_can_manage_document(db, kb, doc, user_id)
+
+        if not doc.attachment_id:
+            raise ValueError("Document has no attachment to update")
+
+        context = (
+            db.query(SubtaskContext)
+            .filter(SubtaskContext.id == doc.attachment_id)
+            .first()
+        )
+        if context is None:
+            raise ValueError("Document attachment not found")
+
+        binary_content = content.encode("utf-8")
+        doc.file_size = len(binary_content)
+
+        filename = context.original_filename or _build_attachment_filename(
+            doc.name, doc.file_extension
+        )
+        context_service.overwrite_attachment_internal(
+            db=db,
+            context_id=context.id,
+            filename=filename,
+            reason="knowledge_manage",
+            binary_data=binary_content,
+        )
+
+        db.refresh(doc)
+        return doc
+
+    # ============== Accessible Knowledge Query ==============
+
+    @staticmethod
+    def get_accessible_knowledge(
+        db: Session,
+        user_id: int,
+    ) -> AccessibleKnowledgeResponse:
+        """
+        Get all knowledge bases accessible to the user.
+
+        Args:
+            db: Database session
+            user_id: Requesting user ID
+
+        Returns:
+            AccessibleKnowledgeResponse with personal, team, and organization knowledge bases
+        """
+        accessible_groups = get_user_groups(db, user_id)
+        permission_context = build_direct_access_permission_context(
+            db,
+            user_id,
+            accessible_groups,
+        )
+
+        # Get personal knowledge bases (created by user)
+        personal_kbs = (
+            db.query(Kind)
+            .filter(
+                Kind.kind == "KnowledgeBase",
+                Kind.user_id == user_id,
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )
+            .order_by(Kind.updated_at.desc())
+            .all()
+        )
+        personal_kbs = filter_directly_accessible_knowledge_bases(
+            db, personal_kbs, user_id, permission_context
+        )
+
+        personal = [
+            AccessibleKnowledgeBase(
+                id=kb.id,
+                name=kb.json.get("spec", {}).get("name", ""),
+                description=kb.json.get("spec", {}).get("description")
+                or None,  # Convert empty string to None
+                document_count=KnowledgeService.get_active_document_count(db, kb.id),
+                updated_at=kb.updated_at,
+            )
+            for kb in personal_kbs
+        ]
+        included_personal_ids = {kb.id for kb in personal_kbs}
+
+        # Include KBs shared directly to the user via ResourceMember (entity_type=user)
+        direct_shared_ids = {
+            member.resource_id for member in permission_context.direct_members
+        }
+
+        # Get team knowledge bases grouped by namespace
+        # Include KBs shared via entity-type bindings (namespace / external resolvers)
+        entity_result = permission_context.entity_result
+        if entity_result is None:
+            raise RuntimeError("Full permission context is required")
+        entity_shared_ids = {kb.id for kb in entity_result.entity_shared_to_me_kbs}
+
+        extra_shared_ids = (
+            direct_shared_ids | entity_shared_ids
+        ) - included_personal_ids
+        if extra_shared_ids:
+            shared_kbs = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "KnowledgeBase",
+                    Kind.id.in_(extra_shared_ids),
+                    Kind.is_active == True,
+                    Kind.user_id != user_id,
+                )
+                .order_by(Kind.updated_at.desc())
+                .all()
+            )
+            shared_kbs = filter_directly_accessible_knowledge_bases(
+                db, shared_kbs, user_id, permission_context
+            )
+            for kb in shared_kbs:
+                if kb.id in included_personal_ids:
+                    continue
+                included_personal_ids.add(kb.id)
+                personal.append(
+                    AccessibleKnowledgeBase(
+                        id=kb.id,
+                        name=kb.json.get("spec", {}).get("name", ""),
+                        description=kb.json.get("spec", {}).get("description") or None,
+                        document_count=KnowledgeService.get_active_document_count(
+                            db, kb.id
+                        ),
+                        updated_at=kb.updated_at,
+                    )
+                )
+
+        team_groups: list[TeamKnowledgeGroup] = []
+
+        for group_name in accessible_groups:
+            # Get namespace display name
+            namespace = (
+                db.query(Namespace)
+                .filter(
+                    Namespace.name == group_name,
+                    Namespace.is_active == True,
+                )
+                .first()
+            )
+            display_name = namespace.display_name if namespace else None
+
+            # Get knowledge bases in this group
+            group_kbs = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "KnowledgeBase",
+                    Kind.namespace == group_name,
+                    Kind.is_active == True,
+                )
+                .order_by(Kind.updated_at.desc())
+                .all()
+            )
+            group_kbs = filter_directly_accessible_knowledge_bases(
+                db, group_kbs, user_id, permission_context
+            )
+
+            if group_kbs:
+                team_groups.append(
+                    TeamKnowledgeGroup(
+                        group_name=group_name,
+                        group_display_name=display_name,
+                        knowledge_bases=[
+                            AccessibleKnowledgeBase(
+                                id=kb.id,
+                                name=kb.json.get("spec", {}).get("name", ""),
+                                description=kb.json.get("spec", {}).get("description")
+                                or None,  # Convert empty string to None
+                                document_count=KnowledgeService.get_active_document_count(
+                                    db, kb.id
+                                ),
+                                updated_at=kb.updated_at,
+                            )
+                            for kb in group_kbs
+                        ],
+                    )
+                )
+
+        # Get organization knowledge bases (accessible to all authenticated users)
+        # Query knowledge bases in namespaces with level='organization'
+        org_kbs = (
+            db.query(Kind, Namespace)
+            .join(Namespace, Kind.namespace == Namespace.name)
+            .filter(
+                Kind.kind == "KnowledgeBase",
+                Kind.is_active == True,
+                Namespace.level == GroupLevel.organization.value,
+                Namespace.is_active == True,
+            )
+            .order_by(Kind.updated_at.desc())
+            .all()
+        )
+        accessible_org_ids = {
+            kb.id
+            for kb in filter_directly_accessible_knowledge_bases(
+                db,
+                [kb for kb, _namespace in org_kbs],
+                user_id,
+                permission_context,
+            )
+        }
+        org_kbs = [
+            (kb, namespace) for kb, namespace in org_kbs if kb.id in accessible_org_ids
+        ]
+
+        if org_kbs:
+            # Group KBs by namespace
+            org_groups: dict[str, list] = {}
+            for kb, ns in org_kbs:
+                if ns.name not in org_groups:
+                    org_groups[ns.name] = {"namespace": ns, "kbs": []}
+                org_groups[ns.name]["kbs"].append(kb)
+
+            for ns_name, group_data in org_groups.items():
+                ns = group_data["namespace"]
+                kbs = group_data["kbs"]
+                team_groups.append(
+                    TeamKnowledgeGroup(
+                        group_name=ns_name,
+                        group_display_name=ns.display_name or ns_name,
+                        knowledge_bases=[
+                            AccessibleKnowledgeBase(
+                                id=kb.id,
+                                name=kb.json.get("spec", {}).get("name", ""),
+                                description=kb.json.get("spec", {}).get("description")
+                                or None,  # Convert empty string to None
+                                document_count=KnowledgeService.get_active_document_count(
+                                    db, kb.id
+                                ),
+                                updated_at=kb.updated_at,
+                            )
+                            for kb in kbs
+                        ],
+                    )
+                )
+
+        return AccessibleKnowledgeResponse(personal=personal, team=team_groups)
+
+    @staticmethod
+    def get_personal_knowledge_bases_grouped(
+        db: Session,
+        user_id: int,
+    ) -> dict:
+        """
+        Get personal knowledge bases grouped by ownership.
+
+        Groups knowledge bases into:
+        - created_by_me: Knowledge bases created by the current user (namespace=default)
+        - shared_with_me: Knowledge bases shared with the current user (via ResourceMember, any namespace)
+
+        Args:
+            db: Database session
+            user_id: Current user ID
+
+        Returns:
+            Dict with 'created_by_me' and 'shared_with_me' lists
+        """
+        permission_context = build_direct_access_permission_context(db, user_id)
+
+        # Get KBs created by user (personal knowledge bases, namespace=default)
+        created_kbs = (
+            db.query(Kind)
+            .filter(
+                Kind.kind == "KnowledgeBase",
+                Kind.is_active == True,
+                Kind.namespace == "default",
+                Kind.user_id == user_id,
+            )
+            .order_by(Kind.updated_at.desc())
+            .all()
+        )
+        created_kbs = filter_directly_accessible_knowledge_bases(
+            db, created_kbs, user_id, permission_context
+        )
+
+        # Get KB IDs that are shared with the user via ResourceMember
+        shared_kb_ids = [
+            member.resource_id for member in permission_context.direct_members
+        ]
+
+        # Include KBs accessible via entity-type bindings (namespace / external resolvers).
+        # Restrict to personal-scope (namespace=default) to match this grouping's semantics.
+        entity_result = permission_context.entity_result
+        if entity_result is None:
+            raise RuntimeError("Full permission context is required")
+        if entity_result.entity_personal_kb_ids:
+            shared_kb_ids = list(
+                set(shared_kb_ids) | entity_result.entity_personal_kb_ids
+            )
+
+        # Query shared personal KBs (namespace=default, but not created by current user)
+        shared_kbs = []
+        if shared_kb_ids:
+            shared_kbs = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "KnowledgeBase",
+                    Kind.is_active == True,
+                    Kind.id.in_(shared_kb_ids),
+                    Kind.namespace == "default",
+                    Kind.user_id != user_id,  # Exclude KBs created by current user
+                )
+                .order_by(Kind.updated_at.desc())
+                .all()
+            )
+            shared_kbs = filter_directly_accessible_knowledge_bases(
+                db, shared_kbs, user_id, permission_context
+            )
+
+        # Batch fetch document counts for all KBs to avoid N+1 queries
+        all_kb_ids = [kb.id for kb in created_kbs] + [kb.id for kb in shared_kbs]
+        document_counts = KnowledgeService.get_document_counts(db, all_kb_ids)
+
+        # Build response lists using batched counts
+        created_by_me = []
+        for kb in created_kbs:
+            document_count = document_counts.get(kb.id, 0)
+            kb_response = KnowledgeBaseResponse.from_kind(kb, document_count)
+            created_by_me.append(kb_response)
+
+        shared_with_me = []
+        for kb in shared_kbs:
+            document_count = document_counts.get(kb.id, 0)
+            kb_response = KnowledgeBaseResponse.from_kind(kb, document_count)
+            shared_with_me.append(kb_response)
+
+        return {
+            "created_by_me": created_by_me,
+            "shared_with_me": shared_with_me,
+        }
+
+    @staticmethod
+    def _merge_roles(*roles: str | None) -> str | None:
+        """Return the highest privilege role from a list of roles."""
+        highest: str | None = None
+        for role in roles:
+            if role is None:
+                continue
+            if highest is None or has_permission(role, highest):
+                highest = role
+        return highest
+
+    @staticmethod
+    def _kb_to_response(
+        kb: Kind,
+        group_id: str,
+        group_name: str,
+        group_type: str,
+        document_counts: dict[int, int],
+        owner_user_map: dict[int, str],
+        my_role: str | None = None,
+        source_group: str | None = None,
+        shared_from: str | None = None,
+        shared_via: str | None = None,
+        shared_from_users: list[str] | None = None,
+    ) -> KnowledgeBaseWithGroupInfo:
+        """Convert a Kind KB to KnowledgeBaseWithGroupInfo response."""
+        spec = kb.json.get("spec", {})
+        return KnowledgeBaseWithGroupInfo(
+            id=kb.id,
+            name=spec.get("name", ""),
+            description=spec.get("description") or None,
+            kb_type=spec.get("kbType", "notebook"),
+            namespace=kb.namespace,
+            document_count=document_counts.get(kb.id, 0),
+            updated_at=kb.updated_at,
+            created_at=kb.created_at,
+            user_id=kb.user_id,
+            group_id=group_id,
+            group_name=group_name,
+            group_type=group_type,
+            my_role=my_role,
+            source_group=source_group,
+            shared_from=shared_from,
+            shared_via=shared_via,
+            shared_from_users=shared_from_users,
+            owner_name=owner_user_map.get(kb.user_id),
+        )
+
+    @staticmethod
+    def _batch_fetch_kb_metadata(
+        db: Session,
+        personal_created: list[Kind],
+        personal_shared: list[Kind],
+        entity_shared_to_me_kbs: list[Kind],
+        group_kbs: list[Kind],
+        shared_into_group_kbs: list[Kind],
+        org_kbs: list[Kind],
+        shared_kb_inviter_map: dict[int, int],
+        entity_member_inviter_map: dict[int, set[int]],
+        remaining_shared_group_kbs: list[Kind],
+        accessible_groups: list[str],
+        shared_group_names: list[str],
+    ) -> tuple[dict[int, int], dict[int, str], dict[str, str], dict[int, str]]:
+        """Batch-fetch document counts, owner names, namespace names, inviter names."""
+        all_kb_ids = list(
+            dict.fromkeys(
+                [kb.id for kb in personal_created]
+                + [kb.id for kb in personal_shared]
+                + [kb.id for kb in entity_shared_to_me_kbs]
+                + [kb.id for kb in group_kbs]
+                + [kb.id for kb in shared_into_group_kbs]
+                + [kb.id for kb in org_kbs]
+                + [kb.id for kb in remaining_shared_group_kbs]
+            )
+        )
+        document_counts = KnowledgeService.get_document_counts(db, all_kb_ids)
+
+        owner_user_ids: set[int] = set()
+        for kb in personal_created:
+            owner_user_ids.add(kb.user_id)
+        for kb in personal_shared:
+            owner_user_ids.add(kb.user_id)
+        for kb in entity_shared_to_me_kbs:
+            owner_user_ids.add(kb.user_id)
+        for kb in group_kbs:
+            owner_user_ids.add(kb.user_id)
+        for kb in shared_into_group_kbs:
+            owner_user_ids.add(kb.user_id)
+        for kb in org_kbs:
+            owner_user_ids.add(kb.user_id)
+        for kb in remaining_shared_group_kbs:
+            owner_user_ids.add(kb.user_id)
+
+        owner_user_map: dict[int, str] = {}
+        if owner_user_ids:
+            users = (
+                db.query(User.id, User.user_name)
+                .filter(User.id.in_(list(owner_user_ids)))
+                .all()
+            )
+            owner_user_map = {u.id: u.user_name for u in users}
+
+        namespace_display_names = {}
+        display_name_namespace_names = list(
+            dict.fromkeys(accessible_groups + shared_group_names)
+        )
+        if display_name_namespace_names:
+            namespaces = (
+                db.query(Namespace)
+                .filter(
+                    Namespace.name.in_(display_name_namespace_names),
+                    Namespace.is_active == True,
+                )
+                .all()
+            )
+            namespace_display_names = {ns.name: ns.display_name for ns in namespaces}
+
+        all_inviter_ids: set[int] = set()
+        all_inviter_ids.update(shared_kb_inviter_map.values())
+        for inviter_set in entity_member_inviter_map.values():
+            all_inviter_ids.update(inviter_set)
+        for kb in remaining_shared_group_kbs:
+            inviter_id = shared_kb_inviter_map.get(kb.id)
+            if inviter_id:
+                all_inviter_ids.add(inviter_id)
+
+        inviter_user_map: dict[int, str] = {}
+        if all_inviter_ids:
+            users = (
+                db.query(User.id, User.user_name)
+                .filter(User.id.in_(list(all_inviter_ids)))
+                .all()
+            )
+            inviter_user_map = {u.id: u.user_name for u in users}
+
+        return (
+            document_counts,
+            owner_user_map,
+            namespace_display_names,
+            inviter_user_map,
+        )
+
+    @staticmethod
+    def _build_shared_with_me(
+        personal_shared: list[Kind],
+        remaining_shared_group_kbs: list[Kind],
+        entity_shared_to_me_kbs: list[Kind],
+        shared_kb_roles: dict[int, str],
+        shared_kb_inviter_map: dict[int, int],
+        entity_member_role_map: dict[int, list[str]],
+        entity_member_inviter_map: dict[int, set[int]],
+        entity_member_type_map: dict[int, list[str]],
+        entity_member_group_map: dict[int, list[str]],
+        entity_member_entity_id_map: dict[int, list[str]],
+        namespace_display_names: dict[str, str],
+        inviter_user_map: dict[int, str],
+        document_counts: dict[int, int],
+        owner_user_map: dict[int, str],
+        db: Session,
+    ) -> list[KnowledgeBaseWithGroupInfo]:
+        """Aggregate multi-source permission info into shared_with_me responses."""
+        from dataclasses import dataclass
+
+        @dataclass
+        class KbSourceInfo:
+            kb: Kind
+            roles: list[str | None] = field(default_factory=list)
+            inviter_ids: set[int] = field(default_factory=set)
+            source_groups: set[str] = field(default_factory=set)
+            shared_vias: set[str] = field(default_factory=set)
+
+        kb_sources: dict[int, KbSourceInfo] = {}
+
+        def _ensure_source(kb: Kind) -> KbSourceInfo:
+            if kb.id not in kb_sources:
+                kb_sources[kb.id] = KbSourceInfo(kb=kb)
+            return kb_sources[kb.id]
+
+        for kb in personal_shared:
+            info = _ensure_source(kb)
+            info.roles.append(shared_kb_roles.get(kb.id))
+            inviter_id = shared_kb_inviter_map.get(kb.id)
+            if inviter_id:
+                info.inviter_ids.add(inviter_id)
+            info.shared_vias.add("user")
+
+        for kb in remaining_shared_group_kbs:
+            info = _ensure_source(kb)
+            info.roles.append(shared_kb_roles.get(kb.id))
+            inviter_id = shared_kb_inviter_map.get(kb.id)
+            if inviter_id:
+                info.inviter_ids.add(inviter_id)
+            info.source_groups.add(
+                namespace_display_names.get(kb.namespace, kb.namespace)
+            )
+            info.shared_vias.add("user")
+
+        for ekb in entity_shared_to_me_kbs:
+            info = _ensure_source(ekb)
+            for role in entity_member_role_map.get(ekb.id, []):
+                info.roles.append(role)
+            direct_role = shared_kb_roles.get(ekb.id)
+            info.roles.append(direct_role)
+
+            for inviter_id in entity_member_inviter_map.get(ekb.id, set()):
+                info.inviter_ids.add(inviter_id)
+
+            type_list = entity_member_type_map.get(ekb.id, [])
+            entity_id_list = entity_member_entity_id_map.get(ekb.id, [])
+            group_list = entity_member_group_map.get(ekb.id, [])
+            group_idx = 0
+            for i, entity_type_str in enumerate(type_list):
+                if entity_type_str == "namespace":
+                    if group_idx < len(group_list):
+                        source_group_name = group_list[group_idx]
+                        if source_group_name:
+                            info.source_groups.add(
+                                namespace_display_names.get(
+                                    source_group_name, source_group_name
+                                )
+                            )
+                        info.shared_vias.add("namespace")
+                        group_idx += 1
+                elif entity_type_str:
+                    entity_id = entity_id_list[i] if i < len(entity_id_list) else None
+                    if entity_id:
+                        from app.services.share import knowledge_share_service
+
+                        display_name = knowledge_share_service._get_entity_display_name(
+                            db, entity_type_str, entity_id
+                        )
+                        if display_name:
+                            info.source_groups.add(display_name)
+                    info.shared_vias.add(entity_type_str)
+
+        shared_with_me = []
+        for info in kb_sources.values():
+            merged_role = KnowledgeService._merge_roles(*info.roles)
+
+            sorted_inviter_ids = sorted(info.inviter_ids)
+            sorted_source_groups = sorted(info.source_groups)
+            sorted_shared_vias = sorted(info.shared_vias)
+
+            source_names: list[str] = []
+            for uid in sorted_inviter_ids:
+                name = inviter_user_map.get(uid)
+                if name and name not in source_names:
+                    source_names.append(name)
+            for sg in sorted_source_groups:
+                if sg and sg not in source_names:
+                    source_names.append(sg)
+
+            primary_inviter = sorted_inviter_ids[0] if sorted_inviter_ids else None
+            shared_from = (
+                inviter_user_map.get(primary_inviter) if primary_inviter else None
+            )
+            primary_source_group = (
+                sorted_source_groups[0] if sorted_source_groups else None
+            )
+            primary_via = sorted_shared_vias[0] if sorted_shared_vias else None
+
+            shared_with_me.append(
+                KnowledgeService._kb_to_response(
+                    info.kb,
+                    "default",
+                    "personal-shared",
+                    "personal-shared",
+                    document_counts,
+                    owner_user_map,
+                    merged_role,
+                    primary_source_group,
+                    shared_from,
+                    primary_via,
+                    source_names if len(source_names) > 1 else None,
+                )
+            )
+
+        return shared_with_me
+
+    @staticmethod
+    def _build_groups_section(
+        grouped_namespace_names: list[str],
+        groups_map: dict[str, list[Kind]],
+        group_kbs: list[Kind],
+        shared_into_group_kbs: list[Kind],
+        entity_member_group_map: dict[int, list[str]],
+        entity_member_role_map: dict[int, list[str]],
+        entity_member_inviter_map: dict[int, set[int]],
+        shared_kb_roles: dict[int, str],
+        group_roles: dict[str, str],
+        namespace_display_names: dict[str, str],
+        owner_user_map: dict[int, str],
+        inviter_user_map: dict[int, str],
+        document_counts: dict[int, int],
+    ) -> list[AllGroupedTeamGroup]:
+        """Build groups section from native and shared-into-group KBs."""
+        groups = []
+        for ns_name in grouped_namespace_names:
+            display_name = namespace_display_names.get(ns_name, ns_name)
+            kbs = groups_map.get(ns_name, [])
+            user_group_role = group_roles.get(ns_name)
+
+            kb_responses = []
+            seen_kb_ids = set()
+            for kb in kbs:
+                if kb.id in seen_kb_ids:
+                    continue
+                seen_kb_ids.add(kb.id)
+
+                is_shared_into_group = (
+                    kb.id in entity_member_group_map
+                    and ns_name in entity_member_group_map.get(kb.id, [])
+                    and kb.namespace != ns_name
+                )
+                if is_shared_into_group:
+                    shared_roles = entity_member_role_map.get(kb.id, [])
+                    merged_shared_role = (
+                        KnowledgeService._merge_roles(*shared_roles)
+                        if shared_roles
+                        else None
+                    )
+                    direct_role = shared_kb_roles.get(kb.id)
+                    merged_role = KnowledgeService._merge_roles(
+                        merged_shared_role, direct_role
+                    )
+                    shared_from_name = None
+                    for inviter_id in entity_member_inviter_map.get(kb.id, set()):
+                        name = inviter_user_map.get(inviter_id)
+                        if name:
+                            shared_from_name = name
+                            break
+                    kb_responses.append(
+                        KnowledgeService._kb_to_response(
+                            kb,
+                            ns_name,
+                            display_name or ns_name,
+                            "group",
+                            document_counts,
+                            owner_user_map,
+                            merged_role,
+                            shared_from=shared_from_name,
+                            shared_via="namespace",
+                        )
+                    )
+                else:
+                    kb_responses.append(
+                        KnowledgeService._kb_to_response(
+                            kb,
+                            ns_name,
+                            display_name or ns_name,
+                            "group",
+                            document_counts,
+                            owner_user_map,
+                            KnowledgeService._merge_roles(
+                                shared_kb_roles.get(kb.id), user_group_role
+                            ),
+                        )
+                    )
+
+            groups.append(
+                AllGroupedTeamGroup(
+                    group_name=ns_name,
+                    group_display_name=display_name or ns_name,
+                    kb_count=len(kb_responses),
+                    knowledge_bases=kb_responses,
+                )
+            )
+
+        return groups
+
+    @staticmethod
+    def get_all_knowledge_bases_grouped(
+        db: Session,
+        user_id: int,
+    ) -> AllGroupedKnowledgeResponse:
+        """
+        Get all knowledge bases accessible to the user, grouped by scope.
+
+        This method optimizes the N+1 query problem by:
+        1. Fetching all accessible group names in one query
+        2. Fetching all knowledge bases in those groups in one query
+        3. Grouping results in memory
+
+        Args:
+            db: Database session
+            user_id: Current user ID
+
+        Returns:
+            AllGroupedKnowledgeResponse with personal, groups, organization, and summary sections
+        """
+        permission_context = build_direct_access_permission_context(db, user_id)
+        user = permission_context.user
+
+        # 1. Get personal knowledge bases created by user (single query)
+        personal_created = (
+            db.query(Kind)
+            .filter(
+                Kind.kind == "KnowledgeBase",
+                Kind.is_active == True,
+                Kind.namespace == "default",
+                Kind.user_id == user_id,
+            )
+            .order_by(Kind.updated_at.desc())
+            .all()
+        )
+        personal_created = filter_directly_accessible_knowledge_bases(
+            db, personal_created, user_id, permission_context
+        )
+
+        # 2. Get shared knowledge bases with their roles and inviters (single query)
+        shared_members = permission_context.direct_members
+        shared_kb_ids = [member.resource_id for member in shared_members]
+        shared_kb_roles: dict[int, str] = {
+            member.resource_id: member.role for member in shared_members
+        }
+        shared_kb_inviter_map: dict[int, int] = {
+            member.resource_id: member.invited_by_user_id
+            for member in shared_members
+            if member.invited_by_user_id
+        }
+
+        shared_kbs: list[Kind] = []
+        if shared_kb_ids:
+            shared_kbs = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "KnowledgeBase",
+                    Kind.is_active == True,
+                    Kind.id.in_(shared_kb_ids),
+                    Kind.user_id != user_id,
+                )
+                .order_by(Kind.updated_at.desc())
+                .all()
+            )
+            shared_kbs = filter_directly_accessible_knowledge_bases(
+                db, shared_kbs, user_id, permission_context
+            )
+
+        shared_namespace_names = {
+            kb.namespace for kb in shared_kbs if kb.namespace != "default"
+        }
+        shared_namespaces = {}
+        if shared_namespace_names:
+            shared_namespaces = {
+                ns.name: ns
+                for ns in db.query(Namespace)
+                .filter(
+                    Namespace.name.in_(shared_namespace_names),
+                    Namespace.is_active == True,
+                )
+                .all()
+            }
+
+        personal_shared_by_id = {
+            kb.id: kb for kb in shared_kbs if kb.namespace == "default"
+        }
+        personal_shared = list(personal_shared_by_id.values())
+        shared_group_kbs = [
+            kb
+            for kb in shared_kbs
+            if kb.namespace != "default"
+            and (
+                shared_namespaces.get(kb.namespace) is None
+                or shared_namespaces[kb.namespace].level
+                != GroupLevel.organization.value
+            )
+        ]
+
+        # 3. Get all accessible groups with roles (single query)
+        from app.services.group_member_helper import get_user_groups_with_roles
+
+        accessible_groups_with_roles = get_user_groups_with_roles(db, user_id)
+        accessible_group_names = [g[0] for g in accessible_groups_with_roles]
+        group_roles: dict[str, str] = {g[0]: g[1] for g in accessible_groups_with_roles}
+
+        accessible_group_namespaces = {}
+        if accessible_group_names:
+            accessible_group_namespaces = {
+                ns.name: ns
+                for ns in db.query(Namespace)
+                .filter(
+                    Namespace.name.in_(accessible_group_names),
+                    Namespace.is_active == True,
+                )
+                .all()
+            }
+
+        accessible_groups = [
+            group_name
+            for group_name in accessible_group_names
+            if accessible_group_namespaces.get(group_name) is None
+            or accessible_group_namespaces[group_name].level
+            != GroupLevel.organization.value
+        ]
+        shared_group_names = list(
+            dict.fromkeys(kb.namespace for kb in shared_group_kbs)
+        )
+        grouped_namespace_names = list(dict.fromkeys(accessible_groups))
+
+        # 4. Get ALL group knowledge bases in ONE query (key optimization)
+        group_kbs: list[Kind] = []
+        if accessible_groups:
+            group_kbs = (
+                db.query(Kind)
+                .filter(
+                    Kind.kind == "KnowledgeBase",
+                    Kind.is_active == True,
+                    Kind.namespace.in_(accessible_groups),
+                )
+                .order_by(Kind.updated_at.desc())
+                .all()
+            )
+            group_kbs = filter_directly_accessible_knowledge_bases(
+                db, group_kbs, user_id, permission_context
+            )
+        group_kb_map = {kb.id: kb for kb in group_kbs}
+
+        remaining_shared_group_kbs: list[Kind] = []
+        for kb in shared_group_kbs:
+            if kb.namespace in accessible_groups:
+                group_kb_map[kb.id] = kb
+            else:
+                remaining_shared_group_kbs.append(kb)
+
+        # 4b. Collect entity-authorized KBs via external resolver
+        entity_result = permission_context.entity_result
+        if entity_result is None:
+            raise RuntimeError("Full permission context is required")
+        entity_personal_kb_ids = entity_result.entity_personal_kb_ids
+        entity_shared_to_me_kbs = filter_directly_accessible_knowledge_bases(
+            db,
+            entity_result.entity_shared_to_me_kbs,
+            user_id,
+            permission_context,
+        )
+        shared_into_group_kbs = filter_directly_accessible_knowledge_bases(
+            db,
+            entity_result.shared_into_group_kbs,
+            user_id,
+            permission_context,
+        )
+        entity_member_group_map = entity_result.member_group_map
+        entity_member_role_map = entity_result.member_role_map
+        entity_member_inviter_map = entity_result.member_inviter_map
+        entity_member_type_map = entity_result.member_type_map
+        entity_member_entity_id_map = entity_result.member_entity_id_map
+
+        group_kbs = list(group_kb_map.values())
+        group_kbs = [kb for kb in group_kbs if kb.id not in entity_personal_kb_ids]
+
+        # 5. Get organization knowledge bases (single query)
+        org_kbs = (
+            db.query(Kind)
+            .join(Namespace, Kind.namespace == Namespace.name)
+            .filter(
+                Kind.kind == "KnowledgeBase",
+                Kind.is_active == True,
+                Namespace.level == GroupLevel.organization.value,
+                Namespace.is_active == True,
+            )
+            .order_by(Kind.updated_at.desc())
+            .all()
+        )
+        org_kbs = filter_directly_accessible_knowledge_bases(
+            db, org_kbs, user_id, permission_context
+        )
+
+        organization_namespaces = (
+            db.query(Namespace)
+            .filter(
+                Namespace.level == GroupLevel.organization.value,
+                Namespace.is_active == True,
+            )
+            .order_by(Namespace.id.asc())
+            .all()
+        )
+        organization_namespace_map = {
+            namespace.name: namespace for namespace in organization_namespaces
+        }
+        org_namespace = organization_namespaces[0] if organization_namespaces else None
+
+        # 6. Batch fetch metadata
+        (
+            document_counts,
+            owner_user_map,
+            namespace_display_names,
+            inviter_user_map,
+        ) = KnowledgeService._batch_fetch_kb_metadata(
+            db,
+            personal_created,
+            personal_shared,
+            entity_shared_to_me_kbs,
+            group_kbs,
+            shared_into_group_kbs,
+            org_kbs,
+            shared_kb_inviter_map,
+            entity_member_inviter_map,
+            remaining_shared_group_kbs,
+            accessible_groups,
+            shared_group_names,
+        )
+
+        # Build personal section
+        created_by_me = [
+            KnowledgeService._kb_to_response(
+                kb,
+                "default",
+                "personal",
+                "personal",
+                document_counts,
+                owner_user_map,
+                "Owner",
+            )
+            for kb in personal_created
+        ]
+
+        shared_with_me = KnowledgeService._build_shared_with_me(
+            personal_shared=personal_shared,
+            remaining_shared_group_kbs=remaining_shared_group_kbs,
+            entity_shared_to_me_kbs=entity_shared_to_me_kbs,
+            shared_kb_roles=shared_kb_roles,
+            shared_kb_inviter_map=shared_kb_inviter_map,
+            entity_member_role_map=entity_member_role_map,
+            entity_member_inviter_map=entity_member_inviter_map,
+            entity_member_type_map=entity_member_type_map,
+            entity_member_group_map=entity_member_group_map,
+            entity_member_entity_id_map=entity_member_entity_id_map,
+            namespace_display_names=namespace_display_names,
+            inviter_user_map=inviter_user_map,
+            document_counts=document_counts,
+            owner_user_map=owner_user_map,
+            db=db,
+        )
+
+        # Build groups section - group KBs by namespace in memory
+        groups_map: dict[str, list[Kind]] = {}
+        for kb in group_kbs:
+            groups_map.setdefault(kb.namespace, []).append(kb)
+        for kb in shared_into_group_kbs:
+            target_groups = entity_member_group_map.get(kb.id, [])
+            for target_group in target_groups:
+                groups_map.setdefault(target_group, []).append(kb)
+
+        groups = KnowledgeService._build_groups_section(
+            grouped_namespace_names=grouped_namespace_names,
+            groups_map=groups_map,
+            group_kbs=group_kbs,
+            shared_into_group_kbs=shared_into_group_kbs,
+            entity_member_group_map=entity_member_group_map,
+            entity_member_role_map=entity_member_role_map,
+            entity_member_inviter_map=entity_member_inviter_map,
+            shared_kb_roles=shared_kb_roles,
+            group_roles=group_roles,
+            namespace_display_names=namespace_display_names,
+            owner_user_map=owner_user_map,
+            inviter_user_map=inviter_user_map,
+            document_counts=document_counts,
+        )
+
+        # Build organization section
+        org_display_name = (
+            org_namespace.display_name if org_namespace else "organization"
+        )
+        org_ns_name = org_namespace.name if org_namespace else None
+
+        def get_namespace_view_role(namespace_name: str, namespace_level: str) -> str:
+            view_role = get_view_role_in_group(
+                db,
+                user_id,
+                namespace_name,
+                user_role=user.role,
+                group_level=namespace_level,
+            )
+            return view_role.value if view_role is not None else BaseRole.Reporter.value
+
+        organization = AllGroupedOrganization(
+            namespace=org_ns_name,
+            display_name=org_display_name,
+            kb_count=len(org_kbs),
+            knowledge_bases=[
+                KnowledgeService._kb_to_response(
+                    kb,
+                    org_ns_name or "organization",
+                    org_display_name,
+                    "organization",
+                    document_counts,
+                    owner_user_map,
+                    KnowledgeService._merge_roles(
+                        shared_kb_roles.get(kb.id),
+                        get_namespace_view_role(
+                            kb.namespace,
+                            organization_namespace_map[kb.namespace].level,
+                        ),
+                    ),
+                )
+                for kb in org_kbs
+            ],
+        )
+
+        # Build summary
+        grouped_kb_ids = {kb.id for kb in group_kbs} | {
+            kb.id for kb in shared_into_group_kbs
+        }
+
+        all_kb_ids = (
+            {kb.id for kb in personal_created}
+            | {kb.id for kb in personal_shared}
+            | {kb.id for kb in entity_shared_to_me_kbs}
+            | grouped_kb_ids
+            | {kb.id for kb in org_kbs}
+            | {kb.id for kb in remaining_shared_group_kbs}
+        )
+
+        summary = AllGroupedSummary(
+            total_count=len(all_kb_ids),
+            personal_count=len(personal_created)
+            + len(personal_shared)
+            + len(entity_shared_to_me_kbs)
+            + len(remaining_shared_group_kbs),
+            group_count=len(grouped_kb_ids),
+            organization_count=len(org_kbs),
+        )
+
+        response = AllGroupedKnowledgeResponse(
+            personal=AllGroupedPersonal(
+                created_by_me=created_by_me,
+                shared_with_me=shared_with_me,
+            ),
+            groups=groups,
+            organization=organization,
+            summary=summary,
+        )
+        return response
+
+    @staticmethod
+    def can_manage_knowledge_base(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+    ) -> bool:
+        """
+        Check if user can manage (create/edit/delete) a knowledge base.
+
+        Args:
+            db: Database session
+            knowledge_base_id: Knowledge base ID
+            user_id: User ID
+
+        Returns:
+            True if user has management permission
+        """
+        permission = get_user_knowledge_base_permission(
+            db,
+            knowledge_base_id,
+            user_id,
+        )
+        return can_manage_accessible_knowledge_base(
+            permission.has_access,
+            permission.role,
+            permission.is_creator,
+        )
+
+    @staticmethod
+    def can_manage_knowledge_base_documents(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+    ) -> bool:
+        """Return whether the user can add documents to the target knowledge base."""
+        permission = get_user_knowledge_base_permission(
+            db,
+            knowledge_base_id,
+            user_id,
+        )
+        return can_manage_accessible_knowledge_base_documents(
+            permission.has_access,
+            permission.role,
+            permission.is_creator,
+        )
+
+    @staticmethod
+    def can_manage_knowledge_document(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+        document_owner_id: int,
+    ) -> bool:
+        """Return whether the user can manage the target document."""
+        permission = get_user_knowledge_base_permission(
+            db,
+            knowledge_base_id,
+            user_id,
+        )
+        return can_manage_accessible_knowledge_document(
+            has_access=permission.has_access,
+            role=permission.role,
+            is_creator=permission.is_creator,
+            user_id=user_id,
+            document_owner_id=document_owner_id,
+        )
+
+    # ============== Batch Document Operations ==============
+
+    @staticmethod
+    def _build_batch_delete_message(
+        success_count: int,
+        failed_ids: list[int],
+        failure_messages: list[str],
+    ) -> str:
+        """Build a batch delete message that preserves the failure class."""
+        message = (
+            f"Successfully deleted {success_count} documents, {len(failed_ids)} failed"
+        )
+        if success_count > 0 or not failed_ids:
+            return message
+        if len(failure_messages) != len(failed_ids):
+            return message
+
+        lower_messages = [
+            failure_message.lower() for failure_message in failure_messages
+        ]
+        if lower_messages and all("not found" in msg for msg in lower_messages):
+            return "Document not found"
+        if any(
+            "permission" in msg
+            or "access denied" in msg
+            or "owner or maintainer" in msg
+            for msg in lower_messages
+        ):
+            return (
+                "Only Owner or Maintainer can delete documents from this knowledge base"
+            )
+        if len(failure_messages) == 1:
+            return failure_messages[0]
+        return message
+
+    @staticmethod
+    def batch_delete_documents(
+        db: Session,
+        document_ids: list[int],
+        user_id: int,
+    ) -> BatchDeleteResult:
+        """
+        Batch delete multiple documents.
+
+        Args:
+            db: Database session
+            document_ids: List of document IDs to delete
+            user_id: Requesting user ID
+
+        Returns:
+            BatchDeleteResult with operation result and KB IDs for summary updates
+        """
+        success_count = 0
+        failed_ids = []
+        failure_messages = []
+        kb_ids = set()  # Collect unique KB IDs from deleted documents
+
+        requested_ids = list(dict.fromkeys(document_ids))
+
+        for doc_id in requested_ids:
+            try:
+                result = KnowledgeService.delete_document(db, doc_id, user_id)
+                if result.success:
+                    success_count += 1
+                    if result.kb_id is not None:
+                        kb_ids.add(result.kb_id)
+                else:
+                    failed_ids.append(doc_id)
+                    failure_messages.append(result.error or "Document not found")
+            except ValueError as exc:
+                failed_ids.append(doc_id)
+                failure_messages.append(str(exc))
+            except Exception as exc:  # noqa: BLE001 - continue deleting remaining docs
+                failed_ids.append(doc_id)
+                failure_messages.append(str(exc))
+                batch_logger.exception("Unexpected error deleting document %s", doc_id)
+
+        operation_result = BatchOperationResult(
+            success_count=success_count,
+            failed_count=len(failed_ids),
+            failed_ids=failed_ids,
+            message=KnowledgeService._build_batch_delete_message(
+                success_count, failed_ids, failure_messages
+            ),
+        )
+
+        return BatchDeleteResult(
+            result=operation_result,
+            kb_ids=list(kb_ids),
+        )
+
+    @staticmethod
+    def batch_enable_documents(
+        db: Session,
+        document_ids: list[int],
+        user_id: int,
+    ) -> BatchOperationResult:
+        """
+        Batch enable multiple documents.
+
+        Args:
+            db: Database session
+            document_ids: List of document IDs to enable
+            user_id: Requesting user ID
+
+        Returns:
+            BatchOperationResult with success/failure counts
+        """
+        from app.schemas.knowledge import DocumentStatus as SchemaDocumentStatus
+        from app.schemas.knowledge import KnowledgeDocumentUpdate
+
+        success_count = 0
+        failed_ids = []
+
+        for doc_id in document_ids:
+            try:
+                update_data = KnowledgeDocumentUpdate(
+                    status=SchemaDocumentStatus.ENABLED
+                )
+                doc = KnowledgeService.update_document(db, doc_id, user_id, update_data)
+                if doc:
+                    success_count += 1
+                else:
+                    failed_ids.append(doc_id)
+            except ValueError:
+                failed_ids.append(doc_id)
+            except Exception:  # noqa: BLE001 - continue updating remaining docs
+                failed_ids.append(doc_id)
+                batch_logger.exception("Unexpected error enabling document %s", doc_id)
+
+        return BatchOperationResult(
+            success_count=success_count,
+            failed_count=len(failed_ids),
+            failed_ids=failed_ids,
+            message=f"Successfully enabled {success_count} documents, {len(failed_ids)} failed",
+        )
+
+    @staticmethod
+    def batch_disable_documents(
+        db: Session,
+        document_ids: list[int],
+        user_id: int,
+    ) -> BatchOperationResult:
+        """
+        Batch disable multiple documents.
+
+        Args:
+            db: Database session
+            document_ids: List of document IDs to disable
+            user_id: Requesting user ID
+
+        Returns:
+            BatchOperationResult with success/failure counts
+        """
+        from app.schemas.knowledge import DocumentStatus as SchemaDocumentStatus
+        from app.schemas.knowledge import KnowledgeDocumentUpdate
+
+        success_count = 0
+        failed_ids = []
+
+        for doc_id in document_ids:
+            try:
+                update_data = KnowledgeDocumentUpdate(
+                    status=SchemaDocumentStatus.DISABLED
+                )
+                doc = KnowledgeService.update_document(db, doc_id, user_id, update_data)
+                if doc:
+                    success_count += 1
+                else:
+                    failed_ids.append(doc_id)
+            except ValueError:
+                failed_ids.append(doc_id)
+            except Exception:  # noqa: BLE001 - continue updating remaining docs
+                failed_ids.append(doc_id)
+                batch_logger.exception("Unexpected error disabling document %s", doc_id)
+
+        return BatchOperationResult(
+            success_count=success_count,
+            failed_count=len(failed_ids),
+            failed_ids=failed_ids,
+            message=f"Successfully disabled {success_count} documents, {len(failed_ids)} failed",
+        )
+
+    # ============== Knowledge Base Migration and Transfer Delegates ==============
+
+    @staticmethod
+    def migrate_knowledge_base_to_group(
+        db: Session,
+        knowledge_base_id: int,
+        user_id: int,
+        target_group_name: str,
+    ) -> dict:
+        """Migrate a personal knowledge base to a group."""
+        from app.services.knowledge.knowledge_transfer import KnowledgeTransferService
+
+        return KnowledgeTransferService.migrate_knowledge_base_to_group(
+            db=db,
+            knowledge_base_id=knowledge_base_id,
+            user_id=user_id,
+            target_group_name=target_group_name,
+        )
+
+    @staticmethod
+    def transfer_documents_to_kb(
+        db: Session,
+        source_kb_id: int,
+        target_kb_id: int,
+        document_ids: list[int],
+        folder_ids: list[int],
+        user_id: int,
+    ) -> TransferDocumentsResponse:
+        """Transfer documents and/or folders from one KB to another."""
+        from app.services.knowledge.knowledge_transfer import KnowledgeTransferService
+
+        return KnowledgeTransferService.transfer_documents_to_kb(
+            db=db,
+            source_kb_id=source_kb_id,
+            target_kb_id=target_kb_id,
+            document_ids=document_ids,
+            folder_ids=folder_ids,
+            user_id=user_id,
+        )
+
+
+def _escape_sql_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

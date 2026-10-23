@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wegent-shared"
+version = "1.0.0"
+description = "Wegent Shared Utilities and Models"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0.1",
+    "cryptography>=42.0.4",
+    "httpx>=0.26.0",
+    "requests>=2.31.0",
+    "dacite>=1.8.0", # For dataclass deserialization
+    # Note: litellm removed - ResponsesAPIStreamEvents now defined locally
+    # to avoid loading ~907 modules (~156MB memory)
+    # Image preprocessing
+    "pillow>=12.0.0",
+    # Database ORM
+    "sqlalchemy>=2.0.25",
+    "pymysql>=1.1.0",
+    "asyncmy>=0.2.9",
+    # OpenTelemetry core packages
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp>=1.27.0",
+    # OpenTelemetry instrumentation packages
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+    "opentelemetry-instrumentation-httpx>=0.48b0",
+    "opentelemetry-instrumentation-requests>=0.48b0",
+    "opentelemetry-instrumentation-system-metrics>=0.48b0",
+    "opentelemetry-instrumentation-redis>=0.48b0",
+    "pydantic>=2.12.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.1",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
+    "pytest-mock>=3.15.1",
+    "black>=23.7.0",
+    "isort>=5.12.0",
+    "flake8>=6.0.0",
+    "mypy>=1.5.0",
+]
+
+[tool.setuptools]
+packages = ["shared", "shared.knowledge_contracts", "shared.knowledge_module", "shared.models", "shared.models.db", "shared.db", "shared.telemetry", "shared.telemetry.context", "shared.telemetry.metrics", "shared.testing", "shared.utils"]
+
+[tool.setuptools.package-dir]
+shared = "."
+
+[tool.setuptools.package-data]
+shared = ["assets/codex-models/*.json"]
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.eggs
+  | \.git
+  | \.mypy_cache
+  | \.venv
+  | venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 88
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+skip = [".venv", "venv"]
+skip_gitignore = true
+known_first_party = ["db", "models", "telemetry", "utils"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

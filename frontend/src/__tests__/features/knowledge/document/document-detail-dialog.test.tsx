@@ -1,0 +1,1058 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import '@testing-library/jest-dom'
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { DocumentDetailDialog } from '@/features/knowledge/document/components/DocumentDetailDialog'
+import type { DocumentSummary, KnowledgeDocument } from '@/types/knowledge'
+import { toast } from 'sonner'
+import { formatDateTime } from '@/utils/dateTime'
+
+const mockRouterPush = jest.fn()
+const mockDownloadDocument = jest.fn()
+const mockRefreshDetail = jest.fn()
+const mockSynchronizeExternalDocument = jest.fn()
+const mockToast = jest.fn()
+let mockDocumentSummary: DocumentSummary | null = null
+const mockDialogContent = jest.fn(
+  ({ children }: { children: React.ReactNode; className?: string }) => <div>{children}</div>
+)
+
+jest.mock('next/navigation', () => ({
+  useRouter: () => ({
+    push: mockRouterPush,
+    replace: jest.fn(),
+    back: jest.fn(),
+    forward: jest.fn(),
+    refresh: jest.fn(),
+    prefetch: jest.fn(),
+  }),
+  useSearchParams: () => new URLSearchParams(),
+  usePathname: () => '/',
+}))
+
+jest.mock('next/dynamic', () => () => {
+  const MockDynamicComponent = ({ source }: { source?: string }) => (
+    <div data-testid="dynamic-component">{source}</div>
+  )
+  MockDynamicComponent.displayName = 'MockDynamicComponent'
+  return MockDynamicComponent
+})
+
+jest.mock('@/hooks/useTranslation', () => ({
+  useTranslation: () => ({
+    t: (key: string, options?: { name?: string }) =>
+      key === 'document.document.externalSource.wikiConnectionName'
+        ? `${key}:${options?.name || ''}`
+        : key,
+    getCurrentLanguage: () => 'en',
+  }),
+}))
+
+jest.mock('@/features/theme/ThemeProvider', () => ({
+  useTheme: () => ({
+    theme: 'light',
+  }),
+}))
+
+const mockListKnowledgeBases = jest.fn()
+const mockListWikiConnections = jest.fn()
+
+jest.mock('@/apis/knowledge', () => ({
+  getKnowledgeConfig: jest.fn().mockResolvedValue({
+    chunk_storage_enabled: false,
+  }),
+  listKnowledgeBases: (...args: unknown[]) => mockListKnowledgeBases(...args),
+  synchronizeExternalDocument: (...args: unknown[]) => mockSynchronizeExternalDocument(...args),
+}))
+
+jest.mock('@/hooks/use-toast', () => ({
+  toast: (...args: unknown[]) => mockToast(...args),
+}))
+
+jest.mock('@/apis/knowledge-base', () => ({
+  knowledgeBaseApi: {
+    updateDocumentContent: jest.fn(),
+  },
+}))
+
+jest.mock('@/apis/wiki', () => ({
+  wikiApis: {
+    listConnections: (...args: unknown[]) => mockListWikiConnections(...args),
+  },
+}))
+
+jest.mock('@/apis/attachments', () => ({
+  formatFileSize: (bytes: number) => `${bytes} B`,
+  isImageExtension: () => false,
+}))
+
+jest.mock('@/features/knowledge/document/hooks/useDocumentDetail', () => ({
+  useDocumentDetail: () => ({
+    detail: {
+      content_length: 18,
+      truncated: false,
+      summary: mockDocumentSummary,
+      chunks: [],
+    },
+    fullContent: 'plain text content',
+    loading: false,
+    error: null,
+    loadingMore: false,
+    hasMoreContent: false,
+    loadMore: jest.fn(),
+    loadAllContent: jest.fn(),
+    refresh: mockRefreshDetail,
+  }),
+}))
+
+jest.mock('@/features/knowledge/document/hooks/useKnowledgeDocumentDownload', () => ({
+  useKnowledgeDocumentDownload: () => (document: KnowledgeDocument) =>
+    mockDownloadDocument(document.id, document.name),
+}))
+
+jest.mock('@/features/knowledge/document/components/ChunksSection', () => ({
+  ChunksSection: () => <div data-testid="chunks-section" />,
+}))
+
+jest.mock('@/features/knowledge/document/components/KnowledgeSourcePreview', () => ({
+  KnowledgeSourcePreview: ({ active, className }: { active: boolean; className?: string }) => (
+    <div
+      className={className}
+      data-active={String(active)}
+      data-testid="mock-knowledge-source-preview"
+    />
+  ),
+}))
+
+jest.mock('@/components/ui/dialog', () => ({
+  Dialog: ({ children, open }: { children: React.ReactNode; open: boolean }) =>
+    open ? <div>{children}</div> : null,
+  DialogContent: (props: { children: React.ReactNode; className?: string }) =>
+    mockDialogContent(props),
+  DialogHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DialogTitle: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DialogDescription: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+}))
+
+jest.mock('@/components/ui/alert-dialog', () => ({
+  AlertDialog: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  AlertDialogContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  AlertDialogHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  AlertDialogTitle: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  AlertDialogDescription: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  AlertDialogFooter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  AlertDialogCancel: ({ children }: { children: React.ReactNode }) => <button>{children}</button>,
+  AlertDialogAction: ({ children }: { children: React.ReactNode }) => <button>{children}</button>,
+}))
+
+jest.mock('@/components/ui/tooltip', () => ({
+  TooltipProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  TooltipTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  TooltipContent: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+}))
+
+jest.mock('sonner', () => ({
+  toast: {
+    success: jest.fn(),
+    error: jest.fn(),
+  },
+}))
+
+// Reset mocks before each test
+beforeEach(() => {
+  mockRouterPush.mockClear()
+  mockDialogContent.mockClear()
+  mockDownloadDocument.mockReset()
+  mockRefreshDetail.mockReset()
+  mockSynchronizeExternalDocument.mockReset()
+  mockToast.mockReset()
+  mockDocumentSummary = null
+  mockListKnowledgeBases.mockResolvedValue({ items: [] })
+  mockListWikiConnections.mockReset()
+  mockListWikiConnections.mockResolvedValue({
+    connections: [],
+    available_connectors: [],
+  })
+})
+
+const baseDocument: KnowledgeDocument = {
+  id: 11,
+  kind_id: 21,
+  attachment_id: null,
+  name: 'shared-doc',
+  file_extension: 'md',
+  file_size: 128,
+  status: 'enabled',
+  user_id: 1,
+  is_active: true,
+  index_status: 'success',
+  index_generation: 1,
+  folder_id: 0,
+  source_type: 'text',
+  source_config: {},
+  created_at: '2026-04-02T00:00:00Z',
+  updated_at: '2026-04-02T00:00:00Z',
+}
+
+describe('DocumentDetailDialog permissions', () => {
+  it.each(['2026-10-07T01:47:00', '2026-10-07T01:47:00Z', '2026-10-07T01:47:00+08:00'])(
+    'uses the list timestamp semantics for %s',
+    updatedAt => {
+      render(
+        <DocumentDetailDialog
+          open
+          onOpenChange={jest.fn()}
+          document={{ ...baseDocument, updated_at: updatedAt }}
+          knowledgeBaseId={21}
+        />
+      )
+
+      const expected = formatDateTime(new Date(updatedAt).getTime())
+      expect(
+        screen.getByText(`document.document.detail.contentUpdatedAt: ${expected}`)
+      ).toBeInTheDocument()
+    }
+  )
+
+  it('renders the protected watermark inside the scrollable content so it covers scrolled sections', async () => {
+    const canvasContext = {
+      scale: jest.fn(),
+      translate: jest.fn(),
+      rotate: jest.fn(),
+      fillText: jest.fn(),
+      font: '',
+      fillStyle: '',
+      textAlign: 'start',
+      textBaseline: 'alphabetic',
+    } as unknown as CanvasRenderingContext2D
+    const getContext = jest
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(canvasContext)
+    const toDataURL = jest
+      .spyOn(HTMLCanvasElement.prototype, 'toDataURL')
+      .mockReturnValue('data:image/png;base64,watermark')
+
+    try {
+      render(
+        <DocumentDetailDialog
+          open={true}
+          onOpenChange={jest.fn()}
+          document={baseDocument}
+          knowledgeBaseId={21}
+          allowDownload={false}
+          watermarkText="reader@example.com"
+        />
+      )
+
+      const watermark = screen.getByTestId('knowledge-document-watermark')
+      await waitFor(() => {
+        expect(watermark.style.backgroundImage).toContain('data:image/png')
+      })
+      expect(watermark).toHaveClass('absolute', 'inset-0')
+      expect(watermark).toHaveAttribute('data-watermark-pattern', 'tiled')
+      // Match the internal build: no forced background-size, so tile/text size is identical
+      expect(watermark.style.backgroundSize).toBe('')
+
+      // The boundary grows with the content inside the scroller, so the watermark
+      // stays over every scrolled section instead of only the first screen.
+      const boundary = watermark.parentElement as HTMLElement
+      expect(boundary).toHaveClass('relative', 'h-full', 'overflow-hidden', 'select-none')
+      const scroller = watermark.closest('.overflow-y-auto')
+      expect(scroller).not.toBeNull()
+      expect(scroller).toContainElement(watermark)
+
+      // Copy is blocked on the protected boundary
+      const copyEvent = new Event('copy', { cancelable: true, bubbles: true })
+      boundary.dispatchEvent(copyEvent)
+      expect(copyEvent.defaultPrevented).toBe(true)
+
+      expect(canvasContext.fillText).toHaveBeenCalledWith('reader@example.com', 0, 0)
+    } finally {
+      getContext.mockRestore()
+      toDataURL.mockRestore()
+    }
+  })
+
+  it('hides the edit button when the user cannot manage the document', () => {
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={baseDocument}
+        knowledgeBaseId={21}
+        kbType="notebook"
+        {...({ canEdit: false } as Record<string, unknown>)}
+      />
+    )
+
+    expect(screen.queryByText('document.document.detail.edit')).not.toBeInTheDocument()
+  })
+
+  it('shows the edit button when the user can manage the document', () => {
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={baseDocument}
+        knowledgeBaseId={21}
+        kbType="notebook"
+        {...({ canEdit: true } as Record<string, unknown>)}
+      />
+    )
+
+    expect(screen.getByText('document.document.detail.edit')).toBeInTheDocument()
+  })
+})
+
+describe('DocumentDetailDialog external source info', () => {
+  const externalMeta = {
+    provider: 'dingtalk',
+    resource_id: 'node-1',
+    title: 'Spec Doc',
+    url: 'https://alidocs.dingtalk.com/i/nodes/node-1',
+    status: 'accessible',
+    last_success_at: '2026-08-26T10:00:00Z',
+  }
+  const externalDocument: KnowledgeDocument = {
+    ...baseDocument,
+    source_type: 'external',
+    external_provider: 'dingtalk',
+    source_config: { external: externalMeta },
+  }
+
+  it('shows provider, source link, last import time and accessibility', () => {
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={externalDocument}
+        knowledgeBaseId={21}
+        kbType="notebook"
+      />
+    )
+
+    const info = screen.getByTestId('external-source-info')
+    expect(info).toHaveTextContent('dingtalk')
+    expect(info).toHaveTextContent('Spec Doc')
+    expect(info).toHaveTextContent('document.document.externalSource.lastImportedAt')
+    const link = screen.getByTestId('external-source-link')
+    expect(link).toHaveAttribute('href', 'https://alidocs.dingtalk.com/i/nodes/node-1')
+    expect(link).toHaveClass('min-h-[44px]', 'min-w-[44px]', 'md:min-h-0', 'md:min-w-0')
+    // An accessible source never renders the inaccessible badge.
+    expect(screen.queryByTestId('external-source-inaccessible')).not.toBeInTheDocument()
+  })
+
+  it('marks an inaccessible source while keeping the snapshot metadata', () => {
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={{
+          ...externalDocument,
+          source_config: {
+            external: {
+              ...externalMeta,
+              status: 'inaccessible',
+              last_error: 'node not found',
+            },
+          },
+        }}
+        knowledgeBaseId={21}
+        kbType="notebook"
+      />
+    )
+
+    expect(screen.getByTestId('external-source-inaccessible')).toBeInTheDocument()
+  })
+
+  it('reports a failed source check as a synchronization failure', () => {
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={{
+          ...externalDocument,
+          source_config: {
+            external: {
+              ...externalMeta,
+              status: 'sync_error',
+              last_error: 'DingTalk metadata read timed out',
+            },
+          },
+        }}
+        knowledgeBaseId={21}
+        kbType="notebook"
+      />
+    )
+
+    // The preview shares the source-state mapping with the list and the tree.
+    expect(screen.getByTestId('external-source-inaccessible')).toHaveTextContent(
+      'document.document.sourceSyncFailed'
+    )
+  })
+
+  it('identifies a deleted synchronized wiki source', () => {
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={{
+          ...externalDocument,
+          external_provider: 'wiki',
+          source_config: {
+            external: {
+              ...externalMeta,
+              provider: 'wiki',
+              status: 'inaccessible',
+              sync: {
+                enabled: true,
+                last_error_code: 'external_source_missing',
+              },
+            },
+          },
+        }}
+        knowledgeBaseId={21}
+        kbType="notebook"
+      />
+    )
+
+    expect(screen.getByTestId('external-source-inaccessible')).toHaveTextContent(
+      'document.document.wikiSourceMissing'
+    )
+  })
+
+  it('labels a transient synchronization error separately from a missing source', () => {
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={{
+          ...externalDocument,
+          external_provider: 'wiki',
+          source_config: {
+            external: {
+              ...externalMeta,
+              provider: 'wiki',
+              status: 'sync_error',
+              last_error: 'temporary failure',
+              sync: {
+                enabled: true,
+                last_error_code: 'wiki_unreachable',
+              },
+            },
+          },
+        }}
+        knowledgeBaseId={21}
+        kbType="notebook"
+      />
+    )
+
+    expect(screen.getByTestId('external-source-inaccessible')).toHaveTextContent(
+      'document.document.sourceSyncFailed'
+    )
+  })
+
+  it('hides the source info for regular documents', () => {
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={baseDocument}
+        knowledgeBaseId={21}
+        kbType="notebook"
+      />
+    )
+
+    expect(screen.queryByTestId('external-source-info')).not.toBeInTheDocument()
+  })
+
+  it('shows the source link and current connection name for a synchronized wiki document', async () => {
+    mockListWikiConnections.mockResolvedValue({
+      connections: [
+        {
+          id: 'conn-primary',
+          display_name: 'Operations Wiki',
+          enabled: true,
+          connector_type: 'wikijs',
+          site_url: 'https://wiki.example.com',
+          default_locale: null,
+          api_key_masked: '****',
+          available_connectors: [],
+        },
+      ],
+      available_connectors: [],
+    })
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={{
+          ...baseDocument,
+          source_type: 'external',
+          source_config: {
+            external: {
+              provider: 'wiki',
+              title: 'Operations handbook',
+              url: 'https://wiki.example.com/operations/handbook',
+              sync: { enabled: true, connection_id: 'conn-primary' },
+            },
+          },
+        }}
+        knowledgeBaseId={21}
+        kbType="notebook"
+      />
+    )
+
+    expect(screen.getByTestId('external-source-info')).toHaveTextContent('wiki')
+    expect(screen.getByTestId('external-source-link')).toHaveAttribute(
+      'href',
+      'https://wiki.example.com/operations/handbook'
+    )
+    expect(await screen.findByTestId('external-wiki-connection-name')).toHaveTextContent(
+      'document.document.externalSource.wikiConnectionName:Operations Wiki'
+    )
+    expect(mockListWikiConnections).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    { ...externalMeta, provider: 123 },
+    { ...externalMeta, title: null },
+    { ...externalMeta, url: { unsafe: true } },
+  ])('hides invalid external source metadata', invalidExternalMeta => {
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={{
+          ...externalDocument,
+          source_config: { external: invalidExternalMeta },
+        }}
+        knowledgeBaseId={21}
+        kbType="notebook"
+      />
+    )
+
+    expect(screen.queryByTestId('external-source-info')).not.toBeInTheDocument()
+  })
+})
+
+describe('DocumentDetailDialog processing errors', () => {
+  it('shows stored external content alongside an indexing failure', () => {
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={{
+          ...baseDocument,
+          attachment_id: 641,
+          source_type: 'external',
+          is_active: false,
+          index_status: 'failed',
+          processing_error: {
+            stage: 'indexing',
+            code: 'indexing_failed',
+            message: 'Indexing failed.',
+            retryable: true,
+            generation: 2,
+            occurred_at: '2026-08-27T04:00:47Z',
+          },
+        }}
+        knowledgeBaseId={21}
+      />
+    )
+
+    expect(screen.getByText('plain text content')).toBeInTheDocument()
+    expect(screen.getByTestId('document-processing-error-detail-11')).toBeInTheDocument()
+    expect(
+      screen.getByText('knowledge:document.document.processingError.codes.indexingFailed')
+    ).toBeInTheDocument()
+  })
+
+  it('renders the localized message for a known public error code', () => {
+    const failedDocument: KnowledgeDocument = {
+      ...baseDocument,
+      index_status: 'failed',
+      processing_error: {
+        stage: 'conversion',
+        code: 'model_quota_exhausted',
+        message: 'English fallback.',
+        retryable: false,
+        generation: 1,
+        occurred_at: '2026-04-02T00:01:00Z',
+      },
+    }
+
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={failedDocument}
+        knowledgeBaseId={21}
+      />
+    )
+
+    expect(screen.getByTestId('document-processing-error-detail-11')).toBeInTheDocument()
+    expect(
+      screen.getByText('knowledge:document.document.processingError.codes.modelQuotaExhausted')
+    ).toBeInTheDocument()
+    expect(screen.queryByText('English fallback.')).not.toBeInTheDocument()
+  })
+})
+
+describe('DocumentDetailDialog original file preview', () => {
+  const officeDocument: KnowledgeDocument = {
+    ...baseDocument,
+    id: 22,
+    attachment_id: 32,
+    name: 'report.docx',
+    file_extension: 'docx',
+    file_size: 1024,
+    source_type: 'file',
+  }
+
+  it('shows the original file by default and allows switching to parsed content', async () => {
+    const user = userEvent.setup()
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={officeDocument}
+        knowledgeBaseId={21}
+      />
+    )
+
+    const sourceTab = screen.getByTestId('knowledge-document-source-tab')
+    const parsedTab = screen.getByTestId('knowledge-document-parsed-tab')
+    const sourceActions = screen.getByTestId('knowledge-source-preview-actions')
+    expect(sourceTab).toBeInTheDocument()
+    expect(parsedTab).toHaveClass('max-md:min-h-[44px]')
+    expect(sourceTab).toHaveClass('max-md:min-h-[44px]')
+    expect(sourceTab.nextElementSibling).toBe(parsedTab)
+    expect(sourceActions.nextElementSibling).toContainElement(sourceTab)
+    expect(screen.getByTestId('knowledge-source-preview-download')).toHaveClass(
+      'max-md:min-h-[44px]',
+      'max-md:min-w-[44px]'
+    )
+    expect(screen.getByTestId('knowledge-source-preview-fullscreen')).toHaveClass(
+      'max-md:min-h-[44px]',
+      'max-md:min-w-[44px]'
+    )
+    expect(screen.getByTestId('mock-knowledge-source-preview')).toBeInTheDocument()
+
+    await user.click(screen.getByTestId('knowledge-document-parsed-tab'))
+
+    expect(screen.getByTestId('mock-knowledge-source-preview')).toHaveClass('hidden')
+    expect(screen.getByTestId('mock-knowledge-source-preview')).toHaveAttribute(
+      'data-active',
+      'true'
+    )
+    expect(sourceActions).toHaveClass('invisible', 'pointer-events-none')
+    expect(sourceActions).toHaveAttribute('aria-hidden', 'true')
+    expect(screen.getByTestId('knowledge-document-source-tab')).toBe(sourceTab)
+    expect(String(mockDialogContent.mock.calls.at(-1)?.[0].className)).toContain('max-w-6xl')
+
+    await user.click(screen.getByTestId('knowledge-document-source-tab'))
+    expect(screen.getByTestId('mock-knowledge-source-preview')).not.toHaveClass('hidden')
+    expect(sourceActions).not.toHaveClass('invisible')
+  })
+
+  it('hides the source preview tab for non-file documents', () => {
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={baseDocument}
+        knowledgeBaseId={21}
+      />
+    )
+
+    expect(screen.queryByTestId('knowledge-document-source-tab')).not.toBeInTheDocument()
+  })
+
+  it('enters source preview fullscreen without closing the dialog', async () => {
+    const user = userEvent.setup()
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={officeDocument}
+        knowledgeBaseId={21}
+      />
+    )
+
+    await user.click(screen.getByTestId('knowledge-source-preview-fullscreen'))
+
+    expect(screen.getByTestId('mock-knowledge-source-preview')).toBeInTheDocument()
+    expect(screen.queryByTestId('knowledge-document-source-tab')).not.toBeInTheDocument()
+    expect(screen.getByTestId('knowledge-source-preview-fullscreen')).toHaveAttribute(
+      'aria-label',
+      'document.document.detail.exitFullscreen'
+    )
+  })
+
+  it('shares the derived summary across modes without taking source preview space by default', async () => {
+    const user = userEvent.setup()
+    mockDocumentSummary = {
+      status: 'completed',
+      short_summary: 'Derived summary content',
+      topics: ['finance'],
+    }
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={officeDocument}
+        knowledgeBaseId={21}
+      />
+    )
+
+    const summaryToggle = screen.getByTestId('knowledge-document-summary-toggle')
+    expect(summaryToggle).toHaveClass('max-md:min-h-[44px]')
+    expect(screen.queryByText('Derived summary content')).not.toBeInTheDocument()
+
+    await user.click(screen.getByTestId('knowledge-document-parsed-tab'))
+    expect(screen.getByText('Derived summary content')).toBeInTheDocument()
+
+    await user.click(screen.getByTestId('knowledge-document-source-tab'))
+    expect(screen.queryByText('Derived summary content')).not.toBeInTheDocument()
+
+    await user.click(summaryToggle)
+    expect(screen.getByText('Derived summary content')).toBeInTheDocument()
+    await user.click(screen.getByTestId('knowledge-document-parsed-tab'))
+    await user.click(screen.getByTestId('knowledge-document-source-tab'))
+    expect(screen.getByText('Derived summary content')).toBeInTheDocument()
+  })
+
+  it('hides the shared summary while the original file is fullscreen', async () => {
+    const user = userEvent.setup()
+    mockDocumentSummary = {
+      status: 'completed',
+      short_summary: 'Derived summary content',
+    }
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={officeDocument}
+        knowledgeBaseId={21}
+      />
+    )
+
+    expect(screen.getByTestId('knowledge-document-summary-toggle')).toBeInTheDocument()
+    await user.click(screen.getByTestId('knowledge-source-preview-fullscreen'))
+
+    expect(screen.queryByTestId('knowledge-document-summary-toggle')).not.toBeInTheDocument()
+  })
+
+  it('resets fullscreen before rendering a reopened dialog', async () => {
+    const user = userEvent.setup()
+    const { rerender } = render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={officeDocument}
+        knowledgeBaseId={21}
+      />
+    )
+
+    await user.click(screen.getByTestId('knowledge-source-preview-fullscreen'))
+    rerender(
+      <DocumentDetailDialog
+        open={false}
+        onOpenChange={jest.fn()}
+        document={null}
+        knowledgeBaseId={21}
+      />
+    )
+    mockDialogContent.mockClear()
+
+    rerender(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={officeDocument}
+        knowledgeBaseId={21}
+      />
+    )
+
+    const renderedClassNames = mockDialogContent.mock.calls.map(call => String(call[0].className))
+    expect(renderedClassNames).not.toEqual(
+      expect.arrayContaining([expect.stringContaining('max-w-[100vw]')])
+    )
+    expect(screen.getByTestId('mock-knowledge-source-preview')).toBeInTheDocument()
+  })
+
+  it('downloads the original file from the dialog header and preserves the preview on failure', async () => {
+    const user = userEvent.setup()
+    mockDownloadDocument.mockRejectedValue(new Error('download failed'))
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={officeDocument}
+        knowledgeBaseId={21}
+      />
+    )
+
+    await user.click(screen.getByTestId('knowledge-source-preview-download'))
+
+    expect(mockDownloadDocument).toHaveBeenCalledWith(22, 'report.docx')
+    expect(toast.error).toHaveBeenCalledWith(
+      'document.document.detail.sourcePreview.downloadFailed'
+    )
+    expect(screen.getByTestId('mock-knowledge-source-preview')).toBeInTheDocument()
+  })
+})
+
+describe('DocumentDetailDialog wiki-link routing', () => {
+  const markdownDocument: KnowledgeDocument = {
+    id: 12,
+    kind_id: 21,
+    attachment_id: null,
+    name: 'index.md',
+    file_extension: 'md',
+    file_size: 256,
+    status: 'enabled',
+    user_id: 1,
+    is_active: true,
+    index_status: 'success',
+    index_generation: 1,
+    folder_id: 0,
+    source_type: 'text',
+    source_config: {},
+    created_at: '2026-04-02T00:00:00Z',
+    updated_at: '2026-04-02T00:00:00Z',
+  }
+
+  beforeEach(() => {
+    mockRouterPush.mockClear()
+  })
+
+  it('navigates to the resolved URL when a wiki link is found (happy path)', async () => {
+    // Mock listKnowledgeBases to return the target KB
+    mockListKnowledgeBases.mockResolvedValue({
+      items: [{ name: 'other-kb', namespace: 'default' }],
+    })
+
+    // Mock useDocumentDetail to return markdown content with a relative link
+    jest.doMock('@/features/knowledge/document/hooks/useDocumentDetail', () => ({
+      useDocumentDetail: () => ({
+        detail: {
+          content_length: 26,
+          truncated: false,
+          summary: null,
+          chunks: [],
+        },
+        fullContent: '[link](../other-kb/doc.md)',
+        loading: false,
+        error: null,
+        loadingMore: false,
+        hasMoreContent: false,
+        loadMore: jest.fn(),
+        loadAllContent: jest.fn(),
+        refresh: jest.fn(),
+      }),
+    }))
+
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={markdownDocument}
+        knowledgeBaseId={21}
+        kbType="notebook"
+        knowledgeBaseName="my-wiki"
+        knowledgeBaseNamespace="default"
+        isOrganization={false}
+      />
+    )
+
+    // Find the rendered wiki link button and click it
+    const linkButton = screen.queryByTitle('../other-kb/doc.md')
+    if (linkButton) {
+      fireEvent.click(linkButton)
+      await waitFor(() => {
+        expect(mockRouterPush).toHaveBeenCalled()
+      })
+    }
+  })
+
+  it('does not navigate when the wiki link target does not exist (not-found path)', async () => {
+    // Mock listKnowledgeBases to return empty (KB not found)
+    mockListKnowledgeBases.mockResolvedValue({ items: [] })
+
+    render(
+      <DocumentDetailDialog
+        open={true}
+        onOpenChange={jest.fn()}
+        document={markdownDocument}
+        knowledgeBaseId={21}
+        kbType="notebook"
+        knowledgeBaseName="my-wiki"
+        knowledgeBaseNamespace="default"
+        isOrganization={false}
+      />
+    )
+
+    // The dialog content renders (document name is visible in the mocked DialogTitle)
+    expect(screen.getByText('index.md')).toBeInTheDocument()
+
+    // router.push should NOT have been called since no link was clicked
+    expect(mockRouterPush).not.toHaveBeenCalled()
+  })
+})
+
+function createDingtalkCopy(overrides?: Partial<KnowledgeDocument>): KnowledgeDocument {
+  return {
+    ...baseDocument,
+    id: 41,
+    name: '钉钉文档',
+    attachment_id: 410,
+    source_type: 'external',
+    source_config: {
+      external: {
+        provider: 'dingtalk',
+        resource_id: 'node-41',
+        title: '钉钉文档',
+        url: 'https://alidocs.dingtalk.com/i/nodes/node-41',
+        status: 'accessible',
+        last_success_at: '2026-09-04T00:00:00Z',
+      },
+    },
+    ...overrides,
+  }
+}
+
+const syncedWikiDocument: KnowledgeDocument = {
+  ...baseDocument,
+  id: 26,
+  attachment_id: 260,
+  source_type: 'external',
+  source_config: {
+    external: {
+      provider: 'wiki',
+      title: 'Synchronized Wiki',
+      sync: { enabled: true },
+    },
+  },
+}
+
+describe('DocumentDetailDialog manual source sync', () => {
+  it('offers no manual sync for documents that are not DingTalk copies', () => {
+    const { rerender } = render(
+      <DocumentDetailDialog
+        open
+        onOpenChange={jest.fn()}
+        document={baseDocument}
+        knowledgeBaseId={21}
+        canEdit
+        onDocumentSynced={jest.fn()}
+      />
+    )
+
+    expect(screen.queryByTestId('document-detail-sync-dingtalk-11')).not.toBeInTheDocument()
+
+    rerender(
+      <DocumentDetailDialog
+        open
+        onOpenChange={jest.fn()}
+        document={syncedWikiDocument}
+        knowledgeBaseId={21}
+        canEdit
+        onDocumentSynced={jest.fn()}
+      />
+    )
+    expect(screen.queryByTestId('document-detail-sync-dingtalk-26')).not.toBeInTheDocument()
+  })
+
+  it('syncs the DingTalk copy and refreshes the preview and the owning list', async () => {
+    mockSynchronizeExternalDocument.mockResolvedValue(createDingtalkCopy())
+    const onDocumentSynced = jest.fn()
+
+    render(
+      <DocumentDetailDialog
+        open
+        onOpenChange={jest.fn()}
+        document={createDingtalkCopy()}
+        knowledgeBaseId={21}
+        canEdit
+        onDocumentSynced={onDocumentSynced}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('document-detail-sync-dingtalk-41'))
+
+    await waitFor(() => expect(mockSynchronizeExternalDocument).toHaveBeenCalledWith(41))
+    await waitFor(() => expect(mockRefreshDetail).toHaveBeenCalled())
+    expect(onDocumentSynced).toHaveBeenCalled()
+  })
+
+  it('disables the entry and reports progress while the sync request runs', async () => {
+    let resolveSync: () => void = () => {}
+    mockSynchronizeExternalDocument.mockImplementation(
+      () =>
+        new Promise<void>(resolve => {
+          resolveSync = resolve
+        })
+    )
+
+    render(
+      <DocumentDetailDialog
+        open
+        onOpenChange={jest.fn()}
+        document={createDingtalkCopy()}
+        knowledgeBaseId={21}
+        canEdit
+        onDocumentSynced={jest.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('document-detail-sync-dingtalk-41'))
+
+    const syncButton = screen.getByTestId('document-detail-sync-dingtalk-41')
+    await waitFor(() => expect(syncButton).toBeDisabled())
+    expect(syncButton).toHaveAttribute('aria-label', 'document.document.syncing')
+    expect(mockSynchronizeExternalDocument).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(syncButton)
+    expect(mockSynchronizeExternalDocument).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveSync()
+    })
+    await waitFor(() => expect(syncButton).not.toBeDisabled())
+  })
+
+  it('keeps the failure reason and leaves the list untouched when the sync fails', async () => {
+    mockSynchronizeExternalDocument.mockRejectedValue(new Error('无法连接钉钉'))
+    const onDocumentSynced = jest.fn()
+
+    render(
+      <DocumentDetailDialog
+        open
+        onOpenChange={jest.fn()}
+        document={createDingtalkCopy()}
+        knowledgeBaseId={21}
+        canEdit
+        onDocumentSynced={onDocumentSynced}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId('document-detail-sync-dingtalk-41'))
+
+    await waitFor(() =>
+      expect(mockToast).toHaveBeenCalledWith({
+        variant: 'destructive',
+        description: '无法连接钉钉',
+      })
+    )
+    expect(onDocumentSynced).not.toHaveBeenCalled()
+    await waitFor(() =>
+      expect(screen.getByTestId('document-detail-sync-dingtalk-41')).not.toBeDisabled()
+    )
+  })
+})

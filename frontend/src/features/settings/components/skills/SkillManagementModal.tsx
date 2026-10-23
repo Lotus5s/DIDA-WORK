@@ -1,0 +1,658 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { useCallback, useEffect, useState } from 'react'
+import {
+  PencilIcon,
+  TrashIcon,
+  DownloadIcon,
+  PackageIcon,
+  RefreshCwIcon,
+  GitBranchIcon,
+  Link2Icon,
+  TagsIcon,
+} from 'lucide-react'
+import LoadingState from '@/features/common/LoadingState'
+import {
+  fetchUnifiedSkillsList,
+  fetchPublicSkillsList,
+  UnifiedSkill,
+  deleteSkill,
+  deletePublicSkill,
+  downloadSkill,
+  downloadPublicSkill,
+  fetchSkillReferences,
+  parseSkillReferenceError,
+  ReferencedGhost,
+  removeSingleSkillReference,
+  removeSkillReferences,
+  updateSkillFromGit,
+  updatePublicSkillFromGit,
+  addSkillToMyDefault,
+  removeSkillFromMyDefault,
+} from '@/apis/skills'
+import SkillUploadModal from './SkillUploadModal'
+import { SkillReferenceConflictDialog } from './SkillReferenceConflictDialog'
+import UnifiedAddButton from '@/components/common/UnifiedAddButton'
+import { Button } from '@/components/ui/button'
+import { Card } from '@/components/ui/card'
+import { Tag } from '@/components/ui/tag'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { useToast } from '@/hooks/use-toast'
+import { useTranslation } from '@/hooks/useTranslation'
+import { MarketplaceTagsDialog } from '@/features/resource-library/components/MarketplaceTagsDialog'
+
+interface SkillManagementModalProps {
+  open: boolean
+  onClose: () => void
+  onSkillsChange?: () => void
+  scope?: 'personal' | 'group' | 'all' | 'public'
+  groupName?: string | null
+}
+
+export default function SkillManagementModal({
+  open,
+  onClose,
+  onSkillsChange,
+  scope = 'personal',
+  groupName,
+}: SkillManagementModalProps) {
+  const { t } = useTranslation()
+  const { toast } = useToast()
+  const [skills, setSkills] = useState<UnifiedSkill[]>([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [uploadModalOpen, setUploadModalOpen] = useState(false)
+  const [editingSkill, setEditingSkill] = useState<UnifiedSkill | null>(null)
+  const [deleteConfirmVisible, setDeleteConfirmVisible] = useState(false)
+  const [skillToDelete, setSkillToDelete] = useState<UnifiedSkill | null>(null)
+  const [isDeleting, setIsDeleting] = useState(false)
+  const [updatingFromGitId, setUpdatingFromGitId] = useState<number | null>(null)
+  const [updatingDefaultSkillId, setUpdatingDefaultSkillId] = useState<number | null>(null)
+  const [referenceDialogOpen, setReferenceDialogOpen] = useState(false)
+  const [tagEditingSkillId, setTagEditingSkillId] = useState<number | null>(null)
+  const [referenceDialogMode, setReferenceDialogMode] = useState<'view' | 'delete_conflict'>(
+    'delete_conflict'
+  )
+  const [referencedGhosts, setReferencedGhosts] = useState<ReferencedGhost[]>([])
+
+  const uploadNamespace = scope === 'group' && groupName ? groupName : undefined
+
+  const loadSkills = useCallback(async () => {
+    setIsLoading(true)
+    try {
+      // For public scope, use fetchPublicSkillsList; otherwise use fetchUnifiedSkillsList
+      const skillsData =
+        scope === 'public'
+          ? await fetchPublicSkillsList()
+          : await fetchUnifiedSkillsList({
+              scope: scope,
+              groupName: groupName || undefined,
+            })
+      // Filter out public skills for management (only show user's own skills) unless scope is 'public'
+      setSkills(scope === 'public' ? skillsData : skillsData.filter(s => !s.is_public))
+    } catch (error) {
+      toast({
+        variant: 'destructive',
+        title: t('common:skills.failed_load'),
+        description: error instanceof Error ? error.message : t('common:common.unknown_error'),
+      })
+    } finally {
+      setIsLoading(false)
+    }
+  }, [toast, scope, groupName, t])
+
+  useEffect(() => {
+    if (open) {
+      loadSkills()
+    }
+  }, [open, loadSkills])
+
+  const handleCreateSkill = () => {
+    setEditingSkill(null)
+    setUploadModalOpen(true)
+  }
+
+  const handleEditSkill = (skill: UnifiedSkill) => {
+    setEditingSkill(skill)
+    setUploadModalOpen(true)
+  }
+
+  const handleDeleteSkill = (skill: UnifiedSkill) => {
+    setSkillToDelete(skill)
+    setDeleteConfirmVisible(true)
+  }
+
+  const handleConfirmDelete = async () => {
+    if (!skillToDelete) return
+
+    setIsDeleting(true)
+    try {
+      if (scope === 'public') {
+        await deletePublicSkill(skillToDelete.id)
+      } else {
+        await deleteSkill(skillToDelete.id)
+      }
+      toast({
+        title: t('common:common.success'),
+        description: t('common:skills.success_delete', { skillName: skillToDelete.name }),
+      })
+      await loadSkills()
+      onSkillsChange?.()
+      setDeleteConfirmVisible(false)
+      setSkillToDelete(null)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : t('common:common.unknown_error')
+      const referenceError = parseSkillReferenceError(errorMessage)
+      if (referenceError) {
+        setDeleteConfirmVisible(false)
+        setReferencedGhosts(referenceError.referenced_ghosts)
+        setReferenceDialogMode('delete_conflict')
+        setReferenceDialogOpen(true)
+      } else {
+        toast({
+          variant: 'destructive',
+          title: t('common:skills.failed_delete'),
+          description: errorMessage,
+        })
+      }
+    } finally {
+      setIsDeleting(false)
+    }
+  }
+
+  const handleViewReferences = async (skill: UnifiedSkill) => {
+    try {
+      const result = await fetchSkillReferences(skill.id)
+      if (result.referenced_ghosts.length === 0) {
+        toast({
+          title: t('common:common.success'),
+          description: t('common:skills.no_references_found', { skillName: skill.name }),
+        })
+        return
+      }
+
+      setSkillToDelete(skill)
+      setReferencedGhosts(result.referenced_ghosts)
+      setReferenceDialogMode('view')
+      setReferenceDialogOpen(true)
+    } catch (error) {
+      toast({
+        variant: 'destructive',
+        title: t('common:skills.references_fetch_failed'),
+        description: error instanceof Error ? error.message : t('common:common.unknown_error'),
+      })
+    }
+  }
+
+  const handleRemoveAllReferencesAndDelete = async () => {
+    if (!skillToDelete) return
+
+    await removeSkillReferences(skillToDelete.id)
+    if (scope === 'public') {
+      await deletePublicSkill(skillToDelete.id)
+    } else {
+      await deleteSkill(skillToDelete.id)
+    }
+    await loadSkills()
+    onSkillsChange?.()
+  }
+
+  const handleClearAllReferencesOnly = async () => {
+    if (!skillToDelete) return
+
+    await removeSkillReferences(skillToDelete.id)
+    await loadSkills()
+    onSkillsChange?.()
+  }
+
+  const handleRemoveSingleReference = async (ghostId: number) => {
+    if (!skillToDelete) return
+
+    await removeSingleSkillReference(skillToDelete.id, ghostId)
+  }
+
+  const handleReferenceDialogUpdate = async () => {
+    setSkillToDelete(null)
+    setReferencedGhosts([])
+    await loadSkills()
+    onSkillsChange?.()
+  }
+
+  const handleDownloadSkill = async (skill: UnifiedSkill) => {
+    try {
+      if (scope === 'public') {
+        await downloadPublicSkill(skill.id, skill.name)
+      } else {
+        // For group scope, use the groupName as namespace
+        // For personal scope, use the skill's namespace (usually 'default')
+        const namespace = scope === 'group' && groupName ? groupName : skill.namespace
+        await downloadSkill(skill.id, skill.name, namespace)
+      }
+      toast({
+        title: t('common:common.success'),
+        description: t('common:skills.success_download', { skillName: skill.name }),
+      })
+    } catch (error) {
+      toast({
+        variant: 'destructive',
+        title: t('common:skills.failed_download'),
+        description: error instanceof Error ? error.message : t('common:common.unknown_error'),
+      })
+    }
+  }
+
+  const handleUpdateFromGit = async (skill: UnifiedSkill) => {
+    if (!skill.source || skill.source.type !== 'git') return
+
+    setUpdatingFromGitId(skill.id)
+    try {
+      if (scope === 'public') {
+        await updatePublicSkillFromGit(skill.id)
+      } else {
+        await updateSkillFromGit(skill.id)
+      }
+      toast({
+        title: t('common:common.success'),
+        description: t('common:skills.success_update_from_git', { skillName: skill.name }),
+      })
+      await loadSkills()
+      onSkillsChange?.()
+    } catch (error) {
+      toast({
+        variant: 'destructive',
+        title: t('common:skills.failed_update_from_git'),
+        description: error instanceof Error ? error.message : t('common:common.unknown_error'),
+      })
+    } finally {
+      setUpdatingFromGitId(null)
+    }
+  }
+
+  const handleToggleDefaultEnabledSkill = async (skill: UnifiedSkill) => {
+    setUpdatingDefaultSkillId(skill.id)
+    try {
+      if (skill.availability?.inMyDefault) {
+        await removeSkillFromMyDefault(skill.id)
+        toast({
+          title: t('common:common.success'),
+          description: t('settings:skills.availability.removeSuccess'),
+        })
+        setSkills(prev =>
+          prev.map(item =>
+            item.id === skill.id
+              ? {
+                  ...item,
+                  availability: { ...(item.availability || {}), inMyDefault: false },
+                }
+              : item
+          )
+        )
+      } else {
+        await addSkillToMyDefault(skill.id)
+        toast({
+          title: t('common:common.success'),
+          description: t('settings:skills.availability.addSuccess'),
+        })
+        setSkills(prev =>
+          prev.map(item =>
+            item.id === skill.id
+              ? {
+                  ...item,
+                  availability: { ...(item.availability || {}), inMyDefault: true },
+                }
+              : item
+          )
+        )
+      }
+      onSkillsChange?.()
+    } catch (error) {
+      toast({
+        variant: 'destructive',
+        title: t('settings:skills.availability.updateFailed'),
+        description: error instanceof Error ? error.message : t('common:common.unknown_error'),
+      })
+    } finally {
+      setUpdatingDefaultSkillId(null)
+    }
+  }
+
+  const handleModalClose = (saved: boolean) => {
+    setUploadModalOpen(false)
+    setEditingSkill(null)
+    if (saved) {
+      loadSkills()
+      onSkillsChange?.()
+    }
+  }
+
+  return (
+    <>
+      <Dialog open={open} onOpenChange={onClose}>
+        <DialogContent className="sm:max-w-[800px] max-h-[80vh] flex flex-col bg-surface">
+          <DialogHeader>
+            <DialogTitle>{t('settings:skills.libraryTitle')}</DialogTitle>
+            <DialogDescription>{t('settings:skills.libraryDescription')}</DialogDescription>
+          </DialogHeader>
+
+          <div className="flex-1 overflow-y-auto py-4">
+            {isLoading ? (
+              <LoadingState message={t('common:skills.loading')} />
+            ) : (
+              <div className="space-y-4">
+                {/* Add Button */}
+                <div className="flex justify-end">
+                  <UnifiedAddButton onClick={handleCreateSkill}>
+                    {t('common:skills.upload_skill')}
+                  </UnifiedAddButton>
+                </div>
+
+                {/* Skills List */}
+                {skills.length === 0 ? (
+                  <Card className="p-8 text-center">
+                    <PackageIcon className="w-12 h-12 mx-auto text-text-muted mb-3" />
+                    <h3 className="text-base font-medium text-text-primary mb-2">
+                      {t('common:skills.no_skills')}
+                    </h3>
+                    <p className="text-sm text-text-muted mb-4">
+                      {t('common:skills.no_skills_description')}
+                    </p>
+                    <Button onClick={handleCreateSkill}>
+                      {t('common:skills.upload_first_skill')}
+                    </Button>
+                  </Card>
+                ) : (
+                  <div className="space-y-3">
+                    {skills.map(skill => (
+                      <Card
+                        key={skill.id || skill.name}
+                        className="p-4 hover:shadow-md transition-shadow"
+                      >
+                        <div className="flex items-start justify-between">
+                          {/* Skill Info */}
+                          <div className="flex items-start gap-3 min-w-0 flex-1">
+                            <PackageIcon className="w-5 h-5 text-primary flex-shrink-0 mt-0.5" />
+                            <div className="min-w-0 flex-1">
+                              <h3 className="text-base font-medium text-text-primary truncate">
+                                {skill.displayName || skill.name}
+                              </h3>
+                              <p className="text-sm text-text-secondary mt-1 line-clamp-2">
+                                {skill.description}
+                              </p>
+
+                              {/* Tags and Metadata */}
+                              <div className="flex flex-wrap gap-1.5 mt-2">
+                                {skill.version && (
+                                  <Tag variant="default">
+                                    {t('common:skills.version', { version: skill.version })}
+                                  </Tag>
+                                )}
+                                {skill.author && (
+                                  <Tag variant="default">
+                                    {t('common:skills.author', { author: skill.author })}
+                                  </Tag>
+                                )}
+                                {skill.tags?.map(tag => (
+                                  <Tag key={tag} variant="info">
+                                    {tag}
+                                  </Tag>
+                                ))}
+                                <Tag
+                                  variant={skill.availability?.inMyDefault ? 'success' : 'default'}
+                                >
+                                  {skill.availability?.inMyDefault
+                                    ? t('settings:skills.availability.inMyDefault')
+                                    : t('settings:skills.availability.notInMyDefault')}
+                                </Tag>
+                              </div>
+
+                              {/* Bind Shells */}
+                              <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                                <span className="text-xs text-text-muted">
+                                  {t('skills.bind_shells')}:
+                                </span>
+                                {skill.bindShells && skill.bindShells.length > 0 ? (
+                                  skill.bindShells.map(shell => (
+                                    <Tag key={shell} variant="success">
+                                      {shell}
+                                    </Tag>
+                                  ))
+                                ) : (
+                                  <span className="text-xs text-text-muted italic">
+                                    {t('skills.no_bind_shells')}
+                                  </span>
+                                )}
+                              </div>
+
+                              {/* Namespace info for group skills */}
+                              {scope === 'group' &&
+                                skill.namespace &&
+                                skill.namespace !== 'default' && (
+                                  <div className="flex items-center gap-1.5 mt-2">
+                                    <span className="text-xs text-text-muted">
+                                      {t('common:skills.namespace')}: {skill.namespace}
+                                    </span>
+                                  </div>
+                                )}
+
+                              {/* Git source info */}
+                              {skill.source?.type === 'git' && skill.source.repo_url && (
+                                <div className="flex items-center gap-1.5 mt-2">
+                                  <GitBranchIcon className="w-3 h-3 text-text-muted" />
+                                  <span className="text-xs text-text-muted truncate max-w-[300px]">
+                                    {skill.source.repo_url}
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Action Buttons */}
+                          <div className="flex gap-1 flex-shrink-0 ml-4">
+                            <Button
+                              variant={skill.availability?.inMyDefault ? 'outline' : 'primary'}
+                              size="sm"
+                              onClick={() => handleToggleDefaultEnabledSkill(skill)}
+                              disabled={updatingDefaultSkillId === skill.id}
+                              data-testid={
+                                skill.availability?.inMyDefault
+                                  ? `remove-skill-default-button-${skill.id}`
+                                  : `add-skill-default-button-${skill.id}`
+                              }
+                            >
+                              {skill.availability?.inMyDefault
+                                ? t('settings:skills.availability.removeFromMyDefault')
+                                : t('settings:skills.availability.addToMyDefault')}
+                            </Button>
+                            {/* Update from Git button - only show for git-imported skills */}
+                            {skill.source?.type === 'git' && (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-11 w-11 md:h-8 md:w-8"
+                                onClick={() => handleUpdateFromGit(skill)}
+                                disabled={updatingFromGitId === skill.id}
+                                title={t('common:skills.update_from_git')}
+                              >
+                                <RefreshCwIcon
+                                  className={`w-4 h-4 ${updatingFromGitId === skill.id ? 'animate-spin' : ''}`}
+                                />
+                              </Button>
+                            )}
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8"
+                              onClick={() => handleViewReferences(skill)}
+                              title={t('common:skills.view_references')}
+                              data-testid={`view-skill-references-button-${skill.id}`}
+                            >
+                              <Link2Icon className="w-4 h-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8"
+                              onClick={() => handleDownloadSkill(skill)}
+                              title={t('common:skills.download_skill')}
+                              data-testid={`download-skill-button-${skill.id}`}
+                            >
+                              <DownloadIcon className="w-4 h-4" />
+                            </Button>
+                            {scope === 'public' && (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8"
+                                onClick={() => setTagEditingSkillId(skill.id)}
+                                title={t('resource-library:marketplace_tags.edit_title')}
+                                data-testid={`edit-skill-marketplace-tags-button-${skill.id}`}
+                              >
+                                <TagsIcon className="w-4 h-4" />
+                              </Button>
+                            )}
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8"
+                              onClick={() => handleEditSkill(skill)}
+                              title={t('common:skills.update_skill')}
+                            >
+                              <PencilIcon className="w-4 h-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 text-error hover:text-error hover:bg-error/10"
+                              onClick={() => handleDeleteSkill(skill)}
+                              title={t('common:skills.delete_skill')}
+                              data-testid={`delete-skill-button-${skill.id}`}
+                            >
+                              <TrashIcon className="w-4 h-4" />
+                            </Button>
+                          </div>
+                        </div>
+                      </Card>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={onClose}>
+              {t('common:actions.close')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Upload/Edit Modal */}
+      {uploadModalOpen && (
+        <SkillUploadModal
+          open={uploadModalOpen}
+          onClose={handleModalClose}
+          skill={editingSkill}
+          namespace={uploadNamespace}
+          isPublic={scope === 'public'}
+        />
+      )}
+
+      <MarketplaceTagsDialog
+        resourceId={tagEditingSkillId}
+        open={tagEditingSkillId !== null}
+        onOpenChange={nextOpen => {
+          if (!nextOpen) setTagEditingSkillId(null)
+        }}
+      />
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog
+        open={deleteConfirmVisible}
+        onOpenChange={open => !open && !isDeleting && setDeleteConfirmVisible(false)}
+      >
+        <DialogContent className="bg-surface">
+          <DialogHeader>
+            <DialogTitle>{t('common:skills.delete_confirm_title')}</DialogTitle>
+            <DialogDescription>
+              {t('common:skills.delete_confirm_message', {
+                skillName: skillToDelete?.name,
+              })}
+              {skillToDelete && (
+                <div className="mt-3 p-3 bg-muted rounded-md text-sm">
+                  <strong>{t('common:skills.delete_note')}</strong>
+                </div>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setDeleteConfirmVisible(false)}
+              disabled={isDeleting}
+            >
+              {t('common:actions.cancel')}
+            </Button>
+            <Button variant="destructive" onClick={handleConfirmDelete} disabled={isDeleting}>
+              {isDeleting ? (
+                <div className="flex items-center">
+                  <svg
+                    className="animate-spin -ml-1 mr-2 h-4 w-4"
+                    xmlns="http://www.w3.org/2000/svg"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                  >
+                    <circle
+                      className="opacity-25"
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      strokeWidth="4"
+                    ></circle>
+                    <path
+                      className="opacity-75"
+                      fill="currentColor"
+                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                    ></path>
+                  </svg>
+                  {t('common:actions.deleting')}
+                </div>
+              ) : (
+                t('common:actions.delete')
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {skillToDelete && (
+        <SkillReferenceConflictDialog
+          open={referenceDialogOpen}
+          onOpenChange={setReferenceDialogOpen}
+          skillName={skillToDelete.name}
+          skillId={skillToDelete.id}
+          referencedGhosts={referencedGhosts}
+          mode={referenceDialogMode}
+          onRemoveAllReferences={
+            referenceDialogMode === 'delete_conflict'
+              ? handleRemoveAllReferencesAndDelete
+              : handleClearAllReferencesOnly
+          }
+          onRemoveSingleReference={handleRemoveSingleReference}
+          onAfterUpdate={handleReferenceDialogUpdate}
+        />
+      )}
+    </>
+  )
+}

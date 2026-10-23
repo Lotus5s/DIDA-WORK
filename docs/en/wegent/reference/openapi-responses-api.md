@@ -1,0 +1,513 @@
+---
+sidebar_position: 1
+---
+
+# OpenAPI v1/responses API
+
+This document describes the OpenAPI v1/responses endpoint, which provides an OpenAI Responses API compatible interface for interacting with Wegent agents (Teams).
+
+## Overview
+
+The `/api/v1/responses` endpoint allows external applications to interact with Wegent agents using a format compatible with OpenAI's Responses API. This makes it easy to integrate Wegent into existing applications that already support the OpenAI API format.
+
+## Authentication
+
+All endpoints require authentication via one of the following methods:
+
+- **Bearer Token**: `Authorization: Bearer <access_token>`
+- **API Key**: `X-API-Key: <api_key>`
+
+### Obtaining an API Key
+
+1. Log in to the Wegent frontend
+2. Click the **Settings** icon in the bottom left corner
+3. Select the **AI Keys** menu
+4. Click the **Create Personal Key** button
+5. Copy the generated API Key for API calls
+
+## Base URL
+
+```
+/api/v1/responses
+```
+
+## Endpoints
+
+### Create Response
+
+Creates a new response (executes a task).
+
+```
+POST /api/v1/responses
+```
+
+#### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `model` | string | Yes | Agent identifier. Format: `namespace#team_name` or `namespace#team_name#model_id` |
+| `input` | string \| array | Yes | User input prompt or conversation history |
+| `stream` | boolean | No | Enable streaming output (default: `false`) |
+| `previous_response_id` | string | No | Previous response ID for follow-up conversations |
+| `reasoning` | object | No | Model reasoning configuration with `effort` and optional `summary` fields |
+| `tools` | array | No | Wegent custom tools configuration |
+| `omit_mcp_binary_output` | boolean | No | Replace media payloads (base64 images, audio, and video) in MCP tool output with a summary placeholder (default: `false`, raw output is returned) |
+
+#### MCP binary output
+
+MCP tools that fetch media answer with base64 payloads, which bloats the response body and can break caller parsers. With `omit_mcp_binary_output` set to `true`, media payloads in `mcp_call` items are replaced with a summary placeholder such as `<image/jpeg payload omitted: 2048 bytes>`:
+
+```json
+{
+  "model": "default#my-assistant",
+  "input": "Download this image and summarise it",
+  "omit_mcp_binary_output": true
+}
+```
+
+Text output is always returned unchanged, and model calls still receive the complete original content, so model output is unaffected.
+
+#### Model Format
+
+The `model` field specifies which agent (Team) to use:
+
+- `namespace#team_name` - Use the default model configured in the Team's Bot
+- `namespace#team_name#model_id` - Override with a specific model
+
+Examples:
+- `default#my-assistant`
+- `my-group#coding-agent#gpt-4o`
+
+#### Input Format
+
+The `input` field supports two formats:
+
+**Simple string:**
+```json
+{
+  "input": "Hello, how are you?"
+}
+```
+
+**Conversation history (for multi-turn):**
+```json
+{
+  "input": [
+    {"type": "message", "role": "user", "content": "What is 2+2?"},
+    {"type": "message", "role": "assistant", "content": "2+2 equals 4."},
+    {"type": "message", "role": "user", "content": "What about 3+3?"}
+  ]
+}
+```
+
+#### Reasoning Configuration
+
+`reasoning.effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. Availability depends on the selected model; clients should use the capability list returned by the model runtime instead of constructing unsupported levels.
+
+`reasoning.summary` accepts `auto`, `concise`, or `detailed`.
+
+```json
+{
+  "reasoning": {
+    "effort": "ultra",
+    "summary": "auto"
+  }
+}
+```
+
+#### Tools Configuration
+
+The `tools` array enables additional server-side capabilities:
+
+```json
+{
+  "tools": [
+    {"type": "wegent_chat_bot"}
+  ]
+}
+```
+
+| Tool Type | Description |
+|-----------|-------------|
+| `wegent_chat_bot` | Enable all server-side capabilities (deep thinking, web search, server MCP tools, message enhancement) |
+| `wegent_code_bot` | Enable code task with git repository (for Executor-based Teams) |
+| `mcp` | Add custom MCP servers |
+| `skill` | Preload specific skills |
+| `knowledge_base` | Let a Chat Shell agent use selected knowledge bases, optionally scoped to folders or documents |
+
+**Code Bot Configuration (for code tasks):**
+```json
+{
+  "tools": [
+    {
+      "type": "wegent_code_bot",
+      "workspace": {
+        "git_url": "https://github.com/user/repo.git",
+        "branch": "main",
+        "git_repo": "user/repo"
+      }
+    }
+  ]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `workspace.git_url` | string | Yes | Git repository URL |
+| `workspace.branch` | string | Yes | Git branch name |
+| `workspace.git_repo` | string | No | Repository name (e.g., `user/repo`). Will be extracted from `git_url` if not provided |
+
+**MCP Server Configuration:**
+```json
+{
+  "tools": [
+    {
+      "type": "mcp",
+      "mcp_servers": [
+        {
+          "my-server": {"url": "http://...", "type": "http"},
+          "another": {"url": "http://...", "type": "sse"}
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Skill Preloading:**
+```json
+{
+  "tools": [
+    {"type": "skill", "preload_skills": ["skill_a", "skill_b"]}
+  ]
+}
+```
+
+**Knowledge Base Configuration:**
+
+Use `knowledge_base_names` for whole-knowledge-base access:
+
+```json
+{
+  "tools": [
+    {
+      "type": "knowledge_base",
+      "knowledge_base_names": ["default#Product Docs"]
+    }
+  ]
+}
+```
+
+Use `knowledge_base_refs` when access must be scoped to folders or documents:
+
+```json
+{
+  "tools": [
+    {
+      "type": "knowledge_base",
+      "knowledge_base_refs": [
+        {
+          "name": "default#Product Docs",
+          "folder_ids": [10],
+          "document_ids": [101],
+          "include_subfolders": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+Scope rules:
+
+- When both `folder_ids` and `document_ids` are provided, the scope is their union.
+- `folder_ids: [0]` means documents directly under the knowledge-base root. It does not mean whole-knowledge-base access.
+- For whole-knowledge-base access, omit both `folder_ids` and `document_ids`.
+- `folder_ids: []` and `document_ids: []` are invalid.
+- `knowledge_base_refs` and `knowledge_base_names` are mutually exclusive.
+- Top-level `folder_ids` / `document_ids` are only a single-KB compatibility form. Multi-KB scoped requests must use `knowledge_base_refs`.
+
+The scope is an access boundary. When a folder or document scope is enabled, `knowledge_base_search`, `kb_ls`, and `kb_head` can only search, list, or read documents inside that scope. Out-of-scope document reads return `document_scope_violation`.
+
+When a request includes `previous_response_id` and does not provide a new `knowledge_base` tool, the system inherits the previously bound knowledge-base scope for that task and re-resolves folder membership for the current turn. Passing a new `knowledge_base` tool explicitly replaces the previous scope.
+
+#### Response Behavior
+
+The response behavior depends on the Team's Shell type:
+
+| Shell Type | Streaming Support | Response Mode |
+|------------|-------------------|---------------|
+| Chat Shell | Yes | Synchronous or SSE streaming; non-streaming device requests are queued |
+| Others (ClaudeCode, Codex, Agno, Dify) | Yes | Non-streaming requests are queued; streaming requests return SSE |
+
+**Chat Shell (stream=false):**
+- Without a bound device, blocks until the LLM completes and returns the completed response
+- With a bound device, returns immediately with status `queued`
+
+**stream=true (Chat and non-Chat Shells):**
+- Returns SSE stream with OpenAI v1/responses compatible events
+- Single and batch device or executor callbacks deliver text and terminal events
+- Video models reject streaming requests with HTTP 400
+
+**Non-Chat Shell (stream=false):**
+- Returns immediately with status `queued`
+- Use `GET /api/v1/responses/{response_id}` to poll for completion
+
+#### Example Request
+
+```bash
+curl -X POST "https://your-domain/api/v1/responses" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "default#my-assistant",
+    "input": "Tell me a joke",
+    "stream": false
+  }'
+```
+
+#### Example Response
+
+```json
+{
+  "id": "resp_123",
+  "object": "response",
+  "created_at": 1704067200,
+  "status": "completed",
+  "model": "default#my-assistant",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_456",
+      "status": "completed",
+      "role": "user",
+      "content": [{"type": "output_text", "text": "Tell me a joke", "annotations": []}]
+    },
+    {
+      "type": "message",
+      "id": "msg_789",
+      "status": "completed",
+      "role": "assistant",
+      "content": [{"type": "output_text", "text": "Why did the programmer quit? Because he didn't get arrays!", "annotations": []}]
+    }
+  ],
+  "error": null,
+  "previous_response_id": null
+}
+```
+
+---
+
+### Get Response
+
+Retrieves a response by ID.
+
+```
+GET /api/v1/responses/{response_id}
+```
+
+#### Path Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `response_id` | string | Response ID in format `resp_{task_id}` |
+
+#### Example Request
+
+```bash
+curl "https://your-domain/api/v1/responses/resp_123" \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
+### Cancel Response
+
+Cancels a running response.
+
+```
+POST /api/v1/responses/{response_id}/cancel
+```
+
+#### Path Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `response_id` | string | Response ID in format `resp_{task_id}` |
+
+#### Behavior
+
+- **Chat Shell tasks**: Stops the model request and saves partial content
+- **Executor-based tasks**: Calls executor_manager to cancel
+
+#### Example Request
+
+```bash
+curl -X POST "https://your-domain/api/v1/responses/resp_123/cancel" \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
+### Delete Response
+
+Deletes a response.
+
+```
+DELETE /api/v1/responses/{response_id}
+```
+
+#### Path Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `response_id` | string | Response ID in format `resp_{task_id}` |
+
+#### Example Request
+
+```bash
+curl -X DELETE "https://your-domain/api/v1/responses/resp_123" \
+  -H "Authorization: Bearer <token>"
+```
+
+#### Example Response
+
+```json
+{
+  "id": "resp_123",
+  "object": "response",
+  "deleted": true
+}
+```
+
+---
+
+## Streaming Events
+
+When `stream=true` is set, Chat and non-Chat Shells can return Server-Sent Events (SSE) in OpenAI v1/responses format. Video models do not support streaming requests.
+
+### Event Types
+
+| Event Type | Description |
+|------------|-------------|
+| `response.created` | Response has been created |
+| `response.output_item.added` | New output item (message) added |
+| `response.content_part.added` | New content part added to message |
+| `response.output_text.delta` | Text chunk received |
+| `response.reasoning_summary_part.added` | New reasoning summary output item added |
+| `response.reasoning_summary_text.delta` | Reasoning summary text chunk received |
+| `response.output_text.done` | Text output completed |
+| `response.content_part.done` | Content part completed |
+| `response.output_item.done` | Output item completed |
+| `response.completed` | Response fully completed |
+| `response.failed` | Response failed with error |
+
+### Reasoning Output Order
+
+When deep thinking is enabled or the model returns reasoning summaries, the stream may contain multiple independent `reasoning` output items. Tool calls or regular text output close the current reasoning block; later reasoning content creates a new `reasoning` output item.
+
+The final `response.completed.response.output` preserves the chronological order of these items, for example `reasoning -> shell_call -> reasoning -> message`. Clients should render the `output` array in order and should not merge multiple `reasoning` items into one block.
+
+### Example SSE Stream
+
+```
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_123","status":"in_progress",...}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant"}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":" world!"}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"Hello world!"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_123","status":"completed",...}}
+```
+
+---
+
+## Response Status
+
+| Status | Description |
+|--------|-------------|
+| `queued` | Task is queued for execution (non-Chat Shell) |
+| `in_progress` | Task is currently running |
+| `completed` | Task completed successfully |
+| `failed` | Task failed with error |
+| `cancelled` | Task was cancelled |
+| `incomplete` | Task partially completed |
+
+---
+
+## Error Handling
+
+### HTTP Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | Success |
+| 400 | Bad request (invalid parameters) |
+| 401 | Unauthorized (missing or invalid authentication) |
+| 404 | Resource not found |
+| 500 | Internal server error |
+
+### Error Response Format
+
+```json
+{
+  "detail": "Error message describing what went wrong"
+}
+```
+
+### Response Object Error
+
+When a task fails, the `error` field contains:
+
+```json
+{
+  "id": "resp_123",
+  "status": "failed",
+  "error": {
+    "code": "task_failed",
+    "message": "Detailed error message"
+  },
+  ...
+}
+```
+
+---
+
+## Follow-up Conversations
+
+To continue a conversation, use `previous_response_id`:
+
+```json
+{
+  "model": "default#my-assistant",
+  "input": "Tell me another one",
+  "previous_response_id": "resp_123"
+}
+```
+
+This appends to the same task, maintaining conversation context.
+
+If the task is bound to a device, follow-up requests continue on that device. An offline device returns HTTP 503.
+
+---
+
+## Notes
+
+- By default, API calls use "clean mode" without server-side enhancements
+- Bot/Ghost MCP tools configured in the CRD are always available
+- Use `wegent_chat_bot` tool to enable full server-side capabilities
+- Streaming is only supported for Chat Shell type Teams
+- Raw `mcp_call` output is returned by default; set `omit_mcp_binary_output` to `true` to replace media payloads such as base64 images with a summary placeholder like `<image/jpeg payload omitted: 2048 bytes>`. Non-media output is returned unchanged and model calls still use the complete original content

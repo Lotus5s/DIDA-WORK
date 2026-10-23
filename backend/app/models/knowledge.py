@@ -1,0 +1,378 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Knowledge base and document models for document knowledge management.
+
+Provides storage for user and team knowledge bases with document management.
+"""
+
+from datetime import datetime
+from enum import Enum as PyEnum
+
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+)
+from sqlalchemy import Enum as SQLEnum
+from sqlalchemy import (
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    TypeDecorator,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import relationship
+from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.sql import func
+
+from app.db.base import Base
+
+
+class DocumentStatus(str, PyEnum):
+    """Document status for knowledge documents."""
+
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+
+
+class DocumentSourceType(str, PyEnum):
+    """Document source type for knowledge documents."""
+
+    FILE = "file"  # Uploaded file
+    TEXT = "text"  # Pasted text
+    WEB = "web"  # Web page (scraped URL)
+    CODE = "code"  # Source file indexed for retrieval, not a browsable document
+    EXTERNAL = "external"  # Document imported from an external provider
+
+
+class ContentOrigin(str, PyEnum):
+    """Ownership of knowledge content, deciding whether regeneration may touch it.
+
+    ``GENERATED`` content is owned by the generating agent: it may be overwritten by
+    a later run and removed by generation-set reconciliation. ``USER`` content is
+    owned by a person and is never touched by regeneration.
+
+    ``USER`` is the safe default: mislabelling generated content as user-owned only
+    stops automatic cleanup, while the reverse would expose user content to deletion.
+    """
+
+    GENERATED = "generated"
+    USER = "user"
+
+
+class DocumentIndexStatus(str, PyEnum):
+    """Business status for document indexing lifecycle."""
+
+    NOT_INDEXED = "not_indexed"
+    QUEUED = "queued"
+    PENDING_CONVERSION = "pending_conversion"
+    CONVERTING = "converting"
+    INDEXING = "indexing"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+class DocumentIndexStatusType(TypeDecorator):
+    """Persist index status as VARCHAR while exposing Python enums to business code."""
+
+    impl = String(32)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        """Convert enum values to strings before writing to the database."""
+        if value is None:
+            return None
+        if isinstance(value, DocumentIndexStatus):
+            return value.value
+        return DocumentIndexStatus(value).value
+
+    def process_result_value(self, value, dialect):
+        """Convert stored strings back into business enums when loading rows."""
+        if value is None:
+            return None
+        try:
+            return DocumentIndexStatus(value)
+        except ValueError:
+            return value
+
+
+class KnowledgeDocumentExternalSource(Base):
+    """One external identity per document and per knowledge base.
+
+    References are maintained in the document transaction, without database FKs.
+    This table owns identity only; content and processing state belong to the document.
+    """
+
+    __tablename__ = "knowledge_document_external_sources"
+
+    document_id = Column(
+        Integer,
+        primary_key=True,
+        autoincrement=False,
+        comment="知识文档ID，关联knowledge_documents.id",
+    )
+    kind_id = Column(
+        Integer,
+        nullable=False,
+        server_default="0",
+        comment="所属知识库ID，与知识文档的kind_id一致",
+    )
+    external_provider = Column(
+        String(32),
+        nullable=False,
+        server_default="",
+        comment="外部文档来源标识，如dingtalk；业务写入时不能为空",
+    )
+    external_resource_id = Column(
+        String(255),
+        nullable=False,
+        server_default="",
+        comment="外部来源中的文档资源ID；业务写入时不能为空",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "kind_id",
+            "external_provider",
+            "external_resource_id",
+            name="uniq_knowledge_documents_external",
+        ),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "comment": "知识文档外部身份表，仅外部导入文档有记录",
+        },
+    )
+
+
+class KnowledgeDocument(Base):
+    """
+    Knowledge document model for storing document metadata.
+
+    Links to subtask_contexts table for actual file storage.
+    Note: kind_id references kinds.id (Kind='KnowledgeBase')
+    Note: attachment_id references subtask_contexts.id but without FK constraint
+          (referential integrity is managed at the application layer)
+    """
+
+    __tablename__ = "knowledge_documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # References kinds.id (Kind='KnowledgeBase') but without FK constraint
+    # Referential integrity is managed at the application layer
+    kind_id = Column(Integer, nullable=False, index=True)
+    # References subtask_contexts.id (context_type='attachment') but without FK constraint
+    # Referential integrity is managed at the application layer
+    attachment_id = Column(Integer, nullable=False, default=0)
+    name = Column(String(255), nullable=False)
+    file_extension = Column(String(50), nullable=False)
+    file_size = Column(BigInteger, nullable=False, default=0)
+    status = Column(
+        SQLEnum(DocumentStatus, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=False,
+        default=DocumentStatus.DISABLED,  # Default to disabled, user can enable manually
+    )
+    user_id = Column(Integer, nullable=False, index=True)
+    is_active = Column(
+        Boolean, nullable=False, default=False
+    )  # Default to False, set to True after indexing completes
+    index_status = Column(
+        DocumentIndexStatusType(),
+        nullable=False,
+        default=DocumentIndexStatus.NOT_INDEXED,
+    )
+    index_generation = Column(Integer, nullable=False, default=0)
+    splitter_config = Column(
+        JSON, nullable=False, default={}
+    )  # Splitter configuration for document chunking
+    source_type = Column(
+        String(50), nullable=False, default=DocumentSourceType.FILE.value
+    )  # Document source type: file, text, table
+    source_config = Column(
+        JSON, nullable=False, default={}
+    )  # Source configuration (e.g., {"url": "..."} for table)
+    # Content ownership; see ContentOrigin. Defaults to ``user`` so that any row this
+    # service did not create is protected from the generated-content projection.
+    origin = Column(
+        String(20),
+        nullable=False,
+        default=ContentOrigin.USER.value,
+        server_default=ContentOrigin.USER.value,
+    )
+    # Batch-load identities for document lists; ORM deletion removes the owned row.
+    external_source = relationship(
+        "KnowledgeDocumentExternalSource",
+        primaryjoin="KnowledgeDocument.id == foreign(KnowledgeDocumentExternalSource.document_id)",
+        uselist=False,
+        cascade="all, delete-orphan",
+        single_parent=True,
+        lazy="selectin",
+    )
+
+    @property
+    def external_provider(self) -> str | None:
+        """Expose the provider from the single identity source to API consumers."""
+        return self.external_source.external_provider if self.external_source else None
+
+    @property
+    def external_resource_id(self) -> str | None:
+        """Expose the resource ID without duplicating its persisted value."""
+        return (
+            self.external_source.external_resource_id if self.external_source else None
+        )
+
+    # --- Helper properties for converted attachment reference ---
+
+    @property
+    def has_external_identity(self) -> bool:
+        """Whether this document owns an external provider identity."""
+        return self.external_source is not None
+
+    @property
+    def external_source_config(self) -> dict:
+        """Return the external source metadata stored in source_config.
+
+        Holds the provider identity, source title / URL, import health
+        (``status``, ``last_success_at``, ``last_error``) and which body the
+        last successful import indexed (``last_success_attachment_id``).
+        Always returns a dict; missing metadata reads as empty.
+        """
+        value = (self.source_config or {}).get("external")
+        return dict(value) if isinstance(value, dict) else {}
+
+    def update_external_source_config(self, **updates: object) -> None:
+        """Merge keys into source_config["external"], preserving the rest."""
+        source_config = dict(self.source_config or {})
+        external = dict(source_config.get("external") or {})
+        for key, value in updates.items():
+            if value is None:
+                external.pop(key, None)
+            else:
+                external[key] = value
+        source_config["external"] = external
+        self.source_config = source_config
+
+    @property
+    def converted_attachment_id(self) -> int | None:
+        """Get the converted attachment ID from source_config.
+
+        Returns the SubtaskContext ID that stores the converted Markdown content,
+        or None if no conversion has been performed for this document.
+        """
+        cfg = self.source_config or {}
+        val = cfg.get("converted_attachment_id")
+        return int(val) if val is not None else None
+
+    @converted_attachment_id.setter
+    def converted_attachment_id(self, value: int | None) -> None:
+        """Set or clear the converted attachment ID in source_config.
+
+        Args:
+            value: SubtaskContext ID for the converted attachment, or None to clear.
+        """
+        if self.source_config is None:
+            self.source_config = {}
+        if value is not None:
+            self.source_config["converted_attachment_id"] = value
+        else:
+            self.source_config.pop("converted_attachment_id", None)
+        # SQLAlchemy JSON column mutation is not auto-detected;
+        # must explicitly flag it as modified for the ORM to flush the change.
+        flag_modified(self, "source_config")
+
+    @property
+    def processing_error_payload(self) -> dict | None:
+        """Return the current processing error stored in source_config."""
+        value = (self.source_config or {}).get("processing_error")
+        return dict(value) if isinstance(value, dict) else None
+
+    def set_processing_error_payload(self, value: dict) -> None:
+        """Store a processing error without replacing other source metadata."""
+        source_config = dict(self.source_config or {})
+        source_config["processing_error"] = dict(value)
+        self.source_config = source_config
+
+    def clear_processing_error_payload(self) -> None:
+        """Remove a stale processing error while preserving source metadata."""
+        source_config = dict(self.source_config or {})
+        source_config.pop("processing_error", None)
+        self.source_config = source_config
+
+    # References knowledge_folders.id, 0 = root level (no FK constraint,
+    # referential integrity managed at the application layer)
+    folder_id = Column(Integer, nullable=False, default=0, index=True)
+    summary = Column(JSON, nullable=True)  # Document summary information (JSON)
+    chunks = Column(
+        JSON, nullable=True
+    )  # Chunk metadata including content and position info
+    created_at = Column(DateTime, nullable=False, default=func.now())
+    updated_at = Column(
+        DateTime, nullable=False, default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        # Index for listing documents in a knowledge base
+        Index(
+            "ix_knowledge_documents_kind_active_created",
+            "kind_id",
+            "is_active",
+            "created_at",
+        ),
+        # Index for attachment lookup
+        Index("ix_knowledge_documents_attachment", "attachment_id"),
+        {
+            "sqlite_autoincrement": True,
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+            "comment": "Knowledge document table for file metadata",
+        },
+    )
+
+
+class KnowledgeFolder(Base):
+    """
+    Knowledge folder model for multi-level document organization.
+
+    Folders form a tree structure within a knowledge base via parent_id.
+    parent_id = 0 means the folder is at root level.
+    """
+
+    __tablename__ = "knowledge_folders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # References kinds.id (Kind='KnowledgeBase') without FK constraint
+    kind_id = Column(Integer, nullable=False, index=True)
+    # Self-referencing parent folder, 0 = root level
+    parent_id = Column(Integer, nullable=False, default=0)
+    name = Column(String(255), nullable=False)
+    # Content ownership; a top-level folder decides ownership for its subtree.
+    # Defaults to ``user`` for the same fail-safe reason as on documents.
+    origin = Column(
+        String(20),
+        nullable=False,
+        default=ContentOrigin.USER.value,
+        server_default=ContentOrigin.USER.value,
+    )
+    created_at = Column(DateTime, nullable=False, default=func.now())
+    updated_at = Column(
+        DateTime, nullable=False, default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        # Index for querying child folders under a parent within a knowledge base
+        Index("ix_knowledge_folders_parent", "kind_id", "parent_id"),
+        {
+            "sqlite_autoincrement": True,
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+            "comment": "Knowledge base folder hierarchy for multi-level document organization",
+        },
+    )

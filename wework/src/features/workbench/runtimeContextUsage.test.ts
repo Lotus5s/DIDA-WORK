@@ -1,0 +1,133 @@
+import { describe, expect, test } from 'vitest'
+import type { RuntimeContextUsage, UnifiedModel } from '@/types/api'
+import {
+  applyModelContextWindowOverride,
+  findModelForSelection,
+  modelContextWindowFromConfig,
+  modelInputTokenBudget,
+  modelMaxOutputTokensFromConfig,
+} from './runtimeContextUsage'
+
+const baseUsage: RuntimeContextUsage = {
+  total: {
+    totalTokens: 43_300,
+    inputTokens: 43_000,
+    cachedInputTokens: 0,
+    outputTokens: 300,
+    reasoningOutputTokens: 0,
+  },
+  last: {
+    totalTokens: 43_300,
+    inputTokens: 43_000,
+    cachedInputTokens: 0,
+    outputTokens: 300,
+    reasoningOutputTokens: 0,
+  },
+  modelContextWindow: 258_400,
+}
+
+function model(
+  config: Record<string, unknown>,
+  overrides: Partial<UnifiedModel> = {}
+): UnifiedModel {
+  return {
+    name: 'local-model',
+    type: 'user',
+    config,
+    ...overrides,
+  }
+}
+
+describe('runtimeContextUsage', () => {
+  test('reads context window from supported model config keys', () => {
+    expect(modelContextWindowFromConfig(model({ model_context_window: 1_000_000 }))).toBe(1_000_000)
+    expect(modelContextWindowFromConfig(model({ context_window: '128000' }))).toBe(128_000)
+    expect(modelContextWindowFromConfig(model({ contextWindow: 'bad-value' }))).toBeNull()
+  })
+
+  test('overrides runtime reported context window with configured model window', () => {
+    expect(
+      applyModelContextWindowOverride(baseUsage, model({ model_context_window: 1_000_000 }))
+        .modelContextWindow
+    ).toBe(1_000_000)
+  })
+
+  test('reads max output tokens from supported model config keys', () => {
+    expect(modelMaxOutputTokensFromConfig(model({ max_output_tokens: 384_000 }))).toBe(384_000)
+    expect(modelMaxOutputTokensFromConfig(model({ maxOutputTokens: '384000' }))).toBe(384_000)
+    expect(modelMaxOutputTokensFromConfig(model({ max_output_tokens: 0 }))).toBeNull()
+  })
+
+  test('reserves the configured output budget from the input token budget', () => {
+    expect(
+      modelInputTokenBudget(model({ context_window: 1_000_000, max_output_tokens: 384_000 }))
+    ).toBe(616_000)
+  })
+
+  test('keeps the full context window when no output budget is reserved', () => {
+    expect(modelInputTokenBudget(model({ context_window: 1_000_000 }))).toBe(1_000_000)
+    expect(
+      modelInputTokenBudget(model({ context_window: 1_000_000, max_output_tokens: 1_000_000 }))
+    ).toBe(1_000_000)
+    expect(modelInputTokenBudget(model({ max_output_tokens: 384_000 }))).toBeNull()
+    expect(modelInputTokenBudget(null)).toBeNull()
+  })
+
+  test('measures reported usage against the reserved input token budget', () => {
+    expect(
+      applyModelContextWindowOverride(
+        baseUsage,
+        model({ context_window: 1_000_000, max_output_tokens: 384_000 })
+      ).modelContextWindow
+    ).toBe(616_000)
+  })
+
+  test('finds selected model by name and type', () => {
+    const models = [
+      model({ model_context_window: 128_000 }, { name: 'shared-model', type: 'public' }),
+      model({ model_context_window: 1_000_000 }, { name: 'shared-model', type: 'user' }),
+    ]
+
+    expect(
+      findModelForSelection(models, { modelName: 'shared-model', modelType: 'user' })?.config
+    ).toEqual({ model_context_window: 1_000_000 })
+  })
+
+  test('uses persisted provider identity when runtime models share a name', () => {
+    const models = [
+      model(
+        { codexProviderId: 'openai' },
+        { name: 'gpt-5.6-luna', type: 'runtime', provider: 'local' }
+      ),
+      model(
+        { codexProviderId: 'wework-e2e' },
+        { name: 'gpt-5.6-luna', type: 'runtime', provider: 'local' }
+      ),
+    ]
+
+    expect(
+      findModelForSelection(models, {
+        modelName: 'gpt-5.6-luna',
+        modelType: 'runtime',
+        options: { codexProviderId: 'wework-e2e', collaborationMode: 'plan' },
+      })?.config
+    ).toEqual({ codexProviderId: 'wework-e2e' })
+  })
+
+  test('does not fall back to another provider when persisted identity is unavailable', () => {
+    const models = [
+      model(
+        { codexProviderId: 'openai' },
+        { name: 'gpt-5.6-luna', type: 'runtime', provider: 'local' }
+      ),
+    ]
+
+    expect(
+      findModelForSelection(models, {
+        modelName: 'gpt-5.6-luna',
+        modelType: 'runtime',
+        options: { codexProviderId: 'wework-e2e' },
+      })
+    ).toBeNull()
+  })
+})

@@ -1,0 +1,1737 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import { apiClient } from './client'
+import {
+  getQuickLaunchFunctionsConfig,
+  updateQuickLaunchFunctionsConfig,
+} from './admin-quick-launch'
+import { outboundTokenAdminApis } from './outboundTokens'
+import { oauthClientAdminApis } from './oauthProvider'
+import { RetrieverCRD } from './retrievers'
+import type { SkillRefMeta } from '@/types/api'
+import type { KnowledgeBaseRetrievalProfile, RetrievalConfigDraft } from '@/types/knowledge'
+import type { MarketplaceTagsResponse, MarketplaceTagsUpdate } from '@/types/marketplace'
+
+// Re-export RetrieverCRD for backward compatibility
+export type { RetrieverCRD } from './retrievers'
+export type {
+  QuickLaunchFunctionConfig,
+  QuickLaunchFunctionsResponse,
+  QuickLaunchFunctionsUpdate,
+  QuickLaunchInputOptions,
+  QuickLaunchInputPreset,
+} from './admin-quick-launch'
+export type {
+  SigningKey,
+  SigningKeyCreateRequest,
+  SigningKeyListResponse,
+  TokenIssuer,
+  TokenIssuerCreateRequest,
+  TokenIssuerListResponse,
+  TokenIssuerUpdateRequest,
+} from './outboundTokens'
+export type {
+  OAuthClient,
+  OAuthClientCreateRequest,
+  OAuthClientListResponse,
+  OAuthClientType,
+  OAuthClientUpdateRequest,
+} from './oauthProvider'
+
+// Admin User Types
+export type UserRole = 'admin' | 'user'
+export type AuthSource = 'password' | 'oidc' | 'unknown'
+
+export interface AdminUser {
+  id: number
+  user_name: string
+  email: string | null
+  role: UserRole
+  auth_source: AuthSource
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface AdminUserListResponse {
+  total: number
+  items: AdminUser[]
+}
+
+export interface AdminUserCreate {
+  user_name: string
+  password?: string
+  email?: string
+  role?: UserRole
+  auth_source?: 'password' | 'oidc'
+}
+
+export interface AdminUserUpdate {
+  user_name?: string
+  email?: string
+  role?: UserRole
+  is_active?: boolean
+}
+
+export interface PasswordResetRequest {
+  new_password: string
+}
+
+export interface RoleUpdateRequest {
+  role: UserRole
+}
+
+// Public Model Types
+export interface AdminPublicModel {
+  id: number
+  name: string
+  namespace: string
+  display_name: string | null
+  json: Record<string, unknown>
+  is_active: boolean
+  is_visible: boolean
+  is_advanced: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface AdminPublicModelListResponse {
+  total: number
+  items: AdminPublicModel[]
+}
+
+export interface AdminPublicModelCreate {
+  name: string
+  namespace?: string
+  json: Record<string, unknown>
+  is_visible?: boolean
+}
+
+export interface AdminPublicModelUpdate {
+  name?: string
+  namespace?: string
+  json?: Record<string, unknown>
+  is_active?: boolean
+  is_visible?: boolean
+  is_advanced?: boolean
+}
+
+// System Stats Types
+export interface SystemStats {
+  total_users: number
+  active_users: number
+  admin_count: number
+  total_tasks: number
+  total_public_models: number
+}
+
+export interface TaskRunFailureReason {
+  reason: string | null
+  count: number
+  percentage: number
+}
+
+export interface RecentTaskRunFailure {
+  subtask_id: number
+  task_id: number
+  task_title: string
+  user_id: number
+  user_name: string | null
+  client_origin: string
+  error_message: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface TaskRunStats {
+  hours: number
+  window_start: string
+  window_end: string
+  total_runs: number
+  total_is_approximate: boolean
+  failed_runs: number
+  failure_rate: number
+  failure_reasons: TaskRunFailureReason[]
+  recent_failures: RecentTaskRunFailure[]
+  data_as_of: string | null
+}
+
+// Connector App Types
+export type ConnectorAuthType = 'none' | 'bearer' | 'oauth2'
+export type ConnectorVisibility = 'all' | 'roles'
+export type ConnectorTransport = 'streamable-http' | 'sse' | 'http'
+
+export interface ConnectorHttpToolDefinition {
+  name: string
+  description: string
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  path: string
+  input_schema: Record<string, unknown>
+  argument_locations: Record<string, 'path' | 'query' | 'body'>
+  timeout_seconds: number
+}
+
+export interface ConnectorToolInfo {
+  name: string
+  title: string | null
+  description: string
+  input_schema: Record<string, unknown>
+  connector_id: string
+  raw_tool_name: string
+  model_visible: boolean
+  risk_hints: Record<string, unknown>
+  source_transport: ConnectorTransport
+}
+
+export interface ConnectorToolListResponse {
+  tools: ConnectorToolInfo[]
+}
+
+export interface ConnectorToolCallResponse {
+  content: unknown
+  structured_content: Record<string, unknown> | null
+  is_error: boolean
+}
+
+export interface AdminConnectorApp {
+  id: number
+  slug: string
+  name: string
+  description: string
+  icon_url: string | null
+  enabled: boolean
+  visibility: ConnectorVisibility
+  allowed_roles: string[]
+  auth_type: ConnectorAuthType
+  transport: ConnectorTransport
+  mcp_url: string
+  provider_header_names: string[]
+  provider_headers_configured: boolean
+  forward_user_context_headers: boolean
+  tool_allowlist: string[]
+  http_tools: ConnectorHttpToolDefinition[]
+  connection_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface AdminConnectorAppCreate {
+  slug: string
+  name: string
+  description: string
+  icon_url: string | null
+  enabled: boolean
+  visibility: ConnectorVisibility
+  allowed_roles: string[]
+  auth_type: ConnectorAuthType
+  transport: ConnectorTransport
+  mcp_url: string
+  provider_headers: Record<string, string>
+  forward_user_context_headers?: boolean
+  tool_allowlist: string[]
+  http_tools: ConnectorHttpToolDefinition[]
+}
+
+export type AdminConnectorAppUpdate = Partial<
+  Omit<AdminConnectorAppCreate, 'slug' | 'provider_headers'>
+> & {
+  provider_headers?: Record<string, string>
+  clear_provider_headers?: boolean
+}
+
+// Chat Slogan & Tips Types
+export type SloganTipMode = 'chat' | 'code' | 'both'
+
+export interface ChatSloganItem {
+  id: number
+  zh: string
+  en: string
+  mode?: SloganTipMode
+}
+
+export interface ChatTipItem {
+  id: number
+  zh: string
+  en: string
+  mode?: SloganTipMode
+}
+
+export interface ChatSloganTipsUpdate {
+  slogans: ChatSloganItem[]
+  tips: ChatTipItem[]
+}
+
+export interface ChatSloganTipsResponse {
+  version: number
+  slogans: ChatSloganItem[]
+  tips: ChatTipItem[]
+}
+
+// Service Key Types
+export interface ServiceKey {
+  id: number
+  name: string
+  key_prefix: string
+  description: string | null
+  expires_at: string
+  last_used_at: string
+  created_at: string
+  is_active: boolean
+  created_by: string | null
+}
+
+export interface ServiceKeyCreated extends ServiceKey {
+  key: string // Full key, only at creation
+}
+
+export interface ServiceKeyCreateRequest {
+  name: string
+  description?: string
+}
+
+export interface ServiceKeyListResponse {
+  items: ServiceKey[]
+  total: number
+}
+
+// Plugin Release Key Types
+export interface PluginReleaseKey {
+  id: number
+  name: string
+  keyPrefix: string
+  description: string | null
+  expiresAt: string
+  lastUsedAt: string
+  createdAt: string
+  isActive: boolean
+  createdBy: string | null
+}
+
+export interface PluginReleaseKeyCreated extends PluginReleaseKey {
+  key: string // Full key, only at creation
+}
+
+export interface PluginReleaseKeyCreateRequest {
+  name: string
+  description?: string
+  expiresAt?: string
+}
+
+export interface PluginReleaseKeyListResponse {
+  items: PluginReleaseKey[]
+  total: number
+}
+
+// Personal Key Types (Admin Management)
+export interface AdminPersonalKey {
+  id: number
+  user_id: number
+  user_name: string
+  name: string
+  key_prefix: string
+  description: string | null
+  expires_at: string
+  last_used_at: string
+  created_at: string
+  is_active: boolean
+}
+
+export interface AdminPersonalKeyListResponse {
+  items: AdminPersonalKey[]
+  total: number
+}
+
+// Background Execution Monitor Types
+export interface BackgroundExecutionMonitorStats {
+  total_executions: number
+  completed_count: number
+  failed_count: number
+  retrying_count: number
+  cancelled_count: number
+  running_count: number
+  pending_count: number
+  success_rate: number
+  failure_rate: number
+  retrying_rate: number
+  active_subscriptions_count: number
+  total_subscriptions_count: number
+}
+
+export interface BackgroundExecutionMonitorError {
+  execution_id: number
+  subscription_id: number
+  user_id: number
+  task_id: number | null
+  status: string
+  error_message: string | null
+  trigger_type: string | null
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+}
+
+export interface BackgroundExecutionMonitorErrorListResponse {
+  total: number
+  items: BackgroundExecutionMonitorError[]
+}
+
+// Public Retriever Types
+export interface AdminPublicRetriever {
+  id: number
+  name: string
+  namespace: string
+  displayName: string | null
+  storageType: string
+  description: string | null
+  json: RetrieverCRD
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface AdminPublicRetrieverListResponse {
+  total: number
+  items: AdminPublicRetriever[]
+}
+
+// Public Team Types
+export interface AdminPublicTeam {
+  id: number
+  name: string
+  namespace: string
+  display_name: string | null
+  description: string | null
+  json: Record<string, unknown>
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface AdminPublicTeamListResponse {
+  total: number
+  items: AdminPublicTeam[]
+}
+
+export interface CodeWikiGenerationPolicyStrategy {
+  id: string
+  enabled: boolean
+  team_name: string
+  team_namespace: string
+  display_name: string
+  description: string
+}
+
+export interface CodeWikiGenerationPolicyConfig {
+  version: number
+  configured: boolean
+  default_strategy: string
+  strategies: CodeWikiGenerationPolicyStrategy[]
+}
+
+export interface CodeWikiGenerationPolicyUpdate {
+  default_strategy: string
+  strategies: CodeWikiGenerationPolicyStrategy[]
+}
+
+export interface AdminPublicTeamCreate {
+  name: string
+  namespace?: string
+  json: Record<string, unknown>
+}
+
+export interface AdminPublicTeamUpdate {
+  name?: string
+  namespace?: string
+  json?: Record<string, unknown>
+  is_active?: boolean
+}
+
+export interface AdminPublicTeamIconUpload {
+  asset_id: number
+  url: string
+}
+
+export type AdminMarketplaceResourceType = 'agent' | 'skill' | 'smart_app'
+
+export interface AdminMarketplaceExampleConversation {
+  title: string
+  url: string
+}
+
+export interface AdminMarketplaceResource {
+  id: number
+  resource_type: AdminMarketplaceResourceType
+  name: string
+  display_name: string
+  description: string | null
+  publisher_user_name: string | null
+  is_system: boolean
+  recommendation_score: number
+  example_conversations: AdminMarketplaceExampleConversation[]
+}
+
+export interface AdminMarketplaceResourceUpdate {
+  recommendation_score?: number
+  example_conversations?: AdminMarketplaceExampleConversation[]
+}
+
+export interface AdminMarketplaceResourceListResponse {
+  items: AdminMarketplaceResource[]
+  total: number
+  page: number
+  limit: number
+}
+
+export type AdminMarketplacePluginSource = 'wework-official' | 'enterprise'
+
+export interface AdminMarketplacePlugin {
+  id: number
+  catalog_namespace: AdminMarketplacePluginSource
+  name: string
+  display_name: string
+  description: string
+  version: string | null
+  author: string | null
+  featured_rank: number
+  is_listed: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface AdminMarketplacePluginFilters {
+  search?: string
+  listingStatus?: 'all' | 'listed' | 'unlisted'
+  source?: 'all' | AdminMarketplacePluginSource
+  scoreOrder?: 'asc' | 'desc'
+}
+
+export interface AdminMarketplacePluginUpdate {
+  description?: string
+  featured_rank?: number
+  is_listed?: boolean
+}
+
+export interface AdminMarketplacePluginListResponse {
+  items: AdminMarketplacePlugin[]
+  total: number
+  page: number
+  limit: number
+}
+
+export interface AdminMarketplaceSmartApp {
+  id: number
+  name: string
+  display_name: string
+  summary: string
+  description_md: string
+  tags: string[]
+  icon_url: string
+  publisher_user_name: string | null
+  is_system: boolean
+  featured_rank: number
+  is_listed: boolean
+  needs_metadata: boolean
+}
+
+export interface AdminMarketplaceSmartAppFilters {
+  search?: string
+  listingStatus?: 'all' | 'listed' | 'unlisted'
+  source?: 'all' | 'official' | 'user'
+}
+
+export interface AdminMarketplaceSmartAppUpdate {
+  featured_rank?: number
+  is_listed?: boolean
+}
+
+export interface AdminMarketplaceSmartAppMetadataUpdate {
+  summary: string
+  descriptionMd: string
+  tags: string[]
+  icon?: File | null
+}
+
+export interface AdminMarketplaceSmartAppListResponse {
+  items: AdminMarketplaceSmartApp[]
+  total: number
+  page: number
+  limit: number
+}
+
+// Public Bot Types
+export interface AdminPublicBot {
+  id: number
+  name: string
+  namespace: string
+  display_name: string | null
+  json: Record<string, unknown>
+  is_active: boolean
+  created_at: string
+  updated_at: string
+  ghost_name: string | null
+  shell_name: string | null
+  model_name: string | null
+  secondary_model_name?: string | null
+  secondary_model_namespace?: string | null
+  // Expanded Ghost fields for UI convenience
+  system_prompt: string | null
+  mcp_servers: Record<string, unknown> | null
+  skills: string[] | null
+  skill_refs: Record<string, SkillRefMeta> | null
+  preload_skills: string[] | null
+  preload_skill_refs: Record<string, SkillRefMeta> | null
+  // Expanded Model fields for UI convenience
+  agent_config: Record<string, unknown> | null
+  default_knowledge_base_refs: { id: number; name: string }[] | null
+}
+
+export interface AdminPublicBotListResponse {
+  total: number
+  items: AdminPublicBot[]
+}
+
+export interface AdminPublicBotCreate {
+  name: string
+  namespace?: string
+  json?: Record<string, unknown> // Raw JSON mode (optional)
+  // Form data mode fields (used when json is not provided)
+  shell_name?: string
+  system_prompt?: string
+  mcp_servers?: Record<string, unknown>
+  skills?: string[]
+  skill_refs?: Record<string, SkillRefMeta>
+  preload_skills?: string[]
+  preload_skill_refs?: Record<string, SkillRefMeta>
+  agent_config?: Record<string, unknown>
+  secondary_model_name?: string | null
+  secondary_model_namespace?: string
+  default_knowledge_base_refs?: { id: number; name: string }[]
+}
+
+export interface AdminPublicBotUpdate {
+  name?: string
+  namespace?: string
+  json?: Record<string, unknown> // Raw JSON mode (optional)
+  is_active?: boolean
+  // Form data mode fields (used when json is not provided)
+  shell_name?: string
+  system_prompt?: string
+  mcp_servers?: Record<string, unknown>
+  skills?: string[]
+  skill_refs?: Record<string, SkillRefMeta>
+  preload_skills?: string[]
+  preload_skill_refs?: Record<string, SkillRefMeta>
+  agent_config?: Record<string, unknown>
+  secondary_model_name?: string | null
+  secondary_model_namespace?: string
+  default_knowledge_base_refs?: { id: number; name: string }[]
+}
+
+// Public Ghost Types
+export interface AdminPublicGhost {
+  id: number
+  name: string
+  namespace: string
+  display_name: string | null
+  description: string | null
+  json: Record<string, unknown>
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface AdminPublicGhostListResponse {
+  total: number
+  items: AdminPublicGhost[]
+}
+
+export interface AdminPublicGhostCreate {
+  name: string
+  namespace?: string
+  json: Record<string, unknown>
+}
+
+export interface AdminPublicGhostUpdate {
+  name?: string
+  namespace?: string
+  json?: Record<string, unknown>
+  is_active?: boolean
+}
+
+// Public Shell Types
+export interface AdminPublicShell {
+  id: number
+  name: string
+  namespace: string
+  display_name: string | null
+  shell_type: string | null
+  json: Record<string, unknown>
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface AdminPublicShellListResponse {
+  total: number
+  items: AdminPublicShell[]
+}
+
+export interface AdminPublicShellCreate {
+  name: string
+  namespace?: string
+  json: Record<string, unknown>
+}
+
+export interface AdminPublicShellUpdate {
+  name?: string
+  namespace?: string
+  json?: Record<string, unknown>
+  is_active?: boolean
+}
+
+// IM Channel Types
+export type IMChannelType = 'dingtalk' | 'feishu' | 'wechat' | 'telegram' | 'discord' | 'weibo'
+
+export interface IMChannel {
+  id: number
+  name: string
+  channel_type: IMChannelType
+  is_enabled: boolean
+  config: Record<string, unknown>
+  default_team_id: number // 0 means no default team
+  default_model_name: string // empty string means use bot's default model
+  created_at: string
+  updated_at: string
+  created_by: number // 0 means system
+}
+
+export interface IMChannelListResponse {
+  total: number
+  items: IMChannel[]
+}
+
+export interface IMChannelCreate {
+  name: string
+  channel_type: IMChannelType
+  config: Record<string, unknown>
+  is_enabled?: boolean
+  default_team_id?: number // 0 or undefined means no default team
+  default_model_name?: string // undefined or empty means use bot's default model
+}
+
+export interface IMChannelUpdate {
+  name?: string
+  is_enabled?: boolean
+  config?: Record<string, unknown>
+  default_team_id?: number // 0 means no default team
+  default_model_name?: string // empty string means clear the override
+}
+
+export interface IMChannelStatus {
+  id: number
+  name: string
+  channel_type: IMChannelType
+  is_enabled: boolean
+  is_connected: boolean
+  last_error: string | null
+  uptime_seconds: number | null
+  extra_info: Record<string, unknown> | null
+}
+
+// Device Monitor Types
+export type DeviceStatus = 'online' | 'offline' | 'busy'
+export type DeviceType = 'local' | 'cloud'
+export type BindShell = 'claudecode' | 'openclaw'
+export type VersionFilterOperator = 'gt' | 'gte' | 'eq' | 'lt' | 'lte'
+
+export interface AdminDeviceInfo {
+  id: number
+  device_id: string
+  name: string
+  status: DeviceStatus
+  device_type: DeviceType
+  bind_shell: BindShell
+  user_id: number
+  user_name: string
+  client_ip: string | null
+  executor_version: string | null
+  slot_used: number
+  slot_max: number
+  created_at: string | null
+}
+
+export interface AdminDeviceListResponse {
+  items: AdminDeviceInfo[]
+  total: number
+}
+
+export interface AdminDeviceStats {
+  total: number
+  user_count: number
+  by_status: Record<string, number>
+  by_device_type: Record<string, number>
+  by_bind_shell: Record<string, number>
+}
+
+// Admin Device Action Types
+export interface AdminDeviceActionResponse {
+  success: boolean
+  message: string
+}
+
+export interface AdminDeviceBatchStartResponse extends AdminDeviceActionResponse {
+  batch_id: string
+  action: string
+  status: string
+  total: number
+}
+
+export interface AdminDeviceBatchItemResponse {
+  user_id: number
+  device_id: string
+  status: string
+  message: string
+}
+
+export interface AdminDeviceBatchStatusResponse extends AdminDeviceBatchStartResponse {
+  triggered: number
+  failed: number
+  skipped: number
+  errors: string[]
+  items: AdminDeviceBatchItemResponse[]
+}
+
+// Template Resource Types
+export interface TemplateResourceGhostConfig {
+  systemPrompt: string
+  mcpServers?: Record<string, unknown>
+  skillRefs?: TemplateResourceSkillRef[]
+  preloadSkillRefs?: TemplateResourceSkillRef[]
+}
+
+export interface TemplateResourceSkillRef {
+  name: string
+  namespace: string
+  userId: number
+}
+
+export interface TemplateResourceBotConfig {
+  shellName: string
+  agentConfig?: Record<string, unknown>
+}
+
+export interface TemplateResourceTeamConfig {
+  collaborationModel: string
+  bindMode?: string[]
+  description?: string
+}
+
+export interface TemplateResourceSubscriptionConfig {
+  promptTemplate: string
+  retryCount: number
+  timeoutSeconds: number
+}
+
+export interface TemplateResourceTeamRef {
+  name: string
+  namespace: string
+}
+
+export interface TemplateResourceQueueConfig {
+  visibility: string
+  triggerMode: string
+  teamRef?: TemplateResourceTeamRef
+}
+
+export interface TemplateResources {
+  ghost?: TemplateResourceGhostConfig
+  bot?: TemplateResourceBotConfig
+  team?: TemplateResourceTeamConfig
+  subscription?: TemplateResourceSubscriptionConfig
+  queue?: TemplateResourceQueueConfig
+}
+
+export interface AdminTemplate {
+  id: number
+  name: string
+  displayName: string
+  description?: string | null
+  category: string
+  tags: string[]
+  icon?: string | null
+  resources: TemplateResources
+  createdAt: string
+  updatedAt: string
+}
+
+export interface AdminTemplateListResponse {
+  total: number
+  items: AdminTemplate[]
+}
+
+export interface AdminTemplateCreate {
+  name: string
+  displayName: string
+  description?: string
+  category?: string
+  tags?: string[]
+  icon?: string
+  resources: TemplateResources
+}
+
+export interface AdminTemplateUpdate {
+  displayName?: string
+  description?: string
+  category?: string
+  tags?: string[]
+  icon?: string
+  resources?: TemplateResources
+}
+
+/**
+ * Upgrade all eligible local devices (admin only)
+ */
+export async function upgradeAllLocalDevices(
+  forceStopTasks: boolean = false
+): Promise<AdminDeviceBatchStartResponse> {
+  return apiClient.post('/admin/device-monitor/devices/local/upgrade-all', {
+    force_stop_tasks: forceStopTasks,
+  })
+}
+
+/**
+ * Restart all cloud devices (admin only)
+ */
+export async function restartAllCloudDevices(): Promise<AdminDeviceBatchStartResponse> {
+  return apiClient.post('/admin/device-monitor/devices/cloud/restart-all')
+}
+
+// Admin API Services
+export const adminApis = {
+  ...outboundTokenAdminApis,
+  ...oauthClientAdminApis,
+  getQuickLaunchFunctionsConfig,
+  updateQuickLaunchFunctionsConfig,
+  upgradeAllLocalDevices,
+  restartAllCloudDevices,
+
+  // ==================== User Management ====================
+
+  /**
+   * Get list of all users with pagination and search
+   */
+  async getUsers(
+    page: number = 1,
+    limit: number = 20,
+    includeInactive: boolean = false,
+    search?: string
+  ): Promise<AdminUserListResponse> {
+    const params = new URLSearchParams()
+    params.append('page', String(page))
+    params.append('limit', String(limit))
+    if (includeInactive) {
+      params.append('include_inactive', 'true')
+    }
+    if (search) {
+      params.append('search', search)
+    }
+    return apiClient.get(`/admin/users?${params.toString()}`)
+  },
+
+  /**
+   * Get user by ID
+   */
+  async getUserById(userId: number): Promise<AdminUser> {
+    return apiClient.get(`/admin/users/${userId}`)
+  },
+
+  /**
+   * Create a new user
+   */
+  async createUser(userData: AdminUserCreate): Promise<AdminUser> {
+    return apiClient.post('/admin/users', userData)
+  },
+
+  /**
+   * Update user information
+   */
+  async updateUser(userId: number, userData: AdminUserUpdate): Promise<AdminUser> {
+    return apiClient.put(`/admin/users/${userId}`, userData)
+  },
+
+  /**
+   * Delete a user (soft delete)
+   */
+  async deleteUser(userId: number): Promise<void> {
+    return apiClient.delete(`/admin/users/${userId}`)
+  },
+
+  /**
+   * Reset user password
+   */
+  async resetPassword(userId: number, data: PasswordResetRequest): Promise<AdminUser> {
+    return apiClient.post(`/admin/users/${userId}/reset-password`, data)
+  },
+
+  /**
+   * Toggle user active status
+   */
+  async toggleUserStatus(userId: number): Promise<AdminUser> {
+    return apiClient.post(`/admin/users/${userId}/toggle-status`)
+  },
+
+  /**
+   * Update user role
+   */
+  async updateUserRole(userId: number, data: RoleUpdateRequest): Promise<AdminUser> {
+    return apiClient.put(`/admin/users/${userId}/role`, data)
+  },
+
+  // ==================== Public Model Management ====================
+
+  /**
+   * Get list of all public models with pagination
+   */
+  async getPublicModels(
+    page: number = 1,
+    limit: number = 20
+  ): Promise<AdminPublicModelListResponse> {
+    return apiClient.get(`/admin/public-models?page=${page}&limit=${limit}`)
+  },
+
+  /**
+   * Create a new public model
+   */
+  async createPublicModel(modelData: AdminPublicModelCreate): Promise<AdminPublicModel> {
+    return apiClient.post('/admin/public-models', modelData)
+  },
+
+  /**
+   * Update a public model
+   */
+  async updatePublicModel(
+    modelId: number,
+    modelData: AdminPublicModelUpdate
+  ): Promise<AdminPublicModel> {
+    return apiClient.put(`/admin/public-models/${modelId}`, modelData)
+  },
+
+  /**
+   * Delete a public model
+   */
+  async deletePublicModel(modelId: number): Promise<void> {
+    return apiClient.delete(`/admin/public-models/${modelId}`)
+  },
+
+  // ==================== System Stats ====================
+
+  /**
+   * Get system statistics
+   */
+  async getSystemStats(): Promise<SystemStats> {
+    return apiClient.get('/admin/stats')
+  },
+
+  /**
+   * Get assistant task run statuses and failure reasons.
+   */
+  async getTaskRunStats(hours: number = 24): Promise<TaskRunStats> {
+    return apiClient.get(`/admin/task-runs/stats?hours=${hours}`)
+  },
+
+  // ==================== System Config (Quick Access) ====================
+
+  /**
+   * Get system recommended quick access configuration
+   */
+  async getQuickAccessConfig(): Promise<{ version: number; teams: number[] }> {
+    return apiClient.get('/admin/system-config/quick-access')
+  },
+
+  /**
+   * Update system recommended quick access configuration
+   */
+  async updateQuickAccessConfig(teams: number[]): Promise<{ version: number; teams: number[] }> {
+    return apiClient.put('/admin/system-config/quick-access', { teams })
+  },
+
+  async getKnowledgeBaseRetrievalProfile(): Promise<KnowledgeBaseRetrievalProfile> {
+    return apiClient.get('/admin/system-config/code-wiki-retrieval-profile')
+  },
+
+  async updateKnowledgeBaseRetrievalProfile(
+    retrievalConfig: RetrievalConfigDraft
+  ): Promise<KnowledgeBaseRetrievalProfile> {
+    return apiClient.put('/admin/system-config/code-wiki-retrieval-profile', {
+      retrieval_config: retrievalConfig,
+    })
+  },
+
+  async getCodeWikiGenerationPolicy(): Promise<CodeWikiGenerationPolicyConfig> {
+    return apiClient.get('/admin/system-config/code-wiki-generation-policy')
+  },
+
+  async updateCodeWikiGenerationPolicy(
+    policy: CodeWikiGenerationPolicyUpdate
+  ): Promise<CodeWikiGenerationPolicyConfig> {
+    return apiClient.put('/admin/system-config/code-wiki-generation-policy', policy)
+  },
+
+  async getMarketplaceTagsConfig(): Promise<MarketplaceTagsResponse> {
+    return apiClient.get('/admin/system-config/marketplace-tags')
+  },
+
+  async updateMarketplaceTagsConfig(data: MarketplaceTagsUpdate): Promise<MarketplaceTagsResponse> {
+    return apiClient.put('/admin/system-config/marketplace-tags', data)
+  },
+
+  // ==================== Chat Slogan & Tips Config ====================
+
+  /**
+   * Get chat slogan and tips configuration
+   */
+  async getSloganTipsConfig(): Promise<ChatSloganTipsResponse> {
+    return apiClient.get('/admin/system-config/slogan-tips')
+  },
+
+  /**
+   * Update chat slogan and tips configuration
+   */
+  async updateSloganTipsConfig(data: ChatSloganTipsUpdate): Promise<ChatSloganTipsResponse> {
+    return apiClient.put('/admin/system-config/slogan-tips', data)
+  },
+
+  // ==================== Service Key Management ====================
+
+  /**
+   * Get list of all service keys
+   */
+  async getServiceKeys(): Promise<ServiceKeyListResponse> {
+    return apiClient.get('/admin/service-keys')
+  },
+
+  /**
+   * Create a new service key
+   * The full key is only returned at creation time
+   */
+  async createServiceKey(data: ServiceKeyCreateRequest): Promise<ServiceKeyCreated> {
+    return apiClient.post('/admin/service-keys', data)
+  },
+
+  /**
+   * Toggle service key active status
+   */
+  async toggleServiceKeyStatus(keyId: number): Promise<ServiceKey> {
+    return apiClient.post(`/admin/service-keys/${keyId}/toggle-status`)
+  },
+
+  /**
+   * Delete a service key
+   */
+  async deleteServiceKey(keyId: number): Promise<void> {
+    return apiClient.delete(`/admin/service-keys/${keyId}`)
+  },
+
+  // ==================== Plugin Release Key Management ====================
+
+  /**
+   * Get all keys dedicated to protected plugin release jobs
+   */
+  async getPluginReleaseKeys(): Promise<PluginReleaseKeyListResponse> {
+    return apiClient.get('/admin/plugin-release-keys')
+  },
+
+  /**
+   * Create a plugin release key
+   * The full key is only returned at creation time
+   */
+  async createPluginReleaseKey(
+    data: PluginReleaseKeyCreateRequest
+  ): Promise<PluginReleaseKeyCreated> {
+    return apiClient.post('/admin/plugin-release-keys', data)
+  },
+
+  /**
+   * Toggle plugin release key active status
+   */
+  async togglePluginReleaseKeyStatus(keyId: number): Promise<PluginReleaseKey> {
+    return apiClient.post(`/admin/plugin-release-keys/${keyId}/toggle-status`)
+  },
+
+  // ==================== Personal Key Management (Admin) ====================
+
+  /**
+   * Get list of all personal keys with their owners
+   */
+  async getPersonalKeys(
+    page: number = 1,
+    limit: number = 50,
+    search?: string
+  ): Promise<AdminPersonalKeyListResponse> {
+    const params = new URLSearchParams()
+    params.append('page', String(page))
+    params.append('limit', String(limit))
+    if (search) {
+      params.append('search', search)
+    }
+    return apiClient.get(`/admin/personal-keys?${params.toString()}`)
+  },
+
+  /**
+   * Toggle personal key active status
+   */
+  async togglePersonalKeyStatus(keyId: number): Promise<AdminPersonalKey> {
+    return apiClient.post(`/admin/personal-keys/${keyId}/toggle-status`)
+  },
+
+  /**
+   * Delete a personal key
+   */
+  async deletePersonalKey(keyId: number): Promise<void> {
+    return apiClient.delete(`/admin/personal-keys/${keyId}`)
+  },
+
+  // ==================== Public Retriever Management ====================
+
+  /**
+   * Get list of all public retrievers with pagination
+   */
+  async getPublicRetrievers(
+    page: number = 1,
+    limit: number = 20
+  ): Promise<AdminPublicRetrieverListResponse> {
+    return apiClient.get(`/admin/public-retrievers?page=${page}&limit=${limit}`)
+  },
+
+  /**
+   * Create a new public retriever
+   */
+  async createPublicRetriever(retrieverData: RetrieverCRD): Promise<AdminPublicRetriever> {
+    return apiClient.post('/admin/public-retrievers', retrieverData)
+  },
+
+  /**
+   * Update a public retriever
+   */
+  async updatePublicRetriever(
+    retrieverId: number,
+    retrieverData: RetrieverCRD
+  ): Promise<AdminPublicRetriever> {
+    return apiClient.put(`/admin/public-retrievers/${retrieverId}`, retrieverData)
+  },
+
+  /**
+   * Delete a public retriever
+   */
+  async deletePublicRetriever(retrieverId: number): Promise<void> {
+    return apiClient.delete(`/admin/public-retrievers/${retrieverId}`)
+  },
+
+  // ==================== Background Execution Monitor ====================
+
+  /**
+   * Get background execution statistics for admin monitoring
+   */
+  async getBackgroundExecutionMonitorStats(
+    hours: number = 24
+  ): Promise<BackgroundExecutionMonitorStats> {
+    return apiClient.get(`/admin/subscription-monitor/stats?hours=${hours}`)
+  },
+
+  /**
+   * Get list of background execution errors for admin monitoring
+   */
+  async getBackgroundExecutionMonitorErrors(
+    page: number = 1,
+    limit: number = 50,
+    hours: number = 24,
+    status?: string
+  ): Promise<BackgroundExecutionMonitorErrorListResponse> {
+    const params = new URLSearchParams()
+    params.append('page', String(page))
+    params.append('limit', String(limit))
+    params.append('hours', String(hours))
+    if (status) {
+      params.append('status', status)
+    }
+    return apiClient.get(`/admin/subscription-monitor/errors?${params.toString()}`)
+  },
+
+  // ==================== Public Team Management ====================
+
+  /**
+   * Get list of all public teams with pagination
+   * @param page Page number
+   * @param limit Items per page
+   * @param chatOnly If true, only return chat-type teams (for IM channel selection)
+   */
+  async getPublicTeams(
+    page: number = 1,
+    limit: number = 20,
+    chatOnly: boolean = false
+  ): Promise<AdminPublicTeamListResponse> {
+    return apiClient.get(`/admin/public-teams?page=${page}&limit=${limit}&chat_only=${chatOnly}`)
+  },
+
+  /**
+   * Create a new public team
+   */
+  async createPublicTeam(teamData: AdminPublicTeamCreate): Promise<AdminPublicTeam> {
+    return apiClient.post('/admin/public-teams', teamData)
+  },
+
+  /**
+   * Update a public team
+   */
+  async updatePublicTeam(
+    teamId: number,
+    teamData: AdminPublicTeamUpdate
+  ): Promise<AdminPublicTeam> {
+    return apiClient.put(`/admin/public-teams/${teamId}`, teamData)
+  },
+
+  /**
+   * Delete a public team
+   */
+  async deletePublicTeam(teamId: number): Promise<void> {
+    return apiClient.delete(`/admin/public-teams/${teamId}`)
+  },
+
+  /**
+   * Upload a custom image used as a public team's canonical icon.
+   */
+  async uploadPublicTeamIcon(file: File): Promise<AdminPublicTeamIconUpload> {
+    const formData = new FormData()
+    formData.append('file', file)
+    return apiClient.postForm('/admin/public-teams/icon-assets', formData)
+  },
+
+  /**
+   * Delete an uploaded public team icon.
+   */
+  async deletePublicTeamIcon(assetId: number): Promise<void> {
+    return apiClient.delete(`/admin/public-teams/icon-assets/${assetId}`)
+  },
+
+  async getMarketplaceResources(
+    resourceType: Exclude<AdminMarketplaceResourceType, 'smart_app'>,
+    page: number = 1,
+    limit: number = 50
+  ): Promise<AdminMarketplaceResourceListResponse> {
+    return apiClient.get(
+      `/admin/marketplace-resources?resource_type=${resourceType}&page=${page}&limit=${limit}`
+    )
+  },
+
+  async updateMarketplaceResource(
+    resourceId: number,
+    update: AdminMarketplaceResourceUpdate
+  ): Promise<AdminMarketplaceResource> {
+    return apiClient.put(`/admin/marketplace-resources/${resourceId}`, update)
+  },
+
+  async getMarketplacePlugins(
+    page: number = 1,
+    limit: number = 50,
+    filters: AdminMarketplacePluginFilters = {}
+  ): Promise<AdminMarketplacePluginListResponse> {
+    const query = new URLSearchParams({ page: String(page), limit: String(limit) })
+    if (filters.search) query.set('search', filters.search)
+    if (filters.listingStatus && filters.listingStatus !== 'all') {
+      query.set('listing_status', filters.listingStatus)
+    }
+    if (filters.source && filters.source !== 'all') query.set('source', filters.source)
+    if (filters.scoreOrder) query.set('score_order', filters.scoreOrder)
+    return apiClient.get(`/admin/marketplace-plugins?${query.toString()}`)
+  },
+
+  async updateMarketplacePlugin(
+    pluginId: number,
+    update: AdminMarketplacePluginUpdate
+  ): Promise<AdminMarketplacePlugin> {
+    return apiClient.put(`/admin/marketplace-plugins/${pluginId}`, update)
+  },
+
+  async getMarketplaceSmartApps(
+    page: number = 1,
+    limit: number = 50,
+    filters: AdminMarketplaceSmartAppFilters = {}
+  ): Promise<AdminMarketplaceSmartAppListResponse> {
+    const query = new URLSearchParams({ page: String(page), limit: String(limit) })
+    if (filters.search) query.set('search', filters.search)
+    if (filters.listingStatus && filters.listingStatus !== 'all') {
+      query.set('listing_status', filters.listingStatus)
+    }
+    if (filters.source && filters.source !== 'all') query.set('source', filters.source)
+    return apiClient.get(`/admin/marketplace-smart-apps?${query.toString()}`)
+  },
+
+  async updateMarketplaceSmartApp(
+    smartAppId: number,
+    update: AdminMarketplaceSmartAppUpdate
+  ): Promise<AdminMarketplaceSmartApp> {
+    return apiClient.put(`/admin/marketplace-smart-apps/${smartAppId}`, update)
+  },
+
+  async importOfficialMarketplaceSmartApp(packageFile: File): Promise<AdminMarketplaceSmartApp> {
+    const form = new FormData()
+    form.append('package', packageFile)
+    return apiClient.postForm('/admin/marketplace-smart-apps/import', form)
+  },
+
+  async updateOfficialMarketplaceSmartAppMetadata(
+    smartAppId: number,
+    update: AdminMarketplaceSmartAppMetadataUpdate
+  ): Promise<AdminMarketplaceSmartApp> {
+    const form = new FormData()
+    form.append('summary', update.summary)
+    form.append('description_md', update.descriptionMd)
+    form.append('tags', JSON.stringify(update.tags))
+    if (update.icon) form.append('icon', update.icon)
+    return apiClient.putForm(`/admin/marketplace-smart-apps/${smartAppId}/metadata`, form)
+  },
+
+  async deleteOfficialMarketplaceSmartApp(smartAppId: number): Promise<void> {
+    return apiClient.delete(`/admin/marketplace-smart-apps/${smartAppId}`)
+  },
+
+  // ==================== Public Bot Management ====================
+
+  /**
+   * Get list of all public bots with pagination
+   */
+  async getPublicBots(page: number = 1, limit: number = 20): Promise<AdminPublicBotListResponse> {
+    return apiClient.get(`/admin/public-bots?page=${page}&limit=${limit}`)
+  },
+
+  /**
+   * Create a new public bot
+   */
+  async createPublicBot(botData: AdminPublicBotCreate): Promise<AdminPublicBot> {
+    return apiClient.post('/admin/public-bots', botData)
+  },
+
+  /**
+   * Update a public bot
+   */
+  async updatePublicBot(botId: number, botData: AdminPublicBotUpdate): Promise<AdminPublicBot> {
+    return apiClient.put(`/admin/public-bots/${botId}`, botData)
+  },
+
+  /**
+   * Delete a public bot
+   */
+  async deletePublicBot(botId: number): Promise<void> {
+    return apiClient.delete(`/admin/public-bots/${botId}`)
+  },
+
+  // ==================== Public Ghost Management ====================
+
+  /**
+   * Get list of all public ghosts with pagination
+   */
+  async getPublicGhosts(
+    page: number = 1,
+    limit: number = 20
+  ): Promise<AdminPublicGhostListResponse> {
+    return apiClient.get(`/admin/public-ghosts?page=${page}&limit=${limit}`)
+  },
+
+  /**
+   * Create a new public ghost
+   */
+  async createPublicGhost(ghostData: AdminPublicGhostCreate): Promise<AdminPublicGhost> {
+    return apiClient.post('/admin/public-ghosts', ghostData)
+  },
+
+  /**
+   * Update a public ghost
+   */
+  async updatePublicGhost(
+    ghostId: number,
+    ghostData: AdminPublicGhostUpdate
+  ): Promise<AdminPublicGhost> {
+    return apiClient.put(`/admin/public-ghosts/${ghostId}`, ghostData)
+  },
+
+  /**
+   * Delete a public ghost
+   */
+  async deletePublicGhost(ghostId: number): Promise<void> {
+    return apiClient.delete(`/admin/public-ghosts/${ghostId}`)
+  },
+
+  // ==================== Public Shell Management ====================
+
+  /**
+   * Get list of all public shells with pagination
+   */
+  async getPublicShells(
+    page: number = 1,
+    limit: number = 20
+  ): Promise<AdminPublicShellListResponse> {
+    return apiClient.get(`/admin/public-shells?page=${page}&limit=${limit}`)
+  },
+
+  /**
+   * Create a new public shell
+   */
+  async createPublicShell(shellData: AdminPublicShellCreate): Promise<AdminPublicShell> {
+    return apiClient.post('/admin/public-shells', shellData)
+  },
+
+  /**
+   * Update a public shell
+   */
+  async updatePublicShell(
+    shellId: number,
+    shellData: AdminPublicShellUpdate
+  ): Promise<AdminPublicShell> {
+    return apiClient.put(`/admin/public-shells/${shellId}`, shellData)
+  },
+
+  /**
+   * Delete a public shell
+   */
+  async deletePublicShell(shellId: number): Promise<void> {
+    return apiClient.delete(`/admin/public-shells/${shellId}`)
+  },
+
+  // ==================== Admin Setup Wizard ====================
+
+  /**
+   * Mark admin setup wizard as completed
+   */
+  async markSetupComplete(): Promise<{ success: boolean; message: string }> {
+    return apiClient.post('/admin/setup-complete')
+  },
+
+  // ==================== IM Channel Management ====================
+
+  /**
+   * Get list of all IM channels with pagination
+   */
+  async getIMChannels(
+    page: number = 1,
+    limit: number = 20,
+    channelType?: IMChannelType
+  ): Promise<IMChannelListResponse> {
+    const params = new URLSearchParams()
+    params.append('page', String(page))
+    params.append('limit', String(limit))
+    if (channelType) {
+      params.append('channel_type', channelType)
+    }
+    return apiClient.get(`/admin/im-channels?${params.toString()}`)
+  },
+
+  /**
+   * Get a specific IM channel by ID
+   */
+  async getIMChannel(channelId: number): Promise<IMChannel> {
+    return apiClient.get(`/admin/im-channels/${channelId}`)
+  },
+
+  /**
+   * Create a new IM channel
+   */
+  async createIMChannel(channelData: IMChannelCreate): Promise<IMChannel> {
+    return apiClient.post('/admin/im-channels', channelData)
+  },
+
+  /**
+   * Update an IM channel
+   */
+  async updateIMChannel(channelId: number, channelData: IMChannelUpdate): Promise<IMChannel> {
+    return apiClient.put(`/admin/im-channels/${channelId}`, channelData)
+  },
+
+  /**
+   * Delete an IM channel
+   */
+  async deleteIMChannel(channelId: number): Promise<void> {
+    return apiClient.delete(`/admin/im-channels/${channelId}`)
+  },
+
+  /**
+   * Toggle IM channel enabled status
+   */
+  async toggleIMChannel(channelId: number): Promise<IMChannel> {
+    return apiClient.post(`/admin/im-channels/${channelId}/toggle`)
+  },
+
+  /**
+   * Restart an IM channel connection
+   */
+  async restartIMChannel(channelId: number): Promise<IMChannelStatus> {
+    return apiClient.post(`/admin/im-channels/${channelId}/restart`)
+  },
+
+  /**
+   * Get IM channel connection status
+   */
+  async getIMChannelStatus(channelId: number): Promise<IMChannelStatus> {
+    return apiClient.get(`/admin/im-channels/${channelId}/status`)
+  },
+
+  // ==================== Device Monitor ====================
+
+  /**
+   * Get list of all devices across all users (admin only)
+   */
+  async getDevices(
+    page: number = 1,
+    limit: number = 20,
+    status?: DeviceStatus,
+    deviceType?: DeviceType,
+    bindShell?: BindShell,
+    search?: string,
+    versionOp?: VersionFilterOperator,
+    version?: string
+  ): Promise<AdminDeviceListResponse> {
+    const params = new URLSearchParams()
+    params.append('page', String(page))
+    params.append('limit', String(limit))
+    if (status) {
+      params.append('status', status)
+    }
+    if (deviceType) {
+      params.append('device_type', deviceType)
+    }
+    if (bindShell) {
+      params.append('bind_shell', bindShell)
+    }
+    if (search) {
+      params.append('search', search)
+    }
+    if (versionOp && version) {
+      params.append('version_op', versionOp)
+      params.append('version', version)
+    }
+    return apiClient.get(`/admin/device-monitor/devices?${params.toString()}`)
+  },
+
+  /**
+   * Get device statistics (admin only)
+   */
+  async getDeviceStats(): Promise<AdminDeviceStats> {
+    return apiClient.get('/admin/device-monitor/stats')
+  },
+
+  /**
+   * Upgrade a device (admin only)
+   */
+  async upgradeDevice(
+    deviceId: string,
+    userId: number,
+    forceStopTasks: boolean = false
+  ): Promise<AdminDeviceActionResponse> {
+    return apiClient.post(`/admin/device-monitor/devices/${encodeURIComponent(deviceId)}/upgrade`, {
+      user_id: userId,
+      force_stop_tasks: forceStopTasks,
+    })
+  },
+
+  /**
+   * Restart a cloud device (admin only)
+   */
+  async restartDevice(deviceId: string, userId: number): Promise<AdminDeviceActionResponse> {
+    return apiClient.post(`/admin/device-monitor/devices/${encodeURIComponent(deviceId)}/restart`, {
+      user_id: userId,
+    })
+  },
+
+  /**
+   * Get admin device batch action status
+   */
+  async getDeviceBatchStatus(batchId: string): Promise<AdminDeviceBatchStatusResponse> {
+    return apiClient.get(`/admin/device-monitor/batches/${encodeURIComponent(batchId)}`)
+  },
+
+  /**
+   * Migrate a cloud device (admin only)
+   */
+  async migrateDevice(
+    deviceId: string,
+    userId: number,
+    targetHost?: string
+  ): Promise<AdminDeviceActionResponse> {
+    return apiClient.post(`/admin/device-monitor/devices/${encodeURIComponent(deviceId)}/migrate`, {
+      user_id: userId,
+      target_host: targetHost,
+    })
+  },
+
+  // ==================== Connector App Management ====================
+
+  async getConnectorApps(): Promise<AdminConnectorApp[]> {
+    return apiClient.get('/admin/connector-apps')
+  },
+
+  async createConnectorApp(data: AdminConnectorAppCreate): Promise<AdminConnectorApp> {
+    return apiClient.post('/admin/connector-apps', data)
+  },
+
+  async updateConnectorApp(
+    appId: number,
+    data: AdminConnectorAppUpdate
+  ): Promise<AdminConnectorApp> {
+    return apiClient.patch(`/admin/connector-apps/${appId}`, data)
+  },
+
+  async disableConnectorApp(appId: number): Promise<void> {
+    return apiClient.delete(`/admin/connector-apps/${appId}`)
+  },
+
+  async discoverConnectorAppTools(appId: number): Promise<ConnectorToolListResponse> {
+    return apiClient.post(`/admin/connector-apps/${appId}/tools/discover`, {})
+  },
+
+  async testConnectorAppTool(
+    appId: number,
+    name: string,
+    argumentsValue: Record<string, unknown> = {}
+  ): Promise<ConnectorToolCallResponse> {
+    return apiClient.post(`/admin/connector-apps/${appId}/tools/test`, {
+      name,
+      arguments: argumentsValue,
+    })
+  },
+
+  // ==================== Template Management ====================
+
+  /**
+   * Get list of all templates with optional category filter
+   */
+  async getTemplates(category?: string): Promise<AdminTemplateListResponse> {
+    const params = new URLSearchParams()
+    if (category) {
+      params.append('category', category)
+    }
+    const query = params.toString()
+    return apiClient.get(`/admin/templates${query ? `?${query}` : ''}`)
+  },
+
+  /**
+   * Create a new template
+   */
+  async createTemplate(data: AdminTemplateCreate): Promise<AdminTemplate> {
+    return apiClient.post('/admin/templates', data)
+  },
+
+  /**
+   * Update an existing template
+   */
+  async updateTemplate(templateId: number, data: AdminTemplateUpdate): Promise<AdminTemplate> {
+    return apiClient.put(`/admin/templates/${templateId}`, data)
+  },
+
+  /**
+   * Delete a template (soft delete)
+   */
+  async deleteTemplate(templateId: number): Promise<void> {
+    return apiClient.delete(`/admin/templates/${templateId}`)
+  },
+}

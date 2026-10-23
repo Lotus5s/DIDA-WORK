@@ -1,0 +1,815 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ComponentType,
+  type ReactNode,
+} from 'react'
+import dynamic from 'next/dynamic'
+import { usePathname, useRouter, useSearchParams } from 'next/navigation'
+import { Building2, Check, ChevronDown, Globe2, Layers3, Search, UserRound } from 'lucide-react'
+
+import { listGroups } from '@/apis/groups'
+import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown'
+import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { useTranslation } from '@/hooks/useTranslation'
+import { cn } from '@/lib/utils'
+import type { Group } from '@/types/group'
+import type { Team } from '@/types/api'
+import { getResourceLibrarySortMode, type ResourceLibrarySortMode } from '../resourceSorting'
+import type {
+  ManagedResourceSourceFilter,
+  ManagedResourceType,
+  ResourceLibraryModelCategoryFilter,
+} from '../types'
+import type { ResourceCreateRequest } from './ResourceCreateButton'
+import type { TeamModeFilter } from '@/features/tasks/components/selector/team-selector-utils'
+
+const managedResourceTypes: ManagedResourceType[] = [
+  'agent',
+  'skill',
+  'model',
+  'shell',
+  'retriever',
+]
+
+const sourceFilters: ManagedResourceSourceFilter[] = ['all', 'mine', 'personal', 'group', 'system']
+
+const resourceLibraryUrlParams = {
+  type: 'type',
+  source: 'source',
+  legacyScope: 'scope',
+  group: 'group',
+  sort: 'sort',
+} as const
+
+const TeamListWithScope = dynamic(
+  () =>
+    import('@/features/settings/components/TeamListWithScope').then(
+      module => module.TeamListWithScope
+    ),
+  { ssr: false }
+)
+const ModelListWithScope = dynamic(
+  () =>
+    import('@/features/settings/components/ModelListWithScope').then(
+      module => module.ModelListWithScope
+    ),
+  { ssr: false }
+)
+const ShellListWithScope = dynamic(
+  () =>
+    import('@/features/settings/components/ShellListWithScope').then(
+      module => module.ShellListWithScope
+    ),
+  { ssr: false }
+)
+const SkillListWithScope = dynamic(
+  () =>
+    import('@/features/settings/components/SkillListWithScope').then(
+      module => module.SkillListWithScope
+    ),
+  { ssr: false }
+)
+const RetrieverListWithScope = dynamic(
+  () =>
+    import('@/features/settings/components/RetrieverListWithScope').then(
+      module => module.RetrieverListWithScope
+    ),
+  { ssr: false }
+)
+
+type SearchParamReader = Pick<URLSearchParams, 'get'>
+
+function getInitialSearchParams(): URLSearchParams {
+  if (typeof window === 'undefined') {
+    return new URLSearchParams()
+  }
+
+  return new URLSearchParams(window.location.search)
+}
+
+function isManagedResourceType(value: string | null): value is ManagedResourceType {
+  return managedResourceTypes.includes(value as ManagedResourceType)
+}
+
+function isSourceFilter(value: string | null): value is ManagedResourceSourceFilter {
+  return sourceFilters.includes(value as ManagedResourceSourceFilter)
+}
+
+function getResourceTypeFromSearchParams(params: SearchParamReader): ManagedResourceType {
+  const type = params.get(resourceLibraryUrlParams.type)
+  return isManagedResourceType(type) ? type : 'agent'
+}
+
+function getSourceFilterFromSearchParams(params: SearchParamReader): ManagedResourceSourceFilter {
+  const source = params.get(resourceLibraryUrlParams.source)
+  if (isSourceFilter(source)) {
+    return source
+  }
+
+  const legacyScope = params.get(resourceLibraryUrlParams.legacyScope)
+  if (legacyScope === 'personal' || legacyScope === 'group') {
+    return legacyScope
+  }
+
+  return 'all'
+}
+
+function getGroupNameFromSearchParams(params: SearchParamReader): string | null {
+  return params.get(resourceLibraryUrlParams.group)
+}
+
+function getSortModeFromSearchParams(params: SearchParamReader): ResourceLibrarySortMode {
+  return getResourceLibrarySortMode(params.get(resourceLibraryUrlParams.sort) || 'latest')
+}
+
+function getInitialResourceType(): ManagedResourceType {
+  return getResourceTypeFromSearchParams(getInitialSearchParams())
+}
+
+function getInitialSourceFilter(): ManagedResourceSourceFilter {
+  return getSourceFilterFromSearchParams(getInitialSearchParams())
+}
+
+function getInitialGroupName(): string | null {
+  return getGroupNameFromSearchParams(getInitialSearchParams())
+}
+
+function getGroupDisplayName(group: Group): string {
+  return group.display_name || group.name
+}
+
+const groupNameCollator = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: 'base',
+})
+
+function compareGroupsByDisplayName(left: Group, right: Group): number {
+  const displayNameResult = groupNameCollator.compare(
+    getGroupDisplayName(left),
+    getGroupDisplayName(right)
+  )
+
+  if (displayNameResult !== 0) {
+    return displayNameResult
+  }
+
+  return groupNameCollator.compare(left.name, right.name)
+}
+
+function getGroupSearchText(group: Group): string {
+  return `${getGroupDisplayName(group)} ${group.name}`.toLowerCase()
+}
+
+function useResourceLibraryTranslation() {
+  const { t: tBase } = useTranslation('resource-library')
+  return (key: string, options?: Record<string, unknown>) =>
+    tBase(`resource-library:${key}`, options)
+}
+
+function ManagedResourceTabs({
+  value,
+  onValueChange,
+  resourceTypes = managedResourceTypes,
+}: {
+  value: ManagedResourceType
+  onValueChange: (value: ManagedResourceType) => void
+  resourceTypes?: ManagedResourceType[]
+}) {
+  const t = useResourceLibraryTranslation()
+
+  return (
+    <div
+      className="flex flex-wrap items-center gap-2"
+      role="tablist"
+      aria-label={t('fields.type')}
+      data-testid="managed-resource-type-tabs"
+    >
+      {resourceTypes.map(type => {
+        const isActive = value === type
+
+        return (
+          <Button
+            key={type}
+            type="button"
+            variant={isActive ? 'primary' : 'outline'}
+            aria-pressed={isActive}
+            data-testid={`managed-resource-${type}-tab`}
+            className="h-11 min-w-[44px] px-4 lg:h-9"
+            onClick={() => onValueChange(type)}
+          >
+            {t(`filters.${type}`)}
+          </Button>
+        )
+      })}
+    </div>
+  )
+}
+
+function ResourceSourceFilterControls({
+  value,
+  onValueChange,
+  groups,
+  selectedGroup,
+  onGroupSourceChange,
+}: {
+  value: ManagedResourceSourceFilter
+  onValueChange: (value: ManagedResourceSourceFilter) => void
+  groups: Group[]
+  selectedGroup: string | null
+  onGroupSourceChange: (groupName: string | null) => void
+}) {
+  const t = useResourceLibraryTranslation()
+  const [isGroupMenuOpen, setIsGroupMenuOpen] = useState(false)
+  const [groupSearchQuery, setGroupSearchQuery] = useState('')
+  const regularOptions: Array<{
+    value: ManagedResourceSourceFilter
+    label: string
+    icon: ComponentType<{ className?: string; 'aria-hidden'?: boolean }>
+  }> = [
+    { value: 'all', label: t('sources.all'), icon: Layers3 },
+    { value: 'personal', label: t('sources.personal'), icon: UserRound },
+  ]
+  const selectedGroupInfo = groups.find(group => group.name === selectedGroup)
+  const selectedGroupLabel = selectedGroupInfo ? getGroupDisplayName(selectedGroupInfo) : null
+  const groupButtonLabel =
+    value === 'group' ? selectedGroupLabel || t('sources.all_groups') : t('sources.group')
+  const sortedGroups = useMemo(() => [...groups].sort(compareGroupsByDisplayName), [groups])
+  const normalizedGroupSearchQuery = groupSearchQuery.trim().toLowerCase()
+  const filteredGroups = useMemo(() => {
+    if (!normalizedGroupSearchQuery) {
+      return sortedGroups
+    }
+
+    return sortedGroups.filter(group =>
+      getGroupSearchText(group).includes(normalizedGroupSearchQuery)
+    )
+  }, [normalizedGroupSearchQuery, sortedGroups])
+
+  return (
+    <div
+      className="flex flex-col gap-2 sm:flex-row sm:items-center"
+      data-testid="managed-resource-source-filter"
+    >
+      <span className="text-xs font-medium text-text-muted">{t('fields.source')}</span>
+      <div className="flex flex-wrap items-center gap-2">
+        {regularOptions.map(option => {
+          const Icon = option.icon
+          const isActive = value === option.value
+
+          return (
+            <Button
+              key={option.value}
+              type="button"
+              variant={isActive ? 'primary' : 'outline'}
+              aria-pressed={isActive}
+              className="h-11 min-w-[44px] px-4 lg:h-9"
+              onClick={() => onValueChange(option.value)}
+              data-testid={`resource-source-${option.value}-button`}
+            >
+              <Icon className="h-4 w-4" aria-hidden />
+              {option.label}
+            </Button>
+          )
+        })}
+        <DropdownMenu
+          open={isGroupMenuOpen}
+          onOpenChange={open => {
+            setIsGroupMenuOpen(open)
+            if (!open) {
+              setGroupSearchQuery('')
+            }
+          }}
+        >
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant={value === 'group' ? 'primary' : 'outline'}
+              aria-pressed={value === 'group'}
+              className={cn(
+                'h-11 min-w-[44px] max-w-full justify-between px-4 lg:h-9 lg:max-w-[260px]',
+                value === 'group' ? 'text-white' : 'text-text-primary'
+              )}
+              data-testid="resource-source-group-button"
+            >
+              <span className="flex min-w-0 items-center gap-2">
+                <Building2 className="h-4 w-4 flex-shrink-0" aria-hidden />
+                <span className="truncate" title={groupButtonLabel}>
+                  {groupButtonLabel}
+                </span>
+              </span>
+              <ChevronDown className="h-4 w-4 flex-shrink-0 opacity-70" aria-hidden />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align="start"
+            sideOffset={6}
+            className="flex max-h-[320px] min-w-[220px] max-w-[min(320px,calc(100vw-2rem))] flex-col overflow-hidden"
+          >
+            <div
+              className="border-b border-border p-1 pb-2"
+              onKeyDown={event => event.stopPropagation()}
+            >
+              <div className="relative">
+                <Search
+                  className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-text-muted"
+                  aria-hidden
+                />
+                <Input
+                  value={groupSearchQuery}
+                  onChange={event => setGroupSearchQuery(event.target.value)}
+                  placeholder={t('search.groups_placeholder')}
+                  data-testid="resource-source-group-search-input"
+                  className="h-9 bg-base pl-9"
+                />
+              </div>
+            </div>
+            <div className="min-h-0 overflow-y-auto pt-1">
+              <DropdownMenuItem
+                className={cn(
+                  'min-h-11 gap-2 lg:min-h-9',
+                  value === 'group' &&
+                    !selectedGroup &&
+                    'bg-primary/10 text-primary focus:text-primary'
+                )}
+                data-testid="resource-source-all-groups-option"
+                onClick={() => onGroupSourceChange(null)}
+              >
+                <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center">
+                  {value === 'group' && !selectedGroup && <Check className="h-4 w-4" aria-hidden />}
+                </span>
+                <span className="truncate">{t('sources.all_groups')}</span>
+              </DropdownMenuItem>
+              {groups.length === 0 ? (
+                <DropdownMenuItem
+                  disabled
+                  className="min-h-11 text-text-muted lg:min-h-9"
+                  data-testid="resource-source-group-empty-option"
+                >
+                  {t('states.no_groups')}
+                </DropdownMenuItem>
+              ) : filteredGroups.length === 0 ? (
+                <DropdownMenuItem
+                  disabled
+                  className="min-h-11 text-text-muted lg:min-h-9"
+                  data-testid="resource-source-group-no-match-option"
+                >
+                  {t('search.groups_empty')}
+                </DropdownMenuItem>
+              ) : (
+                filteredGroups.map(group => {
+                  const isSelected = value === 'group' && selectedGroup === group.name
+                  const displayName = getGroupDisplayName(group)
+
+                  return (
+                    <DropdownMenuItem
+                      key={group.id}
+                      className={cn(
+                        'min-h-11 gap-2 lg:min-h-9',
+                        isSelected && 'bg-primary/10 text-primary focus:text-primary'
+                      )}
+                      data-testid={`resource-source-group-option-${group.id}`}
+                      onClick={() => onGroupSourceChange(group.name)}
+                    >
+                      <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center">
+                        {isSelected && <Check className="h-4 w-4" aria-hidden />}
+                      </span>
+                      <span className="truncate" title={displayName}>
+                        {displayName}
+                      </span>
+                    </DropdownMenuItem>
+                  )
+                })
+              )}
+            </div>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <Button
+          type="button"
+          variant={value === 'system' ? 'primary' : 'outline'}
+          aria-pressed={value === 'system'}
+          className="h-11 min-w-[44px] px-4 lg:h-9"
+          onClick={() => onValueChange('system')}
+          data-testid="resource-source-system-button"
+        >
+          <Globe2 className="h-4 w-4" aria-hidden />
+          {t('sources.system')}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function ResourceSortControls({
+  value,
+  onValueChange,
+}: {
+  value: ResourceLibrarySortMode
+  onValueChange: (value: ResourceLibrarySortMode) => void
+}) {
+  const t = useResourceLibraryTranslation()
+  const options: ResourceLibrarySortMode[] = ['default', 'latest']
+
+  return (
+    <div className="flex items-center gap-2" data-testid="managed-resource-sort-control">
+      <span className="text-xs font-medium text-text-muted">{t('fields.sort')}</span>
+      <Select
+        value={value}
+        onValueChange={option => onValueChange(option as ResourceLibrarySortMode)}
+      >
+        <SelectTrigger
+          className="h-11 w-32 bg-base lg:h-9"
+          aria-label={t('fields.sort')}
+          data-testid="resource-sort-select"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {options.map(option => (
+            <SelectItem key={option} value={option} data-testid={`resource-sort-${option}-option`}>
+              {t(`sort.${option}`)}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  )
+}
+
+function sourceFilterToScope(
+  sourceFilter: ManagedResourceSourceFilter
+): 'personal' | 'group' | 'all' {
+  if (sourceFilter === 'personal' || sourceFilter === 'group') {
+    return sourceFilter
+  }
+
+  return 'all'
+}
+
+interface MyResourcesProps {
+  title?: string
+  allowedTypes?: ManagedResourceType[]
+  fixedSource?: ManagedResourceSourceFilter
+  fixedGroup?: string | null
+  groupFilter?: string[]
+  hideSourceControls?: boolean
+  hideTypeControls?: boolean
+  hideManagerCreateActions?: boolean
+  hideSortControls?: boolean
+  teamModeFilter?: TeamModeFilter
+  onTeamModeFilterChange?: (mode: TeamModeFilter) => void
+  hideTeamModeFilter?: boolean
+  modelCategoryFilter?: ResourceLibraryModelCategoryFilter
+  onModelCategoryFilterChange?: (category: ResourceLibraryModelCategoryFilter) => void
+  hideModelCategoryFilter?: boolean
+  createRequest?: ResourceCreateRequest & { type: ManagedResourceType }
+  onResourceCreated?: (type: 'agent' | 'skill', sourceId?: number) => void
+  onTeamSaved?: (team: Team, created: boolean) => void
+  onCreateRequestClose?: () => void
+  creationOnly?: boolean
+  leadingFilterControls?: ReactNode
+  searchQuery?: string
+}
+
+export function MyResources({
+  title,
+  allowedTypes = managedResourceTypes,
+  fixedSource,
+  fixedGroup,
+  groupFilter,
+  hideSourceControls = false,
+  hideTypeControls = false,
+  hideManagerCreateActions = false,
+  hideSortControls = false,
+  teamModeFilter,
+  onTeamModeFilterChange,
+  hideTeamModeFilter = false,
+  modelCategoryFilter,
+  onModelCategoryFilterChange,
+  hideModelCategoryFilter = false,
+  createRequest,
+  onResourceCreated,
+  onTeamSaved,
+  onCreateRequestClose,
+  creationOnly = false,
+  leadingFilterControls,
+  searchQuery = '',
+}: MyResourcesProps = {}) {
+  const allowedTypesKey = allowedTypes.join(',')
+  const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const searchParamsSnapshot = searchParams.toString()
+  const [resourceType, setResourceType] = useState<ManagedResourceType>(() => {
+    const initialType = getInitialResourceType()
+    return allowedTypes.includes(initialType) ? initialType : allowedTypes[0]
+  })
+  const [sourceFilter, setSourceFilter] = useState<ManagedResourceSourceFilter>(
+    () => fixedSource || getInitialSourceFilter()
+  )
+  const [groups, setGroups] = useState<Group[]>([])
+  const [selectedGroup, setSelectedGroup] = useState<string | null>(() =>
+    fixedGroup === undefined ? getInitialGroupName() : fixedGroup
+  )
+  const [sortMode, setSortMode] = useState<ResourceLibrarySortMode>(() =>
+    getSortModeFromSearchParams(getInitialSearchParams())
+  )
+  const effectiveSortMode = hideSortControls ? 'latest' : sortMode
+
+  const replaceResourceLibraryUrl = useCallback(
+    ({
+      type,
+      source,
+      group,
+      sort,
+    }: {
+      type?: ManagedResourceType
+      source?: ManagedResourceSourceFilter
+      group?: string | null
+      sort?: ResourceLibrarySortMode
+    }) => {
+      const params = new URLSearchParams(searchParamsSnapshot)
+
+      if (type) {
+        params.set(resourceLibraryUrlParams.type, type)
+      }
+
+      if (source) {
+        params.set(resourceLibraryUrlParams.source, source)
+        params.delete(resourceLibraryUrlParams.legacyScope)
+      }
+
+      if (group !== undefined) {
+        if (group) {
+          params.set(resourceLibraryUrlParams.group, group)
+        } else {
+          params.delete(resourceLibraryUrlParams.group)
+        }
+      }
+
+      if (sort) {
+        params.set(resourceLibraryUrlParams.sort, sort)
+      }
+
+      if (source && source !== 'group') {
+        params.delete(resourceLibraryUrlParams.group)
+      }
+
+      const queryString = params.toString()
+      const nextUrl = queryString ? `${pathname}?${queryString}` : pathname
+      router.replace(nextUrl, { scroll: false })
+    },
+    [pathname, router, searchParamsSnapshot]
+  )
+
+  const handleResourceTypeChange = useCallback(
+    (nextType: ManagedResourceType) => {
+      setResourceType(nextType)
+      replaceResourceLibraryUrl({ type: nextType })
+    },
+    [replaceResourceLibraryUrl]
+  )
+
+  const handleSourceFilterChange = useCallback(
+    (nextSource: ManagedResourceSourceFilter) => {
+      setSourceFilter(nextSource)
+      replaceResourceLibraryUrl({
+        source: nextSource,
+        group: nextSource === 'group' ? selectedGroup : null,
+      })
+    },
+    [replaceResourceLibraryUrl, selectedGroup]
+  )
+
+  const handleGroupSourceChange = useCallback(
+    (groupName: string | null) => {
+      setSelectedGroup(groupName)
+      setSourceFilter('group')
+      replaceResourceLibraryUrl({ source: 'group', group: groupName })
+    },
+    [replaceResourceLibraryUrl]
+  )
+
+  const handleSortModeChange = useCallback(
+    (nextSortMode: ResourceLibrarySortMode) => {
+      setSortMode(nextSortMode)
+      replaceResourceLibraryUrl({ sort: nextSortMode })
+    },
+    [replaceResourceLibraryUrl]
+  )
+
+  useEffect(() => {
+    const params = new URLSearchParams(searchParamsSnapshot)
+    const nextType = getResourceTypeFromSearchParams(params)
+    const nextAllowedTypes = allowedTypesKey.split(',') as ManagedResourceType[]
+    const resolvedType = nextAllowedTypes.includes(nextType) ? nextType : nextAllowedTypes[0]
+    setResourceType(resolvedType)
+    setSourceFilter(fixedSource || getSourceFilterFromSearchParams(params))
+    setSelectedGroup(fixedGroup === undefined ? getGroupNameFromSearchParams(params) : fixedGroup)
+    setSortMode(getSortModeFromSearchParams(params))
+  }, [allowedTypesKey, fixedGroup, fixedSource, searchParamsSnapshot])
+
+  useEffect(() => {
+    let isMounted = true
+
+    listGroups({ page: 1, limit: 100 })
+      .then(response => {
+        if (!isMounted) return
+        setGroups(response.items || [])
+      })
+      .catch(() => {
+        if (!isMounted) return
+        setGroups([])
+      })
+
+    return () => {
+      isMounted = false
+    }
+  }, [])
+
+  const renderManager = (managerType: ManagedResourceType = resourceType) => {
+    const managerScope = sourceFilterToScope(sourceFilter)
+    const sourceFilterControls = hideSourceControls ? null : (
+      <ResourceSourceFilterControls
+        value={sourceFilter}
+        onValueChange={handleSourceFilterChange}
+        groups={groups}
+        selectedGroup={selectedGroup}
+        onGroupSourceChange={handleGroupSourceChange}
+      />
+    )
+    const sourceControls =
+      leadingFilterControls || sourceFilterControls ? (
+        <>
+          {leadingFilterControls}
+          {sourceFilterControls}
+        </>
+      ) : null
+    const sortControls = hideSortControls ? null : (
+      <ResourceSortControls value={sortMode} onValueChange={handleSortModeChange} />
+    )
+    const groupName = sourceFilter === 'group' ? selectedGroup : null
+
+    if (managerType === 'agent') {
+      return (
+        <TeamListWithScope
+          scope={managerScope}
+          selectedGroup={groupName}
+          sourceFilter={sourceFilter}
+          sourceControls={sourceControls}
+          sortControls={sortControls}
+          groups={groups}
+          groupFilter={groupFilter}
+          sortMode={effectiveSortMode}
+          modeFilter={teamModeFilter}
+          onModeFilterChange={onTeamModeFilterChange}
+          hideModeFilter={hideTeamModeFilter}
+          createRequest={createRequest?.type === 'agent' ? createRequest : undefined}
+          creationOnly={creationOnly}
+          onCreateRequestClose={onCreateRequestClose}
+          onSaved={onTeamSaved}
+          onCreated={
+            createRequest?.type === 'agent'
+              ? (team: Team) => onResourceCreated?.('agent', team.id)
+              : undefined
+          }
+          compact
+          hideCreateActions={hideManagerCreateActions}
+          searchQuery={searchQuery}
+        />
+      )
+    }
+    if (managerType === 'model') {
+      return (
+        <ModelListWithScope
+          scope={managerScope}
+          selectedGroup={groupName}
+          sourceFilter={sourceFilter}
+          sourceControls={sourceControls}
+          sortControls={sortControls}
+          groups={groups}
+          groupFilter={groupFilter}
+          sortMode={effectiveSortMode}
+          createRequest={createRequest?.type === 'model' ? createRequest : undefined}
+          onCreateRequestClose={onCreateRequestClose}
+          creationOnly={creationOnly}
+          hideCreateActions={hideManagerCreateActions}
+          categoryFilter={modelCategoryFilter}
+          onCategoryFilterChange={onModelCategoryFilterChange}
+          hideCategoryFilterControls={hideModelCategoryFilter}
+          compact
+          searchQuery={searchQuery}
+        />
+      )
+    }
+    if (managerType === 'shell') {
+      return (
+        <ShellListWithScope
+          scope={managerScope}
+          selectedGroup={groupName}
+          sourceFilter={sourceFilter}
+          sourceControls={sourceControls}
+          sortControls={sortControls}
+          groups={groups}
+          groupFilter={groupFilter}
+          sortMode={effectiveSortMode}
+          createRequest={createRequest?.type === 'shell' ? createRequest : undefined}
+          onCreateRequestClose={onCreateRequestClose}
+          creationOnly={creationOnly}
+          hideCreateActions={hideManagerCreateActions}
+          compact
+          searchQuery={searchQuery}
+        />
+      )
+    }
+    if (managerType === 'skill') {
+      return (
+        <SkillListWithScope
+          scope={managerScope}
+          selectedGroup={groupName}
+          sourceFilter={sourceFilter}
+          sourceControls={sourceControls}
+          sortControls={sortControls}
+          groups={groups}
+          groupFilter={groupFilter}
+          sortMode={effectiveSortMode}
+          createRequest={createRequest?.type === 'skill' ? createRequest : undefined}
+          onCreateRequestClose={onCreateRequestClose}
+          creationOnly={creationOnly}
+          showAutoEnabledSkills={sourceFilter === 'all'}
+          hideCreateActions={hideManagerCreateActions}
+          compact
+          onCreated={
+            createRequest?.type === 'skill'
+              ? (skillId?: number) => onResourceCreated?.('skill', skillId)
+              : undefined
+          }
+          searchQuery={searchQuery}
+        />
+      )
+    }
+    if (managerType === 'retriever') {
+      return (
+        <RetrieverListWithScope
+          scope={managerScope}
+          selectedGroup={groupName}
+          sourceFilter={sourceFilter}
+          sourceControls={sourceControls}
+          sortControls={sortControls}
+          groups={groups}
+          groupFilter={groupFilter}
+          sortMode={effectiveSortMode}
+          createRequest={createRequest?.type === 'retriever' ? createRequest : undefined}
+          onCreateRequestClose={onCreateRequestClose}
+          creationOnly={creationOnly}
+          hideCreateActions={hideManagerCreateActions}
+          compact
+          searchQuery={searchQuery}
+        />
+      )
+    }
+
+    return null
+  }
+
+  return (
+    <div className="flex flex-col gap-4" data-testid="my-resources">
+      {!creationOnly && !hideTypeControls && (
+        <div
+          className="flex flex-col gap-3 border-b border-border pb-3 sm:flex-row sm:items-center sm:justify-between"
+          data-testid="managed-resource-header"
+        >
+          {title && <h1 className="shrink-0 text-xl font-semibold text-text-primary">{title}</h1>}
+          <ManagedResourceTabs
+            value={resourceType}
+            onValueChange={handleResourceTypeChange}
+            resourceTypes={allowedTypes}
+          />
+        </div>
+      )}
+
+      <div>{renderManager()}</div>
+    </div>
+  )
+}

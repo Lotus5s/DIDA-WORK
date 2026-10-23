@@ -1,0 +1,163 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use crate::{protocol::ExecutionRequest, runtime_work::runtime_task_title};
+
+pub(super) const TASK_SCOPED_ENV_KEYS: &[&str] = &[
+    "AUTH_TOKEN",
+    "WEGENT_EXECUTOR_BINARY",
+    "WEGENT_EXECUTOR_HOME",
+    "WEGENT_PLUGIN_AUTH_BROKER",
+    "WEGENT_PLUGIN_AUTH_BROKER_TOKEN",
+    "WEGENT_PLUGIN_AUTH_MODE",
+    "WEGENT_RUNTIME_AUTH_TOKEN",
+    "WEGENT_SKILL_IDENTITY_TOKEN",
+    "WEGENT_SKILL_USER_NAME",
+    "WEGENT_TASK_ID",
+    "WEGENT_TASK_WORKSPACE",
+    "WEWORK_PARENT_TITLE",
+];
+
+pub(super) fn task_identity_env(request: &ExecutionRequest) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.extend(crate::plugin_account_auth::broker::environment());
+    let task_id = request
+        .extra
+        .get("runtimeLocalTaskId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| request.task_id.trim());
+
+    if let Ok(executable) = std::env::current_exe() {
+        env.insert(
+            "WEGENT_EXECUTOR_BINARY".to_owned(),
+            executable.to_string_lossy().into_owned(),
+        );
+    }
+
+    if !task_id.is_empty() {
+        env.insert("WEGENT_TASK_ID".to_owned(), task_id.to_owned());
+        let workspace_root = std::env::var("WORKSPACE_ROOT")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/workspace"));
+        let task_workspace = request
+            .cwd()
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    workspace_root.join(path)
+                }
+            })
+            .unwrap_or_else(|| workspace_root.join(task_id));
+        env.insert(
+            "WEGENT_TASK_WORKSPACE".to_owned(),
+            task_workspace.to_string_lossy().into_owned(),
+        );
+    }
+    if let Some(title) = runtime_task_title(request) {
+        env.insert("WEWORK_PARENT_TITLE".to_owned(), title);
+    }
+    if let Some(auth_token) = non_empty(request.auth_token.as_deref()) {
+        env.insert("AUTH_TOKEN".to_owned(), auth_token.to_owned());
+    }
+    if let Some(runtime_auth_token) = non_empty(request.runtime_auth_token.as_deref()) {
+        env.insert(
+            "WEGENT_RUNTIME_AUTH_TOKEN".to_owned(),
+            runtime_auth_token.to_owned(),
+        );
+    }
+    if let Some(token) = non_empty(request.skill_identity_token.as_deref()) {
+        env.insert("WEGENT_SKILL_IDENTITY_TOKEN".to_owned(), token.to_owned());
+    }
+    if let Some(user_name) = non_empty(request.user_name.as_deref()) {
+        env.insert("WEGENT_SKILL_USER_NAME".to_owned(), user_name.to_owned());
+    }
+
+    env
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uses_materialized_workspace_path_for_task_workspace() {
+        let mut request = ExecutionRequest {
+            task_id: "task-1".to_owned(),
+            project_workspace_path: Some("/runtime/workspaces/task-1".to_owned()),
+            ..ExecutionRequest::default()
+        };
+        request.extra.insert(
+            "runtimeTaskTitle".to_owned(),
+            serde_json::json!("Identify local development instances"),
+        );
+
+        let env = task_identity_env(&request);
+
+        assert_eq!(env.get("WEGENT_TASK_ID"), Some(&"task-1".to_owned()));
+        assert_eq!(
+            env.get("WEGENT_TASK_WORKSPACE"),
+            Some(&"/runtime/workspaces/task-1".to_owned())
+        );
+        assert_eq!(
+            env.get("WEWORK_PARENT_TITLE"),
+            Some(&"Identify local development instances".to_owned())
+        );
+        assert!(env
+            .keys()
+            .all(|key| TASK_SCOPED_ENV_KEYS.contains(&key.as_str())));
+    }
+
+    #[test]
+    fn runtime_local_task_id_stabilizes_thread_identity() {
+        let _lock = crate::test_env::lock();
+        let previous_workspace_root = std::env::var_os("WORKSPACE_ROOT");
+        // SAFETY: the shared test environment lock serializes environment mutation.
+        unsafe { std::env::set_var("WORKSPACE_ROOT", "/workspace") };
+        let mut request = ExecutionRequest {
+            task_id: "execution-1".to_owned(),
+            ..ExecutionRequest::default()
+        };
+        request.extra.insert(
+            "runtimeLocalTaskId".to_owned(),
+            serde_json::json!("conversation-1"),
+        );
+
+        let env = task_identity_env(&request);
+        // SAFETY: restore the environment before releasing the shared lock.
+        unsafe {
+            match previous_workspace_root {
+                Some(value) => std::env::set_var("WORKSPACE_ROOT", value),
+                None => std::env::remove_var("WORKSPACE_ROOT"),
+            }
+        }
+
+        assert_eq!(
+            env.get("WEGENT_TASK_ID"),
+            Some(&"conversation-1".to_owned())
+        );
+        assert_eq!(
+            env.get("WEGENT_TASK_WORKSPACE"),
+            Some(
+                &std::path::Path::new("/workspace")
+                    .join("conversation-1")
+                    .display()
+                    .to_string()
+            )
+        );
+    }
+}

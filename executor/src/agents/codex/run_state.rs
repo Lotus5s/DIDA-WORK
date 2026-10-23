@@ -1,0 +1,430 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use serde_json::Value;
+
+use super::diagnostics::{json_string_field, serialized_json_len};
+use super::{codex_error_message, extract_text, message_params, CodexResponseValueOrigin};
+use crate::{
+    codex_phase::{codex_phase_is_final, codex_phase_is_process, CodexAgentMessagePhaseTracker},
+    logging::log_executor_event,
+    runner::ExecutionOutcome,
+};
+
+/// Reduces Codex app-server notifications into the visible root-turn outcome.
+#[derive(Default)]
+pub(super) struct CodexRunState {
+    final_text: String,
+    final_message_id: Option<String>,
+    final_message_saw_delta: bool,
+    pending_text: String,
+    pending_message_id: Option<String>,
+    pending_message_saw_delta: bool,
+    agent_message_phases: CodexAgentMessagePhaseTracker,
+    root_thread_id: Option<String>,
+    goal_status: Option<String>,
+    goal_status_observed: bool,
+    turn_started_at_ms: Option<i64>,
+    turn_completed_at_ms: Option<i64>,
+    turn_duration_ms: Option<i64>,
+}
+
+impl CodexRunState {
+    pub(super) fn set_root_thread_id(&mut self, thread_id: impl Into<String>) {
+        self.root_thread_id = Some(thread_id.into());
+    }
+
+    pub(super) fn set_goal_status(&mut self, status: impl Into<String>) {
+        self.goal_status = Some(status.into().to_ascii_lowercase());
+        self.goal_status_observed = true;
+    }
+
+    pub(super) fn clear_goal_status(&mut self) {
+        self.goal_status = None;
+        self.goal_status_observed = true;
+    }
+
+    pub(super) fn goal_status_snapshot(&self) -> (bool, Option<String>) {
+        (self.goal_status_observed, self.goal_status.clone())
+    }
+
+    pub(super) fn goal_is_active(&self) -> bool {
+        self.goal_status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("active"))
+    }
+
+    pub(super) fn turn_timing(&self) -> (Option<i64>, Option<i64>, Option<i64>) {
+        (
+            self.turn_started_at_ms,
+            self.turn_completed_at_ms,
+            self.turn_duration_ms,
+        )
+    }
+
+    pub(super) fn finish_turn_timing(&mut self, completed_at_ms: i64) {
+        let completed_at_ms = *self
+            .turn_completed_at_ms
+            .get_or_insert(completed_at_ms.max(0));
+        if self.turn_duration_ms.is_none() {
+            self.turn_duration_ms = self
+                .turn_started_at_ms
+                .map(|started_at_ms| completed_at_ms.saturating_sub(started_at_ms).max(0));
+        }
+    }
+
+    pub(super) fn response_item_id(&self) -> Option<&str> {
+        if self.final_text.is_empty() {
+            self.pending_message_id.as_deref()
+        } else {
+            self.final_message_id.as_deref()
+        }
+    }
+
+    pub(super) fn response_value_origin(&self) -> CodexResponseValueOrigin {
+        if !self.final_text.is_empty() {
+            CodexResponseValueOrigin::Final
+        } else if !self.pending_text.is_empty() {
+            CodexResponseValueOrigin::ProcessFallback
+        } else {
+            CodexResponseValueOrigin::Empty
+        }
+    }
+
+    pub(super) fn reset_turn_output(&mut self) {
+        self.final_text.clear();
+        self.final_message_id = None;
+        self.final_message_saw_delta = false;
+        self.pending_text.clear();
+        self.pending_message_id = None;
+        self.pending_message_saw_delta = false;
+        self.agent_message_phases = CodexAgentMessagePhaseTracker::default();
+    }
+
+    pub(super) fn handle_message(&mut self, message: &Value) -> Option<ExecutionOutcome> {
+        match message.get("method").and_then(Value::as_str) {
+            Some("thread/started") => {
+                if self.root_thread_id.is_none() {
+                    if let Some(thread_id) = stream_thread_id(message_params(message)) {
+                        self.root_thread_id = Some(thread_id);
+                    }
+                }
+                None
+            }
+            Some("turn/started") => {
+                if !self.is_subagent_message(message_params(message)) {
+                    self.reset_turn_output();
+                    let params = message_params(message);
+                    let turn = params.get("turn").unwrap_or(params);
+                    self.turn_started_at_ms = integer_field(turn, "startedAt")
+                        .or_else(|| integer_field(turn, "started_at"))
+                        .map(protocol_timestamp_millis);
+                    self.turn_completed_at_ms = None;
+                    self.turn_duration_ms = None;
+                }
+                None
+            }
+            Some("thread/goal/updated") => {
+                if let Some(status) = message_params(message)
+                    .get("goal")
+                    .and_then(|goal| goal.get("status"))
+                    .and_then(Value::as_str)
+                {
+                    self.set_goal_status(status);
+                }
+                None
+            }
+            Some("thread/goal/cleared") => {
+                self.clear_goal_status();
+                None
+            }
+            Some("item/started") => {
+                if self.is_subagent_message(message_params(message)) {
+                    return None;
+                }
+                self.agent_message_phases
+                    .observe_item(message_params(message));
+                None
+            }
+            Some("item/agentMessage/delta") => {
+                if self.is_subagent_message(message_params(message)) {
+                    return None;
+                }
+                self.append_delta(message_params(message));
+                None
+            }
+            Some("item/completed") => {
+                let params = message_params(message);
+                if self.is_subagent_message(params) {
+                    return None;
+                }
+                self.append_completed_message(params);
+                self.agent_message_phases.forget_item(params);
+                None
+            }
+            Some("turn/completed")
+                if !self.is_subagent_message(message_params(message))
+                    && is_root_codex_turn_event(message_params(message)) =>
+            {
+                let params = message_params(message);
+                let turn = params.get("turn").unwrap_or(params);
+                self.turn_started_at_ms = integer_field(turn, "startedAt")
+                    .or_else(|| integer_field(turn, "started_at"))
+                    .map(protocol_timestamp_millis)
+                    .or(self.turn_started_at_ms);
+                self.turn_completed_at_ms = integer_field(turn, "completedAt")
+                    .or_else(|| integer_field(turn, "completed_at"))
+                    .map(protocol_timestamp_millis);
+                self.turn_duration_ms = integer_field(turn, "durationMs")
+                    .or_else(|| integer_field(turn, "duration_ms"));
+                Some(self.completed(message_params(message)))
+            }
+            Some("turn/completed") => None,
+            Some("error") => {
+                let params = message_params(message);
+                log_codex_run_state_error(params);
+                if codex_error_will_retry(params) {
+                    return None;
+                }
+                Some(ExecutionOutcome::Failed {
+                    message: codex_error_message(params),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn is_subagent_message(&self, params: &Value) -> bool {
+        codex_agent_path(params)
+            .or_else(|| params.get("item").and_then(codex_agent_path))
+            .is_some_and(|agent_path| agent_path != "/root")
+            || self
+                .root_thread_id
+                .as_deref()
+                .is_some_and(|root_thread_id| {
+                    stream_thread_id(params).is_some_and(|thread_id| thread_id != root_thread_id)
+                })
+    }
+
+    fn append_delta(&mut self, params: &Value) {
+        self.agent_message_phases.phase_for_delta(params);
+        if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+            self.begin_pending_message(codex_item_id(params), true);
+            self.pending_text.push_str(delta);
+            self.pending_message_saw_delta = true;
+        }
+    }
+
+    fn append_completed_message(&mut self, params: &Value) {
+        let phase = self.agent_message_phases.phase_for_item(params);
+        let item = params.get("item").unwrap_or(params);
+        let item_type = item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .replace('_', "")
+            .to_ascii_lowercase();
+        if item_type == "plan" {
+            return;
+        }
+        if !matches!(item_type.as_str(), "agentmessage" | "message") {
+            return;
+        }
+        if codex_phase_is_process(phase.as_deref()) {
+            let text = extract_text(item).unwrap_or_default();
+            self.begin_pending_message(codex_item_id(params), false);
+            self.pending_text = text;
+            self.pending_message_saw_delta = false;
+            return;
+        }
+        if item
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role != "assistant")
+        {
+            return;
+        }
+        if let Some(text) = extract_text(item) {
+            let item_id = codex_item_id(params);
+            if !codex_phase_is_final(phase.as_deref()) {
+                if self.pending_message_saw_delta
+                    && final_message_ids_match(self.pending_message_id.as_deref(), item_id)
+                {
+                    return;
+                }
+                self.begin_pending_message(item_id, false);
+                self.pending_text = text;
+                self.pending_message_saw_delta = false;
+                return;
+            }
+            if self.final_message_saw_delta
+                && final_message_ids_match(self.final_message_id.as_deref(), item_id)
+            {
+                return;
+            }
+            self.begin_final_message(item_id, false);
+            self.final_text = text;
+            self.final_message_saw_delta = false;
+        }
+    }
+
+    fn begin_final_message(&mut self, item_id: Option<&str>, clear_on_change: bool) {
+        let Some(item_id) = item_id else {
+            return;
+        };
+        if self.final_message_id.as_deref() == Some(item_id) {
+            return;
+        }
+        if clear_on_change && self.final_message_id.is_some() {
+            self.final_text.clear();
+        }
+        self.final_message_id = Some(item_id.to_owned());
+        self.final_message_saw_delta = false;
+    }
+
+    fn begin_pending_message(&mut self, item_id: Option<&str>, clear_on_change: bool) {
+        let Some(item_id) = item_id else {
+            return;
+        };
+        if self.pending_message_id.as_deref() == Some(item_id) {
+            return;
+        }
+        if clear_on_change && self.pending_message_id.is_some() {
+            self.pending_text.clear();
+        }
+        self.pending_message_id = Some(item_id.to_owned());
+        self.pending_message_saw_delta = false;
+    }
+
+    fn completed(&self, params: &Value) -> ExecutionOutcome {
+        let status = params
+            .get("turn")
+            .and_then(|turn| turn.get("status"))
+            .or_else(|| params.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("completed")
+            .to_ascii_lowercase();
+        match status.as_str() {
+            "completed" | "complete" | "succeeded" => ExecutionOutcome::Completed {
+                content: if self.final_text.is_empty() {
+                    self.pending_text.clone()
+                } else {
+                    self.final_text.clone()
+                },
+            },
+            "cancelled" | "canceled" | "interrupted" => {
+                ExecutionOutcome::Cancelled { message: status }
+            }
+            other => ExecutionOutcome::Failed {
+                message: if params
+                    .pointer("/turn/error")
+                    .is_some_and(|error| !error.is_null())
+                {
+                    codex_error_message(params.get("turn").expect("turn error exists"))
+                } else {
+                    format!("codex turn ended with status {other}")
+                },
+            },
+        }
+    }
+}
+
+fn protocol_timestamp_millis(timestamp_seconds: i64) -> i64 {
+    timestamp_seconds.saturating_mul(1_000)
+}
+
+fn integer_field(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(Value::as_i64)
+}
+
+fn codex_error_will_retry(params: &Value) -> bool {
+    params
+        .get("willRetry")
+        .or_else(|| params.get("will_retry"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn is_root_codex_turn_event(params: &Value) -> bool {
+    let turn = params.get("turn").unwrap_or(params);
+    codex_agent_path(turn)
+        .or_else(|| codex_agent_path(params))
+        .map_or(true, |agent_path| agent_path == "/root")
+}
+
+pub(super) fn stream_thread_id(value: &Value) -> Option<String> {
+    value
+        .get("threadId")
+        .or_else(|| value.get("thread_id"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn codex_agent_path(value: &Value) -> Option<String> {
+    value
+        .get("agent_path")
+        .or_else(|| value.get("agentPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn codex_item_id(value: &Value) -> Option<&str> {
+    value
+        .get("itemId")
+        .or_else(|| value.get("item_id"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn final_message_ids_match(current_id: Option<&str>, completed_id: Option<&str>) -> bool {
+    match (current_id, completed_id) {
+        (Some(current_id), Some(completed_id)) => current_id == completed_id,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn log_codex_run_state_error(params: &Value) {
+    let message = codex_error_message(params);
+    log_executor_event(
+        "codex run state error",
+        &[
+            ("message", message),
+            ("code", json_string_field(params, "code")),
+            ("will_retry", codex_error_will_retry(params).to_string()),
+            (
+                "codex_error_info",
+                params
+                    .pointer("/error/codexErrorInfo")
+                    .map(Value::to_string)
+                    .unwrap_or_default(),
+            ),
+            (
+                "params_len",
+                serialized_json_len(params)
+                    .map(|length| length.to_string())
+                    .unwrap_or_else(|error| {
+                        format!("failed to measure codex error params: {error}")
+                    }),
+            ),
+        ],
+    );
+}

@@ -1,0 +1,254 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import type { UnifiedShell } from '@/apis/shells'
+import type { TaskType } from '@/types/api'
+import {
+  getAutomaticSimpleBindMode,
+  getDefaultSimpleBindMode,
+  getCustomShells,
+  getModelCategoryTypeForBindMode,
+  getSimpleBindModeOptions,
+  getSimpleExecutorOptions,
+  matchesAutomaticSimpleBindMode,
+  normalizeExecutorForBindMode,
+  resolveSimpleBindMode,
+  resolveSimpleExecutorFromBot,
+  resolveShellForExecutor,
+  type SimpleExecutorMode,
+} from '@/features/settings/components/team-edit/simple-team-edit-utils'
+import type { Bot } from '@/types/api'
+
+const shells: UnifiedShell[] = [
+  {
+    name: 'Chat',
+    type: 'public',
+    displayName: 'Chat',
+    shellType: 'Chat',
+  },
+  {
+    name: 'Codex',
+    type: 'public',
+    displayName: 'Codex',
+    shellType: 'Codex',
+  },
+  {
+    name: 'ClaudeCode',
+    type: 'public',
+    displayName: 'Claude Code',
+    shellType: 'ClaudeCode',
+  },
+  {
+    name: 'custom-chat',
+    type: 'user',
+    displayName: 'Custom Chat',
+    shellType: 'Chat',
+  },
+  {
+    name: 'custom-code',
+    type: 'group',
+    displayName: 'Custom Code',
+    shellType: 'ClaudeCode',
+    namespace: 'dev-group',
+  },
+  {
+    name: 'custom-agno',
+    type: 'group',
+    displayName: 'Custom Agno',
+    shellType: 'Agno',
+    namespace: 'dev-group',
+  },
+]
+
+const bot: Bot = {
+  id: 10,
+  name: 'bot',
+  namespace: 'default',
+  shell_name: 'Chat',
+  shell_type: 'Chat',
+  agent_config: {},
+  system_prompt: '',
+  mcp_servers: {},
+  is_active: true,
+  created_at: '2026-05-01T00:00:00Z',
+  updated_at: '2026-05-01T00:00:00Z',
+}
+
+describe('simple team edit utils', () => {
+  it('defaults simple bind mode to chat only', () => {
+    expect(getDefaultSimpleBindMode()).toEqual(['chat'])
+  })
+
+  it('derives automatic bind modes from the selected executor', () => {
+    expect(getAutomaticSimpleBindMode('simple', shells[0])).toEqual(['chat'])
+    expect(getAutomaticSimpleBindMode('complex', shells[2])).toEqual(['code', 'task'])
+    expect(getAutomaticSimpleBindMode('custom', shells[3])).toEqual(['chat'])
+    expect(getAutomaticSimpleBindMode('custom', shells[4])).toEqual(['code', 'task'])
+  })
+
+  it('uses explicit bind modes instead of the automatic executor policy', () => {
+    expect(resolveSimpleBindMode(['task'], 'simple', shells[0])).toEqual(['task'])
+    expect(resolveSimpleBindMode([], 'complex', shells[2])).toEqual(['code', 'task'])
+  })
+
+  it('recognizes persisted values that match the automatic executor policy', () => {
+    expect(matchesAutomaticSimpleBindMode(['chat'], 'simple', shells[0])).toBe(true)
+    expect(matchesAutomaticSimpleBindMode(['task', 'code'], 'complex', shells[2])).toBe(true)
+    expect(matchesAutomaticSimpleBindMode(['code'], 'complex', shells[2])).toBe(false)
+  })
+
+  it('exposes all supported bind modes', () => {
+    expect(getSimpleBindModeOptions().map(option => option.value)).toEqual([
+      'chat',
+      'code',
+      'task',
+      'video',
+      'image',
+    ])
+  })
+
+  it('maps single generation bind modes to their model categories', () => {
+    expect(getModelCategoryTypeForBindMode(['image'])).toBe('image')
+    expect(getModelCategoryTypeForBindMode(['video'])).toBe('video')
+    expect(getModelCategoryTypeForBindMode(['chat'])).toBe('llm')
+    expect(getModelCategoryTypeForBindMode(['image', 'video'])).toBe('llm')
+  })
+
+  it('exposes user-facing executor presets', () => {
+    expect(getSimpleExecutorOptions().map(option => option.value)).toEqual([
+      'simple',
+      'complex',
+      'custom',
+    ])
+  })
+
+  it('resolves simple executor to Chat shell', () => {
+    expect(resolveShellForExecutor(shells, 'simple')?.name).toBe('Chat')
+  })
+
+  it('resolves the coding executor to the selected runtime', () => {
+    expect(resolveShellForExecutor(shells, 'complex')?.name).toBe('ClaudeCode')
+    expect(resolveShellForExecutor(shells, 'complex', undefined, 'codex')?.name).toBe('Codex')
+  })
+
+  it('resolves custom executor by selected custom shell name', () => {
+    expect(resolveShellForExecutor(shells, 'custom', 'custom-code')?.name).toBe('custom-code')
+  })
+
+  it('resolves built-in executor mode from shell name', () => {
+    expect(
+      resolveSimpleExecutorFromBot({ ...bot, shell_name: 'Chat', shell_type: 'Chat' })
+    ).toEqual({
+      mode: 'simple',
+      codingRuntime: 'claude_code',
+      customShellName: '',
+    })
+    expect(
+      resolveSimpleExecutorFromBot({
+        ...bot,
+        shell_name: 'ClaudeCode',
+        shell_type: 'ClaudeCode',
+      })
+    ).toEqual({
+      mode: 'complex',
+      codingRuntime: 'claude_code',
+      customShellName: '',
+    })
+    expect(
+      resolveSimpleExecutorFromBot({
+        ...bot,
+        shell_name: 'Codex',
+        shell_type: 'Codex',
+      })
+    ).toEqual({
+      mode: 'complex',
+      codingRuntime: 'codex',
+      customShellName: '',
+    })
+  })
+
+  it('keeps custom ClaudeCode shell selected as a custom executor', () => {
+    expect(
+      resolveSimpleExecutorFromBot({
+        ...bot,
+        shell_name: 'custom-code',
+        shell_type: 'ClaudeCode',
+      })
+    ).toEqual({
+      mode: 'custom',
+      codingRuntime: 'claude_code',
+      customShellName: 'custom-code',
+    })
+  })
+
+  it('excludes Agno custom shells from custom executor choices', () => {
+    expect(getCustomShells(shells).map(shell => shell.name)).toEqual(['custom-chat', 'custom-code'])
+  })
+
+  it('does not resolve custom executor without a selected shell', () => {
+    expect(resolveShellForExecutor(shells, 'custom')).toBeNull()
+  })
+
+  it('normalizes simple executor to complex for code and device bind modes', () => {
+    const bindMode = ['chat', 'code'] as TaskType[]
+
+    expect(normalizeExecutorForBindMode('simple', bindMode, shells)).toEqual({
+      mode: 'complex',
+      codingRuntime: 'claude_code',
+      reason: 'requires_coding_agent',
+    })
+  })
+
+  it('falls back to Codex when Claude Code is unavailable', () => {
+    const bindMode = ['code'] as TaskType[]
+    const shellsWithoutClaudeCode = shells.filter(shell => shell.shellType !== 'ClaudeCode')
+
+    expect(normalizeExecutorForBindMode('simple', bindMode, shellsWithoutClaudeCode)).toEqual({
+      mode: 'complex',
+      codingRuntime: 'codex',
+      reason: 'requires_coding_agent',
+    })
+  })
+
+  it('keeps custom executor when its selected shell is ClaudeCode-compatible', () => {
+    const bindMode = ['task'] as TaskType[]
+
+    expect(normalizeExecutorForBindMode('custom', bindMode, shells, 'custom-code')).toEqual({
+      mode: 'custom',
+      codingRuntime: 'claude_code',
+      reason: null,
+    })
+  })
+
+  it('keeps custom executor selectable even when the selected shell needs validation', () => {
+    const bindMode = ['code'] as TaskType[]
+
+    expect(normalizeExecutorForBindMode('custom', bindMode, shells, 'custom-chat')).toEqual({
+      mode: 'custom',
+      codingRuntime: 'claude_code',
+      reason: null,
+    })
+  })
+
+  it('keeps custom executor selectable before a custom shell is chosen', () => {
+    const bindMode = ['code'] as TaskType[]
+
+    expect(normalizeExecutorForBindMode('custom', bindMode, shells, '')).toEqual({
+      mode: 'custom',
+      codingRuntime: 'claude_code',
+      reason: null,
+    })
+  })
+
+  it('falls back to simple when chat is the only selected bind mode', () => {
+    const bindMode = ['chat'] as TaskType[]
+    const mode: SimpleExecutorMode = 'simple'
+
+    expect(normalizeExecutorForBindMode(mode, bindMode, shells)).toEqual({
+      mode: 'simple',
+      codingRuntime: 'claude_code',
+      reason: null,
+    })
+  })
+})

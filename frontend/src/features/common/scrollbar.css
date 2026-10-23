@@ -1,0 +1,10 @@
+/*
+ * Custom scrollbar styles for global reuse
+ * SPDX-FileCopyrightText: 2025 Weibo, Inc.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* Use default browser scrollbar styles */
+.custom-scrollbar {
+  /* No custom styling - use browser defaults */
+}

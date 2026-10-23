@@ -1,0 +1,753 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::{env, future::Future, path::PathBuf, pin::Pin};
+
+use serde_json::Value;
+
+mod agno;
+pub(crate) mod backend_url;
+mod cargo_cache;
+mod claude_code;
+mod claude_options;
+mod codex;
+mod codex_log_db;
+mod dify;
+pub(crate) mod environment_setup;
+pub(crate) mod git_auth;
+pub(crate) mod git_workspace;
+mod image_validator;
+mod instance_home;
+pub(crate) use instance_home::{claude_session_transcript, validate_session};
+pub mod interactive_mcp;
+mod pnpm_worktree;
+pub(crate) mod runtime_capabilities;
+mod skill_download;
+mod task_identity;
+
+use crate::{
+    emitter::ResponsesEventBuilder,
+    logging::{log_executor_event, task_fields},
+    process::{CommandSpec, StreamProcessEngine},
+    protocol::{AgentKind, ExecutionRequest},
+    runner::{AgentEngine, EventSink, ExecutionOutcome},
+};
+
+pub use agno::build_agno_options;
+pub(crate) use backend_url::bind_backend_model_gateway;
+pub(crate) use backend_url::request_backend_url;
+pub use claude_code::build_claude_command;
+pub(crate) use claude_code::{claude_config_dir, claude_task_dir, model_id, prompt_text};
+use claude_code::{
+    configure_claude_default_settings, configure_claude_file_edit_hooks,
+    restore_claude_plugin_cache, run_pre_execute_hook,
+};
+pub use claude_options::{extract_claude_options, ClaudeOptions};
+pub(crate) use codex::{
+    bind_codex_thread_model_route, codex_notification_requires_user_input,
+    codex_runtime_approval_policy, configured_inference_model_provider, executor_home,
+    mcp_server_elicitation_request_user_input_params, replace_config,
+    select_wework_codex_user_instructions, wework_codex_home,
+    CODEX_DANGER_FULL_ACCESS_PERMISSION_PROFILE, CODEX_READ_ONLY_PERMISSION_PROFILE,
+    CODEX_WORKSPACE_PERMISSION_PROFILE,
+};
+pub use codex::{
+    run_codex_app_server_turn, run_codex_app_server_turn_with_cancel, CodexActiveTurnCallback,
+    CodexActiveTurnFinishedCallback, CodexAppServerClient, CodexAppServerEngine,
+    CodexAppServerTurn, CodexAppServerTurnOptions, CodexCancellationState, CodexIdleMutationError,
+    CodexNotificationSender, CodexRequestUserInputReceiver, CodexResponseValueOrigin,
+    CodexThreadStartedCallback, CodexTurnInterrupter, CODEX_APP_SERVER_EXECUTOR_SHUTDOWN,
+    CODEX_APP_SERVER_TURN_CANCELLED,
+};
+pub use dify::{build_dify_config, saved_dify_task_id, DifyEngine};
+pub use image_validator::ImageValidatorEngine;
+pub(crate) use instance_home::{task_skills_directory, task_skills_directory_at};
+
+pub(crate) fn has_isolated_native_home(request: &ExecutionRequest) -> bool {
+    instance_home::request_home(request).is_some()
+}
+
+/// Terminates every agent process owned by this executor.
+///
+/// Call this when the executor's owner goes away, so the agents it was driving
+/// cannot outlive it. Returns the number of terminated agents.
+pub async fn terminate_agent_processes() -> usize {
+    codex::terminate_shared_codex_app_servers().await
+}
+
+const DEFAULT_CLAUDE_CODE_PROCESS_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+const MACOS_CODEX_APP_BINARIES: [&str; 2] = [
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+];
+const CLAUDE_USER_BINARY_SUFFIX: &str = ".local/bin/claude";
+
+#[cfg(target_os = "windows")]
+const WINDOWS_EXECUTABLE_EXTENSIONS: [&str; 4] = [".exe", ".cmd", ".bat", ".com"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCommandPlanner {
+    claude_binary: String,
+    codex_binary: String,
+}
+
+impl AgentCommandPlanner {
+    pub fn new(claude_binary: impl Into<String>, codex_binary: impl Into<String>) -> Self {
+        Self {
+            claude_binary: claude_binary.into(),
+            codex_binary: codex_binary.into(),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::new(resolve_claude_binary(), resolve_codex_binary())
+    }
+
+    pub fn command_for(&self, request: &ExecutionRequest) -> Result<CommandSpec, String> {
+        let spec = match request.resolved_agent_kind() {
+            AgentKind::ClaudeCode => build_claude_command(
+                request,
+                request
+                    .extra
+                    .get("runtime_executable_path")
+                    .or_else(|| request.extra.get("runtimeExecutablePath"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(&self.claude_binary),
+            ),
+            AgentKind::CodeX => build_codex_app_server_command(&self.codex_binary),
+            agent_kind => return Err(format!("unsupported agent kind: {agent_kind:?}")),
+        };
+        Ok(pnpm_worktree::configure_command(
+            request,
+            cargo_cache::configure_command(request, spec),
+        ))
+    }
+}
+
+pub fn resolve_codex_binary() -> String {
+    read_binary("CODEX_BINARY_PATH", "CODEX_BIN", "codex")
+}
+
+/// Resolve a codex binary name/path to an absolute executable path.
+///
+/// Explicit paths are returned unchanged. A bare `codex` name prefers the
+/// macOS app bundle when present, otherwise it is looked up on `PATH`.
+pub fn resolve_codex_binary_path(value: &str) -> String {
+    let app_candidates = if cfg!(target_os = "macos") {
+        MACOS_CODEX_APP_BINARIES
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut search_paths = env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default();
+    search_paths.extend(windows_fallback_search_paths());
+
+    resolve_codex_binary_path_from_candidates(value, &app_candidates, &search_paths)
+}
+
+fn resolve_codex_binary_path_from_candidates(
+    value: &str,
+    app_candidates: &[PathBuf],
+    search_paths: &[PathBuf],
+) -> String {
+    let trimmed = value.trim();
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return trimmed.to_owned();
+    }
+
+    if trimmed == "codex" {
+        if let Some(path) = app_candidates.iter().find(|path| path.is_file()) {
+            return path.display().to_string();
+        }
+    }
+
+    find_executable_in_paths(trimmed, search_paths)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| trimmed.to_owned())
+}
+
+pub fn build_codex_app_server_command(binary: &str) -> CommandSpec {
+    CommandSpec::new(binary).arg("app-server")
+}
+
+fn resolve_claude_binary() -> String {
+    let binary = read_binary("CLAUDE_BINARY_PATH", "CLAUDE_BIN", "claude");
+    resolve_claude_binary_path(&binary)
+}
+
+/// Resolve a Claude Code binary name/path to an executable path.
+///
+/// GUI-launched local executors may not inherit a user's shell PATH.
+/// `~/.local/bin` is a common user-level Claude Code installation location,
+/// so check it before falling back to PATH lookup.
+pub fn resolve_claude_binary_path(value: &str) -> String {
+    let user_binary = dirs::home_dir().map(|home| home.join(CLAUDE_USER_BINARY_SUFFIX));
+    let mut search_paths = env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default();
+    search_paths.extend(windows_fallback_search_paths());
+
+    resolve_claude_binary_path_from_candidates(value, user_binary.as_ref(), &search_paths)
+}
+
+fn resolve_claude_binary_path_from_candidates(
+    value: &str,
+    user_binary: Option<&PathBuf>,
+    search_paths: &[PathBuf],
+) -> String {
+    let trimmed = value.trim();
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return trimmed.to_owned();
+    }
+
+    if trimmed == "claude" {
+        if let Some(path) = user_binary.filter(|path| path.is_file()) {
+            return path.display().to_string();
+        }
+    }
+
+    find_executable_in_paths(trimmed, search_paths)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| trimmed.to_owned())
+}
+
+fn read_binary(primary: &str, secondary: &str, default: &str) -> String {
+    env::var(primary)
+        .ok()
+        .or_else(|| env::var(secondary).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+/// Returns common user-level binary directories that GUI-launched processes may
+/// not have on PATH.
+#[cfg(target_os = "windows")]
+fn windows_fallback_search_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join("AppData").join("Roaming").join("npm"));
+        paths.push(home.join(".cargo").join("bin"));
+    }
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        paths.push(PathBuf::from(local_app_data).join("npm"));
+    }
+    paths
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_fallback_search_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Looks for `name` in `search_paths`, respecting Windows executable
+/// extensions when no extension is provided.
+fn find_executable_in_paths(name: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {
+    search_paths
+        .iter()
+        .flat_map(|path| executable_candidates(path.join(name)))
+        .find(|path| path.is_file())
+}
+
+#[cfg(target_os = "windows")]
+fn executable_candidates(path: PathBuf) -> Vec<PathBuf> {
+    if path.extension().is_some() {
+        return vec![path];
+    }
+    WINDOWS_EXECUTABLE_EXTENSIONS
+        .iter()
+        .map(|ext| path.with_extension(&ext[1..]))
+        .collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn executable_candidates(path: PathBuf) -> Vec<PathBuf> {
+    vec![path]
+}
+
+fn claude_code_process_timeout_seconds() -> u64 {
+    env::var("WEGENT_CLAUDE_CODE_PROCESS_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CLAUDE_CODE_PROCESS_TIMEOUT_SECONDS)
+}
+
+fn stream_process_engine_for(agent_kind: &AgentKind, spec: CommandSpec) -> StreamProcessEngine {
+    match agent_kind {
+        AgentKind::ClaudeCode => {
+            StreamProcessEngine::new(spec, claude_code_process_timeout_seconds())
+        }
+        agent_kind => unreachable!("unsupported process agent kind: {agent_kind:?}"),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentProcessEngine {
+    planner: AgentCommandPlanner,
+    codex_engine: CodexAppServerEngine,
+}
+
+impl AgentProcessEngine {
+    pub fn new(planner: AgentCommandPlanner) -> Self {
+        let codex_engine = CodexAppServerEngine::new(planner.codex_binary.clone());
+        Self {
+            planner,
+            codex_engine,
+        }
+    }
+}
+
+async fn prepare_standard_codex_request(
+    request: ExecutionRequest,
+) -> Result<ExecutionRequest, String> {
+    git_auth::setup_git_authentication(&request).await;
+    let mut request = git_workspace::prepare_git_workspace(request).await?;
+    let task_dir = request
+        .cwd()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::workspace_paths::task_workspace_dir(&request.task_id));
+    std::fs::create_dir_all(&task_dir).map_err(|error| {
+        format!(
+            "failed to create Codex task workspace {}: {error}",
+            task_dir.display()
+        )
+    })?;
+    request.project_workspace_path = Some(task_dir.display().to_string());
+    Ok(request)
+}
+
+impl AgentEngine for AgentProcessEngine {
+    type RunFuture = Pin<Box<dyn Future<Output = ExecutionOutcome> + Send>>;
+
+    fn cancel_pending(
+        &self,
+        task_id: &str,
+        subtask_id: Option<&str>,
+    ) -> Option<crate::emitter::EventEnvelope> {
+        self.codex_engine.cancel_pending(task_id, subtask_id)
+    }
+
+    fn run(&self, request: ExecutionRequest) -> Self::RunFuture {
+        let agent_kind = request.resolved_agent_kind();
+        let bot_count = request.bot.as_array().map(|bots| bots.len()).unwrap_or(0);
+        log_executor_event(
+            "agent dispatch kind",
+            &[
+                ("task_id", request.task_id.clone()),
+                ("agent_kind", format!("{agent_kind:?}")),
+                ("bot_count", bot_count.to_string()),
+            ],
+        );
+        let planner = self.planner.clone();
+        let codex_engine = self.codex_engine.clone();
+        Box::pin(async move {
+            let agent_kind = request.resolved_agent_kind();
+            let capability_lease = if agent_kind == AgentKind::ClaudeCode {
+                Some(crate::services::capability_activation::begin_execution().await)
+            } else {
+                None
+            };
+            let _home_lease = if agent_kind == AgentKind::ClaudeCode {
+                match instance_home::acquire(&request) {
+                    Ok(lease) => lease,
+                    Err(message) => {
+                        let mut fields = task_fields(&request.task_id, &request.subtask_id);
+                        fields.push(("phase", "agent_home".to_owned()));
+                        fields.push(("error", message.clone()));
+                        log_executor_event("agent preparation failed", &fields);
+                        return ExecutionOutcome::Failed { message };
+                    }
+                }
+            } else {
+                None
+            };
+            let _workspace_lease = match git_workspace::acquire_execution_lease(&request) {
+                Ok(lease) => lease,
+                Err(message) => return ExecutionOutcome::Failed { message },
+            };
+            let mut fields = task_fields(&request.task_id, &request.subtask_id);
+            fields.push(("agent", format!("{agent_kind:?}")));
+            log_executor_event("agent dispatch", &fields);
+
+            match agent_kind {
+                AgentKind::CodeX => {
+                    if request
+                        .extra
+                        .get("interactive_form_answer")
+                        .is_some_and(|answer| !answer.is_null())
+                    {
+                        return codex_engine.run(request).await;
+                    }
+                    let request = match prepare_standard_codex_request(request).await {
+                        Ok(request) => request,
+                        Err(message) => {
+                            log_executor_event(
+                                "codex runtime preparation failed",
+                                &[("error_len", message.len().to_string())],
+                            );
+                            return ExecutionOutcome::Failed { message };
+                        }
+                    };
+                    codex_engine.run(request).await
+                }
+                AgentKind::Dify => DifyEngine::new().run(request).await,
+                AgentKind::ImageValidator => ImageValidatorEngine.run(request).await,
+                _ => {
+                    let request = if agent_kind == AgentKind::ClaudeCode {
+                        let request =
+                            runtime_capabilities::prepare_claude_execution_request(request).await;
+                        match git_workspace::prepare_git_workspace(request).await {
+                            Ok(request) => request,
+                            Err(message) => {
+                                let mut failed_fields = fields.clone();
+                                failed_fields.push(("error_len", message.len().to_string()));
+                                log_executor_event(
+                                    "git workspace preparation failed",
+                                    &failed_fields,
+                                );
+                                return ExecutionOutcome::Failed { message };
+                            }
+                        }
+                    } else {
+                        request
+                    };
+                    if let Err(message) =
+                        environment_setup::prepare_execution_environment(&request).await
+                    {
+                        return ExecutionOutcome::Failed { message };
+                    }
+                    match planner.command_for(&request) {
+                        Ok(mut spec) => {
+                            let mut command_fields = fields.clone();
+                            command_fields.push(("program", spec.program().to_owned()));
+                            command_fields.push(("arg_count", spec.args().len().to_string()));
+                            if let Some(cwd) = spec.current_dir() {
+                                command_fields.push(("cwd", cwd.display().to_string()));
+                            }
+                            log_executor_event("command planned", &command_fields);
+                            if request.resolved_agent_kind() == AgentKind::ClaudeCode {
+                                spec = match runtime_capabilities::prepare_claude_runtime(
+                                    &request, spec,
+                                )
+                                .await
+                                {
+                                    Ok(spec) => spec,
+                                    Err(message) => {
+                                        let mut failed_fields =
+                                            task_fields(&request.task_id, &request.subtask_id);
+                                        failed_fields
+                                            .push(("error_len", message.len().to_string()));
+                                        log_executor_event(
+                                            "claude runtime capability preparation failed",
+                                            &failed_fields,
+                                        );
+                                        return ExecutionOutcome::Failed { message };
+                                    }
+                                };
+                                restore_claude_plugin_cache(&request, &spec);
+                                configure_claude_default_settings(&request, &spec);
+                                configure_claude_file_edit_hooks(&request, &spec);
+                                spec = match git_auth::apply_task_git_authentication(&request, spec)
+                                {
+                                    Ok(spec) => spec,
+                                    Err(message) => {
+                                        let mut failed_fields =
+                                            task_fields(&request.task_id, &request.subtask_id);
+                                        failed_fields
+                                            .push(("reason", "git_auth_failed".to_owned()));
+                                        log_executor_event(
+                                            "Claude task Git authentication failed",
+                                            &failed_fields,
+                                        );
+                                        return ExecutionOutcome::Failed { message };
+                                    }
+                                };
+                                run_pre_execute_hook(&request, &spec).await;
+                            }
+                            drop(capability_lease);
+                            stream_process_engine_for(&agent_kind, spec)
+                                .run(request)
+                                .await
+                        }
+                        Err(message) => {
+                            let mut failed_fields = fields;
+                            failed_fields.push(("error_len", message.len().to_string()));
+                            log_executor_event("command planning failed", &failed_fields);
+                            ExecutionOutcome::Failed { message }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn run_with_events<S>(
+        &self,
+        request: ExecutionRequest,
+        sink: S,
+        builder: ResponsesEventBuilder,
+    ) -> Pin<Box<dyn Future<Output = ExecutionOutcome> + Send>>
+    where
+        S: EventSink,
+    {
+        let agent_kind = request.resolved_agent_kind();
+        let bot_count = request.bot.as_array().map(|bots| bots.len()).unwrap_or(0);
+        log_executor_event(
+            "agent dispatch kind",
+            &[
+                ("task_id", request.task_id.clone()),
+                ("agent_kind", format!("{agent_kind:?}")),
+                ("bot_count", bot_count.to_string()),
+            ],
+        );
+        let planner = self.planner.clone();
+        let codex_engine = self.codex_engine.clone();
+        Box::pin(async move {
+            let agent_kind = request.resolved_agent_kind();
+            let capability_lease = if agent_kind == AgentKind::ClaudeCode {
+                Some(crate::services::capability_activation::begin_execution().await)
+            } else {
+                None
+            };
+            let _home_lease = if agent_kind == AgentKind::ClaudeCode {
+                match instance_home::acquire(&request) {
+                    Ok(lease) => lease,
+                    Err(message) => {
+                        let mut fields = task_fields(&request.task_id, &request.subtask_id);
+                        fields.push(("phase", "agent_home".to_owned()));
+                        fields.push(("error", message.clone()));
+                        log_executor_event("agent preparation failed", &fields);
+                        return ExecutionOutcome::Failed { message };
+                    }
+                }
+            } else {
+                None
+            };
+            let _workspace_lease = match git_workspace::acquire_execution_lease(&request) {
+                Ok(lease) => lease,
+                Err(message) => return ExecutionOutcome::Failed { message },
+            };
+            let mut fields = task_fields(&request.task_id, &request.subtask_id);
+            fields.push(("agent", format!("{agent_kind:?}")));
+            log_executor_event("agent dispatch", &fields);
+
+            match agent_kind {
+                AgentKind::CodeX => {
+                    if request
+                        .extra
+                        .get("interactive_form_answer")
+                        .is_some_and(|answer| !answer.is_null())
+                    {
+                        return codex_engine.run_with_events(request, sink, builder).await;
+                    }
+                    let request = match prepare_standard_codex_request(request).await {
+                        Ok(request) => request,
+                        Err(message) => {
+                            log_executor_event(
+                                "codex runtime preparation failed",
+                                &[("error_len", message.len().to_string())],
+                            );
+                            return ExecutionOutcome::Failed { message };
+                        }
+                    };
+                    codex_engine.run_with_events(request, sink, builder).await
+                }
+                AgentKind::Dify => DifyEngine::new().run(request).await,
+                AgentKind::ImageValidator => ImageValidatorEngine.run(request).await,
+                _ => {
+                    let request = if agent_kind == AgentKind::ClaudeCode {
+                        let request =
+                            runtime_capabilities::prepare_claude_execution_request(request).await;
+                        match git_workspace::prepare_git_workspace(request).await {
+                            Ok(request) => request,
+                            Err(message) => {
+                                let mut failed_fields = fields.clone();
+                                failed_fields.push(("error_len", message.len().to_string()));
+                                log_executor_event(
+                                    "git workspace preparation failed",
+                                    &failed_fields,
+                                );
+                                return ExecutionOutcome::Failed { message };
+                            }
+                        }
+                    } else {
+                        request
+                    };
+                    if let Err(message) =
+                        environment_setup::prepare_execution_environment(&request).await
+                    {
+                        return ExecutionOutcome::Failed { message };
+                    }
+                    match planner.command_for(&request) {
+                        Ok(mut spec) => {
+                            let mut command_fields = fields.clone();
+                            command_fields.push(("program", spec.program().to_owned()));
+                            command_fields.push(("arg_count", spec.args().len().to_string()));
+                            if let Some(cwd) = spec.current_dir() {
+                                command_fields.push(("cwd", cwd.display().to_string()));
+                            }
+                            log_executor_event("command planned", &command_fields);
+                            if request.resolved_agent_kind() == AgentKind::ClaudeCode {
+                                spec = match runtime_capabilities::prepare_claude_runtime(
+                                    &request, spec,
+                                )
+                                .await
+                                {
+                                    Ok(spec) => spec,
+                                    Err(message) => {
+                                        let mut failed_fields =
+                                            task_fields(&request.task_id, &request.subtask_id);
+                                        failed_fields
+                                            .push(("error_len", message.len().to_string()));
+                                        log_executor_event(
+                                            "claude runtime capability preparation failed",
+                                            &failed_fields,
+                                        );
+                                        return ExecutionOutcome::Failed { message };
+                                    }
+                                };
+                                restore_claude_plugin_cache(&request, &spec);
+                                configure_claude_default_settings(&request, &spec);
+                                configure_claude_file_edit_hooks(&request, &spec);
+                                spec = match git_auth::apply_task_git_authentication(&request, spec)
+                                {
+                                    Ok(spec) => spec,
+                                    Err(message) => {
+                                        let mut failed_fields =
+                                            task_fields(&request.task_id, &request.subtask_id);
+                                        failed_fields
+                                            .push(("reason", "git_auth_failed".to_owned()));
+                                        log_executor_event(
+                                            "Claude task Git authentication failed",
+                                            &failed_fields,
+                                        );
+                                        return ExecutionOutcome::Failed { message };
+                                    }
+                                };
+                                run_pre_execute_hook(&request, &spec).await;
+                            }
+                            drop(capability_lease);
+                            stream_process_engine_for(&agent_kind, spec)
+                                .run_with_events(request, sink, builder)
+                                .await
+                        }
+                        Err(message) => {
+                            let mut failed_fields = fields;
+                            failed_fields.push(("error_len", message.len().to_string()));
+                            log_executor_event("command planning failed", &failed_fields);
+                            ExecutionOutcome::Failed { message }
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use super::*;
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn claude_code_process_timeout_uses_claude_specific_env_var() {
+        let _lock = env_lock();
+        let _old_timeout = EnvGuard::remove("WEGENT_EXECUTOR_PROCESS_TIMEOUT_SECONDS");
+        let _timeout = EnvGuard::set("WEGENT_CLAUDE_CODE_PROCESS_TIMEOUT_SECONDS", "42");
+
+        assert_eq!(claude_code_process_timeout_seconds(), 42);
+    }
+
+    #[test]
+    fn claude_code_process_timeout_ignores_generic_process_env_var() {
+        let _lock = env_lock();
+        let _old_timeout = EnvGuard::set("WEGENT_EXECUTOR_PROCESS_TIMEOUT_SECONDS", "1");
+        let _timeout = EnvGuard::remove("WEGENT_CLAUDE_CODE_PROCESS_TIMEOUT_SECONDS");
+
+        assert_eq!(claude_code_process_timeout_seconds(), 86_400);
+    }
+
+    #[test]
+    fn codex_binary_resolver_prefers_available_macos_app_candidate() {
+        let available_binary = std::env::current_exe().expect("current test binary should exist");
+        let app_candidates = vec![
+            PathBuf::from("/missing/Codex.app/Contents/Resources/codex"),
+            available_binary.clone(),
+        ];
+
+        let resolved = resolve_codex_binary_path_from_candidates("codex", &app_candidates, &[]);
+
+        assert_eq!(resolved, available_binary.display().to_string());
+    }
+
+    #[test]
+    fn claude_binary_resolver_prefers_available_user_binary() {
+        let available_binary = std::env::current_exe().expect("current test binary should exist");
+
+        let resolved =
+            resolve_claude_binary_path_from_candidates("claude", Some(&available_binary), &[]);
+
+        assert_eq!(resolved, available_binary.display().to_string());
+    }
+
+    #[test]
+    fn claude_binary_resolver_keeps_explicit_path() {
+        let explicit_path = "/custom/bin/claude";
+
+        let resolved = resolve_claude_binary_path_from_candidates(explicit_path, None, &[]);
+
+        assert_eq!(resolved, explicit_path);
+    }
+
+    #[test]
+    fn macos_codex_app_candidates_include_current_chatgpt_bundle() {
+        assert!(MACOS_CODEX_APP_BINARIES
+            .contains(&"/Applications/ChatGPT.app/Contents/Resources/codex"));
+    }
+}

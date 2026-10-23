@@ -1,0 +1,271 @@
+import type { RuntimeTaskSummary } from '@/types/api'
+import type { RuntimePaneTranscript } from '@/types/workbench'
+import type { RuntimeTaskLifecycleSnapshot } from './types'
+
+export function summarizeRuntimeTaskExecution(task: RuntimeTaskSummary | null) {
+  if (!task) return null
+  return {
+    taskId: task.taskId,
+    status: task.status ?? null,
+    running: task.running ?? null,
+    threadStatus: task.threadStatus ?? null,
+    turnStatus: task.turnStatus ?? null,
+    completedAt: task.completedAt ?? null,
+    updatedAt: task.updatedAt ?? null,
+  }
+}
+
+export type RuntimeTaskBoardState = 'attention' | 'queued' | 'active' | 'completed'
+
+export { projectRuntimePaneTranscript } from '@wegent/chat-core/runtime-transcript-page'
+export function isRuntimePaneTranscriptConfirmedIdle(transcript: RuntimePaneTranscript): boolean {
+  if (transcript.running !== false) return false
+  return !transcript.turns.some(turn => isRuntimeTurnRunningStatus(turn.status))
+}
+
+export function runtimeTaskBoardState(task: RuntimeTaskSummary): RuntimeTaskBoardState {
+  const normalizedTask = normalizeRuntimeTaskSummary(task)
+  const status = normalizedTask.status?.trim().toLowerCase()
+  const turnStatus = normalizedTask.turnStatus?.trim().toLowerCase()
+  if (
+    status === 'failed' ||
+    status === 'error' ||
+    status === 'cancelled' ||
+    status === 'canceled' ||
+    turnStatus === 'failed' ||
+    turnStatus === 'interrupted'
+  ) {
+    return 'attention'
+  }
+  if (
+    normalizedTask.running === true ||
+    isRuntimeTaskConfirmedActive(normalizedTask) ||
+    isRuntimeTaskOptimisticallyActive(normalizedTask)
+  ) {
+    return 'active'
+  }
+  if (isRuntimeTaskQueued(normalizedTask)) return 'queued'
+  if (isRuntimeTaskAuthoritativeCompletion(normalizedTask)) return 'completed'
+  return 'attention'
+}
+
+export function normalizeRuntimeTaskSummary(task: RuntimeTaskSummary): RuntimeTaskSummary {
+  if (!isRuntimeTaskAuthoritativeCompletion(task)) return task
+
+  const status = task.status?.trim().toLowerCase()
+  const turnStatus = task.turnStatus?.trim().toLowerCase()
+  const settledStatus =
+    status === 'failed' || status === 'error' || turnStatus === 'failed'
+      ? 'failed'
+      : status === 'cancelled' || status === 'canceled' || turnStatus === 'interrupted'
+        ? 'cancelled'
+        : status === 'archived'
+          ? 'archived'
+          : 'done'
+  const settledTurnStatus =
+    turnStatus === 'failed' || turnStatus === 'interrupted' ? task.turnStatus : 'completed'
+
+  if (
+    task.status === settledStatus &&
+    task.turnStatus === settledTurnStatus &&
+    task.optimistic !== true
+  ) {
+    return task
+  }
+
+  const canonicalTask = { ...task }
+  delete canonicalTask.optimistic
+  return {
+    ...canonicalTask,
+    status: settledStatus,
+    turnStatus: settledTurnStatus,
+  }
+}
+
+export function runtimeTaskReconciliationSnapshot(task: RuntimeTaskSummary): {
+  runtimeStatus: string
+  running: boolean
+  turnStatus: string | null
+} {
+  const canonical = normalizeRuntimeTaskSummary(task)
+  return {
+    runtimeStatus: canonical.status ?? '',
+    running: isRuntimeTaskConfirmedActive(canonical),
+    turnStatus: canonical.turnStatus ?? null,
+  }
+}
+
+export function shouldReplaceRuntimeTaskProjection(
+  currentTask: RuntimeTaskSummary,
+  candidateTask: RuntimeTaskSummary
+): boolean {
+  const current = normalizeRuntimeTaskSummary(currentTask)
+  const candidate = normalizeRuntimeTaskSummary(candidateTask)
+  if (current.cachedProjection !== candidate.cachedProjection) {
+    return current.cachedProjection === true
+  }
+  const currentCompleted = isRuntimeTaskAuthoritativeCompletion(current)
+  const candidateCompleted = isRuntimeTaskAuthoritativeCompletion(candidate)
+
+  if (currentCompleted !== candidateCompleted) {
+    if (candidateCompleted) {
+      if (!isRuntimeTaskExecutionRunning(current)) return true
+      // Completion belongs to its turn, not to a later metadata refresh.
+      // Native completion timestamps may have only second precision.
+      const completedAt = runtimeTaskTimestamp(candidate.completedAt)
+      const currentTime = runtimeTaskProjectionTime(current)
+      return completedAt === 0 || Math.floor(completedAt / 1000) >= Math.floor(currentTime / 1000)
+    }
+    if (!isRuntimeTaskConfirmedActive(candidate)) return false
+    const candidateTime = runtimeTaskProjectionTime(candidate)
+    // Native completion can be second-precision while the accepted start is milliseconds.
+    return candidateTime === 0 || candidateTime > runtimeTaskProjectionTime(current)
+  }
+
+  if (current.optimistic === true && candidate.optimistic !== true) {
+    return !(
+      isRuntimeTaskOptimisticallyActive(current) &&
+      candidate.running === false &&
+      !isRuntimeTaskQueued(candidate)
+    )
+  }
+  if (current.optimistic !== true && candidate.optimistic === true) return false
+
+  const currentTime = runtimeTaskProjectionTime(current)
+  const candidateTime = runtimeTaskProjectionTime(candidate)
+  if (candidateTime !== currentTime) return candidateTime > currentTime
+
+  return true
+}
+
+export function isRuntimeTaskAuthoritativeCompletion(task: RuntimeTaskSummary): boolean {
+  return task.running === false && task.completedAt != null && !isRuntimeGoalExecutionActive(task)
+}
+
+export type RuntimeTaskTrackingExecutionStatus =
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'archived'
+
+export function runtimeTaskTrackingExecutionStatus(
+  lifecycle: RuntimeTaskLifecycleSnapshot
+): RuntimeTaskTrackingExecutionStatus | null {
+  if (lifecycle.derived.isQueued) return 'queued'
+  if (lifecycle.turn.active) return 'running'
+  if (lifecycle.turn.outcome) return lifecycle.turn.outcome
+  if (lifecycle.derived.isRunning) return 'running'
+
+  const task = lifecycle.task
+  if (!task) return null
+  return runtimeTaskSummaryTrackingExecutionStatus(task)
+}
+
+export function runtimeTaskSummaryTrackingExecutionStatus(
+  task: RuntimeTaskSummary
+): RuntimeTaskTrackingExecutionStatus | null {
+  const normalizedTask = normalizeRuntimeTaskSummary(task)
+  const status = normalizedTask.status?.trim().toLowerCase()
+  const turnStatus = normalizedTask.turnStatus?.trim().toLowerCase()
+  const threadStatus = normalizedTask.threadStatus?.trim().toLowerCase()
+  if (status === 'archived') return 'archived'
+  if (
+    status === 'failed' ||
+    status === 'error' ||
+    turnStatus === 'failed' ||
+    threadStatus === 'systemerror' ||
+    Boolean(normalizedTask.error)
+  ) {
+    return 'failed'
+  }
+  if (
+    status === 'cancelled' ||
+    status === 'canceled' ||
+    turnStatus === 'cancelled' ||
+    turnStatus === 'canceled' ||
+    turnStatus === 'interrupted'
+  ) {
+    return 'cancelled'
+  }
+  if (status === 'queued') return 'queued'
+  if (isRuntimeTaskExecutionRunning(normalizedTask)) return 'running'
+  if (
+    isRuntimeTaskAuthoritativeCompletion(normalizedTask) ||
+    status === 'done' ||
+    status === 'completed' ||
+    status === 'succeeded'
+  ) {
+    return 'succeeded'
+  }
+  return null
+}
+
+export function isRuntimeTaskConfirmedActive(task: RuntimeTaskSummary): boolean {
+  if (task.optimistic === true) return false
+  if (isRuntimeGoalExecutionActive(task)) return true
+  return (
+    task.running === true &&
+    task.completedAt == null &&
+    (isRuntimeTaskRunningStatus(task.threadStatus) || isRuntimeTaskRunningStatus(task.turnStatus))
+  )
+}
+
+export function isRuntimeTaskExecutionRunning(task: RuntimeTaskSummary): boolean {
+  const normalizedTask = normalizeRuntimeTaskSummary(task)
+  if (normalizedTask.optimistic === true) return false
+  if (isRuntimeGoalExecutionActive(normalizedTask)) return true
+  return normalizedTask.running === true && normalizedTask.completedAt == null
+}
+
+export function isRuntimeGoalExecutionActive(task: RuntimeTaskSummary): boolean {
+  if (task.goalExecutionStatus === 'running' || task.goalExecutionStatus === 'recovering') {
+    return true
+  }
+  return task.goalStatus === 'active' && isRuntimeTaskQueued(task)
+}
+
+function isRuntimeTaskOptimisticallyActive(task: RuntimeTaskSummary): boolean {
+  return (
+    task.optimistic === true &&
+    (task.status === 'creating' ||
+      task.status === 'queued' ||
+      task.status === 'active' ||
+      task.status === 'running')
+  )
+}
+
+function isRuntimeTaskQueued(task: RuntimeTaskSummary): boolean {
+  return task.status?.trim().toLowerCase() === 'queued'
+}
+
+function isRuntimeTaskRunningStatus(status: string | null | undefined): boolean {
+  const normalized = status?.replace(/[_-]/g, '').trim().toLowerCase()
+  return normalized === 'active' || normalized === 'inprogress' || normalized === 'running'
+}
+
+function isRuntimeTurnRunningStatus(status: string | null | undefined): boolean {
+  const normalized = status?.replace(/[_-]/g, '').trim().toLowerCase()
+  return (
+    normalized === 'active' ||
+    normalized === 'inprogress' ||
+    normalized === 'pending' ||
+    normalized === 'streaming'
+  )
+}
+
+function runtimeTaskProjectionTime(task: RuntimeTaskSummary): number {
+  return Math.max(
+    runtimeTaskTimestamp(task.updatedAt),
+    runtimeTaskTimestamp(task.completedAt),
+    runtimeTaskTimestamp(task.createdAt)
+  )
+}
+
+function runtimeTaskTimestamp(value: string | number | null | undefined): number {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0
+  if (!value) return 0
+  const timestamp = Date.parse(value)
+  return Number.isNaN(timestamp) ? 0 : timestamp
+}

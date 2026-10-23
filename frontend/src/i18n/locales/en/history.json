@@ -1,0 +1,53 @@
+{
+  "title": "History",
+  "description": "Select and delete conversation history.",
+  "sections": {
+    "recent": "Recent",
+    "today": "Today",
+    "yesterday": "Yesterday",
+    "this_week": "This Week",
+    "this_month": "This Month",
+    "older": "Older"
+  },
+  "actions": {
+    "view": "View",
+    "delete": "Delete",
+    "restore": "Restore",
+    "clear_all": "Clear All",
+    "export": "Export",
+    "search": "Search History",
+    "bulk_delete": "Bulk Delete",
+    "select_all": "Select All",
+    "select_task": "Select {{title}}",
+    "selected_count": "{{count}} selected",
+    "selected_count_one": "{{count}} selected",
+    "selected_count_other": "{{count}} selected",
+    "select_all_count": "Select all {{count}} items",
+    "select_all_count_one": "Select the only item",
+    "select_all_count_other": "Select all {{count}} items"
+  },
+  "filters": {
+    "all": "All",
+    "conversations": "Conversations",
+    "tasks": "Tasks",
+    "files": "Files",
+    "searches": "Searches"
+  },
+  "empty": {
+    "title": "No History",
+    "description": "Your activity history will appear here",
+    "action": "Start using the app to see your history"
+  },
+  "confirm": {
+    "delete_item": "Are you sure you want to delete this item?",
+    "clear_all": "Are you sure you want to clear all history? This action cannot be undone.",
+    "delete_selected": "Delete {{count}} selected items?"
+  },
+  "status": {
+    "loading": "Loading history...",
+    "error": "Failed to load history",
+    "deleted": "Item deleted",
+    "restored": "Item restored",
+    "cleared": "History cleared"
+  }
+}

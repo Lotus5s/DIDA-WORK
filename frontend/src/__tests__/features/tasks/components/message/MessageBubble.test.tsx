@@ -1,0 +1,930 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import '@testing-library/jest-dom'
+import React from 'react'
+import { render, screen } from '@testing-library/react'
+
+import MessageBubble, { type Message } from '@/features/tasks/components/message/MessageBubble'
+import type { TaskDetail, Team } from '@/types/api'
+
+jest.mock('@/hooks/useTraceAction', () => ({
+  useTraceAction: () => ({
+    trace: {
+      event: jest.fn(),
+      copy: jest.fn(),
+      download: jest.fn(),
+    },
+  }),
+}))
+
+jest.mock('@/hooks/useMessageFeedback', () => ({
+  useMessageFeedback: () => ({
+    feedback: null,
+    handleLike: jest.fn(),
+    handleDislike: jest.fn(),
+  }),
+}))
+
+jest.mock('@/contexts/ShareTokenContext', () => ({
+  ShareTokenProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+}))
+
+jest.mock('@/components/common/EnhancedMarkdown', () => ({
+  __esModule: true,
+  default: ({ source }: { source: string }) => <div>{source}</div>,
+}))
+
+jest.mock('@/features/tasks/components/message/ContextBadgeList', () => ({
+  __esModule: true,
+  default: () => null,
+}))
+
+const mockBubbleTools = jest.fn()
+
+jest.mock('@/features/tasks/components/message/BubbleTools', () => ({
+  __esModule: true,
+  default: (props: unknown) => {
+    mockBubbleTools(props)
+    return null
+  },
+  CopyButton: () => null,
+  EditButton: () => null,
+}))
+
+const mockStreamingWaitIndicator = jest.fn()
+
+jest.mock('@/features/tasks/components/message/StreamingWaitIndicator', () => ({
+  __esModule: true,
+  default: (props: { message?: string }) => {
+    mockStreamingWaitIndicator(props)
+    return <div data-testid="streaming-wait-indicator">{props.message || 'waiting'}</div>
+  },
+}))
+
+jest.mock('@/features/tasks/components/message/InlineMessageEdit', () => ({
+  __esModule: true,
+  default: () => null,
+}))
+
+jest.mock('@/features/tasks/components/message/RegenerateModelPopover', () => ({
+  __esModule: true,
+  default: () => null,
+}))
+
+const mockVideoConfigBadge = jest.fn()
+
+jest.mock('@/features/tasks/components/message/VideoConfigBadge', () => ({
+  __esModule: true,
+  default: (props: unknown) => {
+    mockVideoConfigBadge(props)
+    return <div data-testid="video-config-badge" />
+  },
+}))
+
+jest.mock('@/features/tasks/components/message/ErrorCard', () => ({
+  ErrorCard: () => null,
+}))
+
+const mockReasoningDisplay = jest.fn()
+const mockMixedContentView = jest.fn()
+const mockThinkingDisplay = jest.fn()
+const mockFinalPromptMessage = jest.fn()
+
+jest.mock('@/features/tasks/components/message/thinking', () => ({
+  ReasoningDisplay: (props: { reasoningContent: string; isStreaming?: boolean }) => {
+    mockReasoningDisplay(props)
+    return <div data-testid="reasoning-display">{props.reasoningContent}</div>
+  },
+}))
+
+jest.mock('@/features/tasks/components/message/thinking/MixedContentView', () => ({
+  __esModule: true,
+  default: (props: {
+    blocks?: Array<{ type: string; content?: string }>
+    hideToolDetails?: boolean
+    onAskUserSubmit?: unknown
+  }) => {
+    mockMixedContentView(props)
+    return <div data-testid="mixed-content-view" />
+  },
+}))
+
+jest.mock('@/features/tasks/components/message/thinking/ThinkingDisplay', () => ({
+  __esModule: true,
+  default: (props: { thinking?: unknown[] }) => {
+    mockThinkingDisplay(props)
+    return <div data-testid="thinking-display" />
+  },
+}))
+
+jest.mock('@/features/tasks/components/clarification', () => ({
+  AskUserForm: () => null,
+}))
+
+jest.mock('@/features/tasks/components/message/FinalPromptMessage', () => ({
+  __esModule: true,
+  default: (props: unknown) => {
+    mockFinalPromptMessage(props)
+    return <div data-testid="final-prompt-message" />
+  },
+}))
+
+jest.mock('@/features/tasks/components/clarification/ClarificationAnswerSummary', () => ({
+  __esModule: true,
+  default: () => null,
+}))
+
+jest.mock('@/features/tasks/components/chat/SourceReferences', () => ({
+  SourceReferences: () => null,
+}))
+
+jest.mock('@/features/tasks/components/chat/GeminiAnnotations', () => ({
+  GeminiAnnotations: () => null,
+}))
+
+jest.mock('@/features/tasks/components/message/CollapsibleMessage', () => ({
+  __esModule: true,
+  default: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+}))
+
+const t = (key: string) => key
+
+const makeTeam = (overrides: Partial<Team> = {}): Team => ({
+  id: 1,
+  name: 'internal-agent-name',
+  displayName: null,
+  description: '',
+  bots: [],
+  workflow: {},
+  is_active: true,
+  user_id: 1,
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
+  ...overrides,
+})
+
+describe('MessageBubble', () => {
+  beforeEach(() => {
+    mockReasoningDisplay.mockClear()
+    mockMixedContentView.mockClear()
+    mockThinkingDisplay.mockClear()
+    mockStreamingWaitIndicator.mockClear()
+    mockBubbleTools.mockClear()
+    mockVideoConfigBadge.mockClear()
+    mockFinalPromptMessage.mockClear()
+  })
+
+  it('does not display a video config badge for image generation', () => {
+    const msg: Message = {
+      type: 'user',
+      content: 'Generate an image',
+      timestamp: Date.now(),
+      result: {
+        video_config: {
+          model: 'GPT-Image-2',
+        },
+      },
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        taskType="image"
+        theme="light"
+        t={t}
+      />
+    )
+
+    expect(screen.queryByTestId('video-config-badge')).not.toBeInTheDocument()
+    expect(mockVideoConfigBadge).not.toHaveBeenCalled()
+  })
+
+  it('does not display the config badge for video generation', () => {
+    const msg: Message = {
+      type: 'user',
+      content: 'Generate a video',
+      timestamp: Date.now(),
+      result: {
+        video_config: {
+          model: 'Seedance',
+          ratio: '16:9',
+        },
+      },
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        taskType="video"
+        theme="light"
+        t={t}
+      />
+    )
+
+    expect(screen.queryByTestId('video-config-badge')).not.toBeInTheDocument()
+    expect(mockVideoConfigBadge).not.toHaveBeenCalled()
+  })
+
+  it('offers saving completed AI Markdown to a knowledge base', () => {
+    const onSaveToKnowledge = jest.fn()
+    const msg: Message = {
+      type: 'ai',
+      content: '${$$}$# Final answer',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      subtaskStatus: 'COMPLETED',
+      status: 'completed',
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+        onSaveToKnowledge={onSaveToKnowledge}
+      />
+    )
+
+    expect(mockBubbleTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contentToCopy: '# Final answer',
+        onSaveToKnowledge,
+        showSaveToKnowledge: true,
+      })
+    )
+  })
+
+  it('keeps complete cancelled AI output saveable', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '${$$}$Partial but complete answer',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      subtaskStatus: 'CANCELLED',
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+        onSaveToKnowledge={jest.fn()}
+      />
+    )
+
+    expect(mockBubbleTools).toHaveBeenCalledWith(
+      expect.objectContaining({ showSaveToKnowledge: true })
+    )
+  })
+
+  it('re-renders when save action presence changes but ignores callback identity changes', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '${$$}$# Final answer',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      subtaskStatus: 'COMPLETED',
+      status: 'completed',
+    }
+    const team = makeTeam()
+    const props = {
+      msg,
+      index: 0,
+      selectedTaskDetail: null,
+      selectedTeam: team,
+      theme: 'light' as const,
+      t,
+    }
+    const { rerender } = render(<MessageBubble {...props} />)
+
+    expect(mockBubbleTools).toHaveBeenLastCalledWith(
+      expect.objectContaining({ showSaveToKnowledge: false })
+    )
+
+    mockBubbleTools.mockClear()
+    rerender(<MessageBubble {...props} onSaveToKnowledge={jest.fn()} />)
+
+    expect(mockBubbleTools).toHaveBeenLastCalledWith(
+      expect.objectContaining({ showSaveToKnowledge: true })
+    )
+
+    mockBubbleTools.mockClear()
+    rerender(<MessageBubble {...props} onSaveToKnowledge={jest.fn()} />)
+
+    expect(mockBubbleTools).not.toHaveBeenCalled()
+  })
+
+  it('re-renders an interactive block when its submit callback changes', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      subtaskStatus: 'RUNNING',
+      status: 'streaming',
+      result: {
+        blocks: [
+          {
+            id: 'interactive-form',
+            type: 'tool',
+            status: 'done',
+            tool_name: 'interactive_form_question',
+            tool_use_id: 'interactive-form',
+          },
+        ],
+      },
+    }
+    const firstSubmit = jest.fn()
+    const latestSubmit = jest.fn()
+    const props = {
+      msg,
+      index: 0,
+      selectedTaskDetail: null,
+      selectedTeam: makeTeam(),
+      theme: 'light' as const,
+      t,
+    }
+    const { rerender } = render(<MessageBubble {...props} onAskUserSubmit={firstSubmit} />)
+
+    mockMixedContentView.mockClear()
+    rerender(<MessageBubble {...props} onAskUserSubmit={latestSubmit} />)
+
+    expect(mockMixedContentView).toHaveBeenCalledWith(
+      expect.objectContaining({ onAskUserSubmit: latestSubmit })
+    )
+  })
+
+  it('renders card blocks when message text contains the final-format marker', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '${$$}$test-final-format-content',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      subtaskStatus: 'COMPLETED',
+      status: 'completed',
+      result: {
+        blocks: [
+          {
+            id: 'card-video',
+            type: 'card',
+            status: 'done',
+            card_id: 'card-video',
+            card_type: 'video_director_generation',
+            card_status: 'populated',
+            card_data: {},
+          },
+        ],
+      },
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+      />
+    )
+
+    expect(mockMixedContentView).toHaveBeenCalledWith(
+      expect.objectContaining({
+        blocks: [expect.objectContaining({ id: 'card-video', type: 'card' })],
+      })
+    )
+    expect(mockFinalPromptMessage).not.toHaveBeenCalled()
+  })
+
+  it('renders a strict final requirement prompt as a confirmation card before text blocks', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      subtaskId: 456,
+      subtaskStatus: 'COMPLETED',
+      status: 'completed',
+      result: {
+        blocks: [
+          {
+            id: 'final-text',
+            type: 'text',
+            status: 'done',
+            content: [
+              '以下是整合后的最终版本。',
+              '',
+              '## ✅ Final Requirement Prompt',
+              '',
+              'Build the shopping website.',
+            ].join('\n'),
+          },
+        ],
+      },
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={{ id: 123 } as TaskDetail}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+        isPendingConfirmation
+      />
+    )
+
+    expect(mockFinalPromptMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: {
+          type: 'final_prompt',
+          final_prompt: 'Build the shopping website.',
+        },
+        taskId: 123,
+        subtaskId: 456,
+        isPendingConfirmation: true,
+      })
+    )
+    expect(mockMixedContentView).not.toHaveBeenCalled()
+  })
+
+  it('preserves Deep Research citation links in regular messages', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '${$$}$Research result [cite: 1]',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      subtaskStatus: 'COMPLETED',
+      status: 'completed',
+      result: {
+        annotations: [
+          {
+            start_index: 16,
+            end_index: 25,
+            source: 'https://example.com/source',
+          },
+        ],
+      },
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+        onSaveToKnowledge={jest.fn()}
+      />
+    )
+
+    expect(mockBubbleTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contentToCopy: 'Research result (参考来源: [1](https://example.com/source))',
+        showSaveToKnowledge: true,
+      })
+    )
+  })
+
+  it.each([
+    {
+      name: 'error',
+      overrides: { status: 'error' as const, subtaskStatus: 'FAILED' },
+    },
+    {
+      name: 'incomplete',
+      overrides: {
+        status: 'completed' as const,
+        subtaskStatus: 'COMPLETED',
+        isIncomplete: true,
+      },
+    },
+    {
+      name: 'empty',
+      overrides: {
+        status: 'completed' as const,
+        subtaskStatus: 'COMPLETED',
+        content: '${$$}$',
+      },
+    },
+  ])('does not offer saving $name AI messages', ({ overrides }) => {
+    const msg: Message = {
+      type: 'ai',
+      content: '${$$}$Answer',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      ...overrides,
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+        onSaveToKnowledge={jest.fn()}
+      />
+    )
+
+    expect(mockBubbleTools.mock.calls.some(call => call[0].showSaveToKnowledge === true)).toBe(
+      false
+    )
+  })
+
+  it('does not render save tools for a streaming AI message', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '${$$}$Answer',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      status: 'streaming',
+      subtaskStatus: 'RUNNING',
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+        onSaveToKnowledge={jest.fn()}
+      />
+    )
+
+    expect(mockBubbleTools).not.toHaveBeenCalled()
+  })
+
+  it('does not render save tools for an empty AI message', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '${$$}$',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      status: 'completed',
+      subtaskStatus: 'COMPLETED',
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+        onSaveToKnowledge={jest.fn()}
+      />
+    )
+
+    expect(mockBubbleTools).not.toHaveBeenCalled()
+  })
+
+  it('saves only text blocks from a completed blocks message', () => {
+    const onSaveToKnowledge = jest.fn()
+    const msg: Message = {
+      type: 'ai',
+      content: 'Second paragraph',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      status: 'completed',
+      subtaskStatus: 'COMPLETED',
+      result: {
+        blocks: [
+          {
+            id: 'thinking-1',
+            type: 'thinking',
+            status: 'done',
+            content: 'Private reasoning',
+          },
+          {
+            id: 'text-1',
+            type: 'text',
+            status: 'done',
+            content: 'First paragraph',
+          },
+          {
+            id: 'text-2',
+            type: 'text',
+            status: 'done',
+            content: 'Second paragraph',
+          },
+        ],
+      },
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+        onSaveToKnowledge={onSaveToKnowledge}
+      />
+    )
+
+    expect(mockBubbleTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contentToCopy: 'First paragraph\n\nSecond paragraph',
+        onSaveToKnowledge,
+        showSaveToKnowledge: true,
+      })
+    )
+  })
+
+  it('preserves Deep Research citation links in blocks messages', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: 'Second result [cite: 2]',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      status: 'completed',
+      subtaskStatus: 'COMPLETED',
+      result: {
+        blocks: [
+          {
+            id: 'text-1',
+            type: 'text',
+            status: 'done',
+            content: 'First result [cite: 1]',
+          },
+          {
+            id: 'text-2',
+            type: 'text',
+            status: 'done',
+            content: 'Second result [cite: 2]',
+          },
+        ],
+        annotations: [
+          {
+            start_index: 13,
+            end_index: 22,
+            source: 'https://example.com/first',
+          },
+          {
+            start_index: 37,
+            end_index: 46,
+            source: 'https://example.com/second',
+          },
+        ],
+      },
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+        onSaveToKnowledge={jest.fn()}
+      />
+    )
+
+    expect(mockBubbleTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contentToCopy:
+          'First result (参考来源: [1](https://example.com/first))\n\n' +
+          'Second result (参考来源: [2](https://example.com/second))',
+        showSaveToKnowledge: true,
+      })
+    )
+  })
+
+  it('shows the selected agent displayName for AI message headers', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '${$$}$hello',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      botName: 'internal-agent-name',
+      subtaskStatus: 'COMPLETED',
+      status: 'completed',
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam({ displayName: 'Friendly Agent' })}
+        theme="light"
+        t={t}
+      />
+    )
+
+    expect(screen.getByText('Friendly Agent')).toBeInTheDocument()
+    expect(screen.queryByText('internal-agent-name')).not.toBeInTheDocument()
+  })
+
+  it('shows the bot name with the agent displayName for multi-bot teams', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '${$$}$hello',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      botName: 'Planner Bot',
+      subtaskStatus: 'COMPLETED',
+      status: 'completed',
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam({
+          displayName: 'Friendly Agent',
+          bots: [
+            { bot_id: 1, bot_prompt: '' },
+            { bot_id: 2, bot_prompt: '' },
+          ],
+        })}
+        theme="light"
+        t={t}
+      />
+    )
+
+    expect(screen.getByText('Friendly Agent · Planner Bot')).toBeInTheDocument()
+  })
+
+  it('shows inline thinking blocks with the ChatShell reasoning display and omits them from mixed content', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      botName: 'Claude Bot',
+      subtaskStatus: 'RUNNING',
+      status: 'streaming',
+      result: {
+        blocks: [
+          {
+            id: 'thinking-1',
+            type: 'thinking',
+            status: 'streaming',
+            content: 'I need to inspect the current directory.',
+          },
+          {
+            id: 'text-1',
+            type: 'text',
+            status: 'streaming',
+            content: 'Visible answer',
+          },
+        ],
+      },
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+      />
+    )
+
+    expect(screen.getByTestId('reasoning-display')).toHaveTextContent(
+      'I need to inspect the current directory.'
+    )
+    expect(mockReasoningDisplay).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reasoningContent: 'I need to inspect the current directory.',
+        isStreaming: true,
+      })
+    )
+    expect(mockMixedContentView).toHaveBeenCalledWith(
+      expect.objectContaining({
+        blocks: [
+          expect.objectContaining({
+            id: 'text-1',
+            type: 'text',
+            content: 'Visible answer',
+          }),
+        ],
+      })
+    )
+  })
+
+  it('renders tool usage from thinking when device messages also contain content blocks', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      botName: 'Claude Bot',
+      subtaskStatus: 'RUNNING',
+      status: 'streaming',
+      thinking: [
+        {
+          title: 'Using Write',
+          next_action: 'continue',
+          tool_use_id: 'tool-write-1',
+          details: {
+            type: 'tool_use',
+            tool_name: 'Write',
+            status: 'started',
+            input: { file_path: 'PROJECT_INTRO.md' },
+          },
+        },
+        {
+          title: 'Result from Write',
+          next_action: 'continue',
+          tool_use_id: 'tool-write-1',
+          details: {
+            type: 'tool_result',
+            tool_name: 'Write',
+            status: 'completed',
+            content: 'created',
+          },
+        },
+      ],
+      result: {
+        blocks: [
+          {
+            id: 'thinking-1',
+            type: 'thinking',
+            status: 'done',
+            content: 'I need to create a project intro document.',
+          },
+          {
+            id: 'text-1',
+            type: 'text',
+            status: 'streaming',
+            content: 'I will create the document.',
+          },
+        ],
+      },
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+      />
+    )
+
+    expect(screen.getByTestId('thinking-display')).toBeInTheDocument()
+    expect(mockThinkingDisplay).toHaveBeenCalledWith(
+      expect.objectContaining({
+        thinking: msg.thinking,
+      })
+    )
+    expect(mockMixedContentView).toHaveBeenCalledWith(
+      expect.objectContaining({
+        blocks: [
+          expect.objectContaining({
+            id: 'text-1',
+            type: 'text',
+          }),
+        ],
+      })
+    )
+  })
+
+  it('uses the ChatShell reasoning display for empty streaming wait states', () => {
+    const msg: Message = {
+      type: 'ai',
+      content: '',
+      timestamp: new Date('2026-01-01T00:00:00Z').getTime(),
+      botName: 'Claude Bot',
+      subtaskStatus: 'RUNNING',
+      status: 'streaming',
+    }
+
+    render(
+      <MessageBubble
+        msg={msg}
+        index={0}
+        selectedTaskDetail={null}
+        selectedTeam={makeTeam()}
+        theme="light"
+        t={t}
+        isWaiting={true}
+        waitingMessage="正在思考"
+      />
+    )
+
+    expect(screen.getByTestId('reasoning-display')).toHaveTextContent('正在思考')
+    expect(mockReasoningDisplay).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reasoningContent: '正在思考',
+        isStreaming: true,
+      })
+    )
+    expect(screen.queryByTestId('streaming-wait-indicator')).not.toBeInTheDocument()
+    expect(mockStreamingWaitIndicator).not.toHaveBeenCalled()
+  })
+})

@@ -1,0 +1,834 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Socket.IO event definitions and payload schemas.
+
+This module defines all event names and Pydantic models for
+Socket.IO message payloads.
+"""
+
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, Field
+
+from app.core.constants import CLIENT_ORIGIN_FRONTEND, SUPPORTED_CLIENT_ORIGINS
+
+# ============================================================
+# Event Names
+# ============================================================
+
+
+class ClientEvents:
+    """Client -> Server event names."""
+
+    # Chat events
+    CHAT_SEND = "chat:send"
+    CHAT_CANCEL = "chat:cancel"
+    CHAT_RESUME = "chat:resume"
+    CHAT_RETRY = "chat:retry"
+    CHAT_GUIDE = "chat:guide"
+
+    # Task room events
+    TASK_JOIN = "task:join"
+    TASK_LEAVE = "task:leave"
+
+    # History sync
+    # History sync
+    HISTORY_SYNC = "history:sync"
+
+    # Generic Skill Events
+    SKILL_RESPONSE = "skill:response"  # Client -> Server: skill response
+
+
+class ServerEvents:
+    """Server -> Client event names."""
+
+    # Authentication events
+    AUTH_ERROR = "auth:error"  # Token expired or invalid
+
+    # Chat streaming events (to task room)
+    CHAT_START = "chat:start"
+    CHAT_CHUNK = "chat:chunk"
+    CHAT_DONE = "chat:done"
+    CHAT_ERROR = "chat:error"
+    CHAT_CANCELLED = "chat:cancelled"
+    CHAT_STATUS_UPDATED = "chat:status_updated"
+
+    # Block events for mixed content rendering (to task room)
+    CHAT_BLOCK_CREATED = "chat:block_created"
+    CHAT_BLOCK_UPDATED = "chat:block_updated"
+    CHAT_GUIDANCE_QUEUED = "chat:guidance_queued"
+    CHAT_GUIDANCE_APPLIED = "chat:guidance_applied"
+    CHAT_GUIDANCE_EXPIRED = "chat:guidance_expired"
+
+    # Non-streaming messages (to task room, exclude sender)
+    CHAT_MESSAGE = "chat:message"
+    CHAT_BOT_COMPLETE = "chat:bot_complete"
+    CHAT_SYSTEM = "chat:system"
+
+    # Correction events (to task room)
+    CORRECTION_START = "correction:start"
+    CORRECTION_PROGRESS = "correction:progress"
+    CORRECTION_CHUNK = "correction:chunk"
+    CORRECTION_DONE = "correction:done"
+    CORRECTION_ERROR = "correction:error"
+
+    # Task list events (to user room)
+    TASK_CREATED = "task:created"
+    TASK_DELETED = "task:deleted"
+    TASK_RENAMED = "task:renamed"
+    TASK_STATUS = "task:status"
+    TASK_SHARED = "task:shared"
+    TASK_INVITED = "task:invited"  # User invited to group chat
+    TASK_APP_UPDATE = "task:app_update"  # App data updated (to task room)
+    UNREAD_COUNT = "unread:count"
+
+    # Generic Skill Events
+    SKILL_REQUEST = "skill:request"  # Server -> Client: skill request
+
+    # Background execution events (to user room)
+    BACKGROUND_EXECUTION_UPDATE = "background:execution_update"
+    SUBSCRIPTION_GROUP_BINDING_UPDATED = "subscription:group_binding_updated"
+
+    # Pet events (to user room)
+    PET_EXPERIENCE_GAINED = "pet:experience_gained"
+    PET_STAGE_EVOLVED = "pet:stage_evolved"
+    PET_TRAITS_UPDATED = "pet:traits_updated"
+
+    # Work queue events (to user room)
+    QUEUE_MESSAGE_RECEIVED = "queue:message_received"  # New message in queue
+    QUEUE_MESSAGE_PROCESSED = "queue:message_processed"  # Message processed
+    QUEUE_REPLY_RECEIVED = "queue:reply_received"  # Received reply from processing
+
+    # Plugin lifecycle events (to Wework user room)
+    PLUGIN_RELEASE_AVAILABLE = "plugin:release_available"
+
+
+# ============================================================
+# Client -> Server Payloads
+# ============================================================
+
+
+class ContextItem(BaseModel):
+    """Generic context item that can be of different types."""
+
+    type: str = Field(..., description="Context type (e.g., 'knowledge_base')")
+    data: Dict[str, Any] = Field(..., description="Context-specific data")
+
+
+class SkillRef(BaseModel):
+    """Skill reference retaining the canonical ID across shared bindings."""
+
+    skill_id: Optional[int] = Field(default=None, gt=0)
+    name: str = Field(..., description="Skill name")
+    namespace: str = Field(..., description="Skill namespace")
+    is_public: bool = Field(..., description="Whether the skill is public")
+
+
+class GenerateParams(BaseModel):
+    """Generation parameters selected for video, image, or media-aware chat tasks."""
+
+    resolution: Optional[str] = Field(
+        None, description="Video resolution (e.g., '720p')"
+    )
+    ratio: Optional[str] = Field(None, description="Aspect ratio (e.g., '16:9')")
+    duration: Optional[int] = Field(None, description="Duration in seconds")
+    model: Optional[str] = Field(None, description="Selected generation model name")
+    model_display_name: Optional[str] = Field(
+        None, description="Selected generation model display name"
+    )
+    generation_mode_id: Optional[str] = Field(
+        None, description="Selected video generation mode"
+    )
+    size: Optional[str] = Field(None, description="Image dimensions (e.g., '1512x648')")
+    model: Optional[str] = Field(
+        None, description="Selected generation model resource name"
+    )
+
+
+class ChatExecutionWorkspacePayload(BaseModel):
+    """Workspace execution intent for chat:send."""
+
+    source: Literal["git_worktree"] = Field(
+        ..., description="Execution workspace source"
+    )
+    branch: Optional[str] = Field(
+        None, description="Optional source branch used to create the worktree"
+    )
+
+
+class ChatExecutionPayload(BaseModel):
+    """Execution options for chat:send."""
+
+    workspace: Optional[ChatExecutionWorkspacePayload] = Field(
+        None, description="Workspace execution options"
+    )
+
+
+class InteractiveFormAnswerPayload(BaseModel):
+    """Structured answer for a deferred interactive_form_question tool call."""
+
+    type: Literal["interactive_form_question"] = Field(
+        "interactive_form_question",
+        description="Interactive form answer type",
+    )
+    tool_use_id: str = Field(
+        ...,
+        description="Deferred tool call ID for the rendered form",
+    )
+    task_id: Optional[int] = Field(None, description="Task ID for the rendered form")
+    subtask_id: Optional[int] = Field(
+        None,
+        description="Assistant subtask ID that rendered the form",
+    )
+    answers: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Normalized answer values keyed by question ID",
+    )
+    success: bool = Field(
+        True,
+        description="Whether the user submitted the form successfully.",
+    )
+    status: Literal["answered", "cancelled"] = Field(
+        "answered",
+        description="Answer status for the deferred form tool result.",
+    )
+    message: Optional[str] = Field(
+        None,
+        description="Human-readable formatted answer message",
+    )
+
+
+class ArtifactNodeContextPayload(BaseModel):
+    """Reference to an interactive knowledge Artifact node."""
+
+    artifact_id: str = Field(..., min_length=1, max_length=100)
+    node_id: str = Field(..., min_length=1, max_length=100)
+
+
+class ChatSendPayload(BaseModel):
+    """Payload for chat:send event."""
+
+    task_id: Optional[int] = Field(None, description="Task ID for multi-turn chat")
+    team_id: int = Field(..., description="Team ID")
+    message: str = Field(..., description="User message content")
+    title: Optional[str] = Field(None, description="Custom title for new tasks")
+    action: Optional[str] = Field(
+        None,
+        description="Action type. 'pipeline:confirm' for pipeline stage confirmation.",
+    )
+    attachment_id: Optional[int] = Field(
+        None, description="Optional attachment ID (deprecated, use attachment_ids)"
+    )
+    attachment_ids: Optional[List[int]] = Field(
+        None, description="Optional list of attachment IDs"
+    )
+    enable_deep_thinking: bool = Field(
+        True, description="Enable deep thinking mode (enables tool usage)"
+    )
+    enable_web_search: bool = Field(False, description="Enable web search")
+    search_engine: Optional[str] = Field(None, description="Search engine to use")
+    enable_clarification: bool = Field(
+        False, description="Enable clarification mode for smart follow-up questions"
+    )
+    force_override_bot_model: Optional[str] = Field(
+        None, description="Override model name"
+    )
+    force_override_bot_model_type: Optional[str] = Field(
+        None, description="Override model type"
+    )
+    model_options: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Model selection options, such as reasoning or speed.",
+    )
+    is_group_chat: bool = Field(
+        False, description="Whether this is a group chat (for new tasks)"
+    )
+    contexts: Optional[List[ContextItem]] = Field(
+        None, description="Context items (knowledge bases, etc.)"
+    )
+    # Repository info for code tasks
+    git_url: Optional[str] = Field(None, description="Git repository URL")
+    git_repo: Optional[str] = Field(None, description="Git repository name")
+    git_repo_id: Optional[int] = Field(None, description="Git repository ID")
+    git_domain: Optional[str] = Field(None, description="Git domain")
+    branch_name: Optional[str] = Field(None, description="Git branch name")
+    task_type: Optional[
+        Literal["chat", "code", "knowledge", "task", "video", "image"]
+    ] = Field(
+        None, description="Task type: chat, code, knowledge, task, video, or image"
+    )
+    knowledge_base_id: Optional[int] = Field(
+        None, description="Knowledge base ID for knowledge type tasks"
+    )
+    artifact_context: Optional[ArtifactNodeContextPayload] = Field(
+        None,
+        description="Interactive Artifact node that initiated this knowledge message",
+    )
+    additional_skills: Optional[List[SkillRef]] = Field(
+        None,
+        description="Additional skills with full info (name, namespace, is_public)",
+    )
+    # Local device execution
+    device_id: Optional[str] = Field(
+        None,
+        description="Local device ID for task execution (if None, use cloud executor)",
+    )
+    # Project association
+    project_id: Optional[int] = Field(
+        None,
+        description="Project ID to associate this task with",
+    )
+    client_origin: str = Field(
+        CLIENT_ORIGIN_FRONTEND,
+        description="Client surface that owns this task",
+        pattern=f"^({'|'.join(SUPPORTED_CLIENT_ORIGINS)})$",
+    )
+    # Video generation parameters (user-selected at generation time)
+    generate_params: Optional[GenerateParams] = Field(
+        None, description="Video generation params from user selection"
+    )
+    interactive_form_answer: Optional[InteractiveFormAnswerPayload] = Field(
+        None,
+        description="Answer payload for a deferred interactive_form_question tool call",
+    )
+    execution: Optional[ChatExecutionPayload] = Field(
+        None,
+        description="Execution options for new tasks",
+    )
+
+
+class ChatCancelPayload(BaseModel):
+    """Payload for chat:cancel event."""
+
+    subtask_id: int = Field(..., description="Subtask ID to cancel")
+    partial_content: Optional[str] = Field(
+        None, description="Partial content received so far"
+    )
+    shell_type: Optional[str] = Field(
+        None, description="Shell type of the bot (e.g., 'Chat', 'ClaudeCode', 'Agno')"
+    )
+
+
+class ChatResumePayload(BaseModel):
+    """Payload for chat:resume event."""
+
+    task_id: int = Field(..., description="Task ID")
+    subtask_id: int = Field(..., description="Subtask ID to resume")
+    offset: int = Field(0, description="Current content offset")
+
+
+class ChatRetryPayload(BaseModel):
+    """Payload for chat:retry event."""
+
+    task_id: int = Field(..., description="Task ID")
+    subtask_id: int = Field(..., description="Failed AI subtask ID to retry")
+    # Optional: Model to use for retry (overrides task metadata model if provided)
+    force_override_bot_model: Optional[str] = Field(
+        None, description="Model ID to override bot model for this retry"
+    )
+    force_override_bot_model_type: Optional[str] = Field(
+        None, description="Model type (public/user) for the override model"
+    )
+    # Flag indicating whether to use model override
+    # When false and force_override_bot_model is None, use bot's default model
+    use_model_override: bool = Field(
+        False,
+        description="If true, use force_override_bot_model; if false, use bot's default model",
+    )
+
+
+class ChatGuidePayload(BaseModel):
+    """Payload for chat:guide event."""
+
+    task_id: int = Field(..., description="Task ID")
+    subtask_id: int = Field(..., description="Active assistant subtask ID")
+    team_id: int = Field(..., description="Team ID")
+    message: str = Field(..., min_length=1, description="Guidance message")
+    client_guidance_id: Optional[str] = Field(
+        None, description="Client-generated guidance ID for correlation"
+    )
+
+
+class TaskJoinPayload(BaseModel):
+    """Payload for task:join event."""
+
+    task_id: int = Field(..., description="Task ID to join")
+    after_message_id: Optional[int] = Field(
+        None,
+        description="If provided, only return messages after this message_id (for incremental sync on reconnect)",
+    )
+
+
+class TaskLeavePayload(BaseModel):
+    """Payload for task:leave event."""
+
+    task_id: int = Field(..., description="Task ID to leave")
+
+
+class HistorySyncPayload(BaseModel):
+    """Payload for history:sync event."""
+
+    task_id: int = Field(..., description="Task ID")
+    after_message_id: int = Field(..., description="Get messages after this ID")
+
+
+# ============================================================
+# Server -> Client Payloads
+# ============================================================
+
+
+class ChatStartPayload(BaseModel):
+    """Payload for chat:start event."""
+
+    task_id: int
+    subtask_id: int
+    bot_name: Optional[str] = None
+
+
+class SourceReference(BaseModel):
+    """Reference to a knowledge base source document."""
+
+    index: int = Field(..., description="Source index number (e.g., 1, 2, 3)")
+    title: str = Field(..., description="Document title/filename")
+    kb_id: Optional[int] = Field(None, description="Knowledge base ID")
+    source_id: Optional[str] = Field(None, description="Provider-specific source ID")
+    source_type: Optional[str] = Field(None, description="Provider source type")
+    source_uri: Optional[str] = Field(None, description="Provider source URI")
+    source_name: Optional[str] = Field(None, description="Provider source name")
+
+
+class RetrievalSummaryPayload(BaseModel):
+    """Aggregated retrieval coverage summary for a response."""
+
+    searched_source_ids: List[str] = Field(default_factory=list)
+    ignored_source_ids: List[str] = Field(default_factory=list)
+    source_statuses: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ChatChunkPayload(BaseModel):
+    """Payload for chat:chunk event."""
+
+    subtask_id: int
+    content: str
+    offset: int
+    task_id: Optional[int] = None  # Add task_id for page refresh recovery
+    sources: Optional[List[SourceReference]] = Field(
+        None, description="Knowledge base source references (for RAG citations)"
+    )
+    progress: Optional[int] = Field(
+        None, description="Progress percentage (0-100) for long-running operations"
+    )
+
+
+class ChatDonePayload(BaseModel):
+    """Payload for chat:done event."""
+
+    subtask_id: int
+    offset: int
+    result: Dict[str, Any] = Field(default_factory=dict)
+    message_id: Optional[int] = None  # Add message_id for message ordering
+    task_id: Optional[int] = None  # Add task_id for group chat members
+    sources: Optional[List[SourceReference]] = Field(
+        None, description="Knowledge base source references (for RAG citations)"
+    )
+    retrieval_summary: Optional[RetrievalSummaryPayload] = Field(
+        None, description="Aggregated retrieval coverage summary"
+    )
+
+
+class ChatErrorPayload(BaseModel):
+    """Payload for chat:error event."""
+
+    subtask_id: int
+    error: str
+    type: Optional[str] = None
+    message_id: Optional[int] = None
+    task_id: Optional[int] = None
+
+
+class ChatCancelledPayload(BaseModel):
+    """Payload for chat:cancelled event."""
+
+    subtask_id: int
+
+
+class ChatMessagePayload(BaseModel):
+    """Payload for chat:message event (non-streaming message)."""
+
+    subtask_id: int
+    task_id: int
+    message_id: int = Field(
+        ..., description="Message ID for ordering (primary sort key)"
+    )
+    role: str
+    content: str
+    sender: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    attachment: Optional[Dict[str, Any]] = Field(
+        None, description="Single attachment info (for backward compatibility)"
+    )
+    attachments: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Multiple attachments info (legacy)"
+    )
+    contexts: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Subtask contexts (attachments, knowledge bases, etc.)"
+    )
+
+
+class ChatBotCompletePayload(BaseModel):
+    """Payload for chat:bot_complete event."""
+
+    subtask_id: int
+    task_id: int
+    content: str
+    result: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+
+
+class ChatSystemPayload(BaseModel):
+    """Payload for chat:system event."""
+
+    task_id: int
+    type: str
+    content: str
+    data: Optional[Dict[str, Any]] = None
+
+
+class ChatGuidanceQueuedPayload(BaseModel):
+    """Payload for chat:guidance_queued event."""
+
+    task_id: int
+    subtask_id: int
+    team_id: int
+    user_id: int
+    guidance_id: str
+    message: str
+    created_at: str
+
+
+class ChatGuidanceAppliedPayload(BaseModel):
+    """Payload for chat:guidance_applied event."""
+
+    task_id: int
+    subtask_id: int
+    guidance_id: str
+    applied_at: str
+
+
+class ChatGuidanceExpiredPayload(BaseModel):
+    """Payload for chat:guidance_expired event."""
+
+    task_id: int
+    subtask_id: int
+    guidance_ids: List[str]
+
+
+class TaskCreatedPayload(BaseModel):
+    """Payload for task:created event."""
+
+    task_id: int
+    title: str
+    team_id: int
+    team_name: str
+    created_at: str
+    is_group_chat: bool = False
+
+
+class TaskDeletedPayload(BaseModel):
+    """Payload for task:deleted event."""
+
+    task_id: int
+
+
+class TaskRenamedPayload(BaseModel):
+    """Payload for task:renamed event."""
+
+    task_id: int
+    title: str
+
+
+class TaskStatusPayload(BaseModel):
+    """Payload for task:status event."""
+
+    task_id: int
+    status: str
+    progress: Optional[int] = None
+    completed_at: Optional[str] = None
+
+
+class TaskSharedPayload(BaseModel):
+    """Payload for task:shared event."""
+
+    task_id: int
+    title: str
+    shared_by: Dict[str, Any]
+
+
+class TaskInvitedPayload(BaseModel):
+    """Payload for task:invited event (user invited to group chat)."""
+
+    task_id: int
+    title: str
+    team_id: int
+    team_name: str
+    invited_by: Dict[str, Any]
+    is_group_chat: bool = True
+    created_at: str
+
+
+class TaskAppUpdatePayload(BaseModel):
+    """Payload for task:app_update event (app preview data updated)."""
+
+    task_id: int
+    app: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="App data (name, address, previewUrl)",
+    )
+
+
+class UnreadCountPayload(BaseModel):
+    """Payload for unread:count event."""
+
+    count: int
+
+
+# ============================================================
+# Generic Skill Payloads
+# ============================================================
+
+
+class SkillRequestPayload(BaseModel):
+    """
+    Generic payload for skill requests from server to frontend.
+
+    This is the unified payload format for all skills that require
+    frontend interaction (rendering, validation, etc.).
+    """
+
+    request_id: str = Field(..., description="Unique request ID for correlation")
+    skill_name: str = Field(..., description="Name of the skill")
+    action: str = Field(
+        ..., description="Action to perform (e.g., 'render', 'validate')"
+    )
+    data: Dict[str, Any] = Field(
+        default_factory=dict, description="Skill-specific data payload"
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for Socket.IO emission."""
+        return {
+            "request_id": self.request_id,
+            "skill_name": self.skill_name,
+            "action": self.action,
+            "data": self.data,
+        }
+
+
+class SkillResponsePayload(BaseModel):
+    """
+    Generic payload for skill responses from frontend to server.
+
+    This is the unified payload format for all skill responses.
+    """
+
+    request_id: str = Field(..., description="Request ID for correlation")
+    skill_name: str = Field(..., description="Name of the skill")
+    action: str = Field(..., description="Action that was performed")
+    success: bool = Field(..., description="Whether the action succeeded")
+    result: Optional[Any] = Field(None, description="Success result data")
+    error: Optional[str] = Field(None, description="Error message if failed")
+
+
+# ============================================================
+# Correction Event Payloads
+# ============================================================
+
+
+class CorrectionStartPayload(BaseModel):
+    """Payload for correction:start event."""
+
+    task_id: int
+    subtask_id: int
+    correction_model: str
+
+
+class CorrectionProgressPayload(BaseModel):
+    """Payload for correction:progress event.
+
+    Stages:
+    - verifying_facts: Using search tools to verify facts
+    - evaluating: Evaluating the AI response quality
+    - generating_improvement: Generating improved answer
+    """
+
+    task_id: int
+    subtask_id: int
+    stage: Literal["verifying_facts", "evaluating", "generating_improvement"]
+    tool_name: Optional[str] = None
+
+
+class CorrectionChunkPayload(BaseModel):
+    """Payload for correction:chunk event (streaming content)."""
+
+    task_id: int
+    subtask_id: int
+    field: Literal["summary", "improved_answer"]
+    content: str
+    offset: int
+
+
+class CorrectionDonePayload(BaseModel):
+    """Payload for correction:done event."""
+
+    task_id: int
+    subtask_id: int
+    result: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CorrectionErrorPayload(BaseModel):
+    """Payload for correction:error event."""
+
+    task_id: int
+    subtask_id: int
+    error: str
+
+
+# ============================================================
+# Background Execution Event Payloads
+# ============================================================
+
+
+class BackgroundExecutionUpdatePayload(BaseModel):
+    """Payload for background:execution_update event."""
+
+    execution_id: int = Field(..., description="Background execution ID")
+    subscription_id: int = Field(..., description="Subscription ID")
+    subscription_name: Optional[str] = Field(None, description="Subscription name")
+    subscription_display_name: Optional[str] = Field(
+        None, description="Subscription display name"
+    )
+    team_name: Optional[str] = Field(None, description="Team name")
+    status: str = Field(..., description="Execution status")
+    task_id: Optional[int] = Field(None, description="Associated task ID")
+    task_type: Optional[str] = Field(
+        None, description="Task type (execution/collection)"
+    )
+    prompt: Optional[str] = Field(None, description="Prompt used")
+    result_summary: Optional[str] = Field(None, description="Result summary")
+    error_message: Optional[str] = Field(None, description="Error message if failed")
+    trigger_reason: Optional[str] = Field(None, description="Trigger reason")
+    created_at: str = Field(..., description="Creation timestamp")
+    updated_at: str = Field(..., description="Last update timestamp")
+
+
+# ============================================================
+# Work Queue Event Payloads
+# ============================================================
+
+
+class QueueMessageReceivedPayload(BaseModel):
+    """Payload for queue:message_received event."""
+
+    message_id: int = Field(..., description="Queue message ID")
+    queue_id: int = Field(..., description="Work queue ID")
+    queue_name: str = Field(..., description="Work queue name")
+    sender_id: int = Field(..., description="Sender user ID")
+    sender_name: str = Field(..., description="Sender username")
+    preview: str = Field(..., description="Message content preview")
+    priority: str = Field(..., description="Message priority")
+    created_at: str = Field(..., description="Creation timestamp")
+
+
+class QueueMessageProcessedPayload(BaseModel):
+    """Payload for queue:message_processed event."""
+
+    message_id: int = Field(..., description="Queue message ID")
+    queue_id: int = Field(..., description="Work queue ID")
+    status: str = Field(..., description="New message status")
+    process_task_id: Optional[int] = Field(None, description="Processing task ID")
+    result_preview: Optional[str] = Field(None, description="Processing result preview")
+
+
+class QueueReplyReceivedPayload(BaseModel):
+    """Payload for queue:reply_received event."""
+
+    original_message_id: int = Field(..., description="Original forwarded message ID")
+    reply_from_user_id: int = Field(..., description="User who processed the message")
+    reply_from_user_name: str = Field(..., description="Username of processor")
+    reply_content: str = Field(..., description="Reply content")
+    created_at: str = Field(..., description="Reply timestamp")
+
+
+# ============================================================
+# ACK Responses
+# ============================================================
+
+
+class ChatSendAck(BaseModel):
+    """ACK response for chat:send event."""
+
+    task_id: Optional[int] = None
+    subtask_id: Optional[int] = None
+    message_id: Optional[int] = None  # Message ID for the user's subtask
+    error: Optional[str] = None
+    # Pipeline confirmation response fields
+    current_stage: Optional[int] = Field(
+        None, description="Current stage number (for pipeline:confirm action)"
+    )
+    total_stages: Optional[int] = Field(
+        None, description="Total number of stages (for pipeline:confirm action)"
+    )
+    next_stage_name: Optional[str] = Field(
+        None, description="Name of the next stage (for pipeline:confirm action)"
+    )
+
+
+class ChatGuideAck(BaseModel):
+    """ACK response for chat:guide event."""
+
+    guidance_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+class TaskJoinAck(BaseModel):
+    """ACK response for task:join event."""
+
+    streaming: Optional[Dict[str, Any]] = None
+    subtasks: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Subtasks data for immediate message sync"
+    )
+    status_updated: Optional[Dict[str, Any]] = Field(
+        None, description="Latest cached chat:status_updated snapshot"
+    )
+    error: Optional[str] = None
+
+
+class HistorySyncAck(BaseModel):
+    """ACK response for history:sync event."""
+
+    messages: List[Dict[str, Any]] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
+class GenericAck(BaseModel):
+    """Generic ACK response."""
+
+    success: bool = True
+    error: Optional[str] = None
+
+
+# ============================================================
+# Authentication Error Payloads
+# ============================================================
+
+
+class AuthErrorPayload(BaseModel):
+    """Payload for auth:error event."""
+
+    error: str = Field(..., description="Error message")
+    code: Literal["TOKEN_EXPIRED", "INVALID_TOKEN"] = Field(
+        ..., description="Error code for identifying the type of auth error"
+    )

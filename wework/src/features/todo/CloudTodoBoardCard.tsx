@@ -1,0 +1,478 @@
+import { runtimeTaskProgress, runtimeToolActivityText } from '@wegent/collaboration'
+import {
+  IssueBoardCard,
+  IssueBoardCardContent,
+  IssueCardTaskSummary,
+  createIssueBoardCardLabels,
+  createCollaborationTranslator,
+} from '@wegent/collaboration'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from 'react'
+import type { CollaborationIssueBadge } from '@wegent/collaboration'
+import type { CloudLoopItem } from '@/api/deliveries'
+import { canEditProjectSpaceIssue } from './projectSpaceSelection'
+import type { TaskChangeRequestSnapshot, TaskChangeRequestTarget } from '@/api/changeRequests'
+import { DshContributionSlotSurface } from '@/features/dsh-runtime/DshContributionSlotSurface'
+import { WEWORK_DSH_SLOTS } from '@/features/dsh-runtime/dshUiSlots'
+import { TemporaryChatPanel } from '@/components/layout/workspace-panels/TemporaryChatPanel'
+import { Tooltip } from '@/components/ui/tooltip'
+import {
+  getRuntimeConversationTurns,
+  runtimeConversationKey,
+  subscribeRuntimeConversation,
+} from '@/features/workbench/runtimeConversationCache'
+import type { RuntimeLiveActivity } from '@/features/workbench/runtimeThinking'
+import { useTranslation } from '@/hooks/useTranslation'
+import type {
+  ModelSelectionConfig,
+  RuntimeGoal,
+  RuntimeTaskAddress,
+  RuntimeTaskSummary,
+} from '@/types/api'
+import type { RuntimeConversationTurn } from '@/types/workbench'
+import type { ChangeRequestMonitor } from '@/features/workbench/changeRequestMonitor'
+import { useTaskChangeRequest } from '@/features/workbench/changeRequestMonitor'
+import {
+  autoRepairStatus,
+  stoppedTaskNeedsAttention,
+} from '@/features/workbench/changeRequestStatus'
+import { isLoopItemExecutionActive } from './cloudMyWorkModel'
+import { runtimeTaskBindingAddress } from './runtimeTaskBindingAddress'
+import {
+  useBoardRuntimeConversations,
+  type UseBoardRuntimeConversationsOptions,
+} from './useBoardRuntimeConversations'
+import { Archive, CircleCheck } from 'lucide-react'
+import { IssueBadges } from './IssueBadges'
+
+export interface BoardCardDisplaySettings {
+  showAssignee: boolean
+  showPriority: boolean
+  showReference?: boolean
+  showTags: boolean
+  showDate: boolean
+}
+
+export type BoardCardProgressDisplay = 'compact' | 'focused'
+
+const EMPTY_RUNTIME_CONVERSATION_TURNS: RuntimeConversationTurn[] = []
+
+function useBoardTranslate() {
+  const { i18n } = useTranslation('common')
+  return createCollaborationTranslator(i18n.language.startsWith('zh') ? 'zh-CN' : 'en')
+}
+
+interface CloudTodoCardContentProps {
+  item: CloudLoopItem
+  goalBinding?: CloudTodoBoardTaskBinding
+  display: BoardCardDisplaySettings
+  /** Active robot names for the current project, used when the item only
+   * carries `assignee_agent_id` (local projects do not resolve the name). */
+  agentNames?: Record<string, string>
+}
+
+export function CloudTodoCardContent({
+  item,
+  goalBinding,
+  display,
+  agentNames,
+}: CloudTodoCardContentProps) {
+  const t = useBoardTranslate()
+  return (
+    <IssueBoardCardContent
+      item={item}
+      reference={item.id}
+      display={display}
+      labels={createIssueBoardCardLabels(t)}
+      agentNames={agentNames}
+      translate={t}
+      goal={
+        goalBinding?.runtimeGoal
+          ? { bindingId: goalBinding.id, objective: goalBinding.runtimeGoal.objective }
+          : null
+      }
+    />
+  )
+}
+
+export interface CloudTodoBoardTaskBinding {
+  id: string | number
+  device_id: string
+  task_id: string
+  task_title: string | null
+  running: boolean
+  changeRequestTarget?: TaskChangeRequestTarget | null
+  modelSelection?: ModelSelectionConfig | null
+  executionContext?: {
+    runtime?: string | null
+    threadId?: string | null
+    workspacePath?: string | null
+    workspaceKind?: string | null
+    worktreeId?: string | null
+  } | null
+  runtimeGoal?: RuntimeGoal | null
+  runtimeGoalLoaded?: boolean
+  runtimeAddress?: RuntimeTaskAddress
+  runtimeTask?: RuntimeTaskSummary | null
+}
+
+interface CloudTodoBoardCardProps {
+  item: CloudLoopItem
+  columnKey?: string
+  unread?: boolean
+  taskBindings?: CloudTodoBoardTaskBinding[]
+  onClick: () => void
+  onArchive: () => void
+  previewPinned?: boolean
+  onPreviewPinnedChange?: (pinned: boolean) => void
+  onMarkRead?: (item: CloudLoopItem) => void
+  onLoadRuntimeGoal?: (address: RuntimeTaskAddress) => Promise<void>
+  onOpenRuntimeTask?: (address: RuntimeTaskAddress) => Promise<void> | void
+  getRuntimeTranscript?: UseBoardRuntimeConversationsOptions['getRuntimeTranscript']
+  display: BoardCardDisplaySettings
+  agentNames?: Record<string, string>
+  dragDisabled?: boolean
+  previewDisabled?: boolean
+  issueDetailOnly?: boolean
+  archiveDisabled?: boolean
+  /** Menu label for the archive action; defaults to the archive wording. */
+  archiveLabel?: string
+  cardAction?: {
+    kind: 'confirm' | 'archive'
+    label: string
+    testId: string
+    onClick: () => void
+  }
+  progressDisplay?: BoardCardProgressDisplay
+  changeRequestMonitor?: ChangeRequestMonitor | null
+  renderBadges?: (badges: CollaborationIssueBadge[]) => ReactNode
+  onContinueChangeRequestRepair?: (
+    binding: CloudTodoBoardTaskBinding,
+    snapshot: TaskChangeRequestSnapshot
+  ) => Promise<void>
+}
+
+export function CloudTodoBoardCard({
+  item,
+  columnKey,
+  unread,
+  taskBindings = [],
+  onClick,
+  onArchive,
+  previewPinned,
+  onPreviewPinnedChange,
+  onMarkRead,
+  onLoadRuntimeGoal,
+  onOpenRuntimeTask,
+  getRuntimeTranscript,
+  display,
+  agentNames,
+  dragDisabled = false,
+  previewDisabled = false,
+  issueDetailOnly = false,
+  archiveDisabled = false,
+  archiveLabel,
+  cardAction,
+  progressDisplay = 'compact',
+  changeRequestMonitor = null,
+  renderBadges,
+  onContinueChangeRequestRepair,
+}: CloudTodoBoardCardProps) {
+  const t = useBoardTranslate()
+  const editable = canEditProjectSpaceIssue(item)
+  const hasActiveTask = isLoopItemExecutionActive(item)
+  const taskBindingsByConversation = new Map<string, CloudTodoBoardTaskBinding>()
+  for (const binding of taskBindings) {
+    const key = runtimeConversationKey({
+      deviceId: binding.device_id,
+      taskId: binding.task_id,
+    })
+    const existing = taskBindingsByConversation.get(key)
+    if (!existing) {
+      taskBindingsByConversation.set(key, binding)
+    } else if (binding.running && !existing.running) {
+      taskBindingsByConversation.set(key, { ...existing, running: true })
+    }
+  }
+  const conversationTaskBindings = [...taskBindingsByConversation.values()]
+  useBoardRuntimeConversations({
+    item,
+    conversations: conversationTaskBindings.map(binding => ({
+      address: boardTaskAddress(item, binding),
+      task: binding.runtimeTask,
+    })),
+    enabled: hasActiveTask || item.status === 'in_review',
+    getRuntimeTranscript,
+  })
+  const runningTaskBindings = conversationTaskBindings.filter(binding => binding.running)
+  const currentTaskBinding = runningTaskBindings[0] ?? conversationTaskBindings[0]
+  const changeRequestSnapshot = useTaskChangeRequest(
+    changeRequestMonitor,
+    currentTaskBinding?.changeRequestTarget ?? null
+  )
+  const showCurrentTask = Boolean(
+    currentTaskBinding &&
+    (currentTaskBinding.running ||
+      hasActiveTask ||
+      item.status === 'in_review' ||
+      stoppedTaskNeedsAttention(changeRequestSnapshot?.changeRequest ?? null))
+  )
+  const [repairingChangeRequest, setRepairingChangeRequest] = useState(false)
+  const progressTaskBindings =
+    runningTaskBindings.length > 0
+      ? runningTaskBindings
+      : showCurrentTask && currentTaskBinding
+        ? [currentTaskBinding]
+        : []
+  return (
+    <IssueBoardCard
+      columnKey={columnKey}
+      item={item}
+      unread={unread}
+      reference={item.id}
+      display={display}
+      labels={createIssueBoardCardLabels(t)}
+      agentNames={agentNames}
+      translate={t}
+      archiveLabel={archiveLabel}
+      onArchive={editable && !archiveDisabled ? onArchive : undefined}
+      previewPinned={previewPinned}
+      onPreviewPinnedChange={onPreviewPinnedChange}
+      previewDisabled={previewDisabled || issueDetailOnly}
+      showOpenTaskAction={!issueDetailOnly}
+      onMarkRead={onMarkRead ? () => onMarkRead(item) : undefined}
+      progressTaskBindings={progressTaskBindings}
+      goal={
+        currentTaskBinding?.runtimeGoal
+          ? {
+              bindingId: currentTaskBinding.id,
+              objective: currentTaskBinding.runtimeGoal.objective,
+            }
+          : null
+      }
+      dragEnabled={editable && !dragDisabled}
+      cardClassName="group/cloud-todo-card"
+      onOpen={onClick}
+      summary={
+        item.can_view_detail !== false && item.badges?.length ? (
+          renderBadges ? (
+            renderBadges(item.badges)
+          ) : (
+            <IssueBadges
+              badges={item.badges}
+              compact
+              testId={`cloud-todo-card-badges-${item.id}`}
+            />
+          )
+        ) : null
+      }
+      childrenAction={
+        cardAction ? (
+          <span className="absolute right-2 top-2 z-20">
+            <Tooltip label={cardAction.label} side="bottom" align="end">
+              <button
+                type="button"
+                data-testid={cardAction.testId}
+                aria-label={cardAction.label}
+                onClick={event => {
+                  event.stopPropagation()
+                  cardAction.onClick()
+                }}
+                className={
+                  cardAction.kind === 'archive'
+                    ? 'flex h-7 w-7 items-center justify-center rounded-md bg-background/90 text-text-muted opacity-0 shadow-sm transition hover:bg-muted hover:text-red-600 focus:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus/30 group-hover/cloud-todo-card:opacity-100'
+                    : 'flex h-7 w-7 items-center justify-center rounded-md bg-background/90 text-text-muted opacity-0 shadow-sm transition hover:bg-muted hover:text-text-primary focus:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus/30 group-hover/cloud-todo-card:opacity-100'
+                }
+              >
+                {cardAction.kind === 'archive' ? (
+                  <Archive className="h-3.5 w-3.5" />
+                ) : (
+                  <CircleCheck className="h-3.5 w-3.5" />
+                )}
+              </button>
+            </Tooltip>
+          </span>
+        ) : undefined
+      }
+      renderTaskSummary={(binding, compact) => (
+        <RuntimeTaskProgressSummary
+          key={binding.id}
+          item={item}
+          binding={binding}
+          compact={compact}
+          progressDisplay={progressDisplay}
+          active={binding.running || (binding.id === currentTaskBinding?.id && hasActiveTask)}
+          changeRequestSnapshot={
+            compact && binding.id === currentTaskBinding?.id ? changeRequestSnapshot : null
+          }
+          repairingChangeRequest={compact && repairingChangeRequest}
+          onContinueChangeRequestRepair={
+            compact &&
+            binding.id === currentTaskBinding?.id &&
+            changeRequestSnapshot?.changeRequest &&
+            autoRepairStatus(changeRequestSnapshot.changeRequest) &&
+            onContinueChangeRequestRepair
+              ? async () => {
+                  setRepairingChangeRequest(true)
+                  try {
+                    await onContinueChangeRequestRepair(binding, changeRequestSnapshot)
+                  } finally {
+                    setRepairingChangeRequest(false)
+                  }
+                }
+              : undefined
+          }
+          onLoadRuntimeGoal={onLoadRuntimeGoal}
+          onOpenRuntimeTask={onOpenRuntimeTask}
+        />
+      )}
+    />
+  )
+}
+
+function boardTaskAddress(
+  item: CloudLoopItem,
+  binding: CloudTodoBoardTaskBinding
+): RuntimeTaskAddress {
+  const address = { ...runtimeTaskBindingAddress(binding), ...binding.runtimeAddress }
+  return {
+    ...address,
+    ...(binding.modelSelection
+      ? { runtimeHandle: { ...address.runtimeHandle, modelSelection: binding.modelSelection } }
+      : {}),
+    projectSession: binding.runtimeAddress?.projectSession ?? {
+      projectId: String(item.cloud_project_id),
+      issueId: String(item.id),
+    },
+  }
+}
+
+function RuntimeTaskProgressSummary({
+  item,
+  binding,
+  compact,
+  progressDisplay = 'compact',
+  active,
+  changeRequestSnapshot,
+  repairingChangeRequest,
+  onContinueChangeRequestRepair,
+  onLoadRuntimeGoal,
+  onOpenRuntimeTask,
+}: {
+  item: CloudLoopItem
+  binding: CloudTodoBoardTaskBinding
+  compact: boolean
+  progressDisplay?: BoardCardProgressDisplay
+  active: boolean
+  changeRequestSnapshot: TaskChangeRequestSnapshot | null
+  repairingChangeRequest: boolean
+  onContinueChangeRequestRepair?: () => Promise<void>
+  onLoadRuntimeGoal?: (address: RuntimeTaskAddress) => Promise<void>
+  onOpenRuntimeTask?: (address: RuntimeTaskAddress) => Promise<void> | void
+}) {
+  const t = useBoardTranslate()
+  const { t: toolTranslate } = useTranslation('chat')
+  const taskAddress = useMemo<RuntimeTaskAddress>(
+    () => boardTaskAddress(item, binding),
+    [binding, item]
+  )
+  useEffect(() => {
+    if (binding.runtimeGoalLoaded || !onLoadRuntimeGoal) return
+    void onLoadRuntimeGoal(taskAddress)
+  }, [binding.runtimeGoalLoaded, onLoadRuntimeGoal, taskAddress])
+  const { activity, responsePreview } = useRuntimeTaskProjection(
+    compact ? taskAddress : null,
+    active
+  )
+  const taskTitle = binding.task_title || binding.task_id
+  const showCompactChangeRequest = compact && Boolean(changeRequestSnapshot?.changeRequest)
+
+  return (
+    <IssueCardTaskSummary
+      itemId={item.id}
+      bindingId={binding.id}
+      title={taskTitle}
+      compact={compact}
+      focused={progressDisplay === 'focused'}
+      goal={binding.runtimeGoal?.objective}
+      goalLoading={!binding.runtimeGoalLoaded && Boolean(onLoadRuntimeGoal)}
+      translate={t}
+      activity={{
+        ...activity,
+        tools: activity.tools.map(block => ({
+          id: block.id,
+          text: runtimeToolActivityText(block, toolTranslate),
+          running: block.status !== 'done' && block.status !== 'error',
+        })),
+      }}
+      responsePreview={responsePreview}
+      reserveTrailingAction={showCompactChangeRequest}
+      hideTaskIcon={Boolean(changeRequestSnapshot?.changeRequest)}
+      status={
+        <DshContributionSlotSurface
+          attachedClassName="contents"
+          props={{
+            binding,
+            compact,
+            itemId: item.id,
+            onContinueRepair: onContinueChangeRequestRepair,
+            repairing: repairingChangeRequest,
+            snapshot: changeRequestSnapshot,
+          }}
+          slot={WEWORK_DSH_SLOTS.boardCardStatus}
+        />
+      }
+      conversation={
+        !compact ? (
+          <TemporaryChatPanel
+            key={`${taskAddress.deviceId}:${taskAddress.taskId}`}
+            currentProject={null}
+            source={taskAddress}
+            instanceId={`cloud-todo-card:${item.id}:${binding.id}`}
+            testId={`cloud-todo-card-popup-conversation-${item.id}`}
+            initialAddress={taskAddress}
+            runtimeContext={{ cloudProjectId: String(item.cloud_project_id) }}
+            sendEphemeral={false}
+            readOnly
+            collapseComposerWhenIdle
+            initialScrollPosition="latest"
+            emptyStateText={t('todo.task_progress_empty', '暂无任务进展详情')}
+            placeholder={t('workbench.task_activity_inline_placeholder')}
+            onOpenRuntimeTask={onOpenRuntimeTask}
+          />
+        ) : null
+      }
+    />
+  )
+}
+
+function useRuntimeTaskProjection(
+  address: RuntimeTaskAddress | null,
+  active: boolean
+): {
+  activity: RuntimeLiveActivity
+  responsePreview: string | null
+} {
+  const subscribe = useCallback(
+    (listener: () => void) =>
+      address
+        ? subscribeRuntimeConversation(address, listener, {
+            retainWhileSubscribed: false,
+          })
+        : () => undefined,
+    [address]
+  )
+  const getSnapshot = useCallback(
+    () => (address ? getRuntimeConversationTurns(address) : EMPTY_RUNTIME_CONVERSATION_TURNS),
+    [address]
+  )
+  const turns = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+
+  return useMemo(() => runtimeTaskProgress(turns, active), [active, turns])
+}

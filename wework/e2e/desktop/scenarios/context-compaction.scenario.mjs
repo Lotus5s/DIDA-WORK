@@ -1,0 +1,428 @@
+import assert from 'node:assert/strict'
+import { createInterruptedCompactionScenario } from './interrupted-context-compaction.mjs'
+
+const ACTIVE_WORKBENCH_SELECTOR =
+  '[data-testid="desktop-workbench-main"][data-active-workbench-pane="true"]'
+const COMPOSER_SELECTOR = `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="chat-message-input"][contenteditable="true"]`
+const INITIAL_PROMPT = 'WEWORK_DESKTOP_E2E_CONTEXT_COMPACTION_INITIAL'
+const INITIAL_COMPLETION = 'WEWORK_DESKTOP_E2E_CONTEXT_COMPACTION_READY'
+const COMPACTION_SUMMARY = 'WEWORK_DESKTOP_E2E_CONTEXT_COMPACTION_SUMMARY'
+const FOLLOW_UP_PROMPT = 'WEWORK_DESKTOP_E2E_CONTEXT_COMPACTION_FOLLOW_UP'
+const FOLLOW_UP_COMPLETION = 'WEWORK_DESKTOP_E2E_CONTEXT_COMPACTION_VERIFIED'
+const REJECTED_COMPACTION_TIMEOUT_MS = 60_000
+
+function sse(events) {
+  return events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('')
+}
+
+function responseCreated(id) {
+  return {
+    type: 'response.created',
+    response: {
+      id,
+      object: 'response',
+      status: 'in_progress',
+      output: [],
+    },
+  }
+}
+
+function assistantMessage(id, text) {
+  return {
+    type: 'response.output_item.done',
+    item: {
+      id: `${id}-message`,
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text, annotations: [] }],
+      phase: 'final_answer',
+    },
+  }
+}
+
+function responseCompleted(id, inputTokens) {
+  return {
+    type: 'response.completed',
+    response: {
+      id,
+      object: 'response',
+      status: 'completed',
+      output: [],
+      usage: {
+        input_tokens: inputTokens,
+        input_tokens_details: null,
+        output_tokens: 20,
+        output_tokens_details: null,
+        total_tokens: inputTokens + 20,
+      },
+    },
+  }
+}
+
+function requestKind(body) {
+  const metadata = body.client_metadata?.['x-codex-turn-metadata']
+  if (typeof metadata !== 'string') return null
+  try {
+    return JSON.parse(metadata).request_kind ?? null
+  } catch {
+    return null
+  }
+}
+
+async function readJson(request) {
+  const chunks = []
+  for await (const chunk of request) chunks.push(chunk)
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+}
+
+export function currentSessionContext(body) {
+  const texts = (body?.input ?? []).flatMap(item =>
+    Array.isArray(item.content) ? item.content.map(part => part.text ?? '') : [item.content ?? '']
+  )
+  const contexts = texts.flatMap(text =>
+    Array.from(
+      text.matchAll(/<wework\.session\.current>([\s\S]*?)<\/wework\.session\.current>/gu),
+      match => match[1]
+    )
+  )
+  assert.ok(contexts.length > 0, 'The model request did not receive current session context')
+  const content = contexts.at(-1)
+  const jsonStart = content.indexOf('\n')
+  assert.ok(jsonStart >= 0, 'The current session context is missing its JSON payload')
+  const context = JSON.parse(content.slice(jsonStart).trim())
+  assert.match(context.conversation_id, /^conv_/)
+  assert.match(context.response_id, /^resp_/)
+  const conversation = JSON.parse(Buffer.from(context.conversation_id.slice(5), 'base64url'))
+  const response = JSON.parse(Buffer.from(context.response_id.slice(5), 'base64url'))
+  assert.deepEqual(response.slice(0, 2), conversation)
+  assert.equal(response.length, 3)
+  assert.ok(response[2])
+  assert.equal(context.execution.type, 'wework')
+  assert.equal(context.execution.device_id, conversation[0])
+  assert.ok(context.model_name)
+  return context
+}
+
+async function createLocalProject(control, workspacePath, timeoutMs, workbenchReadyTimeoutMs) {
+  await control.command('waitFor', '[data-testid="project-work-button"]', {
+    timeoutMs: workbenchReadyTimeoutMs,
+  })
+  await control.command('click', '[data-testid="project-work-button"]')
+  await control.command('click', '[data-testid="add-local-project-option"]')
+  await control.command('waitFor', '[data-testid="device-folder-path-input"]', { timeoutMs })
+  await control.command('fill', '[data-testid="device-folder-path-input"]', {
+    value: workspacePath,
+  })
+  await control.command('press', '[data-testid="device-folder-path-input"]', { key: 'Enter' })
+  await control.command('clickWhenEnabled', '[data-testid="confirm-device-folder-picker-button"]', {
+    timeoutMs,
+  })
+  await control.command('waitFor', '[data-testid="local-project-create-dialog"]', { timeoutMs })
+  await control.command('fill', '[data-testid="local-project-create-name-input"]', {
+    value: 'context-compaction-e2e',
+  })
+  await control.command('clickWhenEnabled', '[data-testid="confirm-local-project-create-button"]', {
+    timeoutMs,
+  })
+  await control.command('waitFor', '[data-testid="project-work-button"]', {
+    text: 'context-compaction-e2e',
+    timeoutMs,
+  })
+}
+
+async function waitForDisabled(control, selector, timeoutMs) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    if ((await control.command('getAttribute', selector, { value: 'disabled' })) !== null) return
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  throw new Error(`Timed out waiting for ${selector} to become disabled`)
+}
+
+async function waitForRuntimePaneIdle(control, timeoutMs) {
+  const startedAt = Date.now()
+  let lastStatus = null
+  while (Date.now() - startedAt < timeoutMs) {
+    const snapshot = JSON.parse(await control.command('getWorkbenchDebugSnapshot', 'body'))
+    lastStatus = snapshot.pane?.status ?? null
+    if (lastStatus?.isBusy === false) return
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  throw new Error(
+    `The runtime turn did not settle before compaction: ${JSON.stringify(lastStatus)}`
+  )
+}
+
+export function createDesktopScenario({
+  captureScreenshot,
+  modelResponseTimeoutMs,
+  uiTimeoutMs,
+  workbenchReadyTimeoutMs,
+  workspacePath,
+}) {
+  const interrupted = createInterruptedCompactionScenario({ uiTimeoutMs, modelResponseTimeoutMs })
+  let active = false
+  let compactionRequests = 0
+  let rejectedCompactionRequests = 0
+  let rejectCompaction = false
+  let followUpSawCompactedContext = false
+  let initialRequest
+  let initialAuthorization
+  let followUpRequest
+  let resolveCompactionStarted
+  let releaseCompaction
+  const compactionStarted = new Promise(resolve => {
+    resolveCompactionStarted = resolve
+  })
+  const compactionRelease = new Promise(resolve => {
+    releaseCompaction = resolve
+  })
+
+  return {
+    async handleHttp(request, response, url) {
+      if (await interrupted.handleHttp(request, response, url)) return true
+      if (
+        !active ||
+        request.method !== 'POST' ||
+        !['/v1/responses', '/responses'].includes(url.pathname)
+      ) {
+        return false
+      }
+
+      const body = await readJson(request)
+      const kind = requestKind(body)
+      const serialized = JSON.stringify(body)
+      const responseId = `wework-context-compaction-${Date.now()}`
+
+      if (kind === 'prewarm') {
+        response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' })
+        response.end(sse([responseCreated(responseId), responseCompleted(responseId, 0)]))
+        return true
+      }
+
+      if (kind === 'compaction') {
+        compactionRequests += 1
+        assert.ok(initialAuthorization, 'The initial model request did not authenticate')
+        assert.equal(
+          request.headers.authorization,
+          initialAuthorization,
+          'Context compaction lost the model credentials from the initial turn'
+        )
+        if (rejectCompaction) {
+          rejectedCompactionRequests += 1
+          response.writeHead(400, { 'Content-Type': 'application/json' })
+          response.end(JSON.stringify({ detail: 'WEWORK_DESKTOP_E2E_CONTEXT_COMPACTION_REJECTED' }))
+          return true
+        }
+        resolveCompactionStarted()
+        response.writeHead(200, {
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          'Content-Type': 'text/event-stream; charset=utf-8',
+        })
+        response.flushHeaders()
+        response.write(sse([responseCreated(responseId)]))
+        await compactionRelease
+        response.end(
+          sse([
+            assistantMessage(responseId, COMPACTION_SUMMARY),
+            responseCompleted(responseId, 1200),
+          ])
+        )
+        return true
+      }
+
+      if (serialized.includes(FOLLOW_UP_PROMPT)) {
+        followUpRequest = body
+        followUpSawCompactedContext = serialized.includes(COMPACTION_SUMMARY)
+        response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' })
+        response.end(
+          sse([
+            responseCreated(responseId),
+            assistantMessage(responseId, FOLLOW_UP_COMPLETION),
+            responseCompleted(responseId, 1400),
+          ])
+        )
+        return true
+      }
+
+      if (!serialized.includes(INITIAL_PROMPT)) return false
+      initialRequest = body
+      initialAuthorization = request.headers.authorization
+      response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' })
+      response.end(
+        sse([
+          responseCreated(responseId),
+          assistantMessage(responseId, INITIAL_COMPLETION),
+          responseCompleted(responseId, 90_000),
+        ])
+      )
+      return true
+    },
+
+    async verify(control) {
+      active = true
+      try {
+        await createLocalProject(control, workspacePath, uiTimeoutMs, workbenchReadyTimeoutMs)
+        await control.command('waitFor', COMPOSER_SELECTOR, { timeoutMs: uiTimeoutMs })
+        await control.command('fill', COMPOSER_SELECTOR, { value: INITIAL_PROMPT })
+        await control.command(
+          'waitFor',
+          `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="send-message-button"]`,
+          {
+            enabled: true,
+            timeoutMs: uiTimeoutMs,
+          }
+        )
+        await control.command('press', COMPOSER_SELECTOR, { key: 'Enter' })
+        await control.command('waitFor', '[data-testid="message-assistant"]', {
+          text: INITIAL_COMPLETION,
+          timeoutMs: modelResponseTimeoutMs,
+        })
+        await control.command('waitFor', '[data-testid="context-usage-button"]', {
+          timeoutMs: uiTimeoutMs,
+        })
+        await waitForRuntimePaneIdle(control, modelResponseTimeoutMs)
+        const initialSession = currentSessionContext(initialRequest)
+        assert.equal(initialSession.api_conversation_supported, true)
+        await captureScreenshot(control, 'context-compaction-01-ready.png', 'body')
+
+        await control.command('click', '[data-testid="context-usage-button"]')
+        await control.command('waitFor', '[data-testid="confirm-compact-context-button"]', {
+          timeoutMs: uiTimeoutMs,
+        })
+        await captureScreenshot(control, 'context-compaction-02-confirm.png', 'body')
+        await control.command('click', '[data-testid="confirm-compact-context-button"]')
+
+        await waitForDisabled(control, '[data-testid="context-usage-button"]', uiTimeoutMs)
+        await control.command('waitFor', '[data-testid="context-compaction-indicator"]', {
+          text: '正在自动压缩上下文',
+          timeoutMs: uiTimeoutMs,
+        })
+        let compactionStartTimeout
+        try {
+          await Promise.race([
+            compactionStarted,
+            new Promise((_, reject) => {
+              compactionStartTimeout = setTimeout(
+                () => reject(new Error('Compaction model request did not start')),
+                modelResponseTimeoutMs
+              )
+            }),
+          ])
+        } finally {
+          clearTimeout(compactionStartTimeout)
+        }
+        assert.equal(
+          compactionRequests,
+          1,
+          'The first compact click did not start one model request'
+        )
+        const restart = JSON.parse(
+          await control.command('restartLocalCodexAppServerIfIdle', 'body')
+        )
+        assert.equal(restart.restarted, false, 'An idle restart interrupted the active compaction')
+        assert.ok(restart.activeTaskCount >= 1, 'The compaction was not tracked as an active turn')
+        const compacting = JSON.parse(await control.command('getWorkbenchDebugSnapshot', 'body'))
+        assert.equal(
+          compacting.pane?.status?.isBusy,
+          true,
+          'A previous completion snapshot cleared the pending compaction lifecycle'
+        )
+        assert.equal(
+          Number(
+            await control.command('getElementCount', '[data-testid="context-compaction-indicator"]')
+          ),
+          1,
+          'The running context compaction indicator was duplicated'
+        )
+
+        await captureScreenshot(control, 'context-compaction-03-running.png', 'body')
+        releaseCompaction()
+        await control.command('waitFor', '[data-testid="context-compaction-indicator"]', {
+          text: '上下文已自动压缩',
+          timeoutMs: modelResponseTimeoutMs,
+        })
+        assert.match(
+          await control.command('getText', '[data-testid="context-compaction-indicator"]'),
+          /上下文已自动压缩|Context compacted/
+        )
+        assert.equal(compactionRequests, 1, 'Context compaction was submitted more than once')
+        assert.equal(
+          Number(
+            await control.command('getElementCount', '[data-testid="context-compaction-indicator"]')
+          ),
+          1,
+          'The completed context compaction indicator was duplicated'
+        )
+        await captureScreenshot(control, 'context-compaction-04-completed.png', 'body')
+
+        await control.command('fill', COMPOSER_SELECTOR, { value: FOLLOW_UP_PROMPT })
+        await control.command('press', COMPOSER_SELECTOR, { key: 'Enter' })
+        await control.command('waitFor', '[data-testid="message-assistant"]', {
+          text: FOLLOW_UP_COMPLETION,
+          timeoutMs: modelResponseTimeoutMs,
+        })
+        assert.equal(
+          followUpSawCompactedContext,
+          true,
+          'The follow-up model request did not contain the compacted context summary'
+        )
+        const followUpSession = currentSessionContext(followUpRequest)
+        assert.equal(followUpSession.conversation_id, initialSession.conversation_id)
+        assert.notEqual(followUpSession.response_id, initialSession.response_id)
+        await captureScreenshot(control, 'context-compaction-05-follow-up-verified.png', 'body')
+        await waitForRuntimePaneIdle(control, modelResponseTimeoutMs)
+        // Run the interrupted-compaction coverage first: it asserts on the
+        // compaction indicators of the whole transcript, so every phase before
+        // it must leave the transcript in the state that checkpoint already
+        // established.
+        await interrupted.verify(control)
+
+        // A compaction turn the provider rejects must surface its own failure
+        // instead of staying silent until the app-IPC deadline reports a timeout.
+        rejectCompaction = true
+        const rejectedStartedAt = Date.now()
+        await control.command('click', '[data-testid="context-usage-button"]')
+        await control.command('waitFor', '[data-testid="confirm-compact-context-button"]', {
+          timeoutMs: uiTimeoutMs,
+        })
+        await control.command('click', '[data-testid="confirm-compact-context-button"]')
+        const rejectedErrorTitleSelector = `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="assistant-error-title"]`
+        await control.command('waitFor', rejectedErrorTitleSelector, {
+          timeoutMs: modelResponseTimeoutMs,
+        })
+        const rejectedCompactionElapsedMs = Date.now() - rejectedStartedAt
+        assert.ok(
+          rejectedCompactionRequests >= 1,
+          'The rejected compaction never reached the model service'
+        )
+        assert.ok(
+          rejectedCompactionElapsedMs < REJECTED_COMPACTION_TIMEOUT_MS,
+          `The rejected compaction reported after ${rejectedCompactionElapsedMs}ms`
+        )
+        const rejectedErrorTitle = await control.command('getText', rejectedErrorTitleSelector)
+        assert.doesNotMatch(
+          rejectedErrorTitle,
+          /超时|timed out/u,
+          'The rejected compaction was reported as a transport timeout'
+        )
+        await captureScreenshot(control, 'context-compaction-06-rejected.png', 'body')
+        rejectCompaction = false
+      } finally {
+        releaseCompaction()
+      }
+    },
+
+    diagnostics() {
+      return {
+        active,
+        compactionRequests,
+        rejectedCompactionRequests,
+        followUpSawCompactedContext,
+        interrupted: interrupted.diagnostics(),
+      }
+    },
+  }
+}

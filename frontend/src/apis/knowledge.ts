@@ -1,0 +1,731 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Knowledge base and document API client
+ */
+
+import { apiClient } from './client'
+import type {
+  AccessibleKnowledgeResponse,
+  ChunkListResponse,
+  ChunkResponse,
+  KnowledgeBaseRetrievalProfile,
+  DocumentDetailResponse,
+  DocumentProtection,
+  DocumentContentReadResponse,
+  KnowledgeBase,
+  KnowledgeBaseCreate,
+  KnowledgeBaseListResponse,
+  KnowledgeBaseSummaryResponse,
+  KnowledgeBaseUpdate,
+  KnowledgeDocument,
+  KnowledgeDocumentCreate,
+  KnowledgeDocumentListResponse,
+  KnowledgeDocumentUpdate,
+  KnowledgeFolder,
+  KnowledgeFolderCreate,
+  KnowledgeFolderUpdate,
+  KnowledgeContentOrigin,
+  KnowledgeResourceScope,
+  WebScrapeResponse,
+} from '@/types/knowledge'
+
+// ============== Knowledge Base APIs ==============
+
+/**
+ * List knowledge bases
+ */
+export async function listKnowledgeBases(
+  scope: KnowledgeResourceScope = 'all',
+  groupName?: string
+): Promise<KnowledgeBaseListResponse> {
+  let endpoint = `/knowledge-bases?scope=${scope}`
+  if (scope === 'group' && groupName) {
+    endpoint += `&group_name=${encodeURIComponent(groupName)}`
+  }
+  return apiClient.get<KnowledgeBaseListResponse>(endpoint)
+}
+
+/**
+ * Get a knowledge base by ID
+ */
+export async function getKnowledgeBase(id: number): Promise<KnowledgeBase> {
+  return apiClient.get<KnowledgeBase>(`/knowledge-bases/${id}`)
+}
+
+/** Return the effective reader capability used only for knowledge UI state. */
+export async function getDocumentProtection(id: number): Promise<DocumentProtection> {
+  return apiClient.get<DocumentProtection>(`/knowledge-bases/${id}/document-protection`)
+}
+
+/**
+ * Create a new knowledge base
+ */
+export async function createKnowledgeBase(data: KnowledgeBaseCreate): Promise<KnowledgeBase> {
+  return apiClient.post<KnowledgeBase>('/knowledge-bases', data)
+}
+
+/**
+ * Update a knowledge base
+ */
+export async function updateKnowledgeBase(
+  id: number,
+  data: KnowledgeBaseUpdate
+): Promise<KnowledgeBase> {
+  return apiClient.put<KnowledgeBase>(`/knowledge-bases/${id}`, data)
+}
+
+/**
+ * Delete a knowledge base
+ */
+export async function deleteKnowledgeBase(id: number): Promise<void> {
+  return apiClient.delete(`/knowledge-bases/${id}`)
+}
+
+/**
+ * Update the knowledge base default opening view.
+ * @param id Knowledge base ID
+ * @param kbType New default view value: 'notebook' or 'classic'
+ * @returns Updated knowledge base
+ */
+export async function updateKnowledgeBaseType(
+  id: number,
+  kbType: 'notebook' | 'classic'
+): Promise<KnowledgeBase> {
+  return apiClient.patch<KnowledgeBase>(`/knowledge-bases/${id}/type`, { kb_type: kbType })
+}
+
+// ============== Knowledge Document APIs ==============
+
+/** Parameters for listing documents in a knowledge base */
+export interface ListDocumentsParams {
+  limit?: number
+  offset?: number
+  folder_id?: number
+  include_subfolders?: boolean
+  keyword?: string
+  sort_by?: 'name' | 'size' | 'createdAt' | 'updatedAt'
+  sort_order?: 'asc' | 'desc'
+  origin?: KnowledgeContentOrigin
+}
+
+/**
+ * List documents in a knowledge base
+ */
+export async function listDocuments(
+  knowledgeBaseId: number,
+  params?: ListDocumentsParams
+): Promise<KnowledgeDocumentListResponse> {
+  const searchParams = new URLSearchParams()
+  if (params?.limit !== undefined) {
+    searchParams.set('limit', String(params.limit))
+  }
+  if (params?.offset !== undefined) {
+    searchParams.set('offset', String(params.offset))
+  }
+  if (params?.folder_id !== undefined) {
+    searchParams.set('folder_id', String(params.folder_id))
+  }
+  if (params?.include_subfolders !== undefined) {
+    searchParams.set('include_subfolders', String(params.include_subfolders))
+  }
+  if (params?.keyword) {
+    searchParams.set('keyword', params.keyword)
+  }
+  if (params?.sort_by) {
+    searchParams.set('sort_by', params.sort_by)
+  }
+  if (params?.sort_order) {
+    searchParams.set('sort_order', params.sort_order)
+  }
+  if (params?.origin) {
+    searchParams.set('origin', params.origin)
+  }
+  const query = searchParams.toString()
+  return apiClient.get<KnowledgeDocumentListResponse>(
+    `/knowledge-bases/${knowledgeBaseId}/documents${query ? `?${query}` : ''}`
+  )
+}
+
+/**
+ * Create a new document in a knowledge base
+ */
+export async function createDocument(
+  knowledgeBaseId: number,
+  data: KnowledgeDocumentCreate
+): Promise<KnowledgeDocument> {
+  return apiClient.post<KnowledgeDocument>(`/knowledge-bases/${knowledgeBaseId}/documents`, data)
+}
+
+export interface ExternalDocumentBatchImportRequest {
+  provider: string
+  external_resource_ids: string[]
+  folder_id?: number
+}
+
+export type ExternalDocumentImportStatuses = Record<string, KnowledgeDocument['index_status']>
+
+/** Check candidates across the entire KB, without a folder or listing-page filter. */
+export async function getExternalDocumentImportStatuses(
+  knowledgeBaseId: number,
+  provider: string,
+  resourceIds: string[]
+): Promise<ExternalDocumentImportStatuses> {
+  const ids = [...new Set(resourceIds)]
+  const statuses: ExternalDocumentImportStatuses = {}
+  // Bound requests to the server's lookup limit, not the 50-document import limit.
+  for (let offset = 0; offset < ids.length; offset += 500) {
+    const batch = await apiClient.post<ExternalDocumentImportStatuses>(
+      `/knowledge-bases/${knowledgeBaseId}/documents/external-import-status`,
+      { provider, external_resource_ids: ids.slice(offset, offset + 500) }
+    )
+    Object.assign(statuses, batch)
+  }
+  return statuses
+}
+
+export interface ExternalDocumentBatchImportResult {
+  created: KnowledgeDocument[]
+  updated: KnowledgeDocument[]
+  processing: KnowledgeDocument[]
+  requested_count: number
+}
+
+/**
+ * Import several external provider documents into a knowledge base.
+ *
+ * Creates one placeholder per new external resource, refreshes settled copies
+ * in place, and reports copies whose existing attempt is still processing.
+ */
+export async function importExternalDocumentBatch(
+  knowledgeBaseId: number,
+  data: ExternalDocumentBatchImportRequest
+): Promise<ExternalDocumentBatchImportResult> {
+  return apiClient.post<ExternalDocumentBatchImportResult>(
+    `/knowledge-bases/${knowledgeBaseId}/documents/external-import-batch`,
+    data
+  )
+}
+
+/** Get the latest metadata and processing state for one document. */
+export async function getDocument(
+  documentId: number,
+  signal?: AbortSignal
+): Promise<KnowledgeDocument> {
+  return apiClient.get<KnowledgeDocument>(`/knowledge-documents/${documentId}`, { signal })
+}
+
+export interface CreateTextKnowledgeDocumentRequest {
+  knowledge_base_id: number
+  name: string
+  content: string
+}
+
+/**
+ * Create a Markdown document directly from text content.
+ */
+export async function createTextKnowledgeDocument(
+  data: CreateTextKnowledgeDocumentRequest
+): Promise<KnowledgeDocument> {
+  return apiClient.post<KnowledgeDocument>('/knowledge/documents', {
+    ...data,
+    source_type: 'text',
+    file_extension: 'md',
+    folder_id: 0,
+  })
+}
+
+/**
+ * Update a document (enable/disable status)
+ */
+export async function updateDocument(
+  documentId: number,
+  data: KnowledgeDocumentUpdate
+): Promise<KnowledgeDocument> {
+  return apiClient.put<KnowledgeDocument>(`/knowledge-documents/${documentId}`, data)
+}
+
+/**
+ * Delete a document
+ */
+export async function deleteDocument(documentId: number): Promise<void> {
+  return apiClient.delete(`/knowledge-documents/${documentId}`)
+}
+
+/**
+ * Response for document reindex
+ */
+export interface DocumentReindexResponse {
+  success: boolean
+  document_id: number
+  message: string
+}
+
+// ============== Knowledge Base Migration ==============
+
+/**
+ * Response for knowledge base migration
+ */
+export interface KnowledgeBaseMigrateResponse {
+  success: boolean
+  message: string
+  knowledge_base_id: number
+  old_namespace: string
+  new_namespace: string
+}
+
+/**
+ * Migrate a personal knowledge base to a group
+ * @param knowledgeBaseId The knowledge base ID to migrate
+ * @param targetGroupName The target group name (namespace) to migrate to
+ * @returns Migration result
+ */
+export async function migrateKnowledgeBaseToGroup(
+  knowledgeBaseId: number,
+  targetGroupName: string
+): Promise<KnowledgeBaseMigrateResponse> {
+  return apiClient.post<KnowledgeBaseMigrateResponse>(
+    `/knowledge-bases/${knowledgeBaseId}/migrate`,
+    { target_group_name: targetGroupName }
+  )
+}
+
+/**
+ * Optional body for document re-index (supports "modify prompt & re-analyze").
+ */
+export interface DocumentReindexBody {
+  /** Per-document multimodal prompt override; blank = clear override */
+  multimodal_analysis_prompt?: string | null
+}
+
+/**
+ * System default multimodal analysis prompts (single source of truth from
+ * shared.models.multimodal_prompts). Used to prefill prompt editors.
+ *
+ * `enabled` mirrors the backend global KNOWLEDGE_MULTIMODAL_ENABLED switch —
+ * when false the frontend hides the entire multimodal UI.
+ */
+export interface MultimodalDefaultPrompts {
+  enabled: boolean
+  video_prompt: string
+  image_prompt: string
+}
+
+/**
+ * Fetch the system default multimodal analysis prompts.
+ */
+export async function getMultimodalDefaultPrompts(): Promise<MultimodalDefaultPrompts> {
+  return apiClient.get<MultimodalDefaultPrompts>('/knowledge-bases/multimodal-default-prompts')
+}
+
+/**
+ * Trigger re-indexing for a document, optionally overriding its multimodal
+ * analysis prompt (the "modify prompt & re-analyze" flow).
+ * @param documentId The document ID to reindex
+ * @param body Optional body carrying a multimodal prompt override; omit for a
+ *   plain reindex.
+ * @returns Success message indicating reindex has started
+ */
+export async function reindexDocument(
+  documentId: number,
+  body?: DocumentReindexBody
+): Promise<DocumentReindexResponse> {
+  return apiClient.post<DocumentReindexResponse>(
+    `/knowledge-documents/${documentId}/reindex`,
+    body ?? {}
+  )
+}
+
+/**
+ * Retry the background import of one external document record.
+ *
+ * Dedicated entry for external imports: a failed import has no valid
+ * attachment, so the ordinary reindex flow does not apply. The backend
+ * reuses the same document row and re-dispatches the import task.
+ */
+export async function retryExternalDocumentImport(documentId: number): Promise<KnowledgeDocument> {
+  return apiClient.post<KnowledgeDocument>(
+    `/knowledge-documents/${documentId}/external-import/retry`
+  )
+}
+
+/**
+ * Queue a manual refresh of one imported external document.
+ *
+ * The backend fetches the source's latest body and re-indexes it on the same
+ * record; the document keeps its folder and identity.
+ */
+export async function synchronizeExternalDocument(documentId: number): Promise<KnowledgeDocument> {
+  return apiClient.post<KnowledgeDocument>(`/knowledge-documents/${documentId}/external-sync`)
+}
+
+// ============== Batch Document Operations ==============
+
+/**
+ * Batch operation result type
+ */
+export interface BatchOperationResult {
+  success_count: number
+  failed_count: number
+  failed_ids: number[]
+  message: string
+}
+
+/**
+ * Batch delete multiple documents
+ */
+export async function batchDeleteDocuments(documentIds: number[]): Promise<BatchOperationResult> {
+  return apiClient.post<BatchOperationResult>('/knowledge-documents/batch/delete', {
+    document_ids: documentIds,
+  })
+}
+
+// ============== Accessible Knowledge API ==============
+
+/**
+ * Get all accessible knowledge bases for the current user
+ * (For AI chat integration)
+ */
+export async function getAccessibleKnowledge(): Promise<AccessibleKnowledgeResponse> {
+  return apiClient.get<AccessibleKnowledgeResponse>('/knowledge-bases/accessible')
+}
+
+// ============== Web Scraper APIs ==============
+
+/**
+ * Scrape a web page and convert to Markdown
+ * @param url The URL to scrape
+ * @returns Scraped content with title, markdown content, and metadata
+ */
+export async function scrapeWebPage(url: string): Promise<WebScrapeResponse> {
+  return apiClient.post<WebScrapeResponse>('/web-scraper/scrape', { url })
+}
+
+/**
+ * Response for web document creation
+ */
+export interface WebDocumentCreateResponse {
+  success: boolean
+  document?: KnowledgeDocument
+  error_code?: string
+  error_message?: string
+}
+
+/**
+ * Response for web document refresh
+ */
+export interface WebDocumentRefreshResponse {
+  success: boolean
+  document?: KnowledgeDocument
+  error_code?: string
+  error_message?: string
+}
+
+/**
+ * Create a document from a web page in a knowledge base
+ * This endpoint scrapes the web page, saves the content, and creates a document record
+ * @param url The URL to scrape
+ * @param knowledgeBaseId The knowledge base ID to add the document to
+ * @param name Optional document name (uses page title if not provided)
+ * @returns Created document or error
+ */
+export async function createWebDocument(
+  url: string,
+  knowledgeBaseId: number,
+  name?: string,
+  folderId?: number
+): Promise<WebDocumentCreateResponse> {
+  return apiClient.post<WebDocumentCreateResponse>('/web-scraper/create-document', {
+    url,
+    knowledge_base_id: knowledgeBaseId,
+    name,
+    folder_id: folderId || 0,
+  })
+}
+
+/**
+ * Refresh a web document by re-scraping its URL
+ * This endpoint re-scrapes the web page, updates the content, and re-indexes the document
+ * @param documentId The document ID to refresh
+ * @returns Refreshed document or error
+ */
+export async function refreshWebDocument(documentId: number): Promise<WebDocumentRefreshResponse> {
+  return apiClient.post<WebDocumentRefreshResponse>('/web-scraper/refresh-document', {
+    document_id: documentId,
+  })
+}
+
+// ============== Summary Refresh APIs ==============
+
+/**
+ * Response type for knowledge base summary refresh
+ */
+export interface KnowledgeBaseSummaryRefreshResponse {
+  message: string
+  status: string
+}
+
+/**
+ * Refresh knowledge base summary by re-aggregating document summaries
+ * @param kbId The knowledge base ID to refresh summary for
+ * @returns Refresh result with status
+ */
+export async function refreshKnowledgeBaseSummary(
+  kbId: number
+): Promise<KnowledgeBaseSummaryRefreshResponse> {
+  return apiClient.post<KnowledgeBaseSummaryRefreshResponse>(
+    `/knowledge-bases/${kbId}/summary/refresh`
+  )
+}
+
+export async function updateKnowledgeBaseSummary(
+  kbId: number,
+  longSummary: string
+): Promise<KnowledgeBaseSummaryResponse> {
+  return apiClient.put<KnowledgeBaseSummaryResponse>(`/knowledge-bases/${kbId}/summary`, {
+    long_summary: longSummary,
+  })
+}
+
+export async function resetKnowledgeBaseSummary(
+  kbId: number
+): Promise<KnowledgeBaseSummaryResponse> {
+  return apiClient.post<KnowledgeBaseSummaryResponse>(`/knowledge-bases/${kbId}/summary/reset`)
+}
+
+// ============== Configuration APIs ==============
+
+/**
+ * Knowledge base configuration response
+ */
+export interface KnowledgeConfig {
+  chunk_storage_enabled: boolean
+}
+
+/**
+ * Get knowledge base configuration
+ * Returns system-level configuration for knowledge base features
+ */
+export async function getKnowledgeConfig(): Promise<KnowledgeConfig> {
+  return apiClient.get<KnowledgeConfig>('/knowledge-bases/config')
+}
+
+/** Get the authenticated-user-readable retrieval baseline for new knowledge bases. */
+export async function getKnowledgeBaseRetrievalProfile(): Promise<KnowledgeBaseRetrievalProfile> {
+  return apiClient.get<KnowledgeBaseRetrievalProfile>(
+    '/knowledge-bases/code-wiki-retrieval-profile'
+  )
+}
+
+/**
+ * Organization namespace response
+ */
+export interface OrganizationNamespaceResponse {
+  namespace: string | null
+}
+
+/**
+ * Get the organization-level namespace name
+ * Returns the namespace name that has level='organization'
+ * This is used when creating organization knowledge bases
+ */
+export async function getOrganizationNamespace(): Promise<OrganizationNamespaceResponse> {
+  return apiClient.get<OrganizationNamespaceResponse>('/knowledge-bases/organization-namespace')
+}
+
+// ============== Chunk APIs ==============
+
+/**
+ * List chunks for a document with pagination
+ * @param documentId The document ID
+ * @param page Page number (1-based)
+ * @param pageSize Number of items per page
+ * @param search Optional search keyword
+ */
+export async function listDocumentChunks(
+  documentId: number,
+  page: number = 1,
+  pageSize: number = 20,
+  search?: string
+): Promise<ChunkListResponse> {
+  let endpoint = `/knowledge-documents/${documentId}/chunks?page=${page}&page_size=${pageSize}`
+  if (search) {
+    endpoint += `&search=${encodeURIComponent(search)}`
+  }
+  return apiClient.get<ChunkListResponse>(endpoint)
+}
+
+/**
+ * Get a single chunk by index
+ * @param documentId The document ID
+ * @param chunkIndex The chunk index (0-based)
+ */
+export async function getDocumentChunk(
+  documentId: number,
+  chunkIndex: number
+): Promise<ChunkResponse> {
+  return apiClient.get<ChunkResponse>(`/knowledge-documents/${documentId}/chunks/${chunkIndex}`)
+}
+
+/**
+ * Get document detail (content and summary)
+ * Note: This endpoint requires knowing the knowledge_base_id.
+ * Use getDocumentContent for document-only access without kb_id.
+ * @param documentId The document ID
+ */
+export async function getDocumentDetail(documentId: number): Promise<DocumentDetailResponse> {
+  return apiClient.get<DocumentDetailResponse>(`/knowledge-documents/${documentId}/detail`)
+}
+
+/**
+ * Read a slice of document content and its stable identity metadata.
+ *
+ * `limit` is a **character count**, not a page number, and it defaults to 1 — enough
+ * for the identity fields and nothing else. Callers that want the text should use
+ * {@link readDocumentText}; asking for the body here returns a single character, and
+ * looks like a rendering fault rather than a truncated read.
+ */
+export async function getDocumentContent(
+  documentId: number,
+  offset: number = 0,
+  limit: number = 1
+): Promise<DocumentContentReadResponse> {
+  return apiClient.get<DocumentContentReadResponse>(
+    `/knowledge/documents/${documentId}/content?offset=${offset}&limit=${limit}`
+  )
+}
+
+/** The server's own per-request ceiling; asking for more is rejected. */
+const DOCUMENT_READ_CHUNK = 100000
+
+/**
+ * A document's whole text, following the pagination to its end.
+ *
+ * The endpoint is paginated by character offset and caps each request, so a single
+ * call is a truncated read whatever limit it asks for. Long generated pages are the
+ * ones that would be cut, which is also where losing the tail is least visible.
+ */
+export async function readDocumentText(documentId: number): Promise<string> {
+  const parts: string[] = []
+  let offset = 0
+
+  for (;;) {
+    const chunk = await getDocumentContent(documentId, offset, DOCUMENT_READ_CHUNK)
+    parts.push(chunk.content ?? '')
+    // returned_length rather than the string's own length: they agree, but the
+    // server's count is what its has_more was computed against, and advancing by a
+    // different number would re-read or skip.
+    offset += chunk.returned_length
+    // The second test stops a document that reports has_more forever from looping.
+    if (!chunk.has_more || chunk.returned_length <= 0) break
+  }
+
+  return parts.join('')
+}
+
+// ============== Knowledge Folder APIs ==============
+
+/**
+ * Get the folder tree for a knowledge base
+ */
+export async function getFolderTree(
+  knowledgeBaseId: number,
+  origin?: KnowledgeContentOrigin
+): Promise<KnowledgeFolder[]> {
+  const query = origin ? `?origin=${origin}` : ''
+  return apiClient.get<KnowledgeFolder[]>(`/knowledge-bases/${knowledgeBaseId}/folders${query}`)
+}
+
+/**
+ * Create a new folder in a knowledge base
+ */
+export async function createFolder(
+  knowledgeBaseId: number,
+  data: KnowledgeFolderCreate
+): Promise<KnowledgeFolder> {
+  return apiClient.post<KnowledgeFolder>(`/knowledge-bases/${knowledgeBaseId}/folders`, data)
+}
+
+/**
+ * Update a folder (rename and/or move)
+ */
+export async function updateFolder(
+  knowledgeBaseId: number,
+  folderId: number,
+  data: KnowledgeFolderUpdate
+): Promise<KnowledgeFolder> {
+  return apiClient.put<KnowledgeFolder>(
+    `/knowledge-bases/${knowledgeBaseId}/folders/${folderId}`,
+    data
+  )
+}
+
+/**
+ * Delete a folder and move its documents to root level
+ */
+export async function deleteFolder(
+  knowledgeBaseId: number,
+  folderId: number
+): Promise<{ deleted_folder_count: number; moved_document_count: number }> {
+  return apiClient.delete(`/knowledge-bases/${knowledgeBaseId}/folders/${folderId}`)
+}
+
+/**
+ * Move a document to a different folder
+ */
+export async function moveDocument(
+  documentId: number,
+  folderId: number
+): Promise<KnowledgeDocument> {
+  return apiClient.put<KnowledgeDocument>(`/knowledge-documents/${documentId}/move`, {
+    folder_id: folderId,
+  })
+}
+
+/**
+ * Batch move multiple documents to a target folder
+ */
+export async function batchMoveDocuments(
+  documentIds: number[],
+  folderId: number
+): Promise<BatchOperationResult> {
+  return apiClient.post<BatchOperationResult>('/knowledge-documents/batch/move', {
+    document_ids: documentIds,
+    folder_id: folderId,
+  })
+}
+
+// ============== Document Transfer Between KBs ==============
+
+export interface TransferDocumentsRequest {
+  document_ids: number[]
+  folder_ids: number[]
+  target_kb_id: number
+}
+
+export interface TransferDocumentsResponse {
+  success: boolean
+  message: string
+  transferred_document_count: number
+  transferred_folder_count: number
+  deleted_folder_count: number
+  source_kb_id: number
+  target_kb_id: number
+}
+
+/**
+ * Transfer documents and/or folders from one knowledge base to another
+ * @param sourceKbId Source knowledge base ID
+ * @param data Transfer request with document IDs, folder IDs, and target KB ID
+ */
+export async function transferDocuments(
+  sourceKbId: number,
+  data: TransferDocumentsRequest
+): Promise<TransferDocumentsResponse> {
+  return apiClient.post<TransferDocumentsResponse>(
+    `/knowledge-bases/${sourceKbId}/transfer-documents`,
+    data
+  )
+}

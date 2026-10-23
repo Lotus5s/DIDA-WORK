@@ -1,0 +1,1600 @@
+name: E2E Tests
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  merge_group:
+    types: [checks_requested]
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+jobs:
+  changes:
+    name: Detect Platform E2E Changes
+    runs-on: ubuntu-latest
+    outputs:
+      platform_e2e: ${{ steps.classify.outputs.platform_e2e }}
+      wework_desktop_e2e: ${{ steps.classify.outputs.wework_desktop_e2e }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed paths
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
+          FORCE_ALL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:all')) }}
+        run: |
+          if [[ "$FORCE_ALL" == "true" ]]; then
+            .github/scripts/classify-ci-changes.sh --all
+            .github/scripts/classify-wework-desktop-e2e.sh --all
+          else
+            changed_files="$(mktemp)"
+            git diff --name-only "$BASE_SHA...$HEAD_SHA" > "$changed_files"
+            .github/scripts/classify-ci-changes.sh < "$changed_files"
+            .github/scripts/classify-wework-desktop-e2e.sh < "$changed_files"
+          fi
+
+  build-frontend-e2e:
+    name: Build Frontend E2E Artifact
+    needs: changes
+    if: github.event_name != 'pull_request' || (github.event.pull_request.draft == false && needs.changes.outputs.platform_e2e == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Node workspace
+        uses: ./.github/actions/setup-node-workspace
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Restore shared Next.js build cache
+        id: nextjs-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ./frontend/.next/cache
+          key: ${{ runner.os }}-nextjs-e2e-v2-${{ hashFiles('./pnpm-lock.yaml') }}-${{ hashFiles('./frontend/src/**/*.[jt]s', './frontend/src/**/*.[jt]sx') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-e2e-v2-${{ hashFiles('./pnpm-lock.yaml') }}-
+            ${{ runner.os }}-nextjs-e2e-v2-
+
+      - name: Build frontend for E2E
+        working-directory: ./frontend
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+          RUNTIME_INTERNAL_API_URL: http://localhost:8000
+          RUNTIME_SOCKET_DIRECT_URL: http://localhost:8000
+        run: pnpm run build
+
+      - name: Save shared Next.js build cache
+        if: github.ref == 'refs/heads/main' && steps.nextjs-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ./frontend/.next/cache
+          key: ${{ steps.nextjs-cache.outputs.cache-primary-key }}
+
+      - name: Archive frontend E2E build
+        run: .github/scripts/archive-frontend-e2e-build.sh
+
+      - name: Upload frontend E2E build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: frontend-next-build
+          path: .ci-artifacts/frontend-next-build.tar.zst
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  prepare-platform-e2e-image:
+    name: Prepare Platform E2E Image
+    needs: changes
+    if: github.event_name != 'pull_request' || (github.event.pull_request.draft == false && needs.changes.outputs.platform_e2e == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Resolve Platform E2E image
+        id: image
+        run: |
+          dockerfile=docker/wework-e2e/browser.Dockerfile
+          image_ref="$(awk '$1 == "FROM" { print $2 }' "$dockerfile")"
+          image_version="${image_ref#mcr.microsoft.com/playwright:v}"
+          image_version="${image_version%-noble}"
+          playwright_version="$(
+            sed -n 's/^  playwright@\([^:]*\):$/\1/p' pnpm-lock.yaml |
+              head -n 1
+          )"
+          test -n "$playwright_version"
+          if [[ "$image_version" != "$playwright_version" ]]; then
+            echo "Playwright image version $image_version does not match workspace version $playwright_version" >&2
+            exit 1
+          fi
+          digest="$(sha256sum "$dockerfile" | cut -d ' ' -f 1)"
+          echo "ref=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/wegent-wework-e2e:browser-$digest" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Check Platform E2E image
+        id: image-check
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and publish Platform E2E image
+        if: steps.image-check.outputs.exists != 'true'
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
+        with:
+          context: .
+          file: docker/wework-e2e/browser.Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.ref }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/wegent-wework-e2e:buildcache-browser
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/wegent-wework-e2e:buildcache-browser,mode=max
+
+  build-backend-rs-e2e-runtime:
+    name: Build Backend Rust E2E Runtime
+    needs: changes
+    if: github.event_name != 'pull_request' || (github.event.pull_request.draft == false && needs.changes.outputs.platform_e2e == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.runtime.outputs.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Resolve Backend Rust E2E runtime
+        id: runtime
+        env:
+          SOURCE_DIGEST: ${{ hashFiles('backend-rs/Cargo.toml', 'backend-rs/Cargo.lock', 'backend-rs/src/**') }}
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/wegent-backend-rs-e2e:v1-$SOURCE_DIGEST" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check content-addressed Backend Rust E2E image
+        id: image-check
+        env:
+          IMAGE: ${{ steps.runtime.outputs.image }}
+        run: |
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Rust
+        if: steps.image-check.outputs.exists != 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Set up sccache
+        if: steps.image-check.outputs.exists != 'true'
+        uses: ./.github/actions/setup-sccache
+
+      - name: Restore Backend Rust Cargo sources
+        if: steps.image-check.outputs.exists != 'true'
+        id: backend-rs-cargo-sources-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-backend-rs-cargo-sources-v1-${{ hashFiles('backend-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-backend-rs-cargo-sources-v1-
+
+      - name: Build Backend Rust E2E runtime
+        if: steps.image-check.outputs.exists != 'true'
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: "false"
+          CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: "false"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/backend-rs-target
+        run: |
+          cargo build \
+            --release \
+            --manifest-path backend-rs/Cargo.toml \
+            --bin wegent-backend-rs
+          mkdir -p .ci-artifacts
+          cp "$CARGO_TARGET_DIR/release/wegent-backend-rs" \
+            .ci-artifacts/wegent-backend-rs
+          chmod 0755 .ci-artifacts/wegent-backend-rs
+
+      - name: Publish content-addressed Backend Rust E2E image
+        if: steps.image-check.outputs.exists != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          IMAGE: ${{ steps.runtime.outputs.image }}
+        run: |
+          mkdir -p .ci-artifacts/backend-rs-image
+          cp .ci-artifacts/wegent-backend-rs \
+            .ci-artifacts/backend-rs-image/wegent-backend-rs
+          printf '%s\n' \
+            'FROM scratch' \
+            'COPY wegent-backend-rs /app/wegent-backend-rs' \
+            'ENTRYPOINT ["/app/wegent-backend-rs"]' \
+            > .ci-artifacts/backend-rs-image/Dockerfile
+          docker build \
+            --tag "$IMAGE" \
+            .ci-artifacts/backend-rs-image
+          docker push "$IMAGE"
+
+      - name: Restore content-addressed Backend Rust E2E binary
+        if: steps.image-check.outputs.exists == 'true'
+        env:
+          IMAGE: ${{ steps.runtime.outputs.image }}
+        run: |
+          docker pull "$IMAGE"
+          container_id="$(docker create "$IMAGE")"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          mkdir -p .ci-artifacts
+          docker cp \
+            "$container_id:/app/wegent-backend-rs" \
+            .ci-artifacts/wegent-backend-rs
+          chmod 0755 .ci-artifacts/wegent-backend-rs
+
+      - name: Save Backend Rust Cargo sources
+        if: steps.image-check.outputs.exists != 'true' && github.ref == 'refs/heads/main' && steps.backend-rs-cargo-sources-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.backend-rs-cargo-sources-cache.outputs.cache-primary-key }}
+
+      - name: Upload Backend Rust E2E runtime
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: backend-rs-e2e-runtime
+          path: .ci-artifacts/wegent-backend-rs
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  build-executor-e2e-runtime:
+    name: Prepare Executor E2E Runtime
+    needs: changes
+    # Fork pull requests cannot pull the executor E2E image from GHCR, so the
+    # Wework desktop E2E build downloads the executor-e2e-binary artifact from
+    # this job instead. That artifact must exist whenever a fork PR selects
+    # desktop E2E, even when platform_e2e itself is not selected.
+    if: github.event_name != 'pull_request' || (github.event.pull_request.draft == false && (needs.changes.outputs.platform_e2e == 'true' || (needs.changes.outputs.wework_desktop_e2e == 'true' && github.event.pull_request.head.repo.full_name != github.repository)))
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.runtime.outputs.image }}
+      artifact: ${{ steps.access.outputs.artifact }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Resolve Executor E2E registry access
+        id: access
+        env:
+          REGISTRY_ENABLED: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          if [[ "$REGISTRY_ENABLED" == "true" ]]; then
+            echo "artifact=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "artifact=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Resolve Executor E2E runtime
+        id: runtime
+        env:
+          SOURCE_DIGEST: ${{ hashFiles('frontend/e2e/fixtures/claudecode-executor/Dockerfile', 'executor/Cargo.toml', 'executor/Cargo.lock', 'executor/src/**', 'shared/assets/**') }}
+        run: .github/scripts/resolve-executor-e2e-runtime.sh
+
+      - name: Check content-addressed Executor E2E image
+        if: steps.access.outputs.artifact != 'true'
+        id: image-check
+        env:
+          IMAGE: ${{ steps.runtime.outputs.image }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and publish Executor E2E image
+        if: steps.access.outputs.artifact != 'true' && steps.image-check.outputs.exists != 'true'
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
+        with:
+          context: .
+          file: frontend/e2e/fixtures/claudecode-executor/Dockerfile
+          build-args: BASE_IMAGE=${{ steps.runtime.outputs.base-image }}
+          push: true
+          tags: ${{ steps.runtime.outputs.image }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/wegent-executor:buildcache-e2e
+
+      - name: Build fork Executor E2E image
+        if: steps.access.outputs.artifact == 'true'
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
+        with:
+          context: .
+          file: frontend/e2e/fixtures/claudecode-executor/Dockerfile
+          build-args: BASE_IMAGE=${{ steps.runtime.outputs.base-image }}
+          load: true
+          tags: wegent/e2e-claudecode-executor:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/wegent-executor:buildcache-e2e
+
+      - name: Extract fork Executor binary
+        if: steps.access.outputs.artifact == 'true'
+        run: |
+          mkdir -p executor/target/release
+          container_id="$(docker create wegent/e2e-claudecode-executor:latest)"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container_id:/app/executor" executor/target/release/wegent-executor
+          chmod 0755 executor/target/release/wegent-executor
+
+      - name: Extract registry Executor binary
+        if: steps.access.outputs.artifact != 'true'
+        env:
+          EXECUTOR_E2E_IMAGE: ${{ steps.runtime.outputs.image }}
+        run: |
+          docker pull "$EXECUTOR_E2E_IMAGE"
+          mkdir -p executor/target/release
+          container_id="$(docker create "$EXECUTOR_E2E_IMAGE")"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container_id:/app/executor" executor/target/release/wegent-executor
+          chmod 0755 executor/target/release/wegent-executor
+
+      - name: Archive fork Executor E2E runtime
+        if: steps.access.outputs.artifact == 'true'
+        run: .github/scripts/archive-executor-e2e-runtime.sh
+
+      - name: Upload Executor E2E binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: executor-e2e-binary
+          path: executor/target/release/wegent-executor
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload fork Executor E2E runtime
+        if: steps.access.outputs.artifact == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: executor-e2e-runtime
+          path: |
+            .ci-artifacts/e2e-claudecode-executor-image.tar.zst
+            .ci-artifacts/wegent-executor
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  # Runs browser and API tests with sharding. Executor-heavy coverage runs separately.
+  e2e-tests:
+    name: E2E Tests (Shard ${{ matrix.shardIndex }}/${{ matrix.shardTotal }})
+    needs:
+      [
+        build-frontend-e2e,
+        build-backend-rs-e2e-runtime,
+        build-executor-e2e-runtime,
+        prepare-platform-e2e-image,
+      ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      HOME: /root
+    container:
+      image: ${{ needs.prepare-platform-e2e-image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --add-host=host.docker.internal:host-gateway
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        shardIndex: [1, 2, 3, 4]
+        shardTotal: [4]
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test123
+          MYSQL_DATABASE: wegent_test
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-start-period=5s
+          --health-retries=30
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=15
+
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.16
+        env:
+          ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_DATA_DIR: /etcd
+
+      # Start storage before Milvus: the runner pulls and starts services sequentially.
+      minio:
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r0
+        env:
+          MINIO_ROOT_USER: wegent-e2e
+          MINIO_ROOT_PASSWORD: wegent-e2e-secret
+        options: >-
+          --health-cmd="curl -f http://localhost:9000/minio/health/live"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-start-period=5s
+          --health-retries=30
+
+      milvus:
+        image: milvusdb/milvus:v2.5.4
+        command: milvus run standalone
+        env:
+          ETCD_ENDPOINTS: etcd:2379
+          MINIO_ADDRESS: minio:9000
+          MINIO_ACCESS_KEY_ID: wegent-e2e
+          MINIO_SECRET_ACCESS_KEY: wegent-e2e-secret
+        options: >-
+          --health-cmd="curl -f http://localhost:9091/healthz"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-start-period=30s
+          --health-retries=30
+
+      qdrant:
+        image: qdrant/qdrant:v1.15.4
+
+    steps:
+      - name: Generate internal service token
+        run: |
+          token=$(openssl rand -hex 32)
+          bootstrap_admin_password=$(openssl rand -hex 32)
+          e2e_admin_password=$(openssl rand -hex 32)
+          git_token_aes_key=$(openssl rand -hex 16)
+          git_token_aes_iv=$(openssl rand -hex 8)
+          echo "::add-mask::$token"
+          echo "::add-mask::$bootstrap_admin_password"
+          echo "::add-mask::$e2e_admin_password"
+          echo "::add-mask::$git_token_aes_key"
+          echo "::add-mask::$git_token_aes_iv"
+          {
+            echo "E2E_INTERNAL_SERVICE_TOKEN=$token"
+            echo "INTERNAL_SERVICE_TOKEN=$token"
+            echo "CHAT_SHELL_REMOTE_STORAGE_TOKEN=$token"
+            echo "CHAT_SHELL_INTERNAL_SERVICE_TOKEN=$token"
+            echo "E2E_BOOTSTRAP_ADMIN_PASSWORD=$bootstrap_admin_password"
+            echo "E2E_ADMIN_PASSWORD=$e2e_admin_password"
+            echo "GIT_TOKEN_AES_KEY=$git_token_aes_key"
+            echo "GIT_TOKEN_AES_IV=$git_token_aes_iv"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Node workspace
+        uses: ./.github/actions/setup-node-workspace
+        with:
+          setup-toolchain: "false"
+
+      - name: Set up Python 3.11 and uv
+        uses: ./.github/actions/setup-python-uv-cache
+        with:
+          python-version: "3.11"
+          setup-uv: "false"
+
+      - name: Install shared module
+        working-directory: ./shared
+        run: |
+          uv venv --allow-existing
+          source .venv/bin/activate
+          uv pip install -e .
+
+      - name: Install backend dependencies
+        working-directory: ./backend
+        run: |
+          uv sync
+          source .venv/bin/activate
+          uv pip install -e ../shared
+
+      - name: Prepare Chat Shell tokenizers
+        working-directory: ./backend
+        run: |
+          source .venv/bin/activate
+          ../.github/scripts/prepare-chat-shell-tokenizers.sh
+
+      - name: Download frontend E2E build
+        env:
+          ACTIONS_ARTIFACT_WAIT_SECONDS: "300"
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/download-actions-artifact.sh \
+            frontend-next-build \
+            .ci-artifacts
+
+      - name: Download Backend Rust E2E runtime
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/download-actions-artifact.sh \
+            backend-rs-e2e-runtime \
+            .ci-artifacts
+          chmod 0755 .ci-artifacts/wegent-backend-rs
+
+      - name: Download Executor E2E binary
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/download-actions-artifact.sh \
+            executor-e2e-binary \
+            .ci-artifacts
+          chmod 0755 .ci-artifacts/wegent-executor
+
+      - name: Prepare remote workspace Executor runtime
+        env:
+          PLATFORM_E2E_IMAGE: ${{ needs.prepare-platform-e2e-image.outputs.image }}
+          DOCKER_BUILDKIT: "0"
+        run: |
+          uv sync --project executor_manager --frozen
+          docker build --pull=false \
+            --build-arg BASE_IMAGE="$PLATFORM_E2E_IMAGE" \
+            --file frontend/e2e/fixtures/remote-workspace-executor/Dockerfile \
+            --tag wegent/e2e-workspace-executor:latest .ci-artifacts
+
+      - name: Install Knowledge Runtime dependencies
+        run: uv sync --project knowledge_runtime --frozen
+
+      - name: Install Knowledge Doc Converter dependencies
+        run: uv sync --project knowledge_doc_converter --frozen
+
+      - name: Restore frontend E2E build
+        run: .github/scripts/restore-frontend-e2e-build.sh
+
+      - name: Run database migrations
+        working-directory: ./backend
+        env:
+          DATABASE_URL: mysql+pymysql://root:test123@mysql:3306/wegent_test
+        run: |
+          uv run --no-sync alembic upgrade head
+
+      - name: Verify DingTalk sync MySQL transaction rollback
+        if: matrix.shardIndex == 1
+        working-directory: ./backend
+        env:
+          DINGTALK_SYNC_TEST_MYSQL_URL: mysql+pymysql://root:test123@mysql:3306/wegent_test
+          PYTHONPATH: ..:.
+        run: uv run --no-sync python tests/integration/dingtalk_sync_mysql.py
+
+      - name: Verify device registration MySQL serialization
+        if: matrix.shardIndex == 1
+        working-directory: ./backend
+        env:
+          DEVICE_REGISTRATION_TEST_MYSQL_URL: mysql+pymysql://root:test123@mysql:3306/wegent_test
+          PYTHONPATH: ..:.
+        run: uv run --no-sync python tests/integration/device_registration_mysql.py
+
+      - name: Verify MySQL Runtime activity concurrency
+        if: matrix.shardIndex == 1
+        working-directory: ./backend
+        env:
+          RUNTIME_ACTIVITY_TEST_MYSQL_URL: mysql+pymysql://root:test123@mysql:3306/wegent_test
+          PYTHONPATH: ..:.
+        run: uv run --no-sync python tests/integration/runtime_activity_mysql.py
+
+      - name: Start backend server
+        env:
+          EXTERNAL_KNOWLEDGE_MCP_ENABLED: "true"
+          EMBEDDED_CELERY_ENABLED: "false"
+          DATABASE_URL: mysql+pymysql://root:test123@mysql:3306/wegent_test
+          RS_DATABASE_URL_COLLATION: utf8mb4_0900_ai_ci
+          REDIS_URL: redis://redis:6379/0
+          EXECUTOR_MANAGER_URL: http://localhost:8001
+          SECRET_KEY: test-secret-key-for-ci-testing
+          ALGORITHM: HS256
+          ENVIRONMENT: development
+          DB_AUTO_MIGRATE: "false"
+          INIT_DATA_ENABLED: "true"
+          PLUGIN_LEGACY_UPLOAD_ENABLED: "true"
+          KNOWLEDGE_RUNTIME_URL: http://localhost:8200
+          KNOWLEDGE_CONVERSION_ENABLED: "true"
+          KNOWLEDGE_CONVERSION_FILE_TYPES: "pdf"
+          CHUNK_STORAGE_ENABLED: "true"
+          ATTACHMENT_S3_ENDPOINT: minio:9000
+          ATTACHMENT_S3_ACCESS_KEY: wegent-e2e
+          ATTACHMENT_S3_SECRET_KEY: wegent-e2e-secret
+          ATTACHMENT_S3_USE_SSL: "false"
+          DELIVERY_S3_BUCKET: wegent-deliveries
+          WEGENT_RS_BINARY_PATH: ${{ github.workspace }}/.ci-artifacts/wegent-backend-rs
+          WEGENT_HYBRID_STATE_FILE: ${{ github.workspace }}/backend/backend-hybrid.state
+          RUST_LOG: info,brz_http_gateway::proxy=debug
+        run: |
+          nohup backend-rs/scripts/start-hybrid-backend.sh \
+            > backend/backend.log 2>&1 &
+          echo $! > backend/backend.pid
+
+      - name: Start parallel Backend index worker
+        working-directory: ./backend
+        env:
+          DATABASE_URL: mysql+pymysql://root:test123@mysql:3306/wegent_test
+          REDIS_URL: redis://redis:6379/0
+          SECRET_KEY: test-secret-key-for-ci-testing
+          ENVIRONMENT: development
+          DB_AUTO_MIGRATE: "false"
+          INIT_DATA_ENABLED: "false"
+          EMBEDDED_CELERY_ENABLED: "false"
+          RAG_RUNTIME_MODE: remote
+          KNOWLEDGE_RUNTIME_URL: http://localhost:8200
+          KNOWLEDGE_CONVERSION_ENABLED: "true"
+          KNOWLEDGE_CONVERSION_FILE_TYPES: "pdf"
+          CHUNK_STORAGE_ENABLED: "true"
+          ATTACHMENT_S3_ENDPOINT: minio:9000
+          ATTACHMENT_S3_ACCESS_KEY: wegent-e2e
+          ATTACHMENT_S3_SECRET_KEY: wegent-e2e-secret
+          ATTACHMENT_S3_USE_SSL: "false"
+          PYTHONPATH: ..:.
+        run: |
+          uv run --no-sync celery -A app.core.celery_app worker \
+            --pool=threads --concurrency=4 --queues=wegent_online --beat \
+            --hostname=e2e-index@%h --loglevel=INFO > index-worker.log 2>&1 &
+          echo $! > index-worker.pid
+          for i in {1..60}; do
+            if grep -q ' ready.' index-worker.log; then
+              exit 0
+            fi
+            kill -0 "$(cat index-worker.pid)" || { cat index-worker.log; exit 1; }
+            sleep 1
+          done
+          cat index-worker.log
+          exit 1
+
+      - name: Start Knowledge Runtime
+        env:
+          KNOWLEDGE_RUNTIME_DATABASE_URL: mysql+pymysql://root:test123@mysql:3306/wegent_test
+          KNOWLEDGE_RUNTIME_BACKEND_INTERNAL_URL: http://localhost:8000
+          LOG_FILE_ENABLED: "false"
+        run: |
+          nohup uv run --project knowledge_runtime --no-sync uvicorn knowledge_runtime.main:app \
+            --host 0.0.0.0 --port 8200 > knowledge_runtime/ci.log 2>&1 &
+          echo $! > knowledge_runtime/ci.pid
+
+      - name: Start Chat Shell server
+        working-directory: ./backend
+        env:
+          CHAT_SHELL_MODE: http
+          CHAT_SHELL_STORAGE_TYPE: remote
+          CHAT_SHELL_REMOTE_STORAGE_URL: http://localhost:8000/api/internal
+          EXECUTOR_MANAGER_URL: http://localhost:8001
+        run: |
+          source .venv/bin/activate
+          nohup python -m uvicorn chat_shell.main:app --host 0.0.0.0 --port 8100 > chat_shell.log 2>&1 &
+          echo $! > chat_shell.pid
+
+      - name: Start frontend server
+        working-directory: ./frontend
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+          RUNTIME_INTERNAL_API_URL: http://localhost:8000
+          RUNTIME_SOCKET_DIRECT_URL: http://localhost:8000
+        run: ../.github/scripts/start-frontend-e2e-server.sh
+
+      - name: Start Mock Model Server
+        working-directory: ./frontend
+        run: |
+          pnpm exec tsx e2e/utils/mock-model-server.ts > mock-model-server.log 2>&1 &
+          echo $! > mock-server.pid
+
+      - name: Start Knowledge Doc Converter
+        env:
+          BACKEND_BASE_URL: http://localhost:8000
+          BACKEND_INTERNAL_TOKEN: ${{ env.INTERNAL_SERVICE_TOKEN }}
+          CELERY_BROKER_URL: redis://redis:6379/0
+          CELERY_RESULT_BACKEND: redis://redis:6379/1
+          REDIS_URL: redis://redis:6379/0
+          MINERU_API_BASE_URL: http://localhost:9999/mineru
+          MINERU_POLL_INTERVAL_SECONDS: "1"
+          KNOWLEDGE_CONVERSION_QUEUE: knowledge_conversion
+          LOG_FILE_ENABLED: "false"
+        run: |
+          nohup uv run --project knowledge_doc_converter --no-sync celery \
+            -A knowledge_doc_converter.celery_app worker \
+            --queues=knowledge_conversion \
+            --concurrency=1 \
+            --loglevel=INFO > knowledge_doc_converter/ci.log 2>&1 &
+          echo $! > knowledge_doc_converter/ci.pid
+
+      - name: Wait for services
+        run: |
+          wait_for_url() {
+            local url="$1"
+            for i in {1..120}; do
+              if curl -sf "$url" >/dev/null; then
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+
+          wait_for_url http://localhost:8000/api/docs \
+            && wait_for_url http://localhost:8200/internal/rag/health \
+            && wait_for_url http://qdrant:6333/readyz \
+            && wait_for_url http://minio:9000/minio/health/live \
+            && wait_for_url http://localhost:8100/health \
+            && wait_for_url http://localhost:3000 \
+            && wait_for_url http://localhost:9999/health \
+            || (cat backend/backend.log knowledge_runtime/ci.log backend/chat_shell.log frontend/next-dev.log frontend/mock-model-server.log; exit 1)
+
+      - name: Start local Executor device
+        env:
+          EXECUTOR_MODE: local
+          WEGENT_BACKEND_URL: http://localhost:8000
+          DEVICE_ID: e2e-platform-device-${{ matrix.shardIndex }}
+          DEVICE_NAME: E2E Platform Device ${{ matrix.shardIndex }}
+          DEVICE_TYPE: app
+          BIND_SHELL: claudecode
+          WEGENT_EXECUTOR_HOME: /tmp/wegent-platform-executor-${{ matrix.shardIndex }}
+          LOCAL_WORKSPACE_ROOT: /tmp/wegent-platform-workspace-${{ matrix.shardIndex }}
+          WORKSPACE_ROOT: /tmp/wegent-platform-workspace-${{ matrix.shardIndex }}
+          LOCAL_HEARTBEAT_INTERVAL: "5"
+          LOG_LEVEL: info
+        run: |
+          .github/scripts/start-local-e2e-executor.sh \
+            .ci-artifacts/wegent-executor \
+            executor/platform-executor.log \
+            executor/platform-executor.pid
+
+      - name: Start remote workspace Executor Manager
+        working-directory: ./executor_manager
+        env:
+          REDIS_URL: redis://redis:6379/0
+          DOCKER_HOST_ADDR: host.docker.internal
+          SERVICE_POOL: e2e-workspace
+          EXECUTOR_READY_MAX_RETRIES: "30"
+          EXECUTOR_READY_INTERVAL: "1"
+          OTEL_ENABLED: "false"
+        run: |
+          manager_ip="$(hostname -i | awk '{print $1}')"
+          export NETWORK="$(docker inspect "$(hostname)" --format '{{range $name, $network := .NetworkSettings.Networks}}{{$name}}{{end}}')"
+          export TASK_API_DOMAIN="http://$manager_ip:8000"
+          export EXECUTOR_MANAGER_CALLBACK_URL="http://$manager_ip:8001/executor-manager/callback"
+          uv run --no-sync uvicorn main:app --host 0.0.0.0 --port 8001 \
+            > workspace-manager.log 2>&1 &
+          echo $! > workspace-manager.pid
+          for i in {1..60}; do
+            if curl -sf http://localhost:8001/health >/dev/null; then
+              exit 0
+            fi
+            kill -0 "$(cat workspace-manager.pid)" || { cat workspace-manager.log; exit 1; }
+            sleep 1
+          done
+          cat workspace-manager.log
+          exit 1
+
+      - name: Verify backend is running
+        run: |
+          curl -f http://localhost:8000/api/docs > /dev/null 2>&1 || (cat backend/backend.log && exit 1)
+
+      - name: Run DingTalk private-chat AI Card E2E
+        if: matrix.shardIndex == 1
+        working-directory: ./backend
+        env:
+          DATABASE_URL: mysql+pymysql://root:test123@mysql:3306/wegent_test
+          REDIS_URL: redis://redis:6379/0
+          SECRET_KEY: test-secret-key-for-ci-testing
+          ALGORITHM: HS256
+          ENVIRONMENT: development
+          DB_AUTO_MIGRATE: "false"
+          INIT_DATA_ENABLED: "true"
+          PYTHONPATH: ..:.
+        run: uv run --no-sync python tests/e2e/dingtalk_ai_card_conversation.py
+
+      - name: Run knowledge remote index E2E
+        if: matrix.shardIndex == 1
+        working-directory: ./backend
+        env:
+          DATABASE_URL: mysql+pymysql://root:test123@mysql:3306/wegent_test
+          REDIS_URL: redis://redis:6379/0
+          ENVIRONMENT: development
+          DB_AUTO_MIGRATE: "false"
+          INIT_DATA_ENABLED: "true"
+          RAG_RUNTIME_MODE: remote
+          KNOWLEDGE_RUNTIME_URL: http://localhost:8200
+          E2E_KNOWLEDGE_RUNTIME_URL: http://localhost:8200
+          E2E_QDRANT_URL: http://qdrant:6333
+          E2E_MILVUS_URL: http://milvus:19530
+          MOCK_MODEL_SERVER_URL: http://localhost:9999
+          E2E_BOOTSTRAP_ADMIN_USER: admin
+          PYTHONPATH: ..:.
+        run: |
+          uv run --no-sync python tests/e2e/knowledge_remote_index.py
+          uv run --no-sync python tests/e2e/knowledge_milvus_e2e.py
+
+      - name: Verify Chat Shell is running
+        run: |
+          curl -f http://localhost:8100/health > /dev/null 2>&1 || (cat backend/chat_shell.log && exit 1)
+
+      - name: Run E2E tests (Sharded)
+        working-directory: ./frontend
+        env:
+          DATABASE_URL: mysql+pymysql://root:test123@mysql:3306/wegent_test
+          E2E_BASE_URL: http://localhost:3000
+          E2E_API_URL: http://localhost:8000
+          MOCK_MODEL_SERVER_URL: http://localhost:9999
+          E2E_SHARD_INDEX: ${{ matrix.shardIndex }}
+          E2E_USE_ISOLATED_USERS: "false"
+          CI: true
+          RUNNER_PROCESS_DIAGNOSTICS: "1"
+          RUNNER_RESOURCE_LOG_PATH: ci-diagnostics/shard-${{ matrix.shardIndex }}.jsonl
+        run: |
+          # Dependencies are verified; retain resource logging without pnpm's exit worker pool.
+          node ../.github/scripts/run-with-resource-logging.mjs \
+            node ./node_modules/@playwright/test/cli.js test --project=chromium --project=api \
+            --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+
+      - name: Run Provider-native E2E tests
+        timeout-minutes: 15
+        working-directory: ./frontend
+        env:
+          E2E_BASE_URL: http://localhost:3000
+          E2E_API_URL: http://localhost:8000
+          MOCK_MODEL_SERVER_URL: http://localhost:9999
+          E2E_SHARD_INDEX: ${{ matrix.shardIndex }}
+          E2E_QDRANT_URL: http://qdrant:6333
+          E2E_KNOWLEDGE_RUNTIME_URL: http://localhost:8200
+          E2E_USE_ISOLATED_USERS: "false"
+          CI: true
+        run: |
+          node ./node_modules/@playwright/test/cli.js test \
+            --project=provider-native-chromium \
+            --workers=1 \
+            --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }} \
+            --no-deps
+
+      - name: Stop Backend index worker
+        if: always()
+        working-directory: ./backend
+        run: |
+          if [ -f index-worker.pid ]; then
+            kill "$(cat index-worker.pid)" 2>/dev/null || true
+            rm -f index-worker.pid
+          fi
+
+      - name: Stop Knowledge Runtime
+        if: always()
+        run: |
+          if [ -f knowledge_runtime/ci.pid ]; then
+            kill "$(cat knowledge_runtime/ci.pid)"
+          fi
+
+      - name: Stop Knowledge Doc Converter
+        if: always()
+        run: |
+          if [ -f knowledge_doc_converter/ci.pid ]; then
+            kill "$(cat knowledge_doc_converter/ci.pid)" 2>/dev/null || true
+            rm -f knowledge_doc_converter/ci.pid
+          fi
+
+      - name: Stop Mock Model Server
+        if: always()
+        working-directory: ./frontend
+        run: |
+          if [ -f mock-server.pid ]; then
+            kill $(cat mock-server.pid) 2>/dev/null || true
+            rm mock-server.pid
+          fi
+
+      - name: Stop local Executor device
+        if: always()
+        run: |
+          if [ -f executor/platform-executor.pid ]; then
+            kill "$(cat executor/platform-executor.pid)" 2>/dev/null || true
+            rm executor/platform-executor.pid
+          fi
+
+      - name: Stop remote workspace Executor Manager
+        if: always()
+        run: |
+          if [ -f executor_manager/workspace-manager.pid ]; then
+            kill "$(cat executor_manager/workspace-manager.pid)"
+          fi
+          if command -v docker >/dev/null; then
+            mapfile -t containers < <(docker ps -aq \
+              --filter ancestor=wegent/e2e-workspace-executor:latest \
+              --filter label=owner=executor_manager)
+            if ((${#containers[@]})); then
+              docker rm -f "${containers[@]}"
+            fi
+          fi
+
+      - name: Stop frontend dev server
+        if: always()
+        working-directory: ./frontend
+        run: |
+          if [ -f next-dev.pid ]; then
+            kill $(cat next-dev.pid) 2>/dev/null || true
+            rm next-dev.pid
+          fi
+
+      - name: Stop Chat Shell server
+        if: always()
+        working-directory: ./backend
+        run: |
+          if [ -f chat_shell.pid ]; then
+            kill $(cat chat_shell.pid) 2>/dev/null || true
+            rm chat_shell.pid
+          fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: blob-report-${{ matrix.shardIndex }}
+          path: frontend/blob-report/
+          retention-days: 14
+
+      - name: Upload test traces
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: playwright-traces-${{ matrix.shardIndex }}
+          path: frontend/test-results/
+          retention-days: 7
+
+      - name: Upload process diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: e2e-process-diagnostics-${{ matrix.shardIndex }}
+          path: frontend/ci-diagnostics/
+          retention-days: 7
+
+      - name: Upload backend logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: backend-logs-${{ matrix.shardIndex }}
+          path: |
+            backend/backend.log
+            backend/index-worker.log
+            logs/backend/rust/
+            backend/chat_shell.log
+            knowledge_runtime/ci.log
+            frontend/next-dev.log
+            frontend/mock-model-server.log
+            executor/platform-executor.log
+            executor_manager/workspace-manager.log
+          retention-days: 7
+
+  executor-e2e-tests:
+    name: Executor E2E Tests
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    needs:
+      [
+        build-frontend-e2e,
+        build-backend-rs-e2e-runtime,
+        build-executor-e2e-runtime,
+        prepare-platform-e2e-image,
+      ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test123
+          MYSQL_DATABASE: wegent_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=30
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=15
+
+      minio:
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r0
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: wegent-e2e
+          MINIO_ROOT_PASSWORD: wegent-e2e-secret
+        options: >-
+          --health-cmd="curl -f http://localhost:9000/minio/health/live"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-start-period=5s
+          --health-retries=30
+
+    steps:
+      - name: Generate internal service token
+        run: |
+          token=$(openssl rand -hex 32)
+          bootstrap_admin_password=$(openssl rand -hex 32)
+          e2e_admin_password=$(openssl rand -hex 32)
+          git_token_aes_key=$(openssl rand -hex 16)
+          git_token_aes_iv=$(openssl rand -hex 8)
+          echo "::add-mask::$token"
+          echo "::add-mask::$bootstrap_admin_password"
+          echo "::add-mask::$e2e_admin_password"
+          echo "::add-mask::$git_token_aes_key"
+          echo "::add-mask::$git_token_aes_iv"
+          {
+            echo "E2E_INTERNAL_SERVICE_TOKEN=$token"
+            echo "INTERNAL_SERVICE_TOKEN=$token"
+            echo "CHAT_SHELL_REMOTE_STORAGE_TOKEN=$token"
+            echo "CHAT_SHELL_INTERNAL_SERVICE_TOKEN=$token"
+            echo "E2E_BOOTSTRAP_ADMIN_PASSWORD=$bootstrap_admin_password"
+            echo "E2E_ADMIN_PASSWORD=$e2e_admin_password"
+            echo "GIT_TOKEN_AES_KEY=$git_token_aes_key"
+            echo "GIT_TOKEN_AES_IV=$git_token_aes_iv"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull E2E images
+        env:
+          PLATFORM_E2E_IMAGE: ${{ needs.prepare-platform-e2e-image.outputs.image }}
+          EXECUTOR_E2E_IMAGE: ${{ needs.build-executor-e2e-runtime.outputs.image }}
+          USE_EXECUTOR_ARTIFACT: ${{ needs.build-executor-e2e-runtime.outputs.artifact }}
+        run: |
+          docker pull "$PLATFORM_E2E_IMAGE" &
+          platform_pid=$!
+          if [[ "$USE_EXECUTOR_ARTIFACT" != "true" ]]; then
+            docker pull "$EXECUTOR_E2E_IMAGE" &
+            executor_pid=$!
+          fi
+
+          status=0
+          wait "$platform_pid" || status=$?
+          if [[ -n "${executor_pid:-}" ]]; then
+            wait "$executor_pid" || status=$?
+          fi
+          exit "$status"
+
+      - name: Free executor E2E runner disk space
+        run: .github/scripts/free-runner-disk-space-if-needed.sh 50
+
+      - name: Install executor Rust system dependencies
+        run: .github/scripts/install-executor-rust-system-dependencies.sh
+
+      - name: Set up Node workspace
+        uses: ./.github/actions/setup-node-workspace
+
+      - name: Restore bundled Codex cache
+        id: bundled-codex-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ~/.cache/wegent/codex
+          key: ${{ runner.os }}-wework-codex-v1-${{ hashFiles('wework/codex-binaries.lock.json') }}
+
+      - name: Prepare bundled Codex for local Executor
+        working-directory: ./wework
+        run: node scripts/prepare-codex-binary.mjs --materialize
+
+      - name: Add local harness CLIs to PATH
+        run: echo "$GITHUB_WORKSPACE/.github/claude-code-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Restore shared Claude Code CLI
+        id: claude-code-cli-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: .github/claude-code-cli/node_modules
+          key: ${{ runner.os }}-node-24-local-harness-clis-v2-${{ hashFiles('.github/claude-code-cli/package.json', '.github/claude-code-cli/package-lock.json') }}
+
+      - name: Set up Python 3.11 and uv
+        uses: ./.github/actions/setup-python-uv-cache
+        with:
+          python-version: "3.11"
+
+      - name: Install shared module
+        working-directory: ./shared
+        run: |
+          uv venv --allow-existing
+          source .venv/bin/activate
+          uv pip install -e .
+
+      - name: Install backend dependencies
+        working-directory: ./backend
+        run: |
+          uv sync
+          source .venv/bin/activate
+          uv pip install -e ../shared
+
+      - name: Prepare Chat Shell tokenizers
+        working-directory: ./backend
+        run: |
+          source .venv/bin/activate
+          ../.github/scripts/prepare-chat-shell-tokenizers.sh
+
+      - name: Install executor manager dependencies
+        working-directory: ./executor_manager
+        run: |
+          uv sync
+          source .venv/bin/activate
+          uv pip install -e ../shared
+
+      - name: Install local harness CLIs
+        if: steps.claude-code-cli-cache.outputs.cache-hit != 'true'
+        run: npm ci --prefix .github/claude-code-cli --strict-allow-scripts
+
+      - name: Verify local harness CLIs
+        run: .github/scripts/verify-local-harness-clis.sh
+
+      - name: Save shared local harness CLIs
+        if: github.ref == 'refs/heads/main' && steps.claude-code-cli-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: .github/claude-code-cli/node_modules
+          key: ${{ steps.claude-code-cli-cache.outputs.cache-primary-key }}
+
+      - name: Download frontend E2E build
+        env:
+          ACTIONS_ARTIFACT_WAIT_SECONDS: "300"
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/download-actions-artifact.sh \
+            frontend-next-build \
+            .ci-artifacts
+
+      - name: Download Backend Rust E2E runtime
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/download-actions-artifact.sh \
+            backend-rs-e2e-runtime \
+            .ci-artifacts
+          chmod 0755 .ci-artifacts/wegent-backend-rs
+
+      - name: Download Executor E2E binary
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/download-actions-artifact.sh \
+            executor-e2e-binary \
+            .ci-artifacts
+          mkdir -p executor/target/release
+          cp .ci-artifacts/wegent-executor executor/target/release/wegent-executor
+          chmod 0755 executor/target/release/wegent-executor
+
+      - name: Restore frontend E2E build
+        run: .github/scripts/restore-frontend-e2e-build.sh
+
+      - name: Download fork Executor E2E runtime
+        if: needs.build-executor-e2e-runtime.outputs.artifact == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/download-actions-artifact.sh \
+            executor-e2e-runtime \
+            .ci-artifacts
+
+      - name: Restore fork Executor E2E runtime
+        if: needs.build-executor-e2e-runtime.outputs.artifact == 'true'
+        run: .github/scripts/restore-executor-e2e-runtime.sh
+
+      - name: Run database migrations
+        working-directory: ./backend
+        env:
+          DATABASE_URL: mysql+pymysql://root:test123@localhost:3306/wegent_test
+        run: |
+          uv run --no-sync alembic upgrade head
+
+      - name: Resolve Docker bridge host
+        run: |
+          DOCKER_BRIDGE_HOST=$(ip -4 addr show docker0 | awk '/inet / {print $2}' | cut -d/ -f1)
+          if [ -z "$DOCKER_BRIDGE_HOST" ]; then
+            DOCKER_BRIDGE_HOST=172.17.0.1
+          fi
+          echo "E2E_DOCKER_BRIDGE_HOST=$DOCKER_BRIDGE_HOST" >> "$GITHUB_ENV"
+          echo "BACKEND_INTERNAL_URL=http://$DOCKER_BRIDGE_HOST:8000" >> "$GITHUB_ENV"
+          echo "CALLBACK_HOST=http://$DOCKER_BRIDGE_HOST:8001" >> "$GITHUB_ENV"
+          echo "TASK_API_DOMAIN=http://$DOCKER_BRIDGE_HOST:8000" >> "$GITHUB_ENV"
+          echo "E2E_CLAUDE_MODEL_SERVER_URL=http://$DOCKER_BRIDGE_HOST:9999" >> "$GITHUB_ENV"
+          echo "E2E_CODEX_MODEL_SERVER_URL=http://$DOCKER_BRIDGE_HOST:9999" >> "$GITHUB_ENV"
+          echo "Docker bridge host: $DOCKER_BRIDGE_HOST"
+
+      - name: Start backend server
+        env:
+          DATABASE_URL: mysql+pymysql://root:test123@localhost:3306/wegent_test
+          RS_DATABASE_URL_COLLATION: utf8mb4_0900_ai_ci
+          REDIS_URL: redis://localhost:6379/0
+          EXECUTOR_MANAGER_URL: http://localhost:8001
+          SECRET_KEY: test-secret-key-for-ci-testing
+          ALGORITHM: HS256
+          ENVIRONMENT: development
+          DB_AUTO_MIGRATE: "false"
+          INIT_DATA_ENABLED: "true"
+          PLUGIN_LEGACY_UPLOAD_ENABLED: "true"
+          ATTACHMENT_S3_ENDPOINT: localhost:9000
+          ATTACHMENT_S3_ACCESS_KEY: wegent-e2e
+          ATTACHMENT_S3_SECRET_KEY: wegent-e2e-secret
+          ATTACHMENT_S3_USE_SSL: "false"
+          WEGENT_RS_BINARY_PATH: ${{ github.workspace }}/.ci-artifacts/wegent-backend-rs
+          WEGENT_HYBRID_STATE_FILE: ${{ github.workspace }}/backend/backend-hybrid.state
+        run: |
+          nohup backend-rs/scripts/start-hybrid-backend.sh \
+            > backend/backend.log 2>&1 &
+          echo $! > backend/backend.pid
+
+      - name: Start Chat Shell server
+        working-directory: ./backend
+        env:
+          CHAT_SHELL_MODE: http
+          CHAT_SHELL_STORAGE_TYPE: remote
+          CHAT_SHELL_REMOTE_STORAGE_URL: http://localhost:8000/api/internal
+          EXECUTOR_MANAGER_URL: http://localhost:8001
+        run: |
+          source .venv/bin/activate
+          nohup python -m uvicorn chat_shell.main:app --host 0.0.0.0 --port 8100 > chat_shell.log 2>&1 &
+          echo $! > chat_shell.pid
+
+      - name: Start frontend server
+        working-directory: ./frontend
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+          RUNTIME_INTERNAL_API_URL: http://localhost:8000
+          RUNTIME_SOCKET_DIRECT_URL: http://localhost:8000
+        run: ../.github/scripts/start-frontend-e2e-server.sh
+
+      - name: Start Mock Model Server
+        working-directory: ./frontend
+        run: |
+          pnpm exec tsx e2e/utils/mock-model-server.ts > mock-model-server.log 2>&1 &
+          echo $! > mock-server.pid
+
+      - name: Start Local Executor
+        env:
+          EXECUTOR_MODE: local
+          WEGENT_BACKEND_URL: http://localhost:8000
+          DEVICE_ID: e2e-claudecode-device
+          DEVICE_NAME: E2E ClaudeCode Device
+          DEVICE_TYPE: app
+          BIND_SHELL: claudecode
+          WEGENT_EXECUTOR_HOME: ${{ runner.temp }}/wegent-executor
+          LOCAL_WORKSPACE_ROOT: ${{ runner.temp }}/wegent-workspace
+          WORKSPACE_ROOT: ${{ runner.temp }}/wegent-workspace
+          LOCAL_HEARTBEAT_INTERVAL: "5"
+          LOG_LEVEL: info
+          CODEX_BINARY_PATH: ${{ github.workspace }}/wework/resources/binaries/codex/x86_64-unknown-linux-gnu/vendor/x86_64-unknown-linux-musl/bin/codex
+          CODEX_HOME: ${{ runner.temp }}/wegent-executor/codex
+          WEGENT_CODEX_HOME: ${{ runner.temp }}/wegent-executor/codex
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: "1"
+          CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: "1"
+          CLAUDE_CODE_INCLUDE_CO_AUTHORED_BY: "false"
+        run: |
+          .github/scripts/start-local-e2e-executor.sh \
+            executor/target/release/wegent-executor \
+            executor/local-executor.log \
+            executor/local-executor.pid
+
+      - name: Start Executor Manager
+        working-directory: ./executor_manager
+        env:
+          REDIS_URL: redis://localhost:6379/0
+          EXECUTOR_IMAGE: ${{ needs.build-executor-e2e-runtime.outputs.artifact == 'true' && 'wegent/e2e-claudecode-executor:latest' || needs.build-executor-e2e-runtime.outputs.image }}
+          EXECUTOR_PORT_RANGE_MIN: "12000"
+          EXECUTOR_PORT_RANGE_MAX: "12100"
+          EXECUTOR_READY_MAX_RETRIES: "90"
+          EXECUTOR_READY_INTERVAL: "1"
+          SANDBOX_READY_MAX_RETRIES: "90"
+          SANDBOX_READY_INTERVAL: "1"
+          EXECUTOR_MANAGER_CALLBACK_URL: http://localhost:8001/executor-manager/callback
+          DOCKER_HOST_ADDR: localhost
+          NETWORK: bridge
+          SERVICE_POOL: e2e-executor
+          EXECUTOR_WORKSPACE: ${{ runner.temp }}/wegent-executor-workspace
+          OTEL_ENABLED: "false"
+        run: |
+          mkdir -p "${EXECUTOR_WORKSPACE}"
+          source .venv/bin/activate
+          nohup uvicorn main:app --host 0.0.0.0 --port 8001 > executor_manager.log 2>&1 &
+          echo $! > executor_manager.pid
+
+      - name: Wait for services
+        run: |
+          wait_for_url() {
+            local url="$1"
+            for i in {1..120}; do
+              if curl -sf "$url" >/dev/null; then
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+
+          wait_for_url http://localhost:8000/api/docs \
+            && wait_for_url http://localhost:8100/health \
+            && wait_for_url http://localhost:3000 \
+            && wait_for_url http://localhost:9999/health \
+            && wait_for_url http://localhost:8001/health \
+            || (cat backend/backend.log && cat backend/chat_shell.log && cat frontend/next-dev.log && cat frontend/mock-model-server.log && cat executor/local-executor.log && cat executor_manager/executor_manager.log && exit 1)
+
+      - name: Verify backend is running
+        run: |
+          curl -f http://localhost:8000/api/docs > /dev/null 2>&1 || (cat backend/backend.log && exit 1)
+
+      - name: Verify Chat Shell is running
+        run: |
+          curl -f http://localhost:8100/health > /dev/null 2>&1 || (cat backend/chat_shell.log && exit 1)
+
+      - name: Run Executor Manager resilience E2E tests
+        working-directory: ./executor_manager
+        env:
+          E2E_REDIS_URL: redis://localhost:6379/15
+          OTEL_ENABLED: "false"
+          PYTHONPATH: ${{ github.workspace }}
+        run: uv run pytest e2e_tests/ --no-cov -v
+
+      - name: Run Executor E2E tests
+        env:
+          PLATFORM_E2E_IMAGE: ${{ needs.prepare-platform-e2e-image.outputs.image }}
+          E2E_BASE_URL: http://localhost:3000
+          E2E_API_URL: http://localhost:8000
+          E2E_USE_ISOLATED_USERS: "false"
+          MOCK_MODEL_SERVER_URL: http://localhost:9999
+          E2E_LOCAL_CLAUDE_MODEL_SERVER_URL: http://localhost:9999
+          E2E_CLAUDE_EXECUTOR_IMAGE: ${{ needs.build-executor-e2e-runtime.outputs.artifact == 'true' && 'wegent/e2e-claudecode-executor:latest' || needs.build-executor-e2e-runtime.outputs.image }}
+          E2E_DEVICE_ID: e2e-claudecode-device
+          CI: true
+        run: |
+          repository_name="${GITHUB_REPOSITORY##*/}"
+          container_workspace="/__w/$repository_name/$repository_name"
+          docker run --rm \
+            --network host \
+            --ipc host \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --volume "$GITHUB_WORKSPACE:$container_workspace" \
+            --workdir "$container_workspace/frontend" \
+            --env E2E_INTERNAL_SERVICE_TOKEN \
+            --env INTERNAL_SERVICE_TOKEN \
+            --env CHAT_SHELL_REMOTE_STORAGE_TOKEN \
+            --env CHAT_SHELL_INTERNAL_SERVICE_TOKEN \
+            --env E2E_BOOTSTRAP_ADMIN_PASSWORD \
+            --env E2E_ADMIN_PASSWORD \
+            --env GIT_TOKEN_AES_KEY \
+            --env GIT_TOKEN_AES_IV \
+            --env E2E_BASE_URL \
+            --env E2E_API_URL \
+            --env E2E_USE_ISOLATED_USERS \
+            --env MOCK_MODEL_SERVER_URL \
+            --env E2E_CLAUDE_MODEL_SERVER_URL \
+            --env E2E_CODEX_MODEL_SERVER_URL \
+            --env E2E_LOCAL_CLAUDE_MODEL_SERVER_URL \
+            --env E2E_CLAUDE_EXECUTOR_IMAGE \
+            --env E2E_DEVICE_ID \
+            --env CI \
+            "$PLATFORM_E2E_IMAGE" \
+            node ./node_modules/@playwright/test/cli.js test --project=executor-chromium
+
+      - name: Stop Local ClaudeCode Executor
+        if: always()
+        run: |
+          if [ -f executor/local-executor.pid ]; then
+            kill $(cat executor/local-executor.pid) 2>/dev/null || true
+            rm executor/local-executor.pid
+          fi
+
+      - name: Stop frontend dev server
+        if: always()
+        working-directory: ./frontend
+        run: |
+          if [ -f next-dev.pid ]; then
+            kill $(cat next-dev.pid) 2>/dev/null || true
+            rm next-dev.pid
+          fi
+
+      - name: Stop Executor Manager
+        if: always()
+        working-directory: ./executor_manager
+        run: |
+          if [ -f executor_manager.pid ]; then
+            kill $(cat executor_manager.pid) 2>/dev/null || true
+            rm executor_manager.pid
+          fi
+
+      - name: Capture Executor Manager container logs
+        if: failure()
+        run: |
+          mkdir -p executor_manager/container-logs
+          for container_id in $(docker ps -aq --filter label=owner=executor_manager); do
+            container_name=$(docker inspect --format '{{.Name}}' "$container_id" | sed 's#^/##')
+            docker logs "$container_id" \
+              > "executor_manager/container-logs/${container_name}.log" 2>&1 || true
+          done
+
+      - name: Remove Executor Manager Containers
+        if: always()
+        run: |
+          docker ps -aq --filter label=owner=executor_manager | xargs -r docker rm -f
+
+      - name: Stop Mock Model Server
+        if: always()
+        working-directory: ./frontend
+        run: |
+          if [ -f mock-server.pid ]; then
+            kill $(cat mock-server.pid) 2>/dev/null || true
+            rm mock-server.pid
+          fi
+
+      - name: Stop Chat Shell server
+        if: always()
+        working-directory: ./backend
+        run: |
+          if [ -f chat_shell.pid ]; then
+            kill $(cat chat_shell.pid) 2>/dev/null || true
+            rm chat_shell.pid
+          fi
+
+      - name: Upload executor test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: blob-report-executor
+          path: frontend/blob-report/
+          retention-days: 14
+
+      - name: Upload executor test traces
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: playwright-traces-executor
+          path: frontend/test-results/
+          retention-days: 7
+
+      - name: Upload executor logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: backend-logs-executor
+          path: |
+            backend/backend.log
+            backend/chat_shell.log
+            frontend/next-dev.log
+            frontend/mock-model-server.log
+            executor/local-executor.log
+            executor_manager/executor_manager.log
+            executor_manager/container-logs/
+          retention-days: 7
+
+  platform-e2e-summary:
+    name: Platform E2E Summary
+    needs:
+      - changes
+      - build-frontend-e2e
+      - build-executor-e2e-runtime
+      - e2e-tests
+      - executor-e2e-tests
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check Platform E2E results
+        env:
+          RUN_E2E: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && needs.changes.outputs.platform_e2e == 'true') }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          FRONTEND_BUILD_RESULT: ${{ needs.build-frontend-e2e.result }}
+          EXECUTOR_BUILD_RESULT: ${{ needs.build-executor-e2e-runtime.result }}
+          PLATFORM_E2E_RESULT: ${{ needs.e2e-tests.result }}
+          EXECUTOR_E2E_RESULT: ${{ needs.executor-e2e-tests.result }}
+        run: |
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "Platform E2E change detection completed with: $CHANGES_RESULT"
+            exit 1
+          fi
+
+          if [[ "$RUN_E2E" != "true" ]]; then
+            echo "Platform E2E is not required for this pull request"
+            exit 0
+          fi
+
+          assert_success() {
+            local result="$1"
+            local name="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "$name completed with: $result"
+              exit 1
+            fi
+          }
+
+          assert_success "$FRONTEND_BUILD_RESULT" "Frontend E2E build"
+          assert_success "$EXECUTOR_BUILD_RESULT" "Executor E2E build"
+          assert_success "$PLATFORM_E2E_RESULT" "Platform E2E"
+          assert_success "$EXECUTOR_E2E_RESULT" "Executor E2E"

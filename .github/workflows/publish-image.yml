@@ -1,0 +1,1236 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Wegent Release
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Wegent platform version to release (e.g. 1.2.3 or v1.2.3). If empty, auto-increment from latest vX.Y.Z tag"
+        type: string
+        required: false
+
+env:
+  GIT_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.merge_commit_sha || 'main' }}
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+
+concurrency:
+  group: publish-image
+  cancel-in-progress: false
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: >
+      ( github.event_name == 'pull_request' &&
+        github.event.pull_request.base.ref == 'main' &&
+        github.event.pull_request.merged == true &&
+        contains(github.event.pull_request.title, 'Changeset version bump') ) ||
+      github.event_name == 'workflow_dispatch'
+
+    outputs:
+      new_version: ${{ steps.get_version.outputs.version }}
+
+    steps:
+      - name: Checkout code (full history for version detection)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+          fetch-depth: 0
+
+      - name: Get Wegent platform version
+        id: get_version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+
+          validate_version() {
+            local version="$1"
+            if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Error: Invalid version '$version'. Expected MAJOR.MINOR.PATCH, for example 1.2.3." >&2
+              exit 1
+            fi
+          }
+
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="${INPUT_VERSION#v}"
+            validate_version "$VERSION"
+            echo "Using custom Wegent platform version: ${VERSION}"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get the latest version tag (format: vX.X.X)
+          LATEST_TAG=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1 || true)
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No existing version tags found, starting from v0.0.1"
+            echo "version=0.0.1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          VERSION="${LATEST_TAG#v}"
+          validate_version "$VERSION"
+          echo "Current version: $VERSION (from tag $LATEST_TAG)"
+
+          IFS='.' read -ra VERSION_PARTS <<< "$VERSION"
+          if [ ${#VERSION_PARTS[@]} -ne 3 ]; then
+            echo "Error: Invalid version format '$VERSION'. Expected MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+          MAJOR=${VERSION_PARTS[0]}
+          MINOR=${VERSION_PARTS[1]}
+          PATCH=${VERSION_PARTS[2]}
+
+          if ! [[ "$PATCH" =~ ^[0-9]+$ ]]; then
+            echo "Error: PATCH '$PATCH' is not a number"
+            exit 1
+          fi
+
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+
+          echo "New version: $NEW_VERSION"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+  # ============================================================================
+  # Backend Image Build (parallel AMD64 + ARM64)
+  # ============================================================================
+  build-backend-amd64:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Fetch and stage optional application plugins
+        env:
+          WEGENT_SITES_PLUGIN_ARCHIVE_URL: ${{ vars.WEGENT_SITES_PLUGIN_ARCHIVE_URL || secrets.WEGENT_SITES_PLUGIN_ARCHIVE_URL }}
+          WEGENT_SITES_PLUGIN_ARCHIVE_SHA256: ${{ vars.WEGENT_SITES_PLUGIN_ARCHIVE_SHA256 }}
+          WEGENT_SITES_PLUGIN_ARCHIVE_AUTHORIZATION: ${{ secrets.WEGENT_SITES_PLUGIN_ARCHIVE_AUTHORIZATION }}
+          WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_URL: ${{ vars.WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_URL || secrets.WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_URL }}
+          WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_SHA256: ${{ vars.WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_SHA256 }}
+          WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_AUTHORIZATION: ${{ secrets.WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_AUTHORIZATION }}
+        run: node scripts/fetch-builtin-plugins.mjs
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend image (amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/backend/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-backend:${{ needs.prepare-release.outputs.new_version }}-amd64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-backend:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-backend:buildcache-amd64,mode=max
+
+  build-backend-arm64:
+    needs: prepare-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Fetch and stage optional application plugins
+        env:
+          WEGENT_SITES_PLUGIN_ARCHIVE_URL: ${{ vars.WEGENT_SITES_PLUGIN_ARCHIVE_URL || secrets.WEGENT_SITES_PLUGIN_ARCHIVE_URL }}
+          WEGENT_SITES_PLUGIN_ARCHIVE_SHA256: ${{ vars.WEGENT_SITES_PLUGIN_ARCHIVE_SHA256 }}
+          WEGENT_SITES_PLUGIN_ARCHIVE_AUTHORIZATION: ${{ secrets.WEGENT_SITES_PLUGIN_ARCHIVE_AUTHORIZATION }}
+          WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_URL: ${{ vars.WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_URL || secrets.WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_URL }}
+          WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_SHA256: ${{ vars.WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_SHA256 }}
+          WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_AUTHORIZATION: ${{ secrets.WEGENT_MINI_PROGRAM_PLUGIN_ARCHIVE_AUTHORIZATION }}
+        run: node scripts/fetch-builtin-plugins.mjs
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend image (arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/backend/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-backend:${{ needs.prepare-release.outputs.new_version }}-arm64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-backend:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-backend:buildcache-arm64,mode=max
+
+  # ============================================================================
+  # Executor Image Build (parallel AMD64 + ARM64)
+  # ============================================================================
+  build-executor-amd64:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push executor image (amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/executor/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-executor:${{ needs.prepare-release.outputs.new_version }}-amd64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-executor:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-executor:buildcache-amd64,mode=max
+
+  build-executor-arm64:
+    needs: prepare-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push executor image (arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/executor/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-executor:${{ needs.prepare-release.outputs.new_version }}-arm64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-executor:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-executor:buildcache-arm64,mode=max
+
+  # ============================================================================
+  # Executor Manager Image Build (parallel AMD64 + ARM64)
+  # ============================================================================
+  build-executor-manager-amd64:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push executor-manager image (amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/executor_manager/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-executor-manager:${{ needs.prepare-release.outputs.new_version }}-amd64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-executor-manager:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-executor-manager:buildcache-amd64,mode=max
+
+  build-executor-manager-arm64:
+    needs: prepare-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push executor-manager image (arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/executor_manager/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-executor-manager:${{ needs.prepare-release.outputs.new_version }}-arm64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-executor-manager:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-executor-manager:buildcache-arm64,mode=max
+
+  # ============================================================================
+  # Device Image Build (parallel AMD64 + ARM64)
+  # Self-managed remote Docker devices use this image.
+  # ============================================================================
+  build-device-amd64:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push device image (amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/device/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-device:${{ needs.prepare-release.outputs.new_version }}-amd64
+          build-args: |
+            APP_VERSION=${{ needs.prepare-release.outputs.new_version }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-device:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-device:buildcache-amd64,mode=max
+
+      - name: Verify device image version and architecture (amd64)
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_PREFIX}/wegent-device:${VERSION}-amd64"
+          docker pull "$image"
+          test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "amd64"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")" = "$VERSION"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$GITHUB_SHA"
+          test "$(docker run --rm --entrypoint /app/executor "$image" --version)" = "$VERSION"
+
+      - name: Validate Remote Docker Worktree persistence (amd64)
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.new_version }}
+          WEGENT_REMOTE_DEVICE_ACCEPTANCE_IMAGE: ${{ env.IMAGE_PREFIX }}/wegent-device:${{ needs.prepare-release.outputs.new_version }}-amd64
+        run: |
+          set -euo pipefail
+          scripts/acceptance/remote-device-worktree-persistence.sh
+
+  build-device-arm64:
+    needs: prepare-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push device image (arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/device/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-device:${{ needs.prepare-release.outputs.new_version }}-arm64
+          build-args: |
+            APP_VERSION=${{ needs.prepare-release.outputs.new_version }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-device:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-device:buildcache-arm64,mode=max
+
+      - name: Verify device image version and architecture (arm64)
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_PREFIX}/wegent-device:${VERSION}-arm64"
+          docker pull "$image"
+          test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "arm64"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")" = "$VERSION"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$GITHUB_SHA"
+          test "$(docker run --rm --entrypoint /app/executor "$image" --version)" = "$VERSION"
+
+  # ============================================================================
+  # Device Multi-arch Manifest
+  # Publish ghcr.io/wecode-ai/wegent-device:latest as soon as device builds pass.
+  # ============================================================================
+  create-device-manifest:
+    needs:
+      - prepare-release
+      - build-device-amd64
+      - build-device-arm64
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push device multi-arch manifest
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.new_version }}
+          IMAGE_NAME: wegent-device
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools create -t "${IMAGE_PREFIX}/${IMAGE_NAME}:${VERSION}" \
+            "${IMAGE_PREFIX}/${IMAGE_NAME}:${VERSION}-amd64" \
+            "${IMAGE_PREFIX}/${IMAGE_NAME}:${VERSION}-arm64"
+
+          docker buildx imagetools create -t "${IMAGE_PREFIX}/${IMAGE_NAME}:latest" \
+            "${IMAGE_PREFIX}/${IMAGE_NAME}:${VERSION}-amd64" \
+            "${IMAGE_PREFIX}/${IMAGE_NAME}:${VERSION}-arm64"
+
+          echo "✅ Created manifests for ${IMAGE_PREFIX}/${IMAGE_NAME}:${VERSION} and ${IMAGE_PREFIX}/${IMAGE_NAME}:latest"
+
+  # ============================================================================
+  # Frontend Image Build (parallel AMD64 + ARM64)
+  # ============================================================================
+  build-frontend-amd64:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push frontend image (amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/frontend/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-web:${{ needs.prepare-release.outputs.new_version }}-amd64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-web:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-web:buildcache-amd64,mode=max
+          build-args: |
+            NEXT_TELEMETRY_DISABLED=1
+            APP_VERSION=${{ needs.prepare-release.outputs.new_version }}
+
+  build-frontend-arm64:
+    needs: prepare-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push frontend image (arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/frontend/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-web:${{ needs.prepare-release.outputs.new_version }}-arm64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-web:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-web:buildcache-arm64,mode=max
+          build-args: |
+            NEXT_TELEMETRY_DISABLED=1
+            APP_VERSION=${{ needs.prepare-release.outputs.new_version }}
+
+  # ============================================================================
+  # Chat Shell Image Build (parallel AMD64 + ARM64)
+  # ============================================================================
+  build-chat-shell-amd64:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push chat-shell image (amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/chat_shell/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-chat-shell:${{ needs.prepare-release.outputs.new_version }}-amd64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-chat-shell:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-chat-shell:buildcache-amd64,mode=max
+
+  build-chat-shell-arm64:
+    needs: prepare-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push chat-shell image (arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/chat_shell/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-chat-shell:${{ needs.prepare-release.outputs.new_version }}-arm64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-chat-shell:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-chat-shell:buildcache-arm64,mode=max
+
+  # ============================================================================
+  # Knowledge Runtime Image Build (parallel AMD64 + ARM64)
+  # ============================================================================
+  build-knowledge-runtime-amd64:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push knowledge-runtime image (amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/knowledge_runtime/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-knowledge-runtime:${{ needs.prepare-release.outputs.new_version }}-amd64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-knowledge-runtime:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-knowledge-runtime:buildcache-amd64,mode=max
+
+  build-knowledge-runtime-arm64:
+    needs: prepare-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push knowledge-runtime image (arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/knowledge_runtime/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-knowledge-runtime:${{ needs.prepare-release.outputs.new_version }}-arm64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-knowledge-runtime:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-knowledge-runtime:buildcache-arm64,mode=max
+
+  # ============================================================================
+  # Knowledge Document Converter Image Build (parallel AMD64 + ARM64)
+  # ============================================================================
+  build-knowledge-doc-converter-amd64:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push knowledge-doc-converter image (amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/knowledge_doc_converter/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-knowledge-doc-converter:${{ needs.prepare-release.outputs.new_version }}-amd64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-knowledge-doc-converter:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-knowledge-doc-converter:buildcache-amd64,mode=max
+
+  build-knowledge-doc-converter-arm64:
+    needs: prepare-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push knowledge-doc-converter image (arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/knowledge_doc_converter/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-knowledge-doc-converter:${{ needs.prepare-release.outputs.new_version }}-arm64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-knowledge-doc-converter:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-knowledge-doc-converter:buildcache-arm64,mode=max
+
+  # ============================================================================
+  # Standalone Image Build (parallel AMD64 + ARM64)
+  # Single image containing Backend, Frontend, Chat Shell, and Executor
+  # ============================================================================
+  build-standalone-amd64:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build standalone image for verification (amd64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/standalone/Dockerfile
+          load: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-standalone:${{ needs.prepare-release.outputs.new_version }}-amd64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-standalone:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-standalone:buildcache-amd64,mode=max
+          build-args: |
+            APP_VERSION=${{ needs.prepare-release.outputs.new_version }}
+            WEWORK_SOURCE_SHA=${{ github.sha }}
+
+      - name: Verify standalone image startup (amd64)
+        env:
+          IMAGE: ${{ env.IMAGE_PREFIX }}/wegent-standalone:${{ needs.prepare-release.outputs.new_version }}-amd64
+          CONTAINER_NAME: wegent-standalone-verify-amd64
+        run: bash scripts/verify-standalone-image.sh "$IMAGE"
+
+      - name: Push verified standalone image (amd64)
+        env:
+          IMAGE: ${{ env.IMAGE_PREFIX }}/wegent-standalone:${{ needs.prepare-release.outputs.new_version }}-amd64
+        run: docker push "$IMAGE"
+
+  build-standalone-arm64:
+    needs: prepare-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build standalone image for verification (arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/standalone/Dockerfile
+          load: true
+          platforms: linux/arm64
+          tags: ${{ env.IMAGE_PREFIX }}/wegent-standalone:${{ needs.prepare-release.outputs.new_version }}-arm64
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-standalone:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/wegent-standalone:buildcache-arm64,mode=max
+          build-args: |
+            APP_VERSION=${{ needs.prepare-release.outputs.new_version }}
+            WEWORK_SOURCE_SHA=${{ github.sha }}
+
+      - name: Verify standalone image startup (arm64)
+        env:
+          IMAGE: ${{ env.IMAGE_PREFIX }}/wegent-standalone:${{ needs.prepare-release.outputs.new_version }}-arm64
+          CONTAINER_NAME: wegent-standalone-verify-arm64
+        run: bash scripts/verify-standalone-image.sh "$IMAGE"
+
+      - name: Push verified standalone image (arm64)
+        env:
+          IMAGE: ${{ env.IMAGE_PREFIX }}/wegent-standalone:${{ needs.prepare-release.outputs.new_version }}-arm64
+        run: docker push "$IMAGE"
+
+  # ============================================================================
+  # Executor Local Binary Build (macOS)
+  # ============================================================================
+  build-executor-local-macos-arm64:
+    needs: prepare-release
+    runs-on: macos-14 # Apple Silicon runner
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Set up executor Rust cache
+        uses: ./.github/actions/setup-executor-rust-cache
+
+      - name: Install dependencies and build
+        working-directory: executor
+        env:
+          APP_VERSION: ${{ needs.prepare-release.outputs.new_version }}
+        run: |
+          cargo build --release --locked
+          mkdir -p dist
+          cp target/release/wegent-executor dist/wegent-executor
+          chmod 0755 dist/wegent-executor
+          WEGENT_EXECUTOR_VERSION="${APP_VERSION}" dist/wegent-executor --version
+
+      - name: Rename binary with platform suffix
+        run: |
+          mv executor/dist/wegent-executor executor/dist/wegent-executor-macos-arm64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wegent-executor-macos-arm64
+          path: executor/dist/wegent-executor-macos-arm64
+          retention-days: 1
+
+  build-executor-local-macos-amd64:
+    needs: prepare-release
+    runs-on: macos-14 # Apple Silicon runner with Rosetta 2 for x86_64 build
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Install Rosetta 2
+        run: |
+          # Check if Rosetta 2 is already installed
+          if ! /usr/bin/pgrep -q oahd; then
+            sudo softwareupdate --install-rosetta --agree-to-license || true
+          fi
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Set up executor Rust cache
+        uses: ./.github/actions/setup-executor-rust-cache
+
+      - name: Install dependencies and build (x86_64)
+        working-directory: executor
+        env:
+          APP_VERSION: ${{ needs.prepare-release.outputs.new_version }}
+        run: |
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist
+          cp target/x86_64-apple-darwin/release/wegent-executor dist/wegent-executor
+          chmod 0755 dist/wegent-executor
+          WEGENT_EXECUTOR_VERSION="${APP_VERSION}" dist/wegent-executor --version
+
+      - name: Rename binary with platform suffix
+        run: |
+          mv executor/dist/wegent-executor executor/dist/wegent-executor-macos-amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wegent-executor-macos-amd64
+          path: executor/dist/wegent-executor-macos-amd64
+          retention-days: 1
+
+  # ============================================================================
+  # Executor Local Binary Build (Linux)
+  # Note: Using Ubuntu 22.04 for better GLIBC compatibility (GLIBC 2.35)
+  # This ensures the binary works on most Linux distributions including
+  # CentOS 7/8, RHEL, Debian 11+, Ubuntu 20.04+, etc.
+  # ============================================================================
+  build-executor-local-linux-amd64:
+    needs: prepare-release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Set up executor Rust cache
+        uses: ./.github/actions/setup-executor-rust-cache
+
+      - name: Install executor Rust system dependencies
+        run: .github/scripts/install-executor-rust-system-dependencies.sh
+
+      - name: Install dependencies and build
+        working-directory: executor
+        env:
+          APP_VERSION: ${{ needs.prepare-release.outputs.new_version }}
+        run: |
+          cargo build --release --locked
+          mkdir -p dist
+          cp target/release/wegent-executor dist/wegent-executor
+          chmod 0755 dist/wegent-executor
+          WEGENT_EXECUTOR_VERSION="${APP_VERSION}" dist/wegent-executor --version
+
+      - name: Rename binary with platform suffix
+        run: |
+          mv executor/dist/wegent-executor executor/dist/wegent-executor-linux-amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wegent-executor-linux-amd64
+          path: executor/dist/wegent-executor-linux-amd64
+          retention-days: 1
+
+  build-executor-local-linux-arm64:
+    needs: prepare-release
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Set up executor Rust cache
+        uses: ./.github/actions/setup-executor-rust-cache
+
+      - name: Install executor Rust system dependencies
+        run: .github/scripts/install-executor-rust-system-dependencies.sh
+
+      - name: Install dependencies and build
+        working-directory: executor
+        env:
+          APP_VERSION: ${{ needs.prepare-release.outputs.new_version }}
+        run: |
+          cargo build --release --locked
+          mkdir -p dist
+          cp target/release/wegent-executor dist/wegent-executor
+          chmod 0755 dist/wegent-executor
+          WEGENT_EXECUTOR_VERSION="${APP_VERSION}" dist/wegent-executor --version
+
+      - name: Rename binary with platform suffix
+        run: |
+          mv executor/dist/wegent-executor executor/dist/wegent-executor-linux-arm64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wegent-executor-linux-arm64
+          path: executor/dist/wegent-executor-linux-arm64
+          retention-days: 1
+
+  # ============================================================================
+  # Executor Local Binary Build (Windows)
+  # Note: Windows 10 1809+ required for ConPTY support
+  # ============================================================================
+  build-executor-local-windows-amd64:
+    needs: prepare-release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Set up executor Rust cache
+        uses: ./.github/actions/setup-executor-rust-cache
+
+      - name: Install dependencies and build
+        working-directory: executor
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ needs.prepare-release.outputs.new_version }}
+        run: |
+          cargo build --release --locked
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/wegent-executor.exe dist/wegent-executor.exe
+          $env:WEGENT_EXECUTOR_VERSION = "$env:APP_VERSION"
+          & "dist/wegent-executor.exe" --version
+
+      - name: Rename binary with platform suffix
+        shell: pwsh
+        run: |
+          Move-Item executor/dist/wegent-executor.exe executor/dist/wegent-executor-windows-amd64.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wegent-executor-windows-amd64
+          path: executor/dist/wegent-executor-windows-amd64.exe
+          retention-days: 1
+
+  # ============================================================================
+  # Create Multi-arch Manifests (combine amd64 + arm64 into single tag)
+  # ============================================================================
+  create-manifests:
+    needs:
+      - prepare-release
+      - build-backend-amd64
+      - build-backend-arm64
+      - build-executor-amd64
+      - build-executor-arm64
+      - build-executor-manager-amd64
+      - build-executor-manager-arm64
+      - build-frontend-amd64
+      - build-frontend-arm64
+      - build-chat-shell-amd64
+      - build-chat-shell-arm64
+      - build-knowledge-runtime-amd64
+      - build-knowledge-runtime-arm64
+      - build-knowledge-doc-converter-amd64
+      - build-knowledge-doc-converter-arm64
+      - build-standalone-amd64
+      - build-standalone-arm64
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push multi-arch manifests
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.new_version }}
+        run: |
+          set -euo pipefail
+
+          # Function to create manifest for an image
+          create_manifest() {
+            local image_name=$1
+            echo "Creating manifest for ${image_name}..."
+            
+            # Create versioned manifest
+            docker buildx imagetools create -t "${IMAGE_PREFIX}/${image_name}:${VERSION}" \
+              "${IMAGE_PREFIX}/${image_name}:${VERSION}-amd64" \
+              "${IMAGE_PREFIX}/${image_name}:${VERSION}-arm64"
+            
+            # Create latest manifest
+            docker buildx imagetools create -t "${IMAGE_PREFIX}/${image_name}:latest" \
+              "${IMAGE_PREFIX}/${image_name}:${VERSION}-amd64" \
+              "${IMAGE_PREFIX}/${image_name}:${VERSION}-arm64"
+            
+            echo "✅ Created manifests for ${image_name}:${VERSION} and ${image_name}:latest"
+          }
+
+          # Create manifests for all images
+          create_manifest "wegent-backend"
+          create_manifest "wegent-executor"
+          create_manifest "wegent-executor-manager"
+          create_manifest "wegent-web"
+          create_manifest "wegent-chat-shell"
+          create_manifest "wegent-knowledge-runtime"
+          create_manifest "wegent-knowledge-doc-converter"
+          create_manifest "wegent-standalone"
+
+          echo "🎉 All multi-arch manifests created successfully!"
+
+  # ============================================================================
+  # Create Release Tag (after all images are built and manifests created)
+  # ============================================================================
+  create-release-tag:
+    needs:
+      - prepare-release
+      - create-device-manifest
+      - create-manifests
+      - build-executor-local-macos-arm64
+      - build-executor-local-macos-amd64
+      - build-executor-local-linux-amd64
+      - build-executor-local-linux-arm64
+      - build-executor-local-windows-amd64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GIT_REF }}
+          fetch-depth: 0
+
+      - name: Download executor binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wegent-executor-*
+          path: ./executor-binaries
+          merge-multiple: true
+
+      - name: Create and push tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare-release.outputs.new_version }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch --tags --force
+
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "Tag v${VERSION} already exists, skipping tag creation"
+          else
+            git tag -a "v${VERSION}" -m "Release version ${VERSION}"
+            git push origin "v${VERSION}"
+            echo "Created and pushed tag v${VERSION}"
+          fi
+
+      - name: Generate Release Notes
+        id: release-notes
+        uses: actions/github-script@v7
+        env:
+          TAG: v${{ needs.prepare-release.outputs.new_version }}
+        with:
+          script: |
+            const tag = process.env.TAG;
+            if (!tag) {
+              core.setFailed('TAG env is missing; cannot generate release notes.');
+              return;
+            }
+
+            try {
+              const { data } = await github.rest.repos.generateReleaseNotes({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tag,
+              });
+              core.setOutput("tag", tag);
+              core.setOutput("body", data.body || '');
+            } catch (error) {
+              core.setFailed(`Failed to generate release notes: ${error.message}`);
+            }
+
+      - name: Create GitHub Release
+        if: steps.release-notes.outputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release-notes.outputs.tag }}
+          name: Release ${{ steps.release-notes.outputs.tag }}
+          body: ${{ steps.release-notes.outputs.body }}
+          draft: false
+          prerelease: false
+          make_latest: false
+          files: |
+            ./executor-binaries/wegent-executor-macos-arm64
+            ./executor-binaries/wegent-executor-macos-amd64
+            ./executor-binaries/wegent-executor-linux-amd64
+            ./executor-binaries/wegent-executor-linux-arm64
+            ./executor-binaries/wegent-executor-windows-amd64.exe
+            ./executor/scripts/local_executor_install.sh
+            ./executor/scripts/local_executor_install.ps1

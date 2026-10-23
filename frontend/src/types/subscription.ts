@@ -1,0 +1,554 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Subscription (订阅) related types.
+ * Refactored from Flow types to align with CRD architecture.
+ */
+
+// Subscription task type enumeration
+export type SubscriptionTaskType = 'execution' | 'collection'
+
+// Subscription visibility enumeration
+export type SubscriptionVisibility = 'public' | 'private' | 'market'
+
+// Subscription trigger type enumeration
+export type SubscriptionTriggerType = 'cron' | 'interval' | 'one_time' | 'event'
+
+// Event trigger sub-type enumeration
+export type SubscriptionEventType = 'webhook' | 'git_push' | 'inbox_message'
+
+export type SubscriptionExecutionTargetType = 'managed' | 'local' | 'cloud' | 'remote'
+
+export interface SubscriptionExecutionTarget {
+  type: SubscriptionExecutionTargetType
+  device_id?: string
+}
+
+// Background execution status enumeration
+export type BackgroundExecutionStatus =
+  | 'PENDING'
+  | 'RUNNING'
+  | 'COMPLETED'
+  | 'COMPLETED_SILENT'
+  | 'FAILED'
+  | 'RETRYING'
+  | 'CANCELLED'
+
+// Trigger configuration types
+export interface CronTriggerConfig {
+  expression: string
+  timezone?: string
+}
+
+export interface IntervalTriggerConfig {
+  value: number
+  unit: 'minutes' | 'hours' | 'days'
+}
+
+export interface OneTimeTriggerConfig {
+  execute_at: string // ISO datetime string
+}
+
+export interface GitPushEventConfig {
+  repository: string
+  branch?: string
+}
+
+export interface EventTriggerConfig {
+  event_type: SubscriptionEventType
+  git_push?: GitPushEventConfig
+}
+
+export type SubscriptionTriggerConfig =
+  | CronTriggerConfig
+  | IntervalTriggerConfig
+  | OneTimeTriggerConfig
+  | EventTriggerConfig
+
+// Model reference for Subscription
+export interface SubscriptionModelRef {
+  name: string
+  namespace: string
+}
+
+// Notification webhook type enumeration
+export type NotificationWebhookType = 'dingtalk' | 'feishu' | 'custom'
+
+// Notification webhook configuration
+export interface NotificationWebhook {
+  type: NotificationWebhookType
+  url: string
+  secret?: string // Optional signing secret for webhook verification
+  enabled: boolean
+}
+// Knowledge base reference for Subscription
+export interface SubscriptionKnowledgeBaseRef {
+  name: string
+  namespace: string
+}
+
+// Skill reference for Subscription
+export interface SubscriptionSkillRef {
+  name: string
+  namespace: string
+  is_public?: boolean // Whether this is a public skill (user_id=0)
+}
+
+// Subscription configuration
+export interface Subscription {
+  id: number
+  code_wiki_id?: number
+  user_id: number
+  name: string
+  namespace: string
+  display_name: string
+  description?: string
+  task_type: SubscriptionTaskType
+  visibility: SubscriptionVisibility
+  trigger_type: SubscriptionTriggerType
+  trigger_config: Record<string, unknown>
+  team_id: number
+  workspace_id?: number
+  // Git repository fields (alternative to workspace_id)
+  git_repo?: string
+  git_repo_id?: number
+  git_domain?: string
+  branch_name?: string
+  // Model reference fields
+  model_ref?: SubscriptionModelRef
+  force_override_bot_model?: boolean
+  prompt_template: string
+  retry_count: number
+  timeout_seconds: number // Execution timeout (60-86400s, default 600)
+  enabled: boolean
+  execution_target?: SubscriptionExecutionTarget
+  // History preservation settings
+  preserve_history?: boolean // Whether to preserve conversation history across executions
+  history_message_count?: number // Number of history messages to preserve (1-50, default 10)
+  bound_task_id?: number // Task ID bound to this subscription for history preservation
+  webhook_url?: string
+  webhook_secret?: string // HMAC signing secret for webhook verification
+  last_execution_time?: string
+  last_execution_status?: string
+  last_execution_message?: string
+  // Knowledge base references
+  knowledge_base_refs?: SubscriptionKnowledgeBaseRef[]
+  // Skill references
+  skill_refs?: SubscriptionSkillRef[]
+  // Notification webhooks (dingtalk, feishu, custom)
+  notification_webhooks?: NotificationWebhook[]
+  // Market whitelist (empty means visible to all market users)
+  market_whitelist_user_ids?: number[]
+  next_execution_time?: string
+  execution_count: number
+  success_count: number
+  failure_count: number
+  // Visibility and follow-related fields
+  followers_count: number
+  is_following: boolean
+  owner_username?: string
+  // Market rental fields
+  is_rental?: boolean
+  source_subscription_id?: number
+  source_subscription_name?: string
+  source_subscription_display_name?: string
+  source_owner_username?: string
+  rental_count?: number
+  // Trigger config validation status
+  trigger_config_valid?: boolean
+  trigger_config_error?: string
+  // Expiration settings
+  expires_at?: string // ISO format datetime
+  is_expired?: boolean // Whether the subscription has expired
+  created_at: string
+  updated_at: string
+}
+
+// Subscription creation request
+export interface SubscriptionCreateRequest {
+  name?: string
+  namespace?: string
+  display_name: string
+  description?: string
+  task_type: SubscriptionTaskType
+  visibility?: SubscriptionVisibility
+  trigger_type: SubscriptionTriggerType
+  trigger_config: Record<string, unknown>
+  team_id: number
+  workspace_id?: number
+  // Git repository fields (alternative to workspace_id)
+  git_repo?: string
+  git_repo_id?: number
+  git_domain?: string
+  branch_name?: string
+  // Model reference fields
+  model_ref?: SubscriptionModelRef
+  force_override_bot_model?: boolean
+  prompt_template: string
+  retry_count?: number
+  timeout_seconds?: number // Execution timeout (60-86400s)
+  enabled?: boolean
+  execution_target?: SubscriptionExecutionTarget
+  // History preservation settings
+  preserve_history?: boolean // Whether to preserve conversation history across executions
+  history_message_count?: number // Number of history messages to preserve (1-50, default 10)
+  // Knowledge base references
+  knowledge_base_refs?: SubscriptionKnowledgeBaseRef[]
+  // Skill references
+  skill_refs?: SubscriptionSkillRef[]
+  // Notification webhooks (dingtalk, feishu, custom)
+  notification_webhooks?: NotificationWebhook[]
+  // Market whitelist (empty means visible to all market users)
+  market_whitelist_user_ids?: number[]
+  // Expiration settings
+  expires_at?: string // ISO format datetime, e.g., '2025-12-31T23:59:59'
+}
+
+// Subscription update request
+export interface SubscriptionUpdateRequest {
+  display_name?: string
+  description?: string
+  task_type?: SubscriptionTaskType
+  visibility?: SubscriptionVisibility
+  trigger_type?: SubscriptionTriggerType
+  trigger_config?: Record<string, unknown>
+  team_id?: number
+  workspace_id?: number
+  // Git repository fields (alternative to workspace_id)
+  git_repo?: string
+  git_repo_id?: number
+  git_domain?: string
+  branch_name?: string
+  // Model reference fields
+  model_ref?: SubscriptionModelRef
+  force_override_bot_model?: boolean
+  prompt_template?: string
+  retry_count?: number
+  timeout_seconds?: number // Execution timeout (60-86400s)
+  enabled?: boolean
+  execution_target?: SubscriptionExecutionTarget
+  // History preservation settings
+  preserve_history?: boolean // Whether to preserve conversation history across executions
+  history_message_count?: number // Number of history messages to preserve (1-50, default 10)
+  // Knowledge base references
+  knowledge_base_refs?: SubscriptionKnowledgeBaseRef[]
+  // Skill references
+  skill_refs?: SubscriptionSkillRef[]
+  // Notification webhooks (dingtalk, feishu, custom)
+  notification_webhooks?: NotificationWebhook[]
+  // Market whitelist (empty means visible to all market users)
+  market_whitelist_user_ids?: number[]
+  // Expiration settings
+  expires_at?: string // ISO format datetime, e.g., '2025-12-31T23:59:59'
+}
+
+// Subscription list response
+export interface SubscriptionListResponse {
+  total: number
+  items: Subscription[]
+  invalid_schedule_count?: number
+}
+
+// Background execution record
+export interface BackgroundExecution {
+  id: number
+  user_id: number
+  subscription_id: number
+  task_id?: number
+  trigger_type: string
+  trigger_reason?: string
+  prompt: string
+  status: BackgroundExecutionStatus
+  result_summary?: string
+  error_message?: string
+  retry_attempt: number
+  started_at?: string
+  completed_at?: string
+  created_at: string
+  updated_at: string
+  // Enriched fields from subscription
+  subscription_name?: string
+  subscription_display_name?: string
+  team_name?: string
+  task_type?: string
+  // Permission field - indicates if current user can delete this execution
+  can_delete?: boolean
+  // Silent execution flag - indicates if this execution completed silently
+  is_silent?: boolean
+}
+
+// Background execution list response
+export interface BackgroundExecutionListResponse {
+  total: number
+  items: BackgroundExecution[]
+}
+
+// Timeline filter options
+export interface SubscriptionTimelineFilter {
+  time_range?: 'today' | '7d' | '30d' | 'custom'
+  start_date?: string
+  end_date?: string
+  status?: BackgroundExecutionStatus[]
+  subscription_ids?: number[]
+  team_ids?: number[]
+  task_types?: SubscriptionTaskType[]
+}
+
+// ========== Subscription Follow/Visibility Types ==========
+
+// Follow type enumeration
+export type FollowType = 'direct' | 'invited'
+
+// Invitation status enumeration
+export type InvitationStatus = 'pending' | 'accepted' | 'rejected'
+
+// Follower response
+export interface SubscriptionFollowerResponse {
+  user_id: number
+  username: string
+  follow_type: FollowType
+  followed_at: string
+}
+
+// Followers list response
+export interface SubscriptionFollowersListResponse {
+  total: number
+  items: SubscriptionFollowerResponse[]
+}
+
+// Following subscription response
+export interface FollowingSubscriptionResponse {
+  subscription: Subscription
+  follow_type: FollowType
+  followed_at: string
+}
+
+// Following subscriptions list response
+export interface FollowingSubscriptionsListResponse {
+  total: number
+  items: FollowingSubscriptionResponse[]
+}
+
+// Invite user request
+export interface InviteUserRequest {
+  user_id?: number
+  email?: string
+}
+
+// Invite namespace request
+export interface InviteNamespaceRequest {
+  namespace_id: number
+}
+
+// Subscription invitation response
+export interface SubscriptionInvitationResponse {
+  id: number
+  subscription_id: number
+  subscription_name: string
+  subscription_display_name: string
+  invited_by_user_id: number
+  invited_by_username: string
+  invitation_status: InvitationStatus
+  invited_at: string
+  owner_username: string
+}
+
+// Invitations list response
+export interface SubscriptionInvitationsListResponse {
+  total: number
+  items: SubscriptionInvitationResponse[]
+}
+
+// Discover subscription response
+export interface DiscoverSubscriptionResponse {
+  id: number
+  name: string
+  display_name: string
+  description?: string
+  task_type: SubscriptionTaskType
+  owner_user_id: number
+  owner_username: string
+  followers_count: number
+  is_following: boolean
+  created_at: string
+  updated_at: string
+}
+
+// Discover subscriptions list response
+export interface DiscoverSubscriptionsListResponse {
+  total: number
+  items: DiscoverSubscriptionResponse[]
+}
+
+// ========== Market/Rental Types ==========
+
+// Market subscription detail (hides sensitive information)
+export interface MarketSubscriptionDetail {
+  id: number
+  name: string
+  display_name: string
+  description?: string
+  task_type: SubscriptionTaskType
+  trigger_type: SubscriptionTriggerType
+  trigger_description: string
+  owner_user_id: number
+  owner_username: string
+  rental_count: number
+  is_rented: boolean
+  created_at: string
+  updated_at: string
+}
+
+// Market subscriptions list response
+export interface MarketSubscriptionsListResponse {
+  total: number
+  items: MarketSubscriptionDetail[]
+}
+
+// Rent subscription request
+export interface RentSubscriptionRequest {
+  name: string
+  display_name: string
+  trigger_type: SubscriptionTriggerType
+  trigger_config: Record<string, unknown>
+  model_ref?: SubscriptionModelRef
+}
+
+// Rental subscription response
+export interface RentalSubscriptionResponse {
+  id: number
+  name: string
+  display_name: string
+  namespace: string
+  source_subscription_id: number
+  source_subscription_name: string
+  source_subscription_display_name: string
+  source_owner_user_id: number
+  source_owner_username: string
+  trigger_type: SubscriptionTriggerType
+  trigger_config: Record<string, unknown>
+  model_ref?: SubscriptionModelRef
+  enabled: boolean
+  last_execution_time?: string
+  last_execution_status?: string
+  next_execution_time?: string
+  execution_count: number
+  created_at: string
+  updated_at: string
+}
+
+// Rental subscriptions list response
+export interface RentalSubscriptionsListResponse {
+  total: number
+  items: RentalSubscriptionResponse[]
+}
+
+// Rental count response
+export interface RentalCountResponse {
+  subscription_id: number
+  rental_count: number
+}
+
+// ========== Notification Level Types ==========
+
+// Notification level enumeration
+export type NotificationLevel = 'silent' | 'default' | 'notify'
+
+// Subscription follow config
+export interface SubscriptionFollowConfig {
+  notification_level: NotificationLevel
+  notification_channel_ids?: number[]
+}
+
+// Follow subscription request with notification settings
+export interface FollowSubscriptionRequest {
+  notification_level?: NotificationLevel
+  notification_channel_ids?: number[]
+}
+
+// Update follow settings request
+export interface UpdateFollowSettingsRequest {
+  notification_level: NotificationLevel
+  notification_channel_ids?: number[]
+}
+
+// Notification channel info
+export interface NotificationChannelInfo {
+  id: number
+  name: string
+  channel_type: string
+  is_bound: boolean
+}
+
+// Follow settings response
+export interface FollowSettingsResponse {
+  notification_level: NotificationLevel
+  notification_channel_ids: number[]
+  notification_channels: NotificationChannelInfo[]
+  available_channels: NotificationChannelInfo[]
+}
+
+// Developer notification settings response
+export interface DeveloperNotificationSettingsResponse {
+  notification_level: NotificationLevel
+  notification_channel_ids: number[]
+  available_channels: NotificationChannelInfo[]
+  channel_binding_configs: NotificationChannelBindingConfig[]
+}
+
+// Update developer notification settings request
+export interface DeveloperNotificationSettingsUpdateRequest {
+  notification_level: NotificationLevel
+  notification_channel_ids?: number[]
+  channel_binding_configs?: NotificationChannelBindingConfig[]
+}
+
+export interface NotificationChannelBindingConfig {
+  channel_id: number
+  bind_private: boolean
+  bind_group: boolean
+  group_conversation_id?: string
+  group_name?: string
+}
+
+export interface DeveloperBindingSessionStartRequest {
+  channel_id: number
+  bind_private: boolean
+  bind_group: boolean
+}
+
+export interface DeveloperBindingSessionCancelRequest {
+  channel_id: number
+}
+
+export interface DeveloperBindingSessionResponse {
+  status: 'waiting' | 'cancelled'
+  subscription_id?: number
+  channel_id: number
+  bind_private?: boolean
+  bind_group?: boolean
+}
+
+/**
+ * WebSocket payload for subscription group info notification
+ */
+export interface SubscriptionGroupInfoPayload {
+  channel_id: number
+  group_name: string
+  group_conversation_id: string
+}
+
+/**
+ * WebSocket payload for subscription binding status updates
+ */
+export interface SubscriptionBindingUpdatePayload {
+  channel_id: number
+  conversation_id?: string | null
+  private_bound: boolean
+  group_bound: boolean
+  completed: boolean
+  status: 'partial' | 'success'
+  subscription_id?: number
+}

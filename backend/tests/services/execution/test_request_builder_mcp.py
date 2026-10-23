@@ -1,0 +1,837 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Tests for coding executor MCP processing in TaskRequestBuilder.
+
+Verifies shared Skill MCP extraction and Claude-specific transport processing.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from app.services.execution.request_builder import TaskRequestBuilder
+from shared.models.execution import ExecutionRequest
+from shared.models.openai_converter import OpenAIRequestConverter
+
+
+def _bot_kind_with_ghost(
+    *,
+    user_id: int,
+    name: str = "chat-bot",
+    ghost_name: str = "chat-ghost",
+    capability_mode: str = "manual",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        user_id=user_id,
+        kind="Bot",
+        name=name,
+        namespace="default",
+        json={
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Bot",
+            "metadata": {"name": name, "namespace": "default"},
+            "spec": {
+                "ghostRef": {"name": ghost_name, "namespace": "default"},
+                "shellRef": {"name": "Chat", "namespace": "default"},
+                "capability_mode": capability_mode,
+            },
+        },
+    )
+
+
+def _ghost_kind_with_mcp(
+    mcp_servers: dict | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        json={
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Ghost",
+            "metadata": {"name": "chat-ghost", "namespace": "default"},
+            "spec": {
+                "systemPrompt": "You are a chat bot.",
+                "mcpServers": mcp_servers
+                or {
+                    "ghost-server": {
+                        "type": "streamable-http",
+                        "url": "http://ghost.example.com/mcp",
+                    }
+                },
+            },
+        }
+    )
+
+
+class TestClarificationSkillInjection:
+    """Tests for clarification-mode preload skill injection."""
+
+    def test_injects_interactive_skill(self):
+        result = TaskRequestBuilder._inject_clarification_skill([])
+
+        assert result == [
+            {
+                "name": "interactive",
+                "namespace": "default",
+                "is_public": True,
+            }
+        ]
+
+    def test_does_not_duplicate_interactive_skill(self):
+        preload_skills = ["interactive"]
+
+        result = TaskRequestBuilder._inject_clarification_skill(preload_skills)
+
+        assert result == preload_skills
+
+
+class TestExtractSkillMcpToList:
+    """Tests for _extract_skill_mcp_to_list static method."""
+
+    def test_empty_skill_configs(self):
+        result = TaskRequestBuilder._extract_skill_mcp_to_list([])
+        assert result == []
+
+    def test_skill_without_mcp_servers(self):
+        configs = [{"name": "code-review", "description": "Reviews code"}]
+        result = TaskRequestBuilder._extract_skill_mcp_to_list(configs)
+        assert result == []
+
+    def test_single_skill_single_mcp(self):
+        configs = [
+            {
+                "name": "image-toolkit",
+                "mcpServers": {
+                    "imageFetchServer": {
+                        "type": "streamable-http",
+                        "url": "http://mcp.example.com/fetch-image",
+                        "headers": {"Authorization": "Bearer token123"},
+                    }
+                },
+            }
+        ]
+        result = TaskRequestBuilder._extract_skill_mcp_to_list(configs)
+
+        assert len(result) == 1
+        assert result[0]["name"] == "image-toolkit_imageFetchServer"
+        assert result[0]["type"] == "streamable-http"
+        assert result[0]["url"] == "http://mcp.example.com/fetch-image"
+        assert result[0]["headers"]["Authorization"] == "Bearer token123"
+
+    def test_single_skill_multiple_mcps(self):
+        configs = [
+            {
+                "name": "image-toolkit",
+                "mcpServers": {
+                    "imageFetchServer": {
+                        "type": "streamable-http",
+                        "url": "http://mcp.example.com/fetch-image",
+                    },
+                    "nanoBananaServer": {
+                        "type": "streamable-http",
+                        "url": "http://mcp.example.com/nano-banana",
+                    },
+                },
+            }
+        ]
+        result = TaskRequestBuilder._extract_skill_mcp_to_list(configs)
+
+        assert len(result) == 2
+        names = [s["name"] for s in result]
+        assert "image-toolkit_imageFetchServer" in names
+        assert "image-toolkit_nanoBananaServer" in names
+
+    def test_multiple_skills_with_mcps(self):
+        configs = [
+            {
+                "name": "image-toolkit",
+                "mcpServers": {
+                    "imageServer": {
+                        "type": "streamable-http",
+                        "url": "http://mcp.example.com/image",
+                    },
+                },
+            },
+            {
+                "name": "knowledge-base",
+                "mcpServers": {
+                    "kbServer": {
+                        "type": "streamable-http",
+                        "url": "http://mcp.example.com/kb",
+                    },
+                },
+            },
+        ]
+        result = TaskRequestBuilder._extract_skill_mcp_to_list(configs)
+
+        assert len(result) == 2
+        names = [s["name"] for s in result]
+        assert "image-toolkit_imageServer" in names
+        assert "knowledge-base_kbServer" in names
+
+    def test_mixed_skills_with_and_without_mcp(self):
+        configs = [
+            {"name": "no-mcp-skill", "description": "No MCP"},
+            {
+                "name": "with-mcp",
+                "mcpServers": {
+                    "server1": {
+                        "type": "streamable-http",
+                        "url": "http://example.com",
+                    },
+                },
+            },
+        ]
+        result = TaskRequestBuilder._extract_skill_mcp_to_list(configs)
+
+        assert len(result) == 1
+        assert result[0]["name"] == "with-mcp_server1"
+
+    def test_invalid_mcp_servers_type_skipped(self):
+        configs = [{"name": "bad-skill", "mcpServers": "not-a-dict"}]
+        result = TaskRequestBuilder._extract_skill_mcp_to_list(configs)
+        assert result == []
+
+    def test_non_dict_server_config_skipped(self):
+        configs = [
+            {
+                "name": "bad-skill",
+                "mcpServers": {"server1": "not-a-dict"},
+            }
+        ]
+        result = TaskRequestBuilder._extract_skill_mcp_to_list(configs)
+        assert result == []
+
+    def test_selected_kb_skill_keeps_unprefixed_server_name(self):
+        configs = [
+            {
+                "name": "wegent-knowledge",
+                "mcpServers": {
+                    "wegent-knowledge": {
+                        "type": "streamable-http",
+                        "url": "http://mcp.example.com/kb",
+                    }
+                },
+            }
+        ]
+
+        result = TaskRequestBuilder._extract_skill_mcp_to_list(configs)
+
+        assert result == [
+            {
+                "name": "wegent-knowledge",
+                "type": "streamable-http",
+                "url": "http://mcp.example.com/kb",
+            }
+        ]
+
+
+class TestNormalizeMcpTypesForClaudeCode:
+    """Tests for _normalize_mcp_types_for_claude_code static method."""
+
+    def test_empty_list(self):
+        servers = []
+        TaskRequestBuilder._normalize_mcp_types_for_claude_code(servers)
+        assert servers == []
+
+    def test_streamable_http_converted_to_http(self):
+        servers = [
+            {"name": "s1", "type": "streamable-http", "url": "http://example.com"}
+        ]
+        TaskRequestBuilder._normalize_mcp_types_for_claude_code(servers)
+        assert servers[0]["type"] == "http"
+
+    def test_http_type_unchanged(self):
+        servers = [{"name": "s1", "type": "http", "url": "http://example.com"}]
+        TaskRequestBuilder._normalize_mcp_types_for_claude_code(servers)
+        assert servers[0]["type"] == "http"
+
+    def test_mixed_types_normalized(self):
+        servers = [
+            {"name": "s1", "type": "streamable-http", "url": "http://a.com"},
+            {"name": "s2", "type": "http", "url": "http://b.com"},
+            {"name": "s3", "type": "sse", "url": "http://c.com"},
+        ]
+        TaskRequestBuilder._normalize_mcp_types_for_claude_code(servers)
+        assert servers[0]["type"] == "http"
+        assert servers[1]["type"] == "http"
+        assert servers[2]["type"] == "sse"
+
+    def test_non_dict_item_skipped(self):
+        servers = [
+            {"name": "s1", "type": "streamable-http", "url": "http://a.com"},
+            "not-a-dict",
+        ]
+        TaskRequestBuilder._normalize_mcp_types_for_claude_code(servers)
+        assert servers[0]["type"] == "http"
+        assert servers[1] == "not-a-dict"
+
+
+class TestCheckMcpServerReachable:
+    """Tests for _check_mcp_server_reachable static method."""
+
+    def test_no_url_returns_false(self):
+        assert TaskRequestBuilder._check_mcp_server_reachable({}) is False
+
+    def test_empty_url_returns_false(self):
+        assert TaskRequestBuilder._check_mcp_server_reachable({"url": ""}) is False
+
+    def test_regular_url_returns_true(self):
+        server = {"url": "http://mcp.example.com/server", "type": "http"}
+        result = TaskRequestBuilder._check_mcp_server_reachable(server)
+        assert result is True
+
+    def test_placeholder_url_returns_true(self):
+        server = {"url": "${{task_data.user_mcps.test.url}}", "type": "http"}
+        result = TaskRequestBuilder._check_mcp_server_reachable(server)
+        assert result is True
+
+
+class TestFilterReachableMcpServers:
+    """Tests for _filter_reachable_mcp_servers."""
+
+    def test_empty_list_returns_empty(self):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        assert builder._filter_reachable_mcp_servers([]) == []
+
+    @patch.object(
+        TaskRequestBuilder,
+        "_check_mcp_server_reachable",
+        side_effect=lambda s: s.get("name") != "bad-server",
+    )
+    def test_filters_unreachable(self, mock_check):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        servers = [
+            {"name": "good-server", "type": "http", "url": "http://good.example.com"},
+            {"name": "bad-server", "type": "http", "url": "http://bad.example.com"},
+        ]
+        result = builder._filter_reachable_mcp_servers(servers)
+
+        assert len(result) == 1
+        assert result[0]["name"] == "good-server"
+
+
+class TestBuildMcpServers:
+    """Tests for request-level MCP server merging."""
+
+    @patch(
+        "app.services.execution.request_builder.kindReader.get_by_name_and_namespace"
+    )
+    @patch("app.services.execution.request_builder.settings.CHAT_MCP_SERVERS", "{}")
+    def test_follow_device_excludes_ghost_mcp_servers(self, mock_get_kind):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        builder.db = SimpleNamespace()
+        mock_get_kind.return_value = _ghost_kind_with_mcp()
+
+        result = builder._build_mcp_servers(
+            _bot_kind_with_ghost(user_id=1, capability_mode="follow_device"),
+            SimpleNamespace(user_id=1, name="user-agent"),
+            user=SimpleNamespace(id=7),
+        )
+
+        assert result == []
+
+    @patch(
+        "app.services.execution.request_builder.kindReader.get_by_name_and_namespace"
+    )
+    @patch(
+        "app.services.execution.request_builder.settings.CHAT_MCP_SERVERS",
+        '{"mcpServers":{"env-server":{"type":"streamable-http","url":"http://env.example.com/mcp"}}}',
+    )
+    def test_system_team_excludes_env_mcp_servers(self, mock_get_kind):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        builder.db = SimpleNamespace()
+        mock_get_kind.return_value = _ghost_kind_with_mcp()
+
+        result = builder._build_mcp_servers(
+            _bot_kind_with_ghost(user_id=0),
+            SimpleNamespace(user_id=0, name="system-agent"),
+            user=SimpleNamespace(id=7),
+        )
+
+        assert result == [
+            {
+                "name": "ghost-server",
+                "type": "streamable-http",
+                "url": "http://ghost.example.com/mcp",
+            }
+        ]
+
+    @patch(
+        "app.services.execution.request_builder.kindReader.get_by_name_and_namespace"
+    )
+    @patch(
+        "app.services.execution.request_builder.settings.CHAT_MCP_SERVERS",
+        '{"mcpServers":{"env-server":{"type":"streamable-http","url":"http://env.example.com/mcp"}}}',
+    )
+    def test_user_team_keeps_env_mcp_servers(self, mock_get_kind):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        builder.db = SimpleNamespace()
+        mock_get_kind.return_value = _ghost_kind_with_mcp()
+
+        result = builder._build_mcp_servers(
+            _bot_kind_with_ghost(user_id=1),
+            SimpleNamespace(user_id=1, name="user-agent"),
+            user=SimpleNamespace(id=7),
+        )
+
+        assert [server["name"] for server in result] == [
+            "env-server",
+            "ghost-server",
+        ]
+
+    @patch(
+        "app.services.execution.request_builder.kindReader.get_by_name_and_namespace"
+    )
+    @patch("app.services.execution.request_builder.settings.CHAT_MCP_SERVERS", "{}")
+    def test_bot_mcp_preserves_timeout_fields(self, mock_get_kind):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        builder.db = SimpleNamespace()
+        mock_get_kind.return_value = _ghost_kind_with_mcp(
+            {
+                "seconds-server": {
+                    "type": "http",
+                    "url": "http://seconds.example.com/mcp",
+                    "timeoutSeconds": 900,
+                },
+                "native-server": {
+                    "type": "http",
+                    "url": "http://native.example.com/mcp",
+                    "timeout": 900000,
+                },
+            }
+        )
+
+        result = builder._build_mcp_servers(
+            _bot_kind_with_ghost(user_id=1),
+            SimpleNamespace(user_id=1, name="user-agent"),
+            user=SimpleNamespace(id=7),
+        )
+
+        servers = {server["name"]: server for server in result}
+        assert servers["seconds-server"]["timeoutSeconds"] == 900
+        assert servers["native-server"]["timeout"] == 900000
+
+
+@pytest.mark.parametrize(
+    ("shell_type", "transport"), [("ClaudeCode", "http"), ("Codex", "streamable-http")]
+)
+def test_board_task_auto_injects_mcp_for_chat_and_code_shell_contracts(
+    test_db, mocker, shell_type, transport
+):
+    from shared.models.db import User
+
+    builder = TaskRequestBuilder(test_db)
+    test_db.add(User(id=7, user_name="alice", password_hash="unused"))
+    test_db.flush()
+    subtask = SimpleNamespace(
+        id=2,
+        message_id=33,
+        executor_name="",
+        executor_namespace="",
+    )
+    task = SimpleNamespace(
+        id=1,
+        user_id=7,
+        json={
+            "spec": {},
+            "metadata": {
+                "labels": {
+                    "source": "project_automation",
+                    "weworkSpaceProjectId": "100",
+                    "weworkSpaceTaskId": "SPACE-1",
+                }
+            },
+        },
+        project_id=None,
+    )
+    user = SimpleNamespace(id=7, user_name="alice")
+    team = SimpleNamespace(
+        id=5,
+        user_id=7,
+        name="team-a",
+        namespace="default",
+        json={},
+    )
+    bot = SimpleNamespace(id=9)
+
+    mocker.patch(
+        "app.services.execution.request_builder.Team.model_validate",
+        return_value=SimpleNamespace(spec=SimpleNamespace(collaborationModel="solo")),
+    )
+    mocker.patch.object(builder, "_get_bot_for_subtask", return_value=bot)
+    mocker.patch.object(builder, "_build_workspace", return_value={})
+    mocker.patch.object(builder, "_build_user_info", return_value={"id": 7})
+    mocker.patch.object(builder, "_get_model_config", return_value={})
+    mocker.patch.object(builder, "_get_base_system_prompt", return_value="sys")
+    mocker.patch.object(builder, "_inject_conditional_provider_skills", return_value=[])
+    mocker.patch.object(builder, "_get_bot_skills", return_value=([], [], [], {}))
+    mocker.patch.object(
+        builder,
+        "_build_bot_config",
+        return_value=[{"shell_type": shell_type, "skills": [], "mcp_servers": []}],
+    )
+    mocker.patch.object(builder, "_build_mcp_servers", return_value=[])
+    mocker.patch.object(builder, "_is_group_chat", return_value=False)
+    mocker.patch.object(builder, "_generate_auth_token", return_value="task-jwt")
+    mocker.patch.object(
+        builder, "_generate_skill_identity_token", return_value="skill-jwt"
+    )
+    mocker.patch(
+        "app.services.execution.request_builder.settings.WEGENT_BACKEND_PUBLIC_URL",
+        "http://localhost:8000",
+    )
+
+    result = builder.build(
+        subtask=subtask,
+        task=task,
+        user=user,
+        team=team,
+        message="hello",
+    )
+
+    assert result.mcp_servers == [
+        {
+            "name": "wegent-wework-space",
+            "type": "streamable-http",
+            "url": "http://localhost:8000/mcp/wework-space/sse",
+            "timeout": 60,
+            "auth": {"Authorization": "Bearer task-jwt"},
+        }
+    ]
+    assert result.bot[0]["mcp_servers"] == [
+        {
+            "name": "wegent-wework-space",
+            "type": transport,
+            "url": "http://localhost:8000/mcp/wework-space/sse",
+            "timeout": 60,
+            "headers": {"Authorization": "Bearer task-jwt"},
+        }
+    ]
+    assert "get_current_context" in result.system_prompt
+    chat_shell_request = OpenAIRequestConverter.from_execution_request(result)
+    assert chat_shell_request["tools"] == [
+        {
+            "type": "mcp",
+            "server_label": "wegent-wework-space",
+            "server_url": "http://localhost:8000/mcp/wework-space/sse",
+            "server_type": "streamable-http",
+            "require_approval": "never",
+            "server_auth": {"Authorization": "Bearer task-jwt"},
+        }
+    ]
+
+
+def test_generic_wegent_task_does_not_auto_inject_board_mcp():
+    task = SimpleNamespace(id=1, json={"metadata": {"labels": {}}})
+
+    assert TaskRequestBuilder._is_board_wegent_task(task) is False
+
+
+class TestPrepareMcpForCodingExecutor:
+    """Integration tests for _prepare_mcp_for_coding_executor."""
+
+    @patch.object(
+        TaskRequestBuilder,
+        "_check_mcp_server_reachable",
+        return_value=True,
+    )
+    def test_skill_mcp_merged_and_normalized(self, mock_check):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        bot_config = {
+            "shell_type": "ClaudeCode",
+            "mcp_servers": [
+                {
+                    "name": "ghost-server",
+                    "type": "streamable-http",
+                    "url": "http://ghost.example.com/mcp",
+                },
+            ],
+        }
+        skill_configs = [
+            {
+                "name": "my-skill",
+                "mcpServers": {
+                    "skillServer": {
+                        "type": "streamable-http",
+                        "url": "http://skill.example.com/mcp",
+                    },
+                },
+            }
+        ]
+
+        builder._prepare_mcp_for_coding_executor(bot_config, skill_configs)
+
+        mcp = bot_config["mcp_servers"]
+        assert len(mcp) == 2
+        names = [s["name"] for s in mcp]
+        assert "ghost-server" in names
+        assert "my-skill_skillServer" in names
+        # All types should be normalized to http
+        for s in mcp:
+            assert s["type"] == "http"
+
+    @patch.object(
+        TaskRequestBuilder,
+        "_check_mcp_server_reachable",
+        return_value=True,
+    )
+    def test_skill_mcp_only_no_ghost(self, mock_check):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        bot_config = {"shell_type": "ClaudeCode", "mcp_servers": []}
+        skill_configs = [
+            {
+                "name": "my-skill",
+                "mcpServers": {
+                    "server1": {
+                        "type": "streamable-http",
+                        "url": "http://example.com/mcp",
+                    },
+                },
+            }
+        ]
+
+        builder._prepare_mcp_for_coding_executor(bot_config, skill_configs)
+
+        assert len(bot_config["mcp_servers"]) == 1
+        assert bot_config["mcp_servers"][0]["name"] == "my-skill_server1"
+        assert bot_config["mcp_servers"][0]["type"] == "http"
+
+    @patch.object(
+        TaskRequestBuilder,
+        "_check_mcp_server_reachable",
+        return_value=False,
+    )
+    def test_unreachable_servers_removed(self, mock_check):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        bot_config = {
+            "shell_type": "ClaudeCode",
+            "mcp_servers": [
+                {
+                    "name": "unreachable",
+                    "type": "http",
+                    "url": "http://192.0.2.1:9999/mcp",
+                },
+            ],
+        }
+
+        builder._prepare_mcp_for_coding_executor(bot_config, [])
+
+        assert bot_config["mcp_servers"] == []
+
+    def test_placeholder_urls_are_preserved(self):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        bot_config = {
+            "shell_type": "ClaudeCode",
+            "mcp_servers": [],
+        }
+        skill_configs = [
+            {
+                "name": "dingtalk-docs",
+                "mcpServers": {
+                    "dingtalk-docs": {
+                        "type": "streamable-http",
+                        "url": "${{task_data.user_mcps.dingtalk.services.docs.credentials.url}}",
+                    },
+                },
+            }
+        ]
+
+        builder._prepare_mcp_for_coding_executor(bot_config, skill_configs)
+
+        assert bot_config["mcp_servers"] == [
+            {
+                "name": "dingtalk-docs",
+                "type": "http",
+                "url": "${{task_data.user_mcps.dingtalk.services.docs.credentials.url}}",
+            }
+        ]
+
+    @patch.object(
+        TaskRequestBuilder,
+        "_check_mcp_server_reachable",
+        return_value=True,
+    )
+    def test_no_skill_configs_preserves_ghost(self, mock_check):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        bot_config = {
+            "shell_type": "ClaudeCode",
+            "mcp_servers": [
+                {
+                    "name": "ghost-server",
+                    "type": "http",
+                    "url": "http://ghost.example.com/mcp",
+                },
+            ],
+        }
+
+        builder._prepare_mcp_for_coding_executor(bot_config, [])
+
+        assert len(bot_config["mcp_servers"]) == 1
+        assert bot_config["mcp_servers"][0]["name"] == "ghost-server"
+
+    def test_codex_merges_skills_without_claude_normalization_or_filtering(self):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        bot_config = {"shell_type": "Codex", "mcp_servers": []}
+        skill_configs = [
+            {
+                "name": "my-skill",
+                "mcpServers": {
+                    "remote": {
+                        "type": "streamable-http",
+                        "url": "${{backend_url}}/mcp/skill",
+                        "headers": {"Authorization": "Bearer ${{auth_token}}"},
+                    },
+                    "local": {"command": "node", "args": ["skill-server.js"]},
+                },
+            }
+        ]
+
+        builder._prepare_mcp_for_coding_executor(bot_config, skill_configs)
+
+        assert bot_config["mcp_servers"] == [
+            {
+                "name": "my-skill_remote",
+                "type": "streamable-http",
+                "url": "${{backend_url}}/mcp/skill",
+                "headers": {"Authorization": "Bearer ${{auth_token}}"},
+            },
+            {"name": "my-skill_local", "command": "node", "args": ["skill-server.js"]},
+        ]
+
+
+class TestResolveRequestPreloadSkills:
+    """Tests for late skill resolution after context processing."""
+
+    @pytest.mark.parametrize(
+        ("shell_type", "transport"),
+        [("ClaudeCode", "http"), ("Codex", "streamable-http")],
+    )
+    @patch.object(
+        TaskRequestBuilder,
+        "_check_mcp_server_reachable",
+        return_value=True,
+    )
+    def test_inherited_kb_skill_resolves_into_request_and_coding_mcp(
+        self, mock_check, shell_type, transport
+    ):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        request = ExecutionRequest(
+            task_id=1273,
+            subtask_id=1709,
+            knowledge_base_ids=[1408],
+            is_user_selected_kb=False,
+            skill_names=["browser"],
+            skill_configs=[{"name": "browser"}],
+            preload_skills=["wegent-knowledge"],
+            user_selected_skills=["wegent-knowledge"],
+            bot=[
+                {
+                    "shell_type": shell_type,
+                    "skills": ["browser"],
+                    "mcp_servers": [],
+                }
+            ],
+        )
+        bot = SimpleNamespace(name="chat-bot")
+        team = SimpleNamespace(namespace="default")
+        captured = {}
+
+        def fake_get_bot_skills(**kwargs):
+            captured.update(kwargs)
+            return (
+                [
+                    {"name": "browser"},
+                    {
+                        "name": "wegent-knowledge",
+                        "mcpServers": {
+                            "wegent-knowledge": {
+                                "type": "streamable-http",
+                                "url": "${{backend_url}}/mcp/knowledge/sse",
+                            }
+                        },
+                    },
+                ],
+                ["wegent-knowledge"],
+                ["wegent-knowledge"],
+                {
+                    "wegent-knowledge": {
+                        "skill_id": 99,
+                        "namespace": "default",
+                        "is_public": True,
+                    }
+                },
+            )
+
+        builder._get_bot_skills = fake_get_bot_skills
+
+        result = builder.resolve_request_preload_skills(
+            request=request,
+            bot=bot,
+            team=team,
+            user=SimpleNamespace(id=7, preferences="{}"),
+        )
+
+        assert result.skill_names == ["browser", "wegent-knowledge"]
+        assert captured["user_preload_skills"] == [
+            {
+                "name": "wegent-knowledge",
+                "namespace": "default",
+                "is_public": True,
+            }
+        ]
+        assert result.preload_skills == ["wegent-knowledge"]
+        assert result.user_selected_skills == ["wegent-knowledge"]
+        assert result.skill_refs["wegent-knowledge"]["is_public"] is True
+        assert "wegent-knowledge" in result.bot[0]["skills"]
+        assert result.bot[0]["mcp_servers"] == [
+            {
+                "name": "wegent-knowledge",
+                "type": transport,
+                "url": "${{backend_url}}/mcp/knowledge/sse",
+            }
+        ]
+
+    def test_provider_runtime_skill_is_resolved_as_public(self):
+        builder = TaskRequestBuilder.__new__(TaskRequestBuilder)
+        request = ExecutionRequest(
+            preload_skills=["dingtalk-docs"],
+            user_selected_skills=["dingtalk-docs"],
+            bot=[{"shell_type": "Chat", "skills": [], "mcp_servers": []}],
+        )
+        captured = {}
+
+        def fake_get_bot_skills(**kwargs):
+            captured.update(kwargs)
+            return (
+                [{"name": "dingtalk-docs"}],
+                ["dingtalk-docs"],
+                ["dingtalk-docs"],
+                {
+                    "dingtalk-docs": {
+                        "skill_id": 101,
+                        "namespace": "default",
+                        "is_public": True,
+                    }
+                },
+            )
+
+        builder._get_bot_skills = fake_get_bot_skills
+
+        result = builder.resolve_request_preload_skills(
+            request=request,
+            bot=SimpleNamespace(name="chat-bot"),
+            team=SimpleNamespace(namespace="default"),
+            user=SimpleNamespace(id=7, preferences="{}"),
+        )
+
+        assert captured["user_preload_skills"] == [
+            {
+                "name": "dingtalk-docs",
+                "namespace": "default",
+                "is_public": True,
+            }
+        ]
+        assert result.skill_names == ["dingtalk-docs"]

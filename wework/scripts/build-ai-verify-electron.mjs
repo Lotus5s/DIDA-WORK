@@ -1,0 +1,60 @@
+#!/usr/bin/env node
+
+import { spawn } from 'node:child_process'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { isolateAiVerifyRuntimeEnvironment } from './ai-verify-environment.mjs'
+import { wrapWindowsScriptCommand } from './child-process-command.mjs'
+import { resolveHarnessRuntimeAssetCacheEnvironment } from './lib/harness-runtime-cache.mjs'
+
+const scriptDir = dirname(fileURLToPath(import.meta.url))
+const weworkDir = resolve(scriptDir, '..')
+const pnpmCommand = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
+const isolatedEnvironment = isolateAiVerifyRuntimeEnvironment(process.env)
+const buildCacheRoot = await mkdtemp(join(tmpdir(), 'wework-ai-verify-build-'))
+const prebuiltExecutorPath = process.env.WEWORK_E2E_PREBUILT_EXECUTOR_PATH?.trim()
+const prebuiltExecutorWaitSeconds = process.env.WEWORK_E2E_PREBUILT_EXECUTOR_WAIT_SECONDS?.trim()
+const buildEnvironment = {
+  ...resolveHarnessRuntimeAssetCacheEnvironment(
+    isolatedEnvironment,
+    { platform: process.platform },
+    weworkDir,
+    buildCacheRoot
+  ),
+  VITE_WEWORK_E2E: 'true',
+  VITE_WEWORK_RELEASE_CHANNEL: 'stable',
+  VITE_WEWORK_RUNTIME_MODE: 'local-first',
+  ...(prebuiltExecutorPath
+    ? {
+        WEWORK_EXECUTOR_PATH: resolve(prebuiltExecutorPath),
+        ...(prebuiltExecutorWaitSeconds
+          ? { WEWORK_EXECUTOR_WAIT_SECONDS: prebuiltExecutorWaitSeconds }
+          : {}),
+      }
+    : {}),
+}
+
+function run(command, args, environment = process.env) {
+  return new Promise((resolvePromise, reject) => {
+    const resolved = wrapWindowsScriptCommand(command, args)
+    const child = spawn(resolved.command, resolved.args, {
+      cwd: weworkDir,
+      env: environment,
+      stdio: 'inherit',
+    })
+    child.once('error', reject)
+    child.once('exit', code => {
+      if (code === 0) resolvePromise()
+      else reject(new Error(`${command} exited with code ${code ?? 'unknown'}`))
+    })
+  })
+}
+
+try {
+  await run(pnpmCommand, ['run', 'prepare:electron'])
+  await run(pnpmCommand, ['--dir', 'electron', 'run', 'build:package'], buildEnvironment)
+} finally {
+  await rm(buildCacheRoot, { recursive: true, force: true })
+}

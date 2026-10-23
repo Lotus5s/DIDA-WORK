@@ -1,0 +1,612 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { BookOpen, Code2, Database } from 'lucide-react'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { Spinner } from '@/components/ui/spinner'
+import { GenerationTaskRow } from '@/features/knowledge/code-wiki/GenerationTaskRow'
+import { GenerationStrategySelect } from '@/features/knowledge/code-wiki/GenerationStrategySelect'
+import { ScheduledUpdateDialog } from '@/features/knowledge/code-wiki/ScheduledUpdateDialog'
+import { KnowledgeBaseForm } from './KnowledgeBaseForm'
+import { DingtalkAutoSyncSetting } from './DingtalkAutoSyncSetting'
+import { useMultimodalKBConfig } from '@/features/knowledge/multimodal/hooks/useMultimodalKBConfig'
+import { useMultimodalFeatureEnabled } from '@/features/knowledge/multimodal/hooks/useMultimodalFeatureEnabled'
+import { ConvertKnowledgeBaseTypeDialog } from './ConvertKnowledgeBaseTypeDialog'
+import { SimpleConfigRow } from '@/features/settings/components/team-edit/SimpleConfigLayout'
+import { ModelRefSelector } from '@/components/model-select/ModelRefSelector'
+import { useTranslation } from '@/hooks/useTranslation'
+import { getKnowledgeBase } from '@/apis/knowledge'
+import { codeWikiApi } from '@/apis/code-wiki'
+import type {
+  DirectAccessRequirement,
+  KnowledgeBase,
+  KnowledgeBaseUpdate,
+  RetrievalConfigDraft,
+  RetrievalConfigUpdate,
+  SummaryModelRef,
+} from '@/types/knowledge'
+import type { CodeWikiScheduledUpdateRequest } from '@/types/code-wiki'
+
+type ScheduledUpdateChange =
+  | { action: 'configure'; data: CodeWikiScheduledUpdateRequest }
+  | { action: 'delete' }
+  | null
+
+interface EditKnowledgeBaseDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  knowledgeBase: KnowledgeBase | null
+  onSubmit: (data: KnowledgeBaseUpdate) => Promise<void>
+  loading?: boolean
+  /** Optional team ID for reading cached model preference (only used when KB has no existing summary_model_ref) */
+  knowledgeDefaultTeamId?: number | null
+  /** Optional bind model name from team's bot config as fallback */
+  bindModel?: string | null
+  /** Callback when default opening view is updated */
+  onTypeConverted?: (updatedKb: KnowledgeBase) => void
+}
+
+export function EditKnowledgeBaseDialog({
+  open,
+  onOpenChange,
+  knowledgeBase,
+  onSubmit,
+  loading,
+  knowledgeDefaultTeamId,
+  bindModel,
+  onTypeConverted,
+}: EditKnowledgeBaseDialogProps) {
+  const { t } = useTranslation()
+  const { t: tKnowledge } = useTranslation('knowledge')
+  const [name, setName] = useState('')
+  const [showGenerationTask, setShowGenerationTask] = useState(false)
+  const [generationStrategy, setGenerationStrategy] = useState('')
+  const [generationStrategyTouched, setGenerationStrategyTouched] = useState(false)
+  const isCodeWiki = (knowledgeBase?.kb_type || 'notebook') === 'code_wiki'
+  const [description, setDescription] = useState('')
+  const [directAccessRequirement, setDirectAccessRequirement] =
+    useState<DirectAccessRequirement>('read')
+  const [allowDocumentDownload, setAllowDocumentDownload] = useState<boolean | undefined>()
+  const [dingtalkAutoSyncEnabled, setDingtalkAutoSyncEnabled] = useState(false)
+  const [summaryEnabled, setSummaryEnabled] = useState(false)
+  const [summaryModelRef, setSummaryModelRef] = useState<SummaryModelRef | null>(null)
+  // Editable so a wiki created before the field existed can be given a model. Left
+  // unset it keeps falling back to the team's bot, which is what it runs on today.
+  const [executionModelRef, setExecutionModelRef] = useState<SummaryModelRef | null>(null)
+  // Whether the model in this dialog is a choice or just what the selector filled in.
+  //
+  // The selector preselects, so opening this dialog on a wiki that has no model puts
+  // one in the box without anyone asking. Sending that on submit would pin a model
+  // nobody chose -- and replace the team fallback the wiki runs on -- as a side
+  // effect of saving some unrelated setting. So the field is only sent once it has
+  // been touched, or when the wiki already had one to update.
+  const [executionModelTouched, setExecutionModelTouched] = useState(false)
+  const [summaryModelError, setSummaryModelError] = useState('')
+  const {
+    multimodalAnalysisEnabled,
+    multimodalVideoPrompt,
+    multimodalImagePrompt,
+    loadFromKB: loadMultimodalFromKB,
+    validate: validateMultimodal,
+    clearError: clearMultimodalError,
+    buildSubmitFields: buildMultimodalSubmitFields,
+    formProps: multimodalFormProps,
+  } = useMultimodalKBConfig()
+  // Gate prompt overrides by the global pipeline switch, the same way
+  // buildMultimodalSubmitFields() gates multimodal_analysis_enabled. Otherwise
+  // saving a previously-enabled KB after the switch is turned off would send
+  // enabled=false alongside the (non-blank) prompt text.
+  const multimodalFeatureEnabled = useMultimodalFeatureEnabled()
+  const effectiveMultimodalEnabled = multimodalFeatureEnabled && multimodalAnalysisEnabled
+  const [error, setError] = useState('')
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [retrievalConfig, setRetrievalConfig] = useState<RetrievalConfigDraft>({})
+  const [guidedQuestions, setGuidedQuestions] = useState<string[]>([])
+
+  // Call limit configuration state
+  const [maxCalls, setMaxCalls] = useState(10)
+  const [exemptCalls, setExemptCalls] = useState(5)
+
+  // Default view dialog state
+  const [showConvertDialog, setShowConvertDialog] = useState(false)
+  const [scheduledUpdateOpen, setScheduledUpdateOpen] = useState(false)
+  const [scheduledUpdateChange, setScheduledUpdateChange] = useState<ScheduledUpdateChange>(null)
+  const [isSavingChanges, setIsSavingChanges] = useState(false)
+
+  // Full knowledge base data (fetched from API)
+  const [fullKnowledgeBase, setFullKnowledgeBase] = useState<KnowledgeBase | null>(null)
+  const [isLoadingFullKnowledgeBase, setIsLoadingFullKnowledgeBase] = useState(false)
+  const [fullKnowledgeBaseLoadFailed, setFullKnowledgeBaseLoadFailed] = useState(false)
+  const fullKnowledgeBaseRequestId = useRef(0)
+
+  const loadFullKnowledgeBase = useCallback(async (knowledgeBaseId: number) => {
+    const requestId = ++fullKnowledgeBaseRequestId.current
+    setFullKnowledgeBase(null)
+    setIsLoadingFullKnowledgeBase(true)
+    setFullKnowledgeBaseLoadFailed(false)
+
+    try {
+      const fullKb = await getKnowledgeBase(knowledgeBaseId)
+      if (fullKnowledgeBaseRequestId.current === requestId) {
+        setFullKnowledgeBase(fullKb)
+      }
+    } catch (err) {
+      console.error('Failed to fetch full knowledge base data:', err)
+      if (fullKnowledgeBaseRequestId.current === requestId) {
+        setFullKnowledgeBaseLoadFailed(true)
+      }
+    } finally {
+      if (fullKnowledgeBaseRequestId.current === requestId) {
+        setIsLoadingFullKnowledgeBase(false)
+      }
+    }
+  }, [])
+
+  // Fetch full knowledge base data when dialog opens
+  useEffect(() => {
+    if (open && knowledgeBase?.id) {
+      void loadFullKnowledgeBase(knowledgeBase.id)
+    } else {
+      fullKnowledgeBaseRequestId.current += 1
+      setFullKnowledgeBase(null)
+      setIsLoadingFullKnowledgeBase(false)
+      setFullKnowledgeBaseLoadFailed(false)
+    }
+
+    return () => {
+      fullKnowledgeBaseRequestId.current += 1
+    }
+  }, [open, knowledgeBase?.id, loadFullKnowledgeBase])
+
+  // Initialize form fields when full data is loaded
+  useEffect(() => {
+    if (fullKnowledgeBase) {
+      const kb = fullKnowledgeBase
+      setName(kb.name)
+      setDescription(kb.description || '')
+      setDirectAccessRequirement(kb.direct_access_requirement ?? 'read')
+      setAllowDocumentDownload(kb.allow_document_download)
+      setDingtalkAutoSyncEnabled(kb.dingtalk_auto_sync_enabled ?? false)
+      setSummaryEnabled(kb.summary_enabled || false)
+      setSummaryModelRef(kb.summary_model_ref || null)
+      setExecutionModelRef(kb.execution_model_ref || null)
+      setExecutionModelTouched(false)
+      setScheduledUpdateChange(null)
+      setSummaryModelError('')
+      loadMultimodalFromKB({
+        multimodalAnalysisEnabled: kb.multimodal_analysis_enabled || false,
+        multimodalAnalysisModelRef: kb.multimodal_analysis_model_ref || null,
+        multimodalAnalysisModelError: '',
+        multimodalVideoPrompt: kb.multimodal_analysis_video_prompt ?? null,
+        multimodalImagePrompt: kb.multimodal_analysis_image_prompt ?? null,
+      })
+      setShowGenerationTask(kb.show_generation_task ?? false)
+      setGenerationStrategy(kb.generation_strategy || '')
+      setGenerationStrategyTouched(false)
+      setShowAdvanced(false) // Reset expanded state
+      // Initialize retrieval config from knowledge base
+      if (kb.retrieval_config) {
+        setRetrievalConfig(kb.retrieval_config)
+      }
+      // Initialize call limits from knowledge base
+      setMaxCalls(kb.max_calls_per_conversation)
+      setExemptCalls(kb.exempt_calls_before_check)
+      // Initialize guided questions from knowledge base
+      setGuidedQuestions(kb.guided_questions || [])
+    }
+  }, [fullKnowledgeBase])
+
+  const handleRetrievalConfigChange = useCallback((config: RetrievalConfigDraft) => {
+    setRetrievalConfig(config)
+  }, [])
+
+  const handleSubmit = async () => {
+    setError('')
+    setSummaryModelError('')
+    clearMultimodalError()
+
+    if (!fullKnowledgeBase) {
+      return
+    }
+
+    if (!name.trim()) {
+      setError(t('knowledge:document.knowledgeBase.nameRequired'))
+      return
+    }
+
+    if (name.length > 100) {
+      setError(t('knowledge:document.knowledgeBase.nameTooLong'))
+      return
+    }
+
+    // Validate summary model when summary is enabled
+    if (summaryEnabled && !summaryModelRef) {
+      setSummaryModelError(t('knowledge:document.summary.modelRequired'))
+      return
+    }
+
+    // Validate multimodal analysis model when multimodal analysis is enabled
+    if (!validateMultimodal()) {
+      return
+    }
+
+    // Validate call limits
+    if (exemptCalls >= maxCalls) {
+      setError(t('knowledge:document.callLimits.validationError'))
+      return
+    }
+
+    setIsSavingChanges(true)
+    try {
+      // Build update data
+      // Filter out empty guided questions
+      const validGuidedQuestions = guidedQuestions.filter(q => q.trim().length > 0)
+      const kb = fullKnowledgeBase
+      const updateData: KnowledgeBaseUpdate = {
+        name: name.trim(),
+        description: description.trim(), // Allow empty string to clear description
+        direct_access_requirement: directAccessRequirement,
+        allow_document_download: allowDocumentDownload,
+        dingtalk_auto_sync_enabled: dingtalkAutoSyncEnabled,
+        summary_enabled: summaryEnabled,
+        summary_model_ref: summaryEnabled ? summaryModelRef : null,
+        ...buildMultimodalSubmitFields(),
+        // For edit, send "" (never null) so the backend always applies the value:
+        // a blank string clears the override (revert to system default).
+        multimodal_analysis_video_prompt: effectiveMultimodalEnabled
+          ? multimodalVideoPrompt || ''
+          : '',
+        multimodal_analysis_image_prompt: effectiveMultimodalEnabled
+          ? multimodalImagePrompt || ''
+          : '',
+        guided_questions: validGuidedQuestions,
+        max_calls_per_conversation: maxCalls,
+        exempt_calls_before_check: exemptCalls,
+        ...(isCodeWiki ? { show_generation_task: showGenerationTask } : {}),
+        ...(isCodeWiki && generationStrategyTouched && generationStrategy
+          ? { generation_strategy: generationStrategy }
+          : {}),
+        // Applies to the next run. One already going keeps the model it was started
+        // with, which is the model its pages were written by. Omitted entirely when
+        // untouched on a wiki that had none, so "unset" survives an unrelated save.
+        ...(isCodeWiki && (executionModelTouched || kb?.execution_model_ref)
+          ? { execution_model_ref: executionModelRef }
+          : {}),
+      }
+
+      // Add retrieval config update if advanced settings were modified
+      if (kb?.retrieval_config && retrievalConfig) {
+        const retrievalConfigUpdate: RetrievalConfigUpdate = {}
+
+        // Only include fields that can be updated (exclude retriever and embedding_config)
+        if (retrievalConfig.retrieval_mode !== undefined) {
+          retrievalConfigUpdate.retrieval_mode = retrievalConfig.retrieval_mode
+        }
+        if (retrievalConfig.top_k !== undefined) {
+          retrievalConfigUpdate.top_k = retrievalConfig.top_k
+        }
+        if (retrievalConfig.score_threshold !== undefined) {
+          retrievalConfigUpdate.score_threshold = retrievalConfig.score_threshold
+        }
+        if (retrievalConfig.hybrid_weights !== undefined) {
+          retrievalConfigUpdate.hybrid_weights = retrievalConfig.hybrid_weights
+        }
+
+        // Only add retrieval_config if there are changes
+        if (Object.keys(retrievalConfigUpdate).length > 0) {
+          updateData.retrieval_config = retrievalConfigUpdate
+        }
+      }
+
+      await onSubmit(updateData)
+
+      if (scheduledUpdateChange?.action === 'configure') {
+        await codeWikiApi.configureScheduledUpdate(fullKnowledgeBase.id, scheduledUpdateChange.data)
+      } else if (scheduledUpdateChange?.action === 'delete') {
+        await codeWikiApi.deleteScheduledUpdate(fullKnowledgeBase.id)
+      }
+
+      setScheduledUpdateChange(null)
+      handleOpenChange(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common:error'))
+    } finally {
+      setIsSavingChanges(false)
+    }
+  }
+
+  const handleOpenChange = (newOpen: boolean) => {
+    if (!newOpen) {
+      setError('')
+      setSummaryModelError('')
+      clearMultimodalError()
+      setScheduledUpdateChange(null)
+    }
+    onOpenChange(newOpen)
+  }
+
+  // Knowledge base type info - use fullKnowledgeBase for accurate data
+  const kb = fullKnowledgeBase
+  const kbType = kb?.kb_type || 'notebook'
+  const isNotebook = kbType === 'notebook'
+
+  // Handle default opening view update success
+  const handleTypeConverted = (updatedKb: KnowledgeBase) => {
+    setShowConvertDialog(false)
+    onOpenChange(false)
+    onTypeConverted?.(updatedKb)
+  }
+
+  return (
+    <>
+      <Dialog
+        open={open}
+        onOpenChange={nextOpen => {
+          if (!nextOpen && isSavingChanges) return
+          handleOpenChange(nextOpen)
+        }}
+      >
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-hidden flex flex-col">
+          <DialogHeader>
+            <DialogTitle>{t('knowledge:document.knowledgeBase.edit')}</DialogTitle>
+            <DialogDescription>
+              {t('knowledge:document.knowledgeBase.editDialogDescription')}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex-1 overflow-y-auto space-y-4 py-4">
+            {isLoadingFullKnowledgeBase ? (
+              <Spinner
+                center
+                text={tKnowledge('document.knowledgeBase.loadingDetails')}
+                data-testid="edit-knowledge-base-loading"
+              />
+            ) : fullKnowledgeBaseLoadFailed ? (
+              <div
+                className="flex min-h-[200px] flex-col items-center justify-center gap-4 text-center"
+                data-testid="edit-knowledge-base-load-error"
+              >
+                <p className="text-sm text-error">
+                  {tKnowledge('document.knowledgeBase.loadDetailsFailed')}
+                </p>
+                <Button
+                  variant="outline"
+                  onClick={() => knowledgeBase?.id && loadFullKnowledgeBase(knowledgeBase.id)}
+                  data-testid="edit-knowledge-base-retry"
+                >
+                  {tKnowledge('document.knowledgeBase.retryLoadDetails')}
+                </Button>
+              </div>
+            ) : fullKnowledgeBase ? (
+              <>
+                {/* First, because it is what this knowledge base is rather than a
+                    setting on it. Stated, not editable: the binding is fixed at
+                    creation, and its version history hangs off it. */}
+                {isCodeWiki && kb?.source?.sourceUrl && (
+                  <div className="mb-4 flex items-center gap-2 rounded-md bg-muted px-3 py-2">
+                    <Code2 className="h-4 w-4 shrink-0 text-primary" />
+                    <span className="truncate text-sm" title={kb.source.sourceUrl}>
+                      {tKnowledge('codeWiki.create.repository')}:{' '}
+                      {kb.source.projectName || kb.source.sourceUrl}
+                    </span>
+                  </div>
+                )}
+
+                {isCodeWiki && (
+                  <div className="mb-4">
+                    <SimpleConfigRow
+                      label={tKnowledge('codeWiki.create.modelLabel')}
+                      description={tKnowledge('codeWiki.create.modelDescription')}
+                      align="start"
+                    >
+                      <ModelRefSelector
+                        value={executionModelRef}
+                        onChange={value => {
+                          setExecutionModelRef(value)
+                          setExecutionModelTouched(true)
+                        }}
+                        placeholder={tKnowledge('codeWiki.create.modelPlaceholder')}
+                        // Passed unconditionally: with autoSelect off it no longer
+                        // risks the cache overriding what the wiki already has, and
+                        // it is what lets a pick made here be remembered.
+                        knowledgeDefaultTeamId={knowledgeDefaultTeamId}
+                        preferenceScope="wiki"
+                        // Nothing is filled in for a wiki that has no model: an empty
+                        // box is the truth there, and only a real pick may change it.
+                        autoSelect={false}
+                        dataTestId="code-wiki-execution-model-select"
+                      />
+                    </SimpleConfigRow>
+                  </div>
+                )}
+
+                <KnowledgeBaseForm
+                  advancedExtras={
+                    isCodeWiki ? (
+                      <>
+                        <SimpleConfigRow
+                          label={tKnowledge('codeWiki.strategy.label')}
+                          description={tKnowledge('codeWiki.strategy.settingsDescription')}
+                        >
+                          <GenerationStrategySelect
+                            value={generationStrategy}
+                            onChange={strategy => {
+                              setGenerationStrategy(strategy)
+                              setGenerationStrategyTouched(true)
+                            }}
+                            testId="code-wiki-generation-strategy"
+                          />
+                        </SimpleConfigRow>
+                        <SimpleConfigRow
+                          label={tKnowledge('codeWiki.create.scheduledUpdate')}
+                          description={tKnowledge('codeWiki.scheduledUpdate.settingsHint')}
+                          align="start"
+                        >
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => setScheduledUpdateOpen(true)}
+                            disabled={isSavingChanges}
+                            data-testid="code-wiki-scheduled-settings"
+                          >
+                            {tKnowledge('codeWiki.scheduledUpdate.configure')}
+                          </Button>
+                        </SimpleConfigRow>
+                        {scheduledUpdateChange && (
+                          <p
+                            className="text-xs text-text-muted"
+                            data-testid="code-wiki-scheduled-pending-change"
+                          >
+                            {tKnowledge(
+                              scheduledUpdateChange.action === 'delete'
+                                ? 'codeWiki.scheduledUpdate.pendingDelete'
+                                : 'codeWiki.scheduledUpdate.pendingConfigure'
+                            )}
+                          </p>
+                        )}
+                        <GenerationTaskRow
+                          checked={showGenerationTask}
+                          onChange={setShowGenerationTask}
+                        />
+                      </>
+                    ) : (
+                      <DingtalkAutoSyncSetting
+                        checked={dingtalkAutoSyncEnabled}
+                        onCheckedChange={setDingtalkAutoSyncEnabled}
+                      />
+                    )
+                  }
+                  name={name}
+                  description={description}
+                  onNameChange={value => setName(value)}
+                  onDescriptionChange={value => setDescription(value)}
+                  directAccessRequirement={directAccessRequirement}
+                  onDirectAccessRequirementChange={setDirectAccessRequirement}
+                  allowDocumentDownload={allowDocumentDownload}
+                  onAllowDocumentDownloadChange={setAllowDocumentDownload}
+                  summaryEnabled={summaryEnabled}
+                  onSummaryEnabledChange={checked => {
+                    setSummaryEnabled(checked)
+                    if (!checked) {
+                      setSummaryModelRef(null)
+                      setSummaryModelError('')
+                    }
+                  }}
+                  summaryModelRef={summaryModelRef}
+                  summaryModelError={summaryModelError}
+                  onSummaryModelChange={value => {
+                    setSummaryModelRef(value)
+                    setSummaryModelError('')
+                  }}
+                  {...multimodalFormProps}
+                  knowledgeDefaultTeamId={
+                    !kb?.summary_model_ref ? knowledgeDefaultTeamId : undefined
+                  }
+                  bindModel={bindModel}
+                  callLimits={{ maxCalls, exemptCalls }}
+                  onCallLimitsChange={({ maxCalls: nextMax, exemptCalls: nextExempt }) => {
+                    setMaxCalls(nextMax)
+                    setExemptCalls(nextExempt)
+                  }}
+                  advancedOpen={showAdvanced}
+                  onAdvancedOpenChange={setShowAdvanced}
+                  showRetrievalSection={!!kb?.retrieval_config}
+                  retrievalConfig={retrievalConfig}
+                  onRetrievalConfigChange={handleRetrievalConfigChange}
+                  retrievalReadOnly={false}
+                  retrievalPartialReadOnly={true}
+                  showGuidedQuestions={true}
+                  guidedQuestions={guidedQuestions}
+                  onGuidedQuestionsChange={setGuidedQuestions}
+                />
+
+                {/* Default opening view section. A code wiki has neither view — it
+                    is read in its own reader — so offering to switch between them
+                    would show it as "classic" and let it be converted into one. */}
+                {!isCodeWiki && (
+                  <div className="border-t border-border pt-4 mt-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        {isNotebook ? (
+                          <BookOpen className="w-4 h-4 text-primary" />
+                        ) : (
+                          <Database className="w-4 h-4 text-text-secondary" />
+                        )}
+                        <span className="text-sm font-medium">
+                          {tKnowledge('document.knowledgeBase.currentDefaultView')}:{' '}
+                          {isNotebook
+                            ? tKnowledge('document.knowledgeBase.typeNotebook')
+                            : tKnowledge('document.knowledgeBase.typeClassic')}
+                        </span>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setShowConvertDialog(true)}
+                        className="flex items-center gap-1.5"
+                      >
+                        {tKnowledge('document.knowledgeBase.changeDefaultView')}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                {error && <p className="text-sm text-error">{error}</p>}
+              </>
+            ) : null}
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => handleOpenChange(false)}
+              disabled={loading || isSavingChanges}
+              className="h-11 min-w-[44px]"
+            >
+              {t('common:actions.cancel')}
+            </Button>
+            <Button
+              onClick={handleSubmit}
+              variant="primary"
+              disabled={
+                loading || isSavingChanges || isLoadingFullKnowledgeBase || !fullKnowledgeBase
+              }
+              className="h-11 min-w-[44px]"
+            >
+              {loading || isSavingChanges ? t('common:actions.saving') : t('common:actions.save')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Convert type dialog */}
+      <ConvertKnowledgeBaseTypeDialog
+        open={showConvertDialog}
+        onOpenChange={setShowConvertDialog}
+        knowledgeBase={fullKnowledgeBase}
+        onSuccess={handleTypeConverted}
+      />
+      {knowledgeBase && (
+        <ScheduledUpdateDialog
+          knowledgeBaseId={knowledgeBase.id}
+          open={scheduledUpdateOpen}
+          onOpenChange={setScheduledUpdateOpen}
+          draft={scheduledUpdateChange?.action === 'configure' ? scheduledUpdateChange.data : null}
+          deleteRequested={scheduledUpdateChange?.action === 'delete'}
+          onDraftSaved={data => setScheduledUpdateChange({ action: 'configure', data })}
+          onDeleteRequested={() => setScheduledUpdateChange({ action: 'delete' })}
+        />
+      )}
+    </>
+  )
+}

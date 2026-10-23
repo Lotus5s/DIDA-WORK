@@ -1,0 +1,18 @@
+{
+  "name": "wework-space",
+  "version": "0.2.2",
+  "description": "Provides project-space, Issue, attachment, and delivery tools to DIDA Work Agent sessions.",
+  "author": {
+    "name": "DIDA Work"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "DIDA Work 空间",
+    "shortDescription": "读取和更新 DIDA Work 项目与 Issue。",
+    "longDescription": "将 Codex 连接到 DIDA Work 管理的本地项目空间。本地项目可离线使用；云端项目在连接后使用已认证的后端提供方。",
+    "developerName": "DIDA Work",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": "使用当前 DIDA Work 项目空间上下文。"
+  }
+}

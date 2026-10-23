@@ -1,0 +1,900 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Unified Model Aggregation Service
+
+This service provides a unified interface for querying models from both:
+- Public models (user_id=0 in kinds table)
+- User-defined models (via kind_service)
+
+It also handles model type differentiation to avoid naming conflicts.
+"""
+
+import logging
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from app.core.constants import CLIENT_ORIGIN_WEWORK
+from app.models.kind import Kind
+from app.models.user import User
+from app.schemas.kind import Model, ModelCategoryType, Shell
+from app.services.adapters.public_model import public_model_service
+from app.services.adapters.shell_utils import find_shell_json
+from app.services.capability_reference_service import (
+    get_referenced_capability,
+    list_referenced_capabilities_by_namespace,
+)
+from app.services.kind import kind_service
+from app.services.model_capabilities import normalize_model_capabilities
+from app.services.model_listing_queries import load_direct_models_by_namespace
+from app.services.runtime_codex_model import (
+    CODEX_RUNTIME_MODEL_CATEGORY_TYPE,
+    CODEX_RUNTIME_MODEL_DISPLAY_NAME,
+    CODEX_RUNTIME_MODEL_GROUP,
+    CODEX_RUNTIME_MODEL_ID,
+    CODEX_RUNTIME_MODEL_NAME,
+    CODEX_RUNTIME_MODEL_NAMESPACE,
+    CODEX_RUNTIME_MODEL_PROVIDER,
+    CODEX_RUNTIME_MODEL_SUB_GROUP,
+    build_codex_runtime_model_config,
+    is_codex_runtime_model_enabled,
+)
+from app.services.wework_model_config import wework_model_catalog_config
+from app.utils.model_capability import get_model_capability_description
+from shared.codex_model_catalog import codex_catalog_model_id_from_config
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize_runtime_family_part(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def build_model_runtime_family(
+    provider: Optional[str], config: Optional[Dict[str, Any]]
+) -> Optional[str]:
+    provider_key = _normalize_runtime_family_part(provider)
+    if not provider_key:
+        return None
+
+    protocol_key = _normalize_runtime_family_part((config or {}).get("protocol"))
+    if not protocol_key:
+        return provider_key
+
+    return f"{provider_key}.{protocol_key}"
+
+
+class ModelType(str, Enum):
+    """
+    Model type enumeration.
+
+    - PUBLIC: Models from kinds table with user_id=0, shared across all users
+    - USER: User-defined models from kinds table, private to each user
+    - GROUP: Models from kinds table in group namespace, shared within group
+    - RUNTIME: Runtime-only models derived from user execution config
+    """
+
+    PUBLIC = "public"
+    USER = "user"
+    GROUP = "group"
+    RUNTIME = "runtime"
+
+
+class UnifiedModel:
+    """
+    Unified model representation that includes type information
+    to distinguish between public, user-defined, group, and runtime models.
+
+    The 'type' field is critical for:
+    1. Avoiding naming conflicts between model sources
+    2. Determining which table to query when resolving a model
+    3. Frontend display differentiation
+    """
+
+    def __init__(
+        self,
+        name: str,
+        model_type: ModelType,
+        display_name: Optional[str] = None,
+        provider: Optional[str] = None,
+        model_id: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        is_active: bool = True,
+        namespace: str = "default",
+        model_category_type: Optional[
+            str
+        ] = None,  # New: llm, tts, stt, embedding, rerank
+        is_advanced: bool = False,
+        model_group: Optional[str] = None,
+        model_sub_group: Optional[str] = None,
+        context_window: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
+        cost_index: Optional[str] = None,
+        capability: Optional[str] = None,
+        model_capabilities: Optional[Dict[str, bool]] = None,
+        resource_id: Optional[int] = None,
+        resource_user_id: Optional[int] = None,
+        runtime_family: Optional[str] = None,
+        created_at: Optional[Any] = None,
+        updated_at: Optional[Any] = None,
+        is_reference: bool = False,
+    ):
+        self.name = name
+        self.type = model_type
+        self.display_name = display_name
+        self.provider = provider
+        self.model_id = model_id
+        self.config = config or {}
+        self.is_active = is_active
+        self.namespace = namespace  # Resource namespace (group name or 'default')
+        self.model_category_type = (
+            model_category_type or "llm"
+        )  # Default to 'llm' for backward compatibility
+        self.is_advanced = is_advanced
+        self.model_group = model_group
+        self.model_sub_group = model_sub_group
+        self.context_window = context_window
+        self.max_output_tokens = max_output_tokens
+        self.cost_index = cost_index
+        self.capability = capability
+        self.model_capabilities = model_capabilities
+        self.resource_id = resource_id
+        self.resource_user_id = resource_user_id
+        self.created_at = created_at
+        self.updated_at = updated_at
+        self.is_reference = is_reference
+        self.runtime_family = runtime_family or build_model_runtime_family(
+            provider, self.config
+        )
+
+    @property
+    def runtime(self) -> Dict[str, Optional[str]]:
+        return {"family": self.runtime_family, "provider": self.provider}
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert to dictionary for API response.
+        Includes config with sensitive env stripped.
+        """
+        # Strip sensitive env data from config
+        safe_config = (
+            {
+                k: v
+                for k, v in self.config.items()
+                if k not in {"env", "modelCapabilities"}
+            }
+            if self.config
+            else {}
+        )
+        if self.model_capabilities:
+            safe_config["modelCapabilities"] = self.model_capabilities
+        result = {
+            "name": self.name,
+            "type": self.type.value,
+            "displayName": self.display_name,
+            "provider": self.provider,
+            "modelId": self.model_id,
+            "namespace": self.namespace,
+            "modelCategoryType": self.model_category_type,
+            "isAdvanced": self.is_advanced,
+            "modelGroup": self.model_group,
+            "modelSubGroup": self.model_sub_group,
+            "contextWindow": self.context_window,
+            "maxOutputTokens": self.max_output_tokens,
+            "costIndex": self.cost_index,
+            "capability": self.capability,
+            "modelCapabilities": self.model_capabilities,
+            "runtime": self.runtime,
+            "config": safe_config,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "isReference": self.is_reference,
+            "listingId": self.resource_id if self.is_reference else None,
+        }
+        if self.resource_user_id is not None:
+            result["resourceUserId"] = self.resource_user_id
+        return result
+
+    def to_full_dict(self) -> Dict[str, Any]:
+        """Convert to full dictionary without exposing sensitive env values."""
+        result = self.to_dict()
+        result["isActive"] = self.is_active
+        return result
+
+
+class ModelAggregationService:
+    """
+    Service for aggregating models from multiple sources.
+
+    This service provides:
+    1. Unified model listing with type information
+    2. Model lookup by name and type
+    3. Agent-compatible model filtering
+
+    All returned models include a 'type' field ('public', 'user', or 'group')
+    to distinguish their source and avoid naming conflicts.
+    """
+
+    def _extract_model_info_from_crd(
+        self, model_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Extract model information from CRD format data.
+
+        Returns:
+            Dict with keys: provider, model_id, display_name, config, model_category_type
+        """
+        if not isinstance(model_data, dict):
+            return {
+                "provider": None,
+                "model_id": None,
+                "display_name": None,
+                "config": {},
+                "model_category_type": "llm",
+                "is_advanced": False,
+                "is_wework_available": False,
+                "model_group": None,
+                "model_sub_group": None,
+                "context_window": None,
+                "max_output_tokens": None,
+                "cost_index": None,
+                "capability": None,
+                "model_capabilities": None,
+            }
+
+        try:
+            model_crd = Model.model_validate(model_data)
+            env = model_crd.spec.modelConfig.get("env", {})
+            if not isinstance(env, dict):
+                env = {}
+
+            # Extract model category type (defaults to 'llm' for backward compatibility)
+            model_category_type = "llm"
+            if model_crd.spec.modelType:
+                model_category_type = model_crd.spec.modelType.value
+
+            legacy_model_capabilities = model_crd.spec.modelConfig.get(
+                "modelCapabilities"
+            )
+            config = {
+                key: value
+                for key, value in model_crd.spec.modelConfig.items()
+                if key != "modelCapabilities"
+            }
+            codex_catalog_model_id = codex_catalog_model_id_from_config(env)
+            if codex_catalog_model_id:
+                config["codex_catalog_model_id"] = codex_catalog_model_id
+            config = wework_model_catalog_config(config)
+            if model_crd.spec.protocol:
+                config = {**config, "protocol": model_crd.spec.protocol}
+            if model_crd.spec.apiFormat:
+                config = {**config, "apiFormat": model_crd.spec.apiFormat.value}
+
+            if model_crd.spec.modelCapabilities:
+                model_capabilities = model_crd.spec.modelCapabilities.model_dump(
+                    exclude_none=True
+                )
+            elif legacy_model_capabilities is not None:
+                model_capabilities = normalize_model_capabilities(
+                    legacy_model_capabilities
+                )
+            else:
+                model_capabilities = None
+
+            # Include type-specific config for non-LLM models
+            if model_category_type == "video":
+                if model_crd.spec.videoConfig:
+                    config = {
+                        **config,
+                        "videoConfig": model_crd.spec.videoConfig.model_dump(
+                            exclude_none=True
+                        ),
+                    }
+                if model_crd.spec.protocol:
+                    config = {**config, "protocol": model_crd.spec.protocol}
+
+            elif model_category_type == "image":
+                if model_crd.spec.imageConfig:
+                    config = {
+                        **config,
+                        "imageConfig": model_crd.spec.imageConfig.model_dump(
+                            exclude_none=True
+                        ),
+                    }
+                if model_crd.spec.protocol:
+                    config = {**config, "protocol": model_crd.spec.protocol}
+
+            return {
+                "provider": env.get("model"),
+                "model_id": env.get("model_id"),
+                "display_name": model_crd.metadata.displayName,
+                "config": config,
+                "model_category_type": model_category_type,
+                "is_advanced": (
+                    bool(model_crd.spec.isAdvanced)
+                    if model_crd.spec.isAdvanced
+                    else False
+                ),
+                "is_wework_available": bool(model_crd.spec.isWeworkAvailable) or False,
+                "model_group": model_crd.spec.modelGroup,
+                "model_sub_group": model_crd.spec.modelSubGroup,
+                "context_window": model_crd.spec.context_window,
+                "max_output_tokens": model_crd.spec.max_output_tokens,
+                "cost_index": model_crd.spec.costIndex,
+                "capability": get_model_capability_description(
+                    model_crd.spec.capability
+                ),
+                "model_capabilities": model_capabilities,
+            }
+        except (ValueError, KeyError, AttributeError) as e:
+            logger.warning("Failed to extract model info: %s", e)
+            return {
+                "provider": None,
+                "model_id": None,
+                "display_name": None,
+                "config": {},
+                "model_category_type": "llm",
+                "is_advanced": False,
+                "is_wework_available": False,
+                "model_group": None,
+                "model_sub_group": None,
+                "context_window": None,
+                "max_output_tokens": None,
+                "cost_index": None,
+                "capability": None,
+                "model_capabilities": None,
+            }
+
+    @staticmethod
+    def _is_model_compatible_with_shell(
+        provider: Optional[str], support_model: List[str]
+    ) -> bool:
+        """Apply the Shell provider allowlist; an empty list allows all models."""
+        return not support_model or provider in support_model
+
+    def _get_shell_support_model(
+        self, db: Session, shell_name: str, current_user: Optional[User] = None
+    ) -> tuple[List[str], str]:
+        """
+        Get supported model list and shellType from shell configuration.
+
+        Args:
+            db: Database session
+            shell_name: Shell name (can be public shell name or custom shell name)
+            current_user: Current user (optional, for looking up user-defined shells)
+
+        Returns:
+            Tuple of (supported model list, shell type)
+
+        Raises:
+            HTTPException: If the shell is missing or its configuration is invalid.
+        """
+        user_id = current_user.id if current_user else None
+        shell_json = find_shell_json(db, shell_name, user_id)
+        if not shell_json:
+            raise HTTPException(status_code=400, detail="Shell not found")
+
+        try:
+            shell_crd = Shell.model_validate(shell_json)
+            support_model = shell_crd.spec.supportModel or []
+            if any(not provider.strip() for provider in support_model):
+                raise ValueError("Model providers must not be blank")
+            return support_model, shell_crd.spec.shellType
+        except (ValueError, KeyError, AttributeError) as e:
+            raise HTTPException(
+                status_code=400, detail="Invalid shell configuration"
+            ) from e
+
+    def _is_custom_model(self, model_data: Dict[str, Any]) -> bool:
+        """
+        Check if a model is a custom configuration model.
+
+        Custom models have isCustomConfig=True in their spec and should not
+        appear in the unified model list. They are user-specific configurations
+        that are only used internally.
+
+        Args:
+            model_data: Model CRD data dictionary
+
+        Returns:
+            True if the model is a custom config model, False otherwise
+        """
+        if not isinstance(model_data, dict):
+            return False
+
+        try:
+            model_crd = Model.model_validate(model_data)
+            return model_crd.spec.isCustomConfig or False
+        except (ValueError, KeyError, AttributeError) as e:
+            logger.warning("Failed to check if model is custom: %s", e)
+            return False
+
+    def _is_model_available_in_wework(self, model_data: Dict[str, Any]) -> bool:
+        """
+        Check if a model should be exposed to the wework desktop client.
+
+        Only models with isWeworkAvailable=True in their spec are returned
+        when client_origin is 'wework'. Missing or False values are treated
+        as not available.
+
+        Args:
+            model_data: Model CRD data dictionary
+
+        Returns:
+            True if the model is available in wework, False otherwise
+        """
+        if not isinstance(model_data, dict):
+            return False
+
+        try:
+            model_crd = Model.model_validate(model_data)
+            return bool(model_crd.spec.isWeworkAvailable)
+        except (ValueError, KeyError, AttributeError) as e:
+            logger.warning("Failed to check wework availability: %s", e)
+            return False
+
+    def _create_codex_runtime_model(self) -> UnifiedModel:
+        """Create the runtime-only Codex model representation."""
+        return UnifiedModel(
+            name=CODEX_RUNTIME_MODEL_NAME,
+            model_type=ModelType.RUNTIME,
+            display_name=CODEX_RUNTIME_MODEL_DISPLAY_NAME,
+            provider=CODEX_RUNTIME_MODEL_PROVIDER,
+            model_id=CODEX_RUNTIME_MODEL_ID,
+            config=build_codex_runtime_model_config(),
+            namespace=CODEX_RUNTIME_MODEL_NAMESPACE,
+            model_category_type=CODEX_RUNTIME_MODEL_CATEGORY_TYPE,
+            model_group=CODEX_RUNTIME_MODEL_GROUP,
+            model_sub_group=CODEX_RUNTIME_MODEL_SUB_GROUP,
+        )
+
+    def list_available_models(
+        self,
+        db: Session,
+        current_user: User,
+        shell_type: Optional[str] = None,
+        include_config: bool = False,
+        scope: str = "personal",
+        group_name: Optional[str] = None,
+        model_category_type: Optional[str] = None,  # New: filter by model category type
+        client_origin: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        List all available models for the current user with scope support.
+
+        This method aggregates models from:
+        1. User's own models (via kind_service) - marked with type='user'
+        2. Public models (user_id=0 in kinds table) - marked with type='public'
+        3. Group models (when scope includes groups) - marked with type='group'
+        4. Runtime-only models (when enabled for the requested client surface)
+
+        Scope behavior:
+        - scope='personal' (default): personal models + public models
+        - scope='group': group models + public models (requires group_name)
+        - scope='all': personal + public + all user's groups
+
+        Each returned model includes a 'type' field to identify its source.
+
+        Args:
+            db: Database session
+            current_user: Current user
+            shell_type: Optional shell type to filter compatible models
+            include_config: Whether to include full config in response
+            scope: Query scope ('personal', 'group', or 'all')
+            group_name: Group name (required when scope='group')
+            model_category_type: Optional model category type filter (llm, tts, stt, embedding, rerank)
+            client_origin: Optional client surface requesting the list
+
+        Returns:
+            List of unified model dictionaries, each containing:
+            - name: Model name
+            - type: Model source ('public', 'user', 'group', or 'runtime')
+            - displayName: Human-readable name
+            - provider: Model provider
+            - modelId: Model ID
+            - modelCategoryType: Model category type (llm, tts, stt, embedding, rerank)
+        """
+        from app.services.group_permission import get_user_groups
+
+        support_model: List[str] = []
+        if shell_type:
+            support_model, _ = self._get_shell_support_model(
+                db, shell_type, current_user
+            )
+
+        result: List[UnifiedModel] = []
+        seen_names: Dict[str, ModelType] = {}  # Track names to handle duplicates
+
+        # Determine which namespaces to query based on scope
+        namespaces_to_query = []
+
+        if scope == "personal":
+            # Personal models only
+            namespaces_to_query = ["default"]
+        elif scope == "group":
+            # Group models - if group_name not provided, query all user's groups
+            if group_name:
+                namespaces_to_query = [group_name]
+            else:
+                # Query all user's groups (excluding default)
+                user_groups = get_user_groups(db, current_user.id)
+                namespaces_to_query = user_groups if user_groups else []
+        elif scope == "all":
+            # Personal + all user's groups
+            namespaces_to_query = ["default"] + get_user_groups(db, current_user.id)
+        else:
+            raise ValueError(f"Invalid scope: {scope}")
+
+        direct_by_namespace = load_direct_models_by_namespace(
+            db, user_id=current_user.id, namespaces=namespaces_to_query
+        )
+        references_by_namespace = list_referenced_capabilities_by_namespace(
+            db, kind="Model", user_id=current_user.id, namespaces=namespaces_to_query
+        )
+
+        # Keep namespace order and direct-first selection before display filters.
+        for namespace in namespaces_to_query:
+            user_model_resources = direct_by_namespace[namespace]
+            referenced_models = references_by_namespace[namespace]
+            resource_type = (
+                ModelType.USER if namespace == "default" else ModelType.GROUP
+            )
+            direct_model_by_name: dict[str, Kind] = {}
+            for direct_model in sorted(
+                user_model_resources,
+                key=lambda model: model.id,
+            ):
+                direct_model_by_name.setdefault(direct_model.name, direct_model)
+
+            referenced_model_by_name: dict[str, Kind] = {}
+            referenced_models.sort(key=lambda model: model.id)
+            for referenced_model in referenced_models:
+                referenced_model_by_name.setdefault(
+                    referenced_model.name,
+                    referenced_model,
+                )
+            referenced_ids = {
+                resource.id
+                for name, resource in referenced_model_by_name.items()
+                if name not in direct_model_by_name
+            }
+            direct_model_by_name.update(
+                (name, resource)
+                for name, resource in referenced_model_by_name.items()
+                if name not in direct_model_by_name
+            )
+            user_model_resources = list(direct_model_by_name.values())
+
+            for resource in user_model_resources:
+                # Format the resource to get the full CRD data
+                model_data = kind_service._format_resource("Model", resource)
+
+                # Skip custom config models - they should not appear in unified list
+                # Custom models are user-specific configurations (isCustomConfig=True)
+                if self._is_custom_model(model_data):
+                    continue
+                info = self._extract_model_info_from_crd(model_data)
+
+                if shell_type and info["model_category_type"] == "decision":
+                    continue
+                if shell_type and not self._is_model_compatible_with_shell(
+                    info["provider"],
+                    support_model,
+                ):
+                    continue
+
+                # Filter by model category type if specified
+                if (
+                    model_category_type
+                    and info.get("model_category_type", "llm") != model_category_type
+                ):
+                    continue
+
+                # Filter out models not enabled for wework
+                if (
+                    client_origin == CLIENT_ORIGIN_WEWORK
+                    and not self._is_model_available_in_wework(model_data)
+                ):
+                    continue
+
+                # Deduplicate by name
+                if resource.name in seen_names:
+                    continue
+
+                unified = UnifiedModel(
+                    name=resource.name,
+                    model_type=resource_type,  # Use determined type (USER or GROUP)
+                    display_name=info["display_name"],
+                    provider=info["provider"],
+                    model_id=info["model_id"],
+                    config=info["config"],
+                    is_active=resource.is_active,
+                    namespace=namespace,
+                    model_category_type=info.get("model_category_type", "llm"),
+                    is_advanced=info.get("is_advanced", False),
+                    model_group=info.get("model_group"),
+                    model_sub_group=info.get("model_sub_group"),
+                    context_window=info.get("context_window"),
+                    max_output_tokens=info.get("max_output_tokens"),
+                    cost_index=info.get("cost_index"),
+                    capability=info.get("capability"),
+                    model_capabilities=info.get("model_capabilities"),
+                    resource_id=resource.id,
+                    resource_user_id=resource.user_id,
+                    created_at=resource.created_at,
+                    updated_at=resource.updated_at,
+                    is_reference=resource.id in referenced_ids,
+                )
+                result.append(unified)
+                seen_names[resource.name] = resource_type
+
+        # 2. Get public models via public_model_service (type='public')
+        public_models = public_model_service.get_models(
+            db=db,
+            skip=0,
+            limit=1000,  # Get all public models
+            current_user=current_user,
+        )
+
+        for model_dict in public_models:
+            config = model_dict.get("config", {})
+            provider = model_dict.get("provider")
+            model_id = model_dict.get("model_id")
+
+            # Extract model category type from public model data
+            public_model_category_type = model_dict.get("model_category_type", "llm")
+
+            if shell_type and public_model_category_type == "decision":
+                continue
+            if shell_type and not self._is_model_compatible_with_shell(
+                provider,
+                support_model,
+            ):
+                continue
+
+            # Filter by model category type if specified
+            if (
+                model_category_type
+                and public_model_category_type != model_category_type
+            ):
+                continue
+
+            # Filter out public models not enabled for wework
+            if client_origin == CLIENT_ORIGIN_WEWORK and not model_dict.get(
+                "is_wework_available", False
+            ):
+                continue
+
+            unified = UnifiedModel(
+                name=model_dict.get("name", ""),
+                model_type=ModelType.PUBLIC,  # Mark as public model
+                display_name=model_dict.get(
+                    "displayName"
+                ),  # Get displayName from model dict
+                provider=provider,
+                model_id=model_id,
+                config=config,  # Public model env is already stripped
+                is_active=model_dict.get("is_active", True),
+                namespace="default",
+                model_category_type=public_model_category_type,
+                is_advanced=model_dict.get("is_advanced", False),
+                model_group=model_dict.get("modelGroup")
+                or model_dict.get("model_group"),
+                model_sub_group=model_dict.get("modelSubGroup")
+                or model_dict.get("model_sub_group"),
+                context_window=model_dict.get("contextWindow"),
+                max_output_tokens=model_dict.get("maxOutputTokens"),
+                cost_index=model_dict.get("costIndex"),
+                capability=model_dict.get("capability"),
+                model_capabilities=model_dict.get("modelCapabilities"),
+                resource_user_id=0,
+                created_at=model_dict.get("created_at"),
+                updated_at=model_dict.get("updated_at"),
+            )
+
+            # If name already exists as user model, we still add public model
+            # The type field will differentiate them
+            model_name = model_dict.get("name", "")
+            if model_name in seen_names:
+                logger.debug(
+                    f"Model name '{model_name}' exists in both user and public models"
+                )
+
+            result.append(unified)
+            if model_name not in seen_names:
+                seen_names[model_name] = ModelType.PUBLIC
+
+        # Sort by name
+        result.sort(key=lambda x: x.name)
+
+        # Convert to dict - each dict will have 'type' field
+        if include_config:
+            response = [m.to_full_dict() for m in result]
+        else:
+            response = [m.to_dict() for m in result]
+        return response
+
+    def get_model_by_name_and_type(
+        self, db: Session, current_user: User, name: str, model_type: ModelType
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific model by name and type.
+
+        The type parameter is required to avoid ambiguity when
+        both public and user models have the same name.
+
+        Args:
+            db: Database session
+            current_user: Current user
+            name: Model name
+            model_type: Model type ('public' or 'user')
+
+        Returns:
+            Model data dictionary with 'type' field, or None if not found
+        """
+        if model_type == ModelType.USER:
+            resource = kind_service.get_resource(
+                user_id=current_user.id, kind="Model", namespace="default", name=name
+            )
+            if resource is None:
+                resource = get_referenced_capability(
+                    db,
+                    kind="Model",
+                    name=name,
+                    user_id=current_user.id,
+                    namespace="default",
+                )
+
+            if resource:
+                model_data = kind_service._format_resource("Model", resource)
+                info = self._extract_model_info_from_crd(model_data)
+
+                return UnifiedModel(
+                    name=resource.name,
+                    model_type=ModelType.USER,
+                    display_name=info["display_name"],
+                    provider=info["provider"],
+                    model_id=info["model_id"],
+                    config=info["config"],
+                    is_active=resource.is_active,
+                    model_group=info.get("model_group"),
+                    model_sub_group=info.get("model_sub_group"),
+                    context_window=info.get("context_window"),
+                    max_output_tokens=info.get("max_output_tokens"),
+                    cost_index=info.get("cost_index"),
+                    capability=info.get("capability"),
+                    model_capabilities=info.get("model_capabilities"),
+                    resource_user_id=resource.user_id,
+                    created_at=resource.created_at,
+                    updated_at=resource.updated_at,
+                ).to_full_dict()
+
+        elif model_type == ModelType.GROUP:
+            from app.services.group_permission import get_user_groups
+
+            for namespace in get_user_groups(db, current_user.id):
+                resource = get_referenced_capability(
+                    db,
+                    kind="Model",
+                    name=name,
+                    user_id=current_user.id,
+                    namespace=namespace,
+                )
+                if resource is None:
+                    continue
+                model_data = kind_service._format_resource("Model", resource)
+                info = self._extract_model_info_from_crd(model_data)
+                return UnifiedModel(
+                    name=resource.name,
+                    model_type=ModelType.GROUP,
+                    display_name=info["display_name"],
+                    provider=info["provider"],
+                    model_id=info["model_id"],
+                    config=info["config"],
+                    is_active=resource.is_active,
+                    namespace=namespace,
+                    model_category_type=info.get("model_category_type", "llm"),
+                    capability=info.get("capability"),
+                    resource_user_id=resource.user_id,
+                    updated_at=resource.updated_at,
+                ).to_full_dict()
+
+        elif model_type == ModelType.PUBLIC:
+            model_dict = public_model_service.get_model_by_name(
+                db=db,
+                name=name,
+                namespace="default",
+                include_hidden=True,
+            )
+            if model_dict:
+                allowed_users = model_dict.get("allowedUsers") or []
+                if (
+                    model_dict.get("allowedUsersEnabled")
+                    and current_user.user_name not in allowed_users
+                ):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Model '{name}' is restricted to whitelisted users",
+                    )
+                return UnifiedModel(
+                    name=model_dict.get("name", ""),
+                    model_type=ModelType.PUBLIC,
+                    display_name=model_dict.get("displayName"),
+                    provider=model_dict.get("provider"),
+                    model_id=model_dict.get("model_id"),
+                    config=model_dict.get("config", {}),
+                    is_active=model_dict.get("is_active", True),
+                    model_category_type=model_dict.get("model_category_type", "llm"),
+                    is_advanced=model_dict.get("is_advanced", False),
+                    model_group=model_dict.get("modelGroup")
+                    or model_dict.get("model_group"),
+                    model_sub_group=model_dict.get("modelSubGroup")
+                    or model_dict.get("model_sub_group"),
+                    context_window=model_dict.get("contextWindow"),
+                    max_output_tokens=model_dict.get("maxOutputTokens"),
+                    cost_index=model_dict.get("costIndex"),
+                    capability=model_dict.get("capability"),
+                    model_capabilities=model_dict.get("modelCapabilities"),
+                    resource_user_id=0,
+                    created_at=model_dict.get("created_at"),
+                    updated_at=model_dict.get("updated_at"),
+                ).to_full_dict()
+
+        elif model_type == ModelType.RUNTIME:
+            if name == CODEX_RUNTIME_MODEL_NAME and is_codex_runtime_model_enabled(
+                db, current_user
+            ):
+                return self._create_codex_runtime_model().to_full_dict()
+
+        return None
+
+    def resolve_model(
+        self,
+        db: Session,
+        current_user: User,
+        name: str,
+        model_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve a model by name, optionally with type hint.
+
+        If model_type is not provided, it will try to find the model
+        in the following order:
+        1. User's own models (type='user')
+        2. Public models (type='public')
+
+        Args:
+            db: Database session
+            current_user: Current user
+            name: Model name
+            model_type: Optional model type hint ('public', 'user', 'group', or 'runtime')
+
+        Returns:
+            Model data dictionary with 'type' field, or None if not found
+        """
+        if model_type:
+            try:
+                mt = ModelType(model_type)
+                return self.get_model_by_name_and_type(db, current_user, name, mt)
+            except ValueError:
+                logger.warning(f"Invalid model type: {model_type}")
+
+        # Try user models first
+        result = self.get_model_by_name_and_type(db, current_user, name, ModelType.USER)
+        if result:
+            return result
+
+        # Then try public models
+        return self.get_model_by_name_and_type(db, current_user, name, ModelType.PUBLIC)
+
+
+# Singleton instance
+model_aggregation_service = ModelAggregationService()

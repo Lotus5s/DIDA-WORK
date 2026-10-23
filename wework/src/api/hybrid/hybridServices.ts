@@ -1,0 +1,1815 @@
+import { createReplyPredictionApi } from '@/api/runtime/replyPredictionApi'
+import {
+  assertLocalRuntimeSidebarIdentity,
+  qualifyLocalRuntimeWork,
+  isInvalidLocalRuntimeIdentityError,
+  type LocalRuntimeSidebarOptions,
+  type LocalRuntimeSidebarIdentity,
+} from '@/lib/local-runtime-sidebar-identity'
+import {
+  createLocalProjectDevicePluginApi,
+  createRemoteProjectDevicePluginApi,
+  type ProjectDevicePluginApi,
+} from '@/api/projectDevicePlugins'
+import {
+  createWorkbenchDeviceResolver,
+  getWorkbenchDeviceIds,
+  mergeDeviceLists,
+  workbenchDevicesShareRuntimeIdentity,
+} from '@/lib/workbench-device'
+import { mergeRuntimeWorkLists as mergeRuntimeWorkPair } from '@/features/workbench/runtimeWorkMerge'
+import { createBackendWorkbenchServices } from '@/api/backend/backendServices'
+import { runtimeExecutionSnapshot } from '@wegent/chat-core/runtime-execution-snapshot'
+import { ApiError, createHttpClient } from '@/api/http'
+import { createPluginApi } from '@/api/plugins'
+import {
+  createCloudRuntimeIpcClient,
+  RUNTIME_TRANSCRIPT_ACK_TIMEOUT_MS,
+} from '@/api/backend/runtimeIpc'
+import { createExecutorClientFromApis } from '@/api/executorAccess'
+import {
+  createAutomationApiFromIpc,
+  createLocalAppServices,
+  createRuntimeWorkApiFromIpc,
+  materializeCodexTaskModelConfig,
+} from '@/api/local/localServices'
+import { createRuntimeChatStream } from '@/api/runtime/runtimeChatStream'
+import { REMOTE_TEAM_BACKEND_UNSUPPORTED } from '@/api/runtimeWork'
+import type { ChatStreamHandlers } from '@/stream/chatStream'
+import { createCloudProjectSpaceApi } from './cloudProjectSpaceApi'
+import { createCloudModelCatalog } from './cloudModelCatalog'
+import type { WorkbenchServices } from '@/features/workbench/workbenchServices'
+import {
+  notifyWorkbenchCloudArchivesChanged,
+  notifyWorkbenchCloudSearchResults,
+  notifyWorkbenchAutomationsChanged,
+} from '@/features/workbench/workbenchCloudDataEvents'
+import { requestCloudModelCatalogSync } from '@/features/model-settings/cloudModelCatalogSyncRequest'
+import { isAppDeviceRegistration, isCurrentAppDeviceId } from '@/lib/app-device-registration'
+import { isCloudDevice, isRemoteDevice, isUsableDevice } from '@/lib/device-capabilities'
+import { shouldUseCloudDeviceCommand } from '@extensions/device-command-routing'
+import { readElectronLocalFile } from '@/lib/electron-local-file'
+import { logRuntimeTaskCreateStage } from '@/lib/runtime-create-diagnostics'
+import type { LocalExecutorEvent } from '@/desktop/localExecutor'
+import { EMPTY_RUNTIME_WORK } from '@/features/workbench/workbenchCloudStatus'
+import { supportsCloudExecution } from '@/features/cloud-connection/modelExecution'
+import type {
+  Attachment,
+  ArchivedConversationItem,
+  ArchivedConversationsListRequest,
+  ArchivedConversationsListResponse,
+  DeleteDeviceWorkspaceRequest,
+  DeviceCommandResponse,
+  DeviceInfo as RuntimeDeviceInfo,
+  DeviceWorkspacePrepareRequest,
+  RuntimeArchivedConversationCleanupResponse,
+  RuntimeCompactRequest,
+  RuntimeRollbackRequest,
+  RuntimeFileChangesRevertRequest,
+  RuntimeGlobalIMNotificationUpdateRequest,
+  RuntimeIMNotificationPresenceUpdateRequest,
+  RuntimeLocalProjectUpsertRequest,
+  RuntimeSendRequest,
+  RuntimeSidebarMutationResponse,
+  RuntimeTaskAddress,
+  RuntimeTaskCreateRequest,
+  RuntimeTaskForkRequest,
+  RuntimeTaskIMNotificationSubscriptionRequest,
+  RuntimeTranscriptRequest,
+  RuntimeWorkspaceOpenRequest,
+  RuntimeWorkspaceRemoveRequest,
+  RuntimeWorkspaceRenameRequest,
+  RuntimeWorkListResponse,
+  RuntimeWorkSearchRequest,
+  RuntimeWorkSearchResponse,
+  RuntimeWorkSearchItem,
+  UnifiedModel,
+  UnifiedModelListResponse,
+  User,
+} from '@/types/api'
+import type { Automation } from '@/types/automation'
+import type { DeviceInfo } from '@/types/devices'
+import { mergeProjectPluginCatalogs } from '@/features/plugins/projectPluginCatalog'
+
+const LOCAL_DEVICE_ID = 'local-device'
+const CLOUD_BACKGROUND_CACHE_TTL_MS = 30_000
+
+async function uploadLocalAttachmentToCloud(
+  attachment: Attachment,
+  uploadAttachment: (file: File) => Promise<Attachment>
+): Promise<Attachment> {
+  const localPath = attachment.local_path?.trim()
+  if (!localPath) {
+    throw new Error(`Attachment ${attachment.filename} has no local file path`)
+  }
+
+  const payload = {
+    name: attachment.filename,
+    bytes: Array.from(await readElectronLocalFile(localPath)),
+  }
+  if (!payload) {
+    throw new Error(`Attachment file is unavailable: ${attachment.filename}`)
+  }
+
+  const file = new File([Uint8Array.from(payload.bytes)], attachment.filename || payload.name, {
+    type: attachment.mime_type || 'application/octet-stream',
+  })
+  return uploadAttachment(file)
+}
+
+export interface HybridWorkbenchServicesOptions {
+  backendUrl?: string
+  apiBaseUrl: string
+  socketBaseUrl: string
+  socketPath: string
+  token: string
+  user: User
+}
+
+function runtimeAddressDebug(address: RuntimeTaskAddress): Record<string, unknown> {
+  return {
+    deviceId: address.deviceId,
+    taskId: address.taskId,
+    workspacePath: address.workspacePath ?? null,
+  }
+}
+
+function isRuntimeCodexModel(model: UnifiedModel): boolean {
+  const config = recordValue(model.config)
+  const ui = recordValue(config.ui)
+  return (
+    model.type === 'runtime' &&
+    (config.weworkModelKind === 'codex-official' ||
+      config.weworkModelKind === 'codex-provider' ||
+      ui.family === 'codex-official' ||
+      ui.family === 'codex-provider' ||
+      (typeof ui.family === 'string' && ui.family.startsWith('codex-provider:')))
+  )
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key]
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function annotateLocalModels(models: UnifiedModel[]): UnifiedModel[] {
+  return models
+}
+
+function cloudExecutableModels(models: UnifiedModel[]): UnifiedModel[] {
+  return models.filter(supportsCloudExecution)
+}
+
+function normalizedModelId(model: UnifiedModel): string {
+  return model.modelId?.trim().toLowerCase() || ''
+}
+
+function canonicalModelKey(model: UnifiedModel): string {
+  return [
+    model.type,
+    model.name.trim().toLowerCase(),
+    model.namespace?.trim().toLowerCase() ?? '',
+    model.resourceUserId ?? '',
+  ].join(':')
+}
+
+function mergeModelCatalogs(
+  localModels: UnifiedModel[],
+  cloudModels: UnifiedModel[]
+): UnifiedModel[] {
+  const localCodexModelIds = new Set(
+    localModels.filter(isRuntimeCodexModel).map(normalizedModelId).filter(Boolean)
+  )
+  const seenModelKeys = new Set(localModels.map(canonicalModelKey))
+  const uniqueCloudModels = cloudModels.filter(model => {
+    const key = canonicalModelKey(model)
+    if (seenModelKeys.has(key)) return false
+    if (
+      isRuntimeCodexModel(model) &&
+      normalizedModelId(model) &&
+      localCodexModelIds.has(normalizedModelId(model))
+    ) {
+      return false
+    }
+    seenModelKeys.add(key)
+    return true
+  })
+  return [...localModels, ...uniqueCloudModels]
+}
+
+function modelIdentityForLog(model: UnifiedModel): Record<string, unknown> {
+  return {
+    name: model.name,
+    displayName: model.displayName ?? null,
+    type: model.type,
+    provider: model.provider ?? null,
+    modelId: model.modelId ?? null,
+    namespace: model.namespace ?? null,
+    resourceUserId: model.resourceUserId ?? null,
+  }
+}
+
+function removeCurrentAppCloudRuntimeWork(
+  cloudWork: RuntimeWorkListResponse,
+  localDeviceIds: Set<string>
+): RuntimeWorkListResponse {
+  const projects = cloudWork.projects
+    .map(projectWork => {
+      const deviceWorkspaces = projectWork.deviceWorkspaces.filter(
+        workspace => !isCurrentAppDeviceId(workspace.deviceId, localDeviceIds)
+      )
+      return {
+        ...projectWork,
+        deviceWorkspaces,
+        totalTasks: deviceWorkspaces.reduce(
+          (total, workspace) => total + workspace.tasks.length,
+          0
+        ),
+      }
+    })
+    .filter(projectWork => projectWork.deviceWorkspaces.length > 0)
+  const chats = cloudWork.chats.filter(
+    workspace => !isCurrentAppDeviceId(workspace.deviceId, localDeviceIds)
+  )
+
+  return {
+    projects,
+    chats,
+    totalTasks:
+      projects.reduce((total, projectWork) => total + (projectWork.totalTasks ?? 0), 0) +
+      chats.reduce((total, workspace) => total + workspace.tasks.length, 0),
+  }
+}
+
+function emptyArchiveList(): ArchivedConversationsListResponse {
+  return { items: [], projectGroups: [], total: 0 }
+}
+
+function emptyCleanupResponse(): RuntimeArchivedConversationCleanupResponse {
+  return {
+    success: true,
+    deleted: false,
+    taskCount: 0,
+    targetCount: 0,
+    cleanableCount: 0,
+    skippedCount: 0,
+    errorCount: 0,
+    bytes: 0,
+    results: [],
+  }
+}
+
+function mergeArchiveLists(
+  localList: ArchivedConversationsListResponse,
+  cloudList: ArchivedConversationsListResponse
+): ArchivedConversationsListResponse {
+  const items = [...localList.items, ...cloudList.items]
+  return {
+    items: items.sort(compareArchivedConversationUpdatedAt),
+    projectGroups: [...localList.projectGroups, ...cloudList.projectGroups],
+    total: localList.total + cloudList.total,
+  }
+}
+
+function compareArchivedConversationUpdatedAt(
+  left: ArchivedConversationItem,
+  right: ArchivedConversationItem
+): number {
+  const leftTime = left.updatedAt ? new Date(left.updatedAt).getTime() : 0
+  const rightTime = right.updatedAt ? new Date(right.updatedAt).getTime() : 0
+  return rightTime - leftTime
+}
+
+function mergeSearchResults(
+  localResults: RuntimeWorkSearchResponse,
+  cloudResults: RuntimeWorkSearchResponse,
+  limit?: number
+): RuntimeWorkSearchResponse {
+  const items = [...localResults.items, ...cloudResults.items].sort(compareSearchItemUpdatedAt)
+  return {
+    items: typeof limit === 'number' && limit > 0 ? items.slice(0, limit) : items,
+  }
+}
+
+function compareSearchItemUpdatedAt(
+  left: RuntimeWorkSearchItem,
+  right: RuntimeWorkSearchItem
+): number {
+  const leftTime = left.updatedAt ? new Date(left.updatedAt).getTime() : 0
+  const rightTime = right.updatedAt ? new Date(right.updatedAt).getTime() : 0
+  return rightTime - leftTime
+}
+
+function requestCacheKey(value: object): string {
+  return JSON.stringify(
+    Object.entries(value)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+  )
+}
+
+function withoutSearchSource(data: RuntimeWorkSearchRequest): RuntimeWorkSearchRequest {
+  const request = { ...data }
+  delete request.source
+  return request
+}
+
+function withoutArchiveSource(
+  data: ArchivedConversationsListRequest = {}
+): ArchivedConversationsListRequest {
+  const request = { ...data }
+  delete request.source
+  return request
+}
+
+function cloudDeviceIdFromData(data?: Record<string, unknown> | null): string | undefined {
+  if (!data) return undefined
+  const direct = stringField(data, 'deviceId') ?? stringField(data, 'device_id')
+  if (direct) return direct
+  const address = recordValue(data.address)
+  return stringField(address, 'deviceId') ?? stringField(address, 'device_id')
+}
+
+function projectCloudRuntimeEventDeviceId(
+  event: LocalExecutorEvent,
+  devices: DeviceInfo[]
+): LocalExecutorEvent {
+  const eventDeviceId = cloudDeviceIdFromData(event.payload)
+  if (!eventDeviceId) return event
+
+  const device = createWorkbenchDeviceResolver(devices).resolve(eventDeviceId)
+  const logicalDeviceId = device?.device_id.trim()
+  if (!logicalDeviceId || logicalDeviceId === eventDeviceId) return event
+
+  return {
+    ...event,
+    payload: {
+      ...event.payload,
+      deviceId: logicalDeviceId,
+      device_id: logicalDeviceId,
+    },
+  }
+}
+
+export function createHybridWorkbenchServices(
+  options: HybridWorkbenchServicesOptions
+): WorkbenchServices {
+  const cloudRuntimeIpc = createCloudRuntimeIpcClient({
+    socketBaseUrl: options.socketBaseUrl,
+    socketPath: options.socketPath,
+    token: options.token,
+  })
+  const cloudServices = createBackendWorkbenchServices({
+    apiBaseUrl: options.apiBaseUrl,
+    socketBaseUrl: options.socketBaseUrl,
+    socketPath: options.socketPath,
+    getToken: () => options.token,
+    redirectOnUnauthorized: false,
+    transportKind: 'backend-relay',
+    runtimeIpc: cloudRuntimeIpc,
+  })
+  const cloudModelGateway = {
+    baseUrl: `${options.apiBaseUrl.replace(/\/+$/, '')}/runtime-work/llm-responses-proxy`,
+    apiKey: options.token,
+    ...(options.backendUrl ? { backendUrl: options.backendUrl } : {}),
+  }
+  const localProjectServices = createLocalAppServices({
+    cloudModelGateway,
+    listCloudModels: () => cloudServices.agentResourceApi!.listModels(),
+    user: options.user,
+  })
+  const localServices = createLocalAppServices({
+    listCloudInstalledPlugins: deviceId =>
+      createPluginApi(
+        createHttpClient({
+          baseUrl: options.apiBaseUrl,
+          getToken: () => options.token,
+          redirectOnUnauthorized: false,
+        }),
+        options.apiBaseUrl
+      )
+        .listInstalledPlugins(deviceId)
+        .then(response => response.items),
+    cloudModelGateway,
+    listCloudModels: () => cloudServices.agentResourceApi!.listModels(),
+    user: options.user,
+    materializeRuntimeTask: async request => {
+      try {
+        return await cloudServices.runtimeWorkApi!.materializeRuntimeTask(request)
+      } catch (error) {
+        if (isUnsupportedRuntimeMaterialization(error)) {
+          throw new Error(REMOTE_TEAM_BACKEND_UNSUPPORTED, { cause: error })
+        }
+        throw error
+      }
+    },
+  })
+  const cloudRuntimeApis = new Map<string, NonNullable<WorkbenchServices['runtimeWorkApi']>>()
+  const cloudAutomationApis = new Map<string, NonNullable<WorkbenchServices['automationApi']>>()
+  const rememberedCloudAutomations = new Map<string, Automation[]>()
+  const cloudAutomationRequests = new Map<string, Promise<void>>()
+  const automationDevices = new Map<string, string>()
+  const localDeviceIds = new Set<string>([LOCAL_DEVICE_ID])
+  let rememberedLocalDevices: DeviceInfo[] = []
+  const localRuntimeInstanceIds = new Set<string>()
+  const localRuntimeProjectKeys = new Set<string>()
+  let rememberedCloudDevices: DeviceInfo[] = []
+  let rememberedAppDeviceRegistrations: DeviceInfo[] = []
+  let rememberedCloudDevicesRevision = 0
+  let nextCloudDevicesRevision = 1
+  let unscopedCloudDevicesRequest: Promise<DeviceInfo[]> | null = null
+  const cloudDevicesRequestsBySignal = new WeakMap<AbortSignal, Promise<DeviceInfo[]>>()
+  const cloudModels = createCloudModelCatalog(async (signal, forceRefresh) => {
+    const response = await cloudServices.modelApi.listModels({ signal, forceRefresh })
+    console.info('[DIDA] Cloud model catalog loaded', {
+      count: response.data.length,
+      models: response.data.map(modelIdentityForLog),
+    })
+    return cloudExecutableModels(response.data)
+  })
+  const rememberedCloudSearch = new Map<string, RuntimeWorkSearchResponse>()
+  const cloudSearchRequests = new Map<string, Promise<void>>()
+  const rememberedCloudArchives = new Map<string, ArchivedConversationsListResponse>()
+  const cloudArchiveRequests = new Map<string, Promise<void>>()
+  const cloudArchiveFetchedAt = new Map<string, number>()
+  const projectDevicePluginApis = new Map<string, ProjectDevicePluginApi>()
+  const observeProjectPluginDevices = () => {
+    const resolver = createWorkbenchDeviceResolver([
+      ...rememberedLocalDevices,
+      ...currentAppDeviceRegistrations(),
+      ...rememberedCloudDevices,
+    ])
+    const localResolver = createWorkbenchDeviceResolver(rememberedLocalDevices)
+    projectDevicePluginApis.forEach((api, id) => {
+      const localSource = localResolver.resolve(id)
+      api.observeDevice?.(resolver.resolve(localSource?.runtime_instance_id || id))
+    })
+  }
+
+  const rememberLocalDevices = (devices: DeviceInfo[]) => {
+    if (
+      rememberedLocalDevices.some(
+        previous =>
+          !devices.some(
+            current =>
+              previous.device_id === current.device_id &&
+              previous.runtime_instance_id === current.runtime_instance_id
+          )
+      )
+    ) {
+      localRuntimeProjectKeys.clear()
+    }
+    rememberedLocalDevices = devices
+    localDeviceIds.clear()
+    localDeviceIds.add(LOCAL_DEVICE_ID)
+    localRuntimeInstanceIds.clear()
+    devices.forEach(device => {
+      localDeviceIds.add(device.device_id)
+      if (device.runtime_instance_id) {
+        localRuntimeInstanceIds.add(device.runtime_instance_id)
+      }
+    })
+    observeProjectPluginDevices()
+  }
+  const revokeLocalRuntimeIdentity = () => {
+    rememberedLocalDevices = []
+    localDeviceIds.clear()
+    localDeviceIds.add(LOCAL_DEVICE_ID)
+    localRuntimeInstanceIds.clear()
+    localRuntimeProjectKeys.clear()
+    projectDevicePluginApis.forEach(api => api.invalidate?.())
+  }
+  const getLocalRuntimeSidebarIdentity = async () => {
+    let identity: LocalRuntimeSidebarIdentity | null
+    try {
+      identity = (await localServices.getLocalRuntimeSidebarIdentity?.()) ?? null
+    } catch (error) {
+      if (isInvalidLocalRuntimeIdentityError(error)) {
+        revokeLocalRuntimeIdentity()
+      }
+      throw error
+    }
+    if (
+      !identity ||
+      rememberedLocalDevices.some(
+        device =>
+          device.device_id !== identity.deviceId ||
+          device.runtime_instance_id !== identity.runtimeInstanceId
+      )
+    ) {
+      revokeLocalRuntimeIdentity()
+    }
+    return identity
+  }
+  const rememberCloudDevices = (
+    devices: DeviceInfo[],
+    appDeviceRegistrations: DeviceInfo[],
+    revision: number
+  ) => {
+    if (revision < rememberedCloudDevicesRevision) return
+    rememberedCloudDevices = devices
+    rememberedAppDeviceRegistrations = appDeviceRegistrations
+    rememberedCloudDevicesRevision = revision
+    observeProjectPluginDevices()
+  }
+  const rememberLocalRuntimeWorkDevices = (work: RuntimeWorkListResponse) => {
+    work.projects.forEach(project => {
+      localRuntimeProjectKeys.add(project.project.key)
+      project.deviceWorkspaces.forEach(workspace => {
+        if (workspace.workspaceSource !== 'remote') localDeviceIds.add(workspace.deviceId)
+      })
+    })
+    work.chats.forEach(workspace => localDeviceIds.add(workspace.deviceId))
+  }
+  const deviceMatchesId = (device: RuntimeDeviceInfo, deviceId: string) =>
+    getWorkbenchDeviceIds(device).includes(deviceId)
+  const currentAppDeviceRegistrations = () =>
+    rememberedAppDeviceRegistrations.filter(device =>
+      rememberedLocalDevices.some(local => workbenchDevicesShareRuntimeIdentity(local, device))
+    )
+  const isLocalDeviceId = (deviceId?: string | null) =>
+    Boolean(
+      deviceId &&
+      (deviceId === 'local-device' ||
+        localDeviceIds.has(deviceId) ||
+        currentAppDeviceRegistrations().some(device => deviceMatchesId(device, deviceId)))
+    )
+  const isKnownCloudDeviceId = (deviceId?: string | null) =>
+    Boolean(deviceId && rememberedCloudDevices.some(device => deviceMatchesId(device, deviceId)))
+  const runtimeApiForCreate = async (
+    deviceId: string | null | undefined,
+    taskId: string | undefined
+  ) => {
+    const discoveryRequired =
+      !deviceId ||
+      (!rememberedLocalDevices.some(device => device.device_id === deviceId) &&
+        !isKnownCloudDeviceId(deviceId))
+    const api = await runtimeApiForDevice(deviceId)
+    const route = isLocalDeviceId(deviceId) ? 'local' : 'cloud'
+    logRuntimeTaskCreateStage('hybrid-route-resolved', {
+      taskId: taskId ?? null,
+      deviceId: deviceId ?? null,
+      route,
+      discoveryRequired,
+    })
+    return { api, route }
+  }
+  const invalidateCloudArchiveCache = () => {
+    rememberedCloudArchives.clear()
+    cloudArchiveFetchedAt.clear()
+  }
+  const archiveAllCloudConversationsInBackground = () => {
+    void Promise.resolve()
+      .then(() => cloudServices.runtimeWorkApi!.archiveAllConversations())
+      .then(() => {
+        invalidateCloudArchiveCache()
+        notifyWorkbenchCloudArchivesChanged()
+      })
+      .catch(error => {
+        console.warn('[DIDA] Failed to archive cloud conversations in background', error)
+      })
+  }
+  const cloudRuntimeApi = (deviceId?: string | null) => {
+    const logicalDeviceId = deviceId?.trim()
+    if (!logicalDeviceId) {
+      throw new Error('Cloud runtime deviceId is required')
+    }
+    const cached = cloudRuntimeApis.get(logicalDeviceId)
+    if (cached) return cached
+    const api = createRuntimeWorkApiFromIpc(
+      (method, params) =>
+        method === 'runtime.tasks.transcript'
+          ? cloudRuntimeIpc.request(
+              method,
+              params,
+              logicalDeviceId,
+              RUNTIME_TRANSCRIPT_ACK_TIMEOUT_MS
+            )
+          : cloudRuntimeIpc.request(method, params, logicalDeviceId),
+      async () => logicalDeviceId,
+      {
+        resolveDeviceId: async data => cloudDeviceIdFromData(data) ?? logicalDeviceId,
+        cloudModelGateway,
+        user: options.user,
+        transportLabel: 'Cloud',
+        syncConfiguredModelCatalog: true,
+        requestModelCatalogSync: requestCloudModelCatalogSync,
+        resolveDeviceName: deviceId =>
+          rememberedCloudDevices.find(device => device.device_id === deviceId)?.name,
+      }
+    ) as unknown as NonNullable<WorkbenchServices['runtimeWorkApi']>
+    cloudRuntimeApis.set(logicalDeviceId, api)
+    return api
+  }
+  const runtimeApi = (deviceId?: string | null) =>
+    isLocalDeviceId(deviceId) ? localServices.runtimeWorkApi! : cloudRuntimeApi(deviceId)
+  const automationApiForDevice = (deviceId?: string | null) => {
+    const logicalDeviceId = deviceId?.trim()
+    if (!logicalDeviceId || isLocalDeviceId(logicalDeviceId)) {
+      return localServices.automationApi!
+    }
+    const cached = cloudAutomationApis.get(logicalDeviceId)
+    if (cached) return cached
+    const request = <T>(method: string, params?: Record<string, unknown>) =>
+      cloudRuntimeIpc.request<T>(method, params, logicalDeviceId)
+    const api = createAutomationApiFromIpc(
+      request,
+      (method, params) => request(method, params as Record<string, unknown>),
+      {
+        resolveDeviceId: async data => cloudDeviceIdFromData(data) ?? logicalDeviceId,
+        cloudModelGateway,
+        user: options.user,
+        syncConfiguredModelCatalog: true,
+        prepareRuntimeModel: data => runtimeApi(logicalDeviceId).prepareRuntimeModel(data),
+      },
+      logicalDeviceId,
+      'cloud'
+    )
+    cloudAutomationApis.set(logicalDeviceId, api)
+    return api
+  }
+  const deviceApi = (deviceId?: string | null) =>
+    isLocalDeviceId(deviceId) ? localServices.deviceApi : cloudServices.deviceApi
+  const routeByAddress = (address: RuntimeTaskAddress) => runtimeApi(address.deviceId)
+
+  const listLocalDevices = async (signal?: AbortSignal) => {
+    const devices = signal
+      ? await localServices.deviceApi.listDevices({ signal })
+      : await localServices.deviceApi.listDevices()
+    rememberLocalDevices(devices)
+    return devices
+  }
+  const fetchCloudDevices = async (signal?: AbortSignal) => {
+    const revision = nextCloudDevicesRevision
+    nextCloudDevicesRevision += 1
+    const discoveredDevices = signal
+      ? await cloudServices.deviceApi.listDevices({ signal })
+      : await cloudServices.deviceApi.listDevices()
+    const devices = discoveredDevices.filter(
+      device => isCloudDevice(device) || isRemoteDevice(device)
+    )
+    const appDeviceRegistrations = discoveredDevices.filter(isAppDeviceRegistration)
+    rememberCloudDevices(devices, appDeviceRegistrations, revision)
+    return devices
+  }
+  const listCloudDevices = (signal?: AbortSignal): Promise<DeviceInfo[]> => {
+    if (signal) {
+      const existing = cloudDevicesRequestsBySignal.get(signal)
+      if (existing) return existing
+      const request = fetchCloudDevices(signal)
+      cloudDevicesRequestsBySignal.set(signal, request)
+      return request
+    }
+    if (unscopedCloudDevicesRequest) return unscopedCloudDevicesRequest
+    const request = fetchCloudDevices().finally(() => {
+      if (unscopedCloudDevicesRequest === request) {
+        unscopedCloudDevicesRequest = null
+      }
+    })
+    unscopedCloudDevicesRequest = request
+    return request
+  }
+  const projectDevicePluginApi = (deviceId: string): ProjectDevicePluginApi => {
+    const cached = projectDevicePluginApis.get(deviceId)
+    if (cached) return cached
+    const local = createLocalProjectDevicePluginApi()
+    const remote = createRemoteProjectDevicePluginApi(deviceId, (method, params) =>
+      cloudRuntimeIpc.request('runtime.codex.app_server.request', { method, params }, deviceId)
+    )
+    const resolve = async () =>
+      (await runtimeApiForDevice(deviceId)) === localServices.runtimeWorkApi ? local : remote
+    const api: ProjectDevicePluginApi = {
+      observeDevice: device => remote.observeDevice?.(device),
+      invalidate: () => remote.invalidate?.(),
+      checkSupport: async () => (await resolve()).checkSupport?.(),
+      readState: async params => (await resolve()).readState(params),
+      installAvailablePlugin: async item => (await resolve()).installAvailablePlugin(item),
+    }
+    projectDevicePluginApis.set(deviceId, api)
+    observeProjectPluginDevices()
+    return api
+  }
+  const runtimeApiForDevice = async (deviceId?: string | null) => {
+    const normalizedDeviceId = deviceId?.trim()
+    if (!normalizedDeviceId) {
+      throw new Error('executor-not-found:missing-device-id')
+    }
+
+    const resolveDevice = () =>
+      createWorkbenchDeviceResolver([
+        ...rememberedLocalDevices,
+        ...currentAppDeviceRegistrations(),
+        ...rememberedCloudDevices,
+      ]).resolve(normalizedDeviceId)
+    let device = resolveDevice()
+    if (!device) {
+      await listLocalDevices()
+      device = resolveDevice()
+    }
+    if (!device) {
+      await listCloudDevices()
+      device = resolveDevice()
+    }
+    if (!device) {
+      throw new Error(`executor-not-found:${normalizedDeviceId}`)
+    }
+    if (!isUsableDevice(device)) {
+      throw new Error(`executor-offline:${normalizedDeviceId}`)
+    }
+    if (device.device_type === 'local' || device.device_type === 'app')
+      return localServices.runtimeWorkApi!
+    if (isCloudDevice(device) || isRemoteDevice(device)) {
+      return cloudRuntimeApi(device.device_id)
+    }
+    throw new Error(`executor-not-found:${normalizedDeviceId}`)
+  }
+  const mergeKnownDevices = (localDevices: DeviceInfo[], cloudDevices: DeviceInfo[]) =>
+    mergeDeviceLists(localDevices, [...currentAppDeviceRegistrations(), ...cloudDevices]).filter(
+      device => !isAppDeviceRegistration(device)
+    )
+  const routeLocalSidebarMutation = async (
+    deviceId: string,
+    options: LocalRuntimeSidebarOptions | undefined,
+    mutate: (
+      api: NonNullable<WorkbenchServices['runtimeWorkApi']>
+    ) => Promise<RuntimeSidebarMutationResponse>
+  ) => {
+    const identity = options?.localSidebarIdentity
+    if (identity) {
+      assertLocalRuntimeSidebarIdentity(identity, await getLocalRuntimeSidebarIdentity())
+      if (deviceId !== identity.deviceId) throw new Error('local-sidebar-runtime-changed')
+      return mutate(localServices.runtimeWorkApi!)
+    }
+    return mutate(await runtimeApiForDevice(deviceId))
+  }
+  const listKnownDevices = async (signal?: AbortSignal) =>
+    mergeKnownDevices(await listLocalDevices(signal), rememberedCloudDevices)
+  const resolveExecutorDevice = async (deviceId: string): Promise<RuntimeDeviceInfo | null> => {
+    const knownDevice = (await listKnownDevices()).find(device => deviceMatchesId(device, deviceId))
+    if (knownDevice) return knownDevice
+
+    const cloudDevices = await listCloudDevices()
+    return cloudDevices.find(device => deviceMatchesId(device, deviceId)) ?? null
+  }
+  const listLocalRuntimeWork = async (
+    requestOptions?: Parameters<
+      NonNullable<WorkbenchServices['runtimeWorkApi']>['listRuntimeWork']
+    >[0]
+  ) => {
+    const identity = await getLocalRuntimeSidebarIdentity()
+    try {
+      const work = requestOptions
+        ? await localServices.runtimeWorkApi!.listRuntimeWork(requestOptions)
+        : await localServices.runtimeWorkApi!.listRuntimeWork()
+      if (identity)
+        assertLocalRuntimeSidebarIdentity(identity, await getLocalRuntimeSidebarIdentity())
+      const qualifiedWork = identity ? qualifyLocalRuntimeWork(work, identity) : work
+      rememberLocalRuntimeWorkDevices(qualifiedWork)
+      return qualifiedWork
+    } catch (error) {
+      if (isInvalidLocalRuntimeIdentityError(error)) revokeLocalRuntimeIdentity()
+      throw error
+    }
+  }
+  const listCloudRuntimeWork = async (signal?: AbortSignal) => {
+    const localDevices = await listLocalDevices(signal)
+    const localRuntimeIds = new Set([
+      ...localRuntimeInstanceIds,
+      ...localDevices.flatMap(device =>
+        device.runtime_instance_id ? [device.runtime_instance_id] : []
+      ),
+    ])
+    const devices = await listCloudDevices(signal)
+    const runtimeDevices = devices.filter(
+      device =>
+        isUsableDevice(device) &&
+        !(device.runtime_instance_id && localRuntimeIds.has(device.runtime_instance_id))
+    )
+    const results = await Promise.allSettled(
+      runtimeDevices.map(device =>
+        signal
+          ? cloudRuntimeApi(device.device_id).listRuntimeWork({ signal })
+          : cloudRuntimeApi(device.device_id).listRuntimeWork()
+      )
+    )
+    const failedResult = results.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected'
+    )
+    if (failedResult) {
+      throw failedResult.reason
+    }
+    return removeCurrentAppCloudRuntimeWork(
+      results.reduce(
+        (merged, result) =>
+          result.status === 'fulfilled'
+            ? mergeRuntimeWorkPair(merged, result.value, {
+                devices: mergeKnownDevices(localDevices, devices),
+              })
+            : merged,
+        EMPTY_RUNTIME_WORK
+      ),
+      localDeviceIds
+    )
+  }
+  const searchCloudRuntimeWork = async (
+    data: RuntimeWorkSearchRequest
+  ): Promise<RuntimeWorkSearchResponse> => {
+    const request = withoutSearchSource(data)
+    const devices = await listCloudDevices()
+    const results = await Promise.allSettled(
+      devices
+        .filter(isUsableDevice)
+        .map(device => cloudRuntimeApi(device.device_id).searchRuntimeWork(request))
+    )
+    return mergeSearchResults(
+      { items: [] },
+      {
+        items: results.flatMap(result => (result.status === 'fulfilled' ? result.value.items : [])),
+      },
+      request.limit
+    )
+  }
+  const searchCloudRuntimeWorkInBackground = (data: RuntimeWorkSearchRequest) => {
+    const request = withoutSearchSource(data)
+    const key = requestCacheKey(request)
+    if (cloudSearchRequests.has(key)) return
+    const pending = searchCloudRuntimeWork(request)
+      .then(response => {
+        rememberedCloudSearch.set(key, response)
+        notifyWorkbenchCloudSearchResults({ request, response })
+      })
+      .catch(error => {
+        console.warn('[DIDA] Failed to refresh cloud search results in background', error)
+      })
+      .finally(() => {
+        cloudSearchRequests.delete(key)
+      })
+    cloudSearchRequests.set(key, pending)
+  }
+  const listCloudArchivesInBackground = (data: ArchivedConversationsListRequest = {}) => {
+    const request = withoutArchiveSource(data)
+    const key = requestCacheKey(request)
+    const fetchedAt = cloudArchiveFetchedAt.get(key)
+    if (
+      cloudArchiveRequests.has(key) ||
+      (fetchedAt !== undefined && Date.now() - fetchedAt < CLOUD_BACKGROUND_CACHE_TTL_MS)
+    ) {
+      return
+    }
+    const pending = Promise.resolve()
+      .then(() =>
+        cloudServices.runtimeWorkApi!.listArchivedConversations({ ...request, source: 'cloud' })
+      )
+      .then(response => {
+        rememberedCloudArchives.set(key, response)
+        cloudArchiveFetchedAt.set(key, Date.now())
+        notifyWorkbenchCloudArchivesChanged()
+      })
+      .catch(error => {
+        console.warn('[DIDA] Failed to refresh cloud archives in background', error)
+      })
+      .finally(() => {
+        cloudArchiveRequests.delete(key)
+      })
+    cloudArchiveRequests.set(key, pending)
+  }
+
+  const hybridDeviceApi: WorkbenchServices['deviceApi'] = {
+    async listDevices(requestOptions) {
+      const devices = await listKnownDevices(requestOptions?.signal)
+      return devices as Awaited<ReturnType<WorkbenchServices['deviceApi']['listDevices']>>
+    },
+    async getRuntimeSettings(deviceId) {
+      if (!isLocalDeviceId(deviceId)) {
+        return deviceApi(deviceId).getRuntimeSettings(deviceId)
+      }
+      const settings = await localServices.runtimeWorkApi!.getRuntimeSettings()
+      return {
+        device_id: deviceId,
+        max_concurrent_tasks: settings.maxConcurrentTasks,
+        active_tasks: 0,
+        queued_tasks: 0,
+      }
+    },
+    async updateRuntimeSettings(deviceId, maxConcurrentTasks) {
+      if (!isLocalDeviceId(deviceId)) {
+        return deviceApi(deviceId).updateRuntimeSettings(deviceId, maxConcurrentTasks)
+      }
+      const settings = await localServices.runtimeWorkApi!.updateRuntimeSettings({
+        maxConcurrentTasks,
+      })
+      return {
+        device_id: deviceId,
+        max_concurrent_tasks: settings.maxConcurrentTasks,
+        active_tasks: 0,
+        queued_tasks: 0,
+      }
+    },
+    getHomeDirectory(deviceId) {
+      return deviceApi(deviceId).getHomeDirectory(deviceId)
+    },
+    getProjectWorkspaceRoot(deviceId) {
+      return deviceApi(deviceId).getProjectWorkspaceRoot(deviceId)
+    },
+    listDirectories(deviceId, path) {
+      return deviceApi(deviceId).listDirectories(deviceId, path)
+    },
+    createDirectory(deviceId, path) {
+      return deviceApi(deviceId).createDirectory(deviceId, path)
+    },
+    executeCommand(deviceId, data) {
+      if (isLocalDeviceId(deviceId)) {
+        return localServices.deviceApi.executeCommand(deviceId, data)
+      }
+      if (shouldUseCloudDeviceCommand(data.command_key)) {
+        return cloudServices.deviceApi.executeCommand(deviceId, data)
+      }
+      return cloudRuntimeIpc.request<DeviceCommandResponse>(
+        'device.execute_command',
+        data,
+        deviceId
+      )
+    },
+    upgradeDevice(deviceId, options) {
+      return deviceApi(deviceId).upgradeDevice(deviceId, options)
+    },
+    listSkills(deviceId) {
+      return deviceApi(deviceId).listSkills(deviceId)
+    },
+    listWorkspaceEntries(deviceId, path, workspaceRoot) {
+      return deviceApi(deviceId).listWorkspaceEntries(deviceId, path, workspaceRoot)
+    },
+    readWorkspaceTextFile(deviceId, filePath, workspaceRoot) {
+      return deviceApi(deviceId).readWorkspaceTextFile(deviceId, filePath, workspaceRoot)
+    },
+    readWorkspaceFileChunk(deviceId, filePath, offset, workspaceRoot) {
+      return deviceApi(deviceId).readWorkspaceFileChunk(deviceId, filePath, offset, workspaceRoot)
+    },
+    writeWorkspaceTextFile(deviceId, filePath, content, expectedRevision) {
+      if (!isLocalDeviceId(deviceId) || !localServices.deviceApi.writeWorkspaceTextFile) {
+        throw new Error('Workspace file editing is only available for local devices')
+      }
+      return localServices.deviceApi.writeWorkspaceTextFile(
+        deviceId,
+        filePath,
+        content,
+        expectedRevision
+      )
+    },
+    createDockerRemoteDeviceCommand(data) {
+      if (!cloudServices.deviceApi.createDockerRemoteDeviceCommand) {
+        throw new Error('Remote device startup command is unavailable')
+      }
+      return cloudServices.deviceApi.createDockerRemoteDeviceCommand(data)
+    },
+  }
+  const projectSpaceDeviceApi: WorkbenchServices['deviceApi'] = {
+    ...hybridDeviceApi,
+    async listDevices(requestOptions) {
+      const localDevices = await listLocalDevices(requestOptions?.signal)
+      let cloudDevices: DeviceInfo[] = []
+      try {
+        cloudDevices = await listCloudDevices(requestOptions?.signal)
+      } catch (error) {
+        console.warn(
+          '[DIDA] Failed to load cloud devices for project execution configuration',
+          error
+        )
+      }
+      return mergeKnownDevices(localDevices, cloudDevices) as Awaited<
+        ReturnType<WorkbenchServices['deviceApi']['listDevices']>
+      >
+    },
+  }
+
+  const standInApiForDevice = async (deviceId: string) => {
+    const identity = await getLocalRuntimeSidebarIdentity()
+    const api =
+      deviceId === identity?.deviceId ? localServices.standInApi : cloudServices.standInApi
+    if (!api) throw new Error('Executor settings are unavailable')
+    return api
+  }
+
+  const hybridRuntimeWorkApi: NonNullable<WorkbenchServices['runtimeWorkApi']> = {
+    materializeRuntimeTask(data) {
+      return cloudServices.runtimeWorkApi!.materializeRuntimeTask(data)
+    },
+    prepareRuntimeModel(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.prepareRuntimeModel(data))
+    },
+    async listRuntimeWork(requestOptions) {
+      if (requestOptions?.deviceId) {
+        const api = await runtimeApiForDevice(requestOptions.deviceId)
+        return api === localServices.runtimeWorkApi
+          ? listLocalRuntimeWork(requestOptions)
+          : api.listRuntimeWork(requestOptions)
+      }
+      return listLocalRuntimeWork(requestOptions)
+    },
+    getKeybindings() {
+      return localServices.runtimeWorkApi!.getKeybindings()
+    },
+    getRuntimeSettings() {
+      return localServices.runtimeWorkApi!.getRuntimeSettings()
+    },
+    updateRuntimeSettings(data) {
+      return localServices.runtimeWorkApi!.updateRuntimeSettings(data)
+    },
+    updateKeybindings(data) {
+      return localServices.runtimeWorkApi!.updateKeybindings(data)
+    },
+    upsertDeviceWorkspace(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.upsertDeviceWorkspace(data))
+    },
+    prepareDeviceWorkspace(data: DeviceWorkspacePrepareRequest) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.prepareDeviceWorkspace(data))
+    },
+    deleteDeviceWorkspace(data: DeleteDeviceWorkspaceRequest) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.deleteDeviceWorkspace(data))
+    },
+    async getRuntimeTranscript(data: RuntimeTranscriptRequest) {
+      const route = isLocalDeviceId(data.deviceId) ? 'local' : 'cloud'
+      try {
+        const response = await (
+          data.projectSession ? cloudServices.runtimeWorkApi! : routeByAddress(data)
+        ).getRuntimeTranscript(data)
+        const snapshot = runtimeExecutionSnapshot(data, response)
+        if (
+          snapshot &&
+          response.origin?.projectStore !== 'local' &&
+          (data.runtimeHandle?.origin as { projectStore?: string } | undefined)?.projectStore !==
+            'local' &&
+          cloudServices.projectChatClient?.reconcileExecutionSnapshot
+        ) {
+          // Cloud write-back must not prevent an offline local history read.
+          // A failed report is retried on the next read, never cached as saved.
+          void cloudServices.projectChatClient.reconcileExecutionSnapshot(snapshot).catch(error => {
+            console.error('[DIDA] Failed to persist runtime execution status', {
+              address: runtimeAddressDebug(data),
+              error,
+            })
+          })
+        }
+        return response
+      } catch (error) {
+        console.error('[DIDA] Hybrid runtime transcript failed', {
+          route,
+          address: runtimeAddressDebug(data),
+          error,
+        })
+        throw error
+      }
+    },
+    async searchRuntimeWork(data: RuntimeWorkSearchRequest) {
+      if (data.source === 'cloud') {
+        return searchCloudRuntimeWork(data)
+      }
+
+      const request = withoutSearchSource(data)
+      const localResult = await localServices.runtimeWorkApi!.searchRuntimeWork(request)
+      if (data.source === 'local') return localResult
+
+      searchCloudRuntimeWorkInBackground(request)
+      const cloudResult = rememberedCloudSearch.get(requestCacheKey(request)) ?? { items: [] }
+      return mergeSearchResults(localResult, cloudResult, request.limit)
+    },
+    searchRuntimeWorkspace(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.searchRuntimeWorkspace(data))
+    },
+    revertRuntimeFileChanges(data: RuntimeFileChangesRevertRequest) {
+      return routeByAddress(data.address).revertRuntimeFileChanges(data)
+    },
+    sendRuntimeMessage(data: RuntimeSendRequest) {
+      if (
+        data.origin?.projectStore === 'local' ||
+        (data.address.runtimeHandle?.origin as { projectStore?: string } | undefined)
+          ?.projectStore === 'local'
+      ) {
+        return localProjectServices.runtimeWorkApi!.sendRuntimeMessage(data)
+      }
+      return routeByAddress(data.address).sendRuntimeMessage(data)
+    },
+    interruptAndSendRuntimeMessage(data) {
+      if (
+        data.origin?.projectStore === 'local' ||
+        (data.address.runtimeHandle?.origin as { projectStore?: string } | undefined)
+          ?.projectStore === 'local'
+      ) {
+        return localProjectServices.runtimeWorkApi!.interruptAndSendRuntimeMessage(data)
+      }
+      return routeByAddress(data.address).interruptAndSendRuntimeMessage(data)
+    },
+    rollbackRuntimeTask(data: RuntimeRollbackRequest) {
+      return routeByAddress(data.address).rollbackRuntimeTask(data)
+    },
+    compactRuntimeTask(data: RuntimeCompactRequest) {
+      return routeByAddress(data.address).compactRuntimeTask(data)
+    },
+    cleanRuntimeBackgroundTerminals(address: RuntimeTaskAddress) {
+      const api = routeByAddress(address)
+      if (!api.cleanRuntimeBackgroundTerminals) {
+        throw new Error('Executor does not support background terminals')
+      }
+      return api.cleanRuntimeBackgroundTerminals(address)
+    },
+    guideRuntimeTask(data) {
+      return routeByAddress(data.address).guideRuntimeTask(data)
+    },
+    getRuntimeGoal(data) {
+      return routeByAddress(data.address).getRuntimeGoal(data)
+    },
+    setRuntimeGoal(data) {
+      return routeByAddress(data.address).setRuntimeGoal(data)
+    },
+    clearRuntimeGoal(data) {
+      return routeByAddress(data.address).clearRuntimeGoal(data)
+    },
+    getRuntimeSupervisor(data) {
+      return routeByAddress(data.address).getRuntimeSupervisor(data)
+    },
+    setRuntimeSupervisor(data) {
+      return routeByAddress(data.address).setRuntimeSupervisor(data)
+    },
+    clearRuntimeSupervisor(data) {
+      return routeByAddress(data.address).clearRuntimeSupervisor(data)
+    },
+    runRuntimeSupervisorNow(data) {
+      return routeByAddress(data.address).runRuntimeSupervisorNow(data)
+    },
+    resolveRuntimeSupervisor(data) {
+      return routeByAddress(data.address).resolveRuntimeSupervisor(data)
+    },
+    openRuntimeWorkspace(data: RuntimeWorkspaceOpenRequest) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.openRuntimeWorkspace(data))
+    },
+    upsertLocalRuntimeProject(data: RuntimeLocalProjectUpsertRequest) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.upsertLocalRuntimeProject(data))
+    },
+    renameRuntimeWorkspace(data: RuntimeWorkspaceRenameRequest) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.renameRuntimeWorkspace(data))
+    },
+    removeRuntimeWorkspace(data: RuntimeWorkspaceRemoveRequest) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.removeRuntimeWorkspace(data))
+    },
+    reorderRuntimeProjects(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.reorderRuntimeProjects(data))
+    },
+    setRuntimeProjectPinned(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.setRuntimeProjectPinned(data))
+    },
+    setRuntimeProjectAppearance(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.setRuntimeProjectAppearance(data))
+    },
+    syncRuntimeRemoteProjects(data, options) {
+      return routeLocalSidebarMutation(data.deviceId, options, api =>
+        api.syncRuntimeRemoteProjects(data, options)
+      )
+    },
+    activateRuntimeProject(data, options) {
+      return routeLocalSidebarMutation(data.deviceId, options, api =>
+        api.activateRuntimeProject(data, options)
+      )
+    },
+    reorderRuntimeProjectTasks(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.reorderRuntimeProjectTasks(data))
+    },
+    setRuntimeTaskPinned(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.setRuntimeTaskPinned(data))
+    },
+    getWorktreeCapabilities(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.getWorktreeCapabilities(data))
+    },
+    preflightWorktree(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.preflightWorktree(data))
+    },
+    getWorktreeSettings(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.getWorktreeSettings(data))
+    },
+    updateWorktreeSettings(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.updateWorktreeSettings(data))
+    },
+    listWorktrees(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.listWorktrees(data))
+    },
+    prepareWorktree(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.prepareWorktree(data))
+    },
+    deleteWorktree(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.deleteWorktree(data))
+    },
+    restoreWorktree(data) {
+      return runtimeApiForDevice(data.deviceId).then(api => api.restoreWorktree(data))
+    },
+    bindRuntimeTaskImSessions(data) {
+      return cloudServices.runtimeWorkApi!.bindRuntimeTaskImSessions(data)
+    },
+    getImNotificationSettings() {
+      return cloudServices.runtimeWorkApi!.getImNotificationSettings()
+    },
+    updateGlobalImNotification(data: RuntimeGlobalIMNotificationUpdateRequest) {
+      return cloudServices.runtimeWorkApi!.updateGlobalImNotification(data)
+    },
+    updateImNotificationPresence(data: RuntimeIMNotificationPresenceUpdateRequest) {
+      return cloudServices.runtimeWorkApi!.updateImNotificationPresence(data)
+    },
+    subscribeRuntimeTaskNotifications(data: RuntimeTaskIMNotificationSubscriptionRequest) {
+      return cloudServices.runtimeWorkApi!.subscribeRuntimeTaskNotifications(data)
+    },
+    unsubscribeRuntimeTaskNotifications(address: RuntimeTaskAddress) {
+      return cloudServices.runtimeWorkApi!.unsubscribeRuntimeTaskNotifications(address)
+    },
+    archiveRuntimeTask(address: RuntimeTaskAddress) {
+      const request = routeByAddress(address).archiveRuntimeTask(address)
+      if (isLocalDeviceId(address.deviceId)) return request
+      return request.then(response => {
+        invalidateCloudArchiveCache()
+        return response
+      })
+    },
+    renameRuntimeTask(data) {
+      return routeByAddress(data.address).renameRuntimeTask(data)
+    },
+    async listArchivedConversations(data = {}) {
+      if (data.source === 'local') {
+        return localServices.runtimeWorkApi!.listArchivedConversations({
+          ...withoutArchiveSource(data),
+          source: 'local',
+        })
+      }
+      if (data.source === 'cloud') {
+        return cloudServices.runtimeWorkApi!.listArchivedConversations(data)
+      }
+      const request = withoutArchiveSource(data)
+      const localResult = await localServices.runtimeWorkApi!.listArchivedConversations({
+        ...request,
+        source: 'local',
+      })
+      listCloudArchivesInBackground(request)
+      const cloudResult =
+        rememberedCloudArchives.get(requestCacheKey(request)) ?? emptyArchiveList()
+      return mergeArchiveLists(localResult, cloudResult)
+    },
+    archiveConversation(address: RuntimeTaskAddress) {
+      const request = routeByAddress(address).archiveConversation(address)
+      if (isLocalDeviceId(address.deviceId)) return request
+      return request.then(response => {
+        invalidateCloudArchiveCache()
+        return response
+      })
+    },
+    archiveProjectConversations(data) {
+      const runtimeProjectKey = data.runtimeProjectKey ?? ''
+      const isLocalProject =
+        runtimeProjectKey.startsWith('local:') || localRuntimeProjectKeys.has(runtimeProjectKey)
+      return isLocalProject
+        ? localServices.runtimeWorkApi!.archiveProjectConversations(data)
+        : cloudServices.runtimeWorkApi!.archiveProjectConversations(data).then(response => {
+            invalidateCloudArchiveCache()
+            return response
+          })
+    },
+    async archiveAllConversations() {
+      const response = await localServices.runtimeWorkApi!.archiveAllConversations()
+      archiveAllCloudConversationsInBackground()
+      return response
+    },
+    unarchiveConversation(address: RuntimeTaskAddress) {
+      const request = routeByAddress(address).unarchiveConversation(address)
+      if (isLocalDeviceId(address.deviceId)) return request
+      return request.then(response => {
+        invalidateCloudArchiveCache()
+        return response
+      })
+    },
+    deleteArchivedConversation(address: RuntimeTaskAddress) {
+      const request = routeByAddress(address).deleteArchivedConversation(address)
+      if (isLocalDeviceId(address.deviceId)) return request
+      return request.then(response => {
+        invalidateCloudArchiveCache()
+        return response
+      })
+    },
+    async deleteArchivedConversationsBulk(data) {
+      const localItems = data.items.filter(item => isLocalDeviceId(item.deviceId))
+      const cloudItems = data.items.filter(item => !isLocalDeviceId(item.deviceId))
+      if (localItems.length > 0 && cloudItems.length > 0) {
+        throw new Error('Archived conversation bulk requests must target one source')
+      }
+      if (localItems.length > 0) {
+        return localServices.runtimeWorkApi!.deleteArchivedConversationsBulk({
+          items: localItems,
+        })
+      }
+      if (cloudItems.length > 0) {
+        const response = await cloudServices.runtimeWorkApi!.deleteArchivedConversationsBulk({
+          items: cloudItems,
+        })
+        invalidateCloudArchiveCache()
+        return response
+      }
+      return {
+        accepted: true,
+        requestedCount: 0,
+        acceptedCount: 0,
+        deletedCount: 0,
+        results: [],
+      }
+    },
+    async previewArchivedConversationCleanup(data) {
+      const localItems = data.items.filter(item => isLocalDeviceId(item.deviceId))
+      return localItems.length > 0
+        ? localServices.runtimeWorkApi!.previewArchivedConversationCleanup({ items: localItems })
+        : emptyCleanupResponse()
+    },
+    async cleanupArchivedConversations(data) {
+      const localItems = data.items.filter(item => isLocalDeviceId(item.deviceId))
+      return localItems.length > 0
+        ? localServices.runtimeWorkApi!.cleanupArchivedConversations({ items: localItems })
+        : emptyCleanupResponse()
+    },
+    cancelRuntimeTask(address: RuntimeTaskAddress) {
+      return routeByAddress(address).cancelRuntimeTask(address)
+    },
+    forceStartRuntimeTask(address: RuntimeTaskAddress) {
+      return routeByAddress(address).forceStartRuntimeTask(address)
+    },
+    reorderQueuedRuntimeTask(data) {
+      return routeByAddress(data).reorderQueuedRuntimeTask(data)
+    },
+    async createRuntimeTask(
+      data: RuntimeTaskCreateRequest,
+      ...dispatchHooks: [beforeDispatch?: () => Promise<void>]
+    ) {
+      if (data.origin?.projectStore === 'local') {
+        return localProjectServices.runtimeWorkApi!.createRuntimeTask(data, ...dispatchHooks)
+      }
+      const startedAt = Date.now()
+      logRuntimeTaskCreateStage('hybrid-create-started', {
+        taskId: data.taskId ?? null,
+        deviceId: data.deviceId ?? null,
+        runtime: data.runtime,
+      })
+      try {
+        const { api, route } = await runtimeApiForCreate(data.deviceId, data.taskId)
+        logRuntimeTaskCreateStage('hybrid-create-forwarded', {
+          taskId: data.taskId ?? null,
+          deviceId: data.deviceId ?? null,
+          elapsedMs: Date.now() - startedAt,
+        })
+        const request =
+          route === 'local'
+            ? { ...data, executionDeviceId: data.deviceId }
+            : data.wegentTeamId
+              ? { ...data, schemaVersion: 3 as const }
+              : data
+        let response
+        try {
+          response =
+            data.wegentTeamId && route === 'cloud'
+              ? await cloudServices.runtimeWorkApi!.createRuntimeTask(request, ...dispatchHooks)
+              : await api.createRuntimeTask(request, ...dispatchHooks)
+        } catch (error) {
+          if (data.wegentTeamId && route === 'cloud' && rejectsRuntimeTaskCreateV3(error)) {
+            throw new Error(REMOTE_TEAM_BACKEND_UNSUPPORTED, {
+              cause: error,
+            })
+          }
+          throw error
+        }
+        logRuntimeTaskCreateStage('hybrid-create-resolved', {
+          taskId: response.taskId || data.taskId || null,
+          deviceId: response.deviceId || data.deviceId || null,
+          elapsedMs: Date.now() - startedAt,
+          accepted: response.accepted,
+        })
+        return response
+      } catch (error) {
+        logRuntimeTaskCreateStage('hybrid-create-failed', {
+          taskId: data.taskId ?? null,
+          deviceId: data.deviceId ?? null,
+          elapsedMs: Date.now() - startedAt,
+          error: error instanceof Error ? error.name : typeof error,
+          errorMessage: error instanceof Error ? error.message : String(error),
+        })
+        throw error
+      }
+    },
+    forkRuntimeTask(data: RuntimeTaskForkRequest) {
+      return runtimeApiForDevice(data.target.deviceId).then(api => api.forkRuntimeTask(data))
+    },
+  }
+  const rememberAutomationRoutes = (deviceId: string, automations: Automation[]) => {
+    automations.forEach(automation => automationDevices.set(automation.id, deviceId))
+  }
+  const sameAutomationVersions = (left: Automation[], right: Automation[]) =>
+    left.length === right.length &&
+    left.every(automation =>
+      right.some(
+        candidate => candidate.id === automation.id && candidate.version === automation.version
+      )
+    )
+  const writeCloudAutomation = (deviceId: string, automation: Automation) => {
+    if (isLocalDeviceId(deviceId)) return
+    const current = rememberedCloudAutomations.get(deviceId) ?? []
+    rememberedCloudAutomations.set(deviceId, [
+      ...current.filter(candidate => candidate.id !== automation.id),
+      automation,
+    ])
+  }
+  const removeCloudAutomation = (deviceId: string, automationId: string) => {
+    if (isLocalDeviceId(deviceId)) return
+    const current = rememberedCloudAutomations.get(deviceId) ?? []
+    rememberedCloudAutomations.set(
+      deviceId,
+      current.filter(automation => automation.id !== automationId)
+    )
+  }
+  const refreshCloudAutomationsInBackground = () => {
+    rememberedCloudDevices.filter(isUsableDevice).forEach(device => {
+      const deviceId = device.device_id
+      if (cloudAutomationRequests.has(deviceId)) return
+      const request = automationApiForDevice(deviceId)
+        .listAutomations()
+        .then(response => {
+          const previous = rememberedCloudAutomations.get(deviceId) ?? []
+          rememberAutomationRoutes(deviceId, response.items)
+          rememberedCloudAutomations.set(deviceId, response.items)
+          if (!sameAutomationVersions(previous, response.items)) {
+            notifyWorkbenchAutomationsChanged()
+          }
+        })
+        .catch(error => {
+          console.warn('[DIDA] Failed to refresh cloud automations in background', {
+            deviceId,
+            error,
+          })
+        })
+        .finally(() => {
+          cloudAutomationRequests.delete(deviceId)
+        })
+      cloudAutomationRequests.set(deviceId, request)
+    })
+  }
+  const automationMutationDeviceId = (data: { taskRequest?: RuntimeTaskCreateRequest }) => {
+    const deviceId = data.taskRequest?.deviceId?.trim()
+    if (!deviceId) throw new Error('Automation target device is required')
+    return deviceId
+  }
+  const automationDeviceId = async (automationId: string) => {
+    const known = automationDevices.get(automationId)
+    if (known) return known
+    await automationApi.listAutomations()
+    const discovered = automationDevices.get(automationId)
+    if (!discovered) throw new Error(`Automation ${automationId} was not found`)
+    return discovered
+  }
+  const automationApi: NonNullable<WorkbenchServices['automationApi']> = {
+    async listAutomations() {
+      const localResponse = await localServices.automationApi!.listAutomations()
+      rememberAutomationRoutes(LOCAL_DEVICE_ID, localResponse.items)
+      refreshCloudAutomationsInBackground()
+      return {
+        items: [...localResponse.items, ...Array.from(rememberedCloudAutomations.values()).flat()],
+      }
+    },
+    async getAutomation(automationId) {
+      const deviceId = await automationDeviceId(automationId)
+      const response = await automationApiForDevice(deviceId).getAutomation(automationId)
+      rememberAutomationRoutes(deviceId, [response.automation])
+      return response
+    },
+    async createAutomation(data) {
+      const deviceId = automationMutationDeviceId(data)
+      const response = await automationApiForDevice(deviceId).createAutomation(data)
+      rememberAutomationRoutes(deviceId, [response.automation])
+      writeCloudAutomation(deviceId, response.automation)
+      return response
+    },
+    async updateAutomation(automationId, data) {
+      const deviceId = automationDevices.get(automationId) ?? automationMutationDeviceId(data)
+      const response = await automationApiForDevice(deviceId).updateAutomation(automationId, data)
+      rememberAutomationRoutes(deviceId, [response.automation])
+      writeCloudAutomation(deviceId, response.automation)
+      return response
+    },
+    async deleteAutomation(automationId) {
+      const deviceId = await automationDeviceId(automationId)
+      const response = await automationApiForDevice(deviceId).deleteAutomation(automationId)
+      automationDevices.delete(automationId)
+      removeCloudAutomation(deviceId, automationId)
+      return response
+    },
+    async toggleAutomation(automationId, enabled) {
+      const deviceId = await automationDeviceId(automationId)
+      const response = await automationApiForDevice(deviceId).toggleAutomation(
+        automationId,
+        enabled
+      )
+      rememberAutomationRoutes(deviceId, [response.automation])
+      writeCloudAutomation(deviceId, response.automation)
+      return response
+    },
+    async runAutomationNow(automationId) {
+      const deviceId = await automationDeviceId(automationId)
+      return automationApiForDevice(deviceId).runAutomationNow(automationId)
+    },
+    async listAutomationRuns(automationId) {
+      if (automationId) {
+        const deviceId = await automationDeviceId(automationId)
+        return automationApiForDevice(deviceId).listAutomationRuns(automationId)
+      }
+      return localServices.automationApi!.listAutomationRuns()
+    },
+  }
+
+  const cloudRuntimeChatStream = createRuntimeChatStream({
+    request: (method, params) => {
+      const deviceId = cloudDeviceIdFromData(params)
+      return cloudRuntimeIpc.request(method, params, deviceId)
+    },
+    subscribe: handler =>
+      cloudRuntimeIpc.subscribe(event => {
+        handler(projectCloudRuntimeEventDeviceId(event, rememberedCloudDevices))
+      }),
+  })
+  const hybridChatStream: WorkbenchServices['chatStream'] = {
+    subscribe(handlers) {
+      const scopedDeviceId = handlers.scope?.deviceId
+      const cleanupLocal =
+        !scopedDeviceId || isLocalDeviceId(scopedDeviceId)
+          ? localServices.chatStream.subscribe(
+              scopedDeviceId
+                ? handlers
+                : filterRuntimeChatStreamHandlers(handlers, isLocalDeviceId, true)
+            )
+          : () => undefined
+      const cleanupCloudRuntime =
+        !scopedDeviceId || !isLocalDeviceId(scopedDeviceId)
+          ? cloudRuntimeChatStream.subscribe(
+              scopedDeviceId
+                ? handlers
+                : filterRuntimeChatStreamHandlers(
+                    handlers,
+                    deviceId => !isLocalDeviceId(deviceId),
+                    false
+                  )
+            )
+          : () => undefined
+      const cleanupCloudDeviceEvents = cloudServices.chatStream.subscribe({
+        onDeviceOnline: handlers.onDeviceOnline,
+        onDeviceOffline: handlers.onDeviceOffline,
+        onDeviceStatus: handlers.onDeviceStatus,
+        onDeviceSlotUpdate: handlers.onDeviceSlotUpdate,
+        onDeviceUpgradeStatus: handlers.onDeviceUpgradeStatus,
+      })
+      return () => {
+        cleanupLocal()
+        cleanupCloudRuntime()
+        cleanupCloudDeviceEvents()
+      }
+    },
+  }
+  const cloudProjectSpaceApi = createCloudProjectSpaceApi(cloudServices.deliveryApi!)
+  const localProjectSpaceDetailServices = localProjectServices.projectSpaceDetailServices?.local
+  const projectPluginApi: NonNullable<WorkbenchServices['pluginApi']> = {
+    async listPlugins(deviceId: string) {
+      const cloudPlugins = (
+        await cloudServices.pluginApi?.listPlugins(deviceId).catch(() => [])
+      )?.map(plugin => ({ ...plugin, catalogSource: 'cloud' as const }))
+      if (deviceId && !isLocalDeviceId(deviceId)) return cloudPlugins ?? []
+      const localPlugins = (
+        await localServices.pluginApi?.listPlugins(deviceId).catch(() => [])
+      )?.map(plugin => ({ ...plugin, catalogSource: 'local' as const }))
+      return mergeProjectPluginCatalogs(localPlugins ?? [], cloudPlugins ?? [])
+    },
+  }
+
+  return {
+    ...cloudServices,
+    composerCatalogApi: {
+      async readCatalog(address, forceRefresh) {
+        const runtime = await runtimeApiForDevice(address.deviceId)
+        const catalog =
+          runtime === localServices.runtimeWorkApi
+            ? localServices.composerCatalogApi
+            : cloudServices.composerCatalogApi
+        if (!catalog) throw new Error('Composer catalog service is unavailable')
+        return catalog.readCatalog(address, forceRefresh)
+      },
+    },
+    branchNameApi: localServices.branchNameApi,
+    textGenerationApi: localServices.textGenerationApi,
+    replyPredictionApi: {
+      async predict(data) {
+        const api = await runtimeApiForDevice(data.address.deviceId)
+        if (api === localServices.runtimeWorkApi) {
+          return localServices.replyPredictionApi!.predict(data)
+        }
+        return createReplyPredictionApi(
+          (method, params) => cloudRuntimeIpc.request(method, params, data.address.deviceId),
+          selection => materializeCodexTaskModelConfig(selection, { cloudModelGateway }, false)
+        ).predict(data)
+      },
+    },
+    aitableApi: localServices.aitableApi,
+    dwsApi: localServices.dwsApi,
+    localExecutionServices: localProjectServices,
+    localProjectChatAgentApi: localProjectServices.localProjectChatAgentApi,
+    localLoopItemExecutionApi: localServices.localLoopItemExecutionApi,
+    localHarnessModelApi: localServices.localHarnessModelApi,
+    localDecisionRouterApi: localServices.localDecisionRouterApi,
+    localProjectChatClient: localServices.localProjectChatClient,
+    projectSpaceApis: {
+      local: localServices.deliveryApi,
+      cloud: cloudProjectSpaceApi,
+      defaultLocation: 'cloud',
+    },
+    projectSpaceDetailServices: {
+      local: localProjectSpaceDetailServices,
+      cloud: cloudServices.projectSpaceDetailServices?.cloud
+        ? {
+            ...cloudServices.projectSpaceDetailServices.cloud,
+            deviceApi: projectSpaceDeviceApi,
+            pluginApi: projectPluginApi,
+          }
+        : undefined,
+    },
+    pluginApi: projectPluginApi,
+    agentResourceApi: cloudServices.agentResourceApi
+      ? {
+          ...cloudServices.agentResourceApi,
+          listNativeModels: (environment, projectId) =>
+            isLocalDeviceId(environment.device_key)
+              ? localProjectServices.localProjectChatAgentApi!.listNativeModels(
+                  environment,
+                  projectId
+                )
+              : cloudServices.agentResourceApi!.listNativeModels(environment, projectId),
+        }
+      : undefined,
+    teamApi: {
+      // Wegent Teams are exposed only for explicitly selected Wegent execution.
+      listTeams: cloudServices.teamApi.listTeams,
+    },
+    skillApi: localServices.skillApi,
+    projectApi: {
+      ...cloudServices.projectApi,
+      listProjects: localServices.projectApi.listProjects,
+    },
+    modelApi: {
+      subscribe: cloudModels.subscribe,
+      refresh: cloudModels.refresh,
+      async listModels(): Promise<UnifiedModelListResponse> {
+        cloudModels.loadIfNeeded()
+        // Start the cloud catalog before awaiting the local one: the local
+        // catalog depends on the local executor and the desktop preferences,
+        // and a failure there must never keep the cloud models from loading.
+        const localModels = await localServices.modelApi.listModels().catch(error => {
+          console.warn('[DIDA] Failed to list local models', error)
+          return { data: [] }
+        })
+        return {
+          data: mergeModelCatalogs(annotateLocalModels(localModels.data), cloudModels.getModels()),
+        }
+      },
+    },
+    deviceApi: hybridDeviceApi,
+    runtimeWorkApi: hybridRuntimeWorkApi,
+    standInApi: {
+      async readTask(deviceId, taskId) {
+        return (await standInApiForDevice(deviceId)).readTask(deviceId, taskId)
+      },
+      async catalog(deviceId) {
+        return (await standInApiForDevice(deviceId)).catalog(deviceId)
+      },
+      async run(projectId, issueId, userId, projectStore, deviceId, standInId) {
+        return (await standInApiForDevice(deviceId)).run(
+          projectId,
+          issueId,
+          userId,
+          projectStore,
+          deviceId,
+          standInId
+        )
+      },
+      async list(userId, deviceId, includeDisabled) {
+        return (await standInApiForDevice(deviceId)).list(userId, deviceId, includeDisabled)
+      },
+      async get(projectId, userId, projectStore, deviceId, standInId) {
+        return (await standInApiForDevice(deviceId)).get(
+          projectId,
+          userId,
+          projectStore,
+          deviceId,
+          standInId
+        )
+      },
+      async save(projectId, userId, projectStore, settings) {
+        return (await standInApiForDevice(settings.executionDeviceId)).save(
+          projectId,
+          userId,
+          projectStore,
+          settings
+        )
+      },
+    },
+    projectDevicePluginApi,
+    automationApi,
+    attachmentApi: {
+      uploadAttachment: localServices.attachmentApi!.uploadAttachment,
+      deleteAttachment: localServices.attachmentApi!.deleteAttachment,
+      fetchAttachmentBlob: cloudServices.attachmentApi!.fetchAttachmentBlob,
+      uploadLocalAttachmentToCloud: attachment =>
+        uploadLocalAttachmentToCloud(attachment, cloudServices.attachmentApi!.uploadAttachment),
+    },
+    userApi: cloudServices.userApi,
+    cloudBackgroundApi: {
+      listTeams: cloudServices.teamApi.listTeams,
+      listDevices: requestOptions => listCloudDevices(requestOptions?.signal),
+      listRuntimeWork: requestOptions => listCloudRuntimeWork(requestOptions?.signal),
+    },
+    getLocalRuntimeSidebarIdentity,
+    executorClient: createExecutorClientFromApis({
+      transportKind: 'backend-relay',
+      deviceApi: hybridDeviceApi,
+      runtimeWorkApi: hybridRuntimeWorkApi,
+      reviewApi: {
+        loadTurnFileChangesDiff: cloudServices.taskApi.getTurnFileChangesDiff,
+      },
+      resolveDevice: resolveExecutorDevice,
+    }),
+    chatStream: hybridChatStream,
+    async recoverRuntimeConnections() {
+      projectDevicePluginApis.forEach(api => api.invalidate?.())
+      await Promise.all([
+        localServices.recoverRuntimeConnections?.(),
+        cloudServices.recoverRuntimeConnections?.(),
+        cloudRuntimeIpc.reconnect(),
+      ])
+    },
+  }
+}
+
+function filterRuntimeChatStreamHandlers(
+  handlers: ChatStreamHandlers,
+  acceptsDevice: (deviceId?: string | null) => boolean,
+  localRuntime: boolean
+): ChatStreamHandlers {
+  const route = <Payload extends { deviceId?: string }>(handler?: (payload: Payload) => void) =>
+    handler
+      ? (payload: Payload) => {
+          if (acceptsDevice(payload.deviceId)) handler(payload)
+        }
+      : undefined
+
+  return {
+    onChatStart: route(handlers.onChatStart),
+    onChatChunk: route(handlers.onChatChunk),
+    onChatDone: route(handlers.onChatDone),
+    onChatError: route(handlers.onChatError),
+    onBlockCreated: route(handlers.onBlockCreated),
+    onBlockUpdated: route(handlers.onBlockUpdated),
+    onSubagentActivity: route(handlers.onSubagentActivity),
+    onRuntimeTaskTitleUpdated: route(handlers.onRuntimeTaskTitleUpdated),
+    onRuntimeWorkChanged: route(handlers.onRuntimeWorkChanged),
+    onRuntimeGoalUpdated: route(handlers.onRuntimeGoalUpdated),
+    onRuntimeGoalCleared: route(handlers.onRuntimeGoalCleared),
+    onRuntimeSupervisorUpdated: route(handlers.onRuntimeSupervisorUpdated),
+    onRuntimeGoalContinuation: route(handlers.onRuntimeGoalContinuation),
+    onRuntimePlanUpdated: route(handlers.onRuntimePlanUpdated),
+    onGuidanceApplied: route(handlers.onGuidanceApplied),
+    onRuntimeEventLagged: handlers.onRuntimeEventLagged,
+    onRuntimeTransportReplaced: localRuntime ? handlers.onRuntimeTransportReplaced : undefined,
+    onWeworkNotification: acceptsDevice(undefined) ? handlers.onWeworkNotification : undefined,
+    onProjectTaskAssigned: handlers.onProjectTaskAssigned
+      ? payload => {
+          if ((payload.projectStore === 'local') === localRuntime)
+            handlers.onProjectTaskAssigned?.(payload)
+        }
+      : undefined,
+  }
+}
+
+function rejectsRuntimeTaskCreateV3(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.status !== 422 || !Array.isArray(error.detail)) {
+    return false
+  }
+  return error.detail.some(item => {
+    if (!item || typeof item !== 'object' || !('loc' in item)) return false
+    const location = (item as { loc?: unknown }).loc
+    return Array.isArray(location) && location.includes('schemaVersion')
+  })
+}
+
+function isUnsupportedRuntimeMaterialization(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    (error.status === 404 || error.status === 405 || rejectsRuntimeTaskCreateV3(error))
+  )
+}

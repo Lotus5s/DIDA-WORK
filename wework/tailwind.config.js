@@ -1,0 +1,72 @@
+import collaborationPreset from '@wegent/collaboration/tailwind-preset'
+
+/** @type {import('tailwindcss').Config} */
+export default {
+  presets: [collaborationPreset],
+  darkMode: 'class',
+  content: [
+    './index.html',
+    './src/**/*.{ts,tsx}',
+    './dsh/*/client.js',
+    './dsh/*/src/**/*.{ts,tsx}',
+    './wecode/**/*.{ts,tsx}',
+    '../packages/collaboration/src/**/*.{ts,tsx}',
+    '../packages/collaboration/node_modules/streamdown/dist/*.js',
+  ],
+  theme: {
+    fontSize: {
+      xs: ['var(--text-xs)', { lineHeight: '1.333333' }],
+      sm: ['var(--text-sm)', { lineHeight: '1.428571' }],
+      base: ['var(--text-base)', { lineHeight: '1.5' }],
+      lg: ['var(--text-lg)', { lineHeight: '1.555556' }],
+      xl: ['var(--text-xl)', { lineHeight: '1.4' }],
+      '2xl': ['var(--text-2xl)', { lineHeight: '1.333333' }],
+      '3xl': ['var(--text-3xl)', { lineHeight: '1.2' }],
+      '4xl': ['var(--text-4xl)', { lineHeight: '1.111111' }],
+      'heading-sm': ['var(--text-heading-sm)', { lineHeight: '1.33' }],
+      'heading-md': ['var(--text-heading-md)', { lineHeight: '1.33' }],
+      'heading-lg': ['var(--text-heading-lg)', { lineHeight: '1.2' }],
+    },
+    extend: {
+      fontFamily: {
+        mono: ['var(--font-code)'],
+      },
+      backgroundColor: {
+        base: 'rgb(var(--color-bg-base) / <alpha-value>)',
+      },
+      colors: {
+        primary: 'rgb(var(--color-primary) / <alpha-value>)',
+        'primary-contrast': 'rgb(var(--color-primary-contrast) / <alpha-value>)',
+        focus: 'rgb(var(--color-focus) / <alpha-value>)',
+        success: 'rgb(var(--color-success) / <alpha-value>)',
+        destructive: 'rgb(var(--color-destructive) / <alpha-value>)',
+        'text-primary': 'rgb(var(--color-text-primary) / <alpha-value>)',
+        'text-secondary': 'rgb(var(--color-text-secondary) / <alpha-value>)',
+        'text-muted': 'rgb(var(--color-text-muted) / <alpha-value>)',
+        background: 'rgb(var(--color-bg-base) / <alpha-value>)',
+        surface: 'rgb(var(--color-bg-surface) / <alpha-value>)',
+        border: 'rgb(var(--color-border) / <alpha-value>)',
+        muted: 'rgb(var(--color-muted) / <alpha-value>)',
+        hover: 'rgb(var(--color-bg-hover))',
+        sidebar: 'rgb(var(--color-sidebar))',
+        'sidebar-active': 'rgb(var(--color-sidebar-active) / <alpha-value>)',
+        'sidebar-hover': 'rgb(var(--color-sidebar-hover))',
+        'sidebar-text-primary': 'rgb(var(--color-sidebar-text-primary) / <alpha-value>)',
+        'sidebar-text-secondary': 'rgb(var(--color-sidebar-text-secondary) / <alpha-value>)',
+        'sidebar-text-muted': 'rgb(var(--color-sidebar-text-muted) / <alpha-value>)',
+        'mobile-drawer': 'rgb(var(--color-mobile-drawer))',
+        popover: 'rgb(var(--color-popover) / <alpha-value>)',
+        'code-bg': 'rgb(var(--color-code-bg) / <alpha-value>)',
+        'reasoning-standard': 'rgb(var(--color-reasoning-standard) / <alpha-value>)',
+        'reasoning-ultra-start': 'rgb(var(--color-reasoning-ultra-start) / <alpha-value>)',
+        'reasoning-ultra-end': 'rgb(var(--color-reasoning-ultra-end) / <alpha-value>)',
+        'reasoning-ultra-text': 'rgb(var(--color-reasoning-ultra-text) / <alpha-value>)',
+        'reasoning-contrast': 'rgb(var(--color-reasoning-contrast) / <alpha-value>)',
+      },
+      borderRadius: {
+        DEFAULT: 'var(--radius)',
+      },
+    },
+  },
+  plugins: [],
+}

@@ -1,0 +1,3211 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Knowledge Orchestrator - Unified business layer for knowledge base operations.
+
+This module provides a unified service layer for both REST API and MCP tools,
+handling complete business flows without FastAPI-specific dependencies.
+
+Key responsibilities:
+- Orchestrate complete workflows (e.g., create document = upload + create + index)
+- Auto-select default retrievers and embedding models (following frontend logic)
+- Schedule async tasks via Celery for both indexing and summary generation
+
+Architecture:
+- REST API and MCP tools both call Orchestrator methods
+- Orchestrator uses Celery tasks for async operations (unified approach)
+- Shared indexing logic lives in `app/services/knowledge/indexing.py`
+"""
+
+import base64
+import logging
+from typing import Any, Dict, List, Literal, Optional
+
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import ObjectDeletedError
+
+from app.core.config import settings
+from app.models.kind import Kind
+from app.models.knowledge import (
+    DocumentIndexStatus,
+    DocumentSourceType,
+    KnowledgeDocument,
+)
+from app.models.subtask_context import SubtaskContext
+from app.models.task import TaskResource
+from app.models.user import User
+from app.schemas.knowledge import (
+    DocumentContentReadResponse,
+    DocumentDetailResponse,
+    KnowledgeBaseCreate,
+    KnowledgeBaseListResponse,
+    KnowledgeBaseResponse,
+    KnowledgeBaseType,
+    KnowledgeDocumentCreate,
+    KnowledgeDocumentListResponse,
+    KnowledgeDocumentResponse,
+    ResourceScope,
+)
+from app.services.knowledge.attachment_cleanup import (
+    EXTERNAL_WIKI_ATTACHMENT_LIFECYCLE_OWNER,
+    delete_attachment_best_effort,
+    mark_attachments_for_orphan_cleanup,
+)
+from app.services.knowledge.code_wiki.source import SourceRepository
+from app.services.knowledge.document_read_service import (
+    DOCUMENT_READ_ERROR_NOT_FOUND,
+    document_read_service,
+)
+from app.services.knowledge.external_document_identity import WIKI_PROVIDER_ID
+from app.services.knowledge.external_document_providers import (
+    ExternalDocumentContent,
+    ExternalImportLostWriteError,
+)
+from app.services.knowledge.external_refresh_snapshot import (
+    get_external_refresh_snapshot,
+    stage_external_refresh_attachment,
+)
+from app.services.knowledge.knowledge_service import KnowledgeService
+from app.services.knowledge.retrieval_profile import (
+    load_profile,
+)
+from app.services.knowledge.retrieval_resource_resolver import (
+    resolve_embedding_model_resource,
+    resolve_retriever_resource,
+)
+from app.stores.tasks import task_store
+from shared.knowledge_module import (
+    EMBEDDING_RESOURCE_CATEGORY,
+    MODEL_RESOURCE_KIND,
+    RETRIEVER_RESOURCE_KIND,
+    RetrievalProfileRecord,
+    RetrievalResource,
+    evaluate_profile,
+    normalize_document_extension,
+    prepare_knowledge_config,
+    validate_retrieval_config_update,
+)
+from shared.models import SearchHints
+from shared.telemetry.decorators import trace_async
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_TEXT_FILE_EXTENSION = "txt"
+MAX_DOCUMENT_READ_LIMIT = 100000
+DEFAULT_KNOWLEDGE_LIST_LIMIT = 50
+MAX_KNOWLEDGE_LIST_LIMIT = 500
+REQUIRED_DOCUMENT_READ_KEYS = (
+    "id",
+    "name",
+    "content",
+    "total_length",
+    "offset",
+    "returned_length",
+    "has_more",
+    "kb_id",
+)
+
+
+def _normalize_file_extension(file_extension: Optional[str]) -> str:
+    """Normalize file extension to a safe, dot-less form.
+
+    Args:
+        file_extension: File extension provided by caller (may include leading dot)
+
+    Returns:
+        Normalized file extension without leading dot (e.g., "txt")
+    """
+    ext = (file_extension or "").strip()
+    ext = ext.lstrip(".")
+    if not ext:
+        return DEFAULT_TEXT_FILE_EXTENSION
+    # Basic safety checks (avoid path injection / invalid filenames)
+    if "/" in ext or "\\" in ext or ".." in ext:
+        raise ValueError("Invalid file_extension")
+    return ext
+
+
+def _build_filename(name: str, file_extension: str) -> str:
+    """Build a safe filename for attachment upload."""
+    ext = _normalize_file_extension(file_extension)
+    suffix = f".{ext}"
+    return f"{name[: 255 - len(suffix)]}{suffix}"
+
+
+def _validate_document_read_paging(offset: int, limit: int) -> None:
+    """Validate raw document read paging arguments."""
+    if offset < 0:
+        raise ValueError("offset must be greater than or equal to 0")
+    if limit <= 0:
+        raise ValueError("limit must be greater than 0")
+    if limit > MAX_DOCUMENT_READ_LIMIT:
+        raise ValueError(
+            f"limit must be less than or equal to {MAX_DOCUMENT_READ_LIMIT}"
+        )
+
+
+def _validate_document_read_result_payload(result: Dict[str, Any]) -> None:
+    """Validate the reader payload contains all required paginator fields."""
+    missing_keys = [key for key in REQUIRED_DOCUMENT_READ_KEYS if key not in result]
+    if missing_keys:
+        raise ValueError(
+            "Incomplete document read payload: missing " + ", ".join(missing_keys)
+        )
+
+
+class _WegentRetrievalConfigAdapter:
+    """Supplies Wegent's authorized records to the pure knowledge module.
+
+    The module decides how to compose and validate the configuration; this only
+    reports the stored profile and the candidates Wegent has authorized for this
+    user and namespace.
+    """
+
+    def __init__(
+        self, orchestrator: "KnowledgeOrchestrator", db: Session, user: User
+    ) -> None:
+        self._orchestrator = orchestrator
+        self._db = db
+        self._user = user
+
+    def retrieval_profile(self) -> RetrievalProfileRecord:
+        profile, _version, record = load_profile(self._db)
+        health = evaluate_profile(record)
+        if profile and health["status"] != "valid":
+            logger.warning(
+                "[Orchestrator] Retrieval profile is unavailable; using automatic "
+                "defaults: %s",
+                health["fallback_reason"],
+            )
+        return record
+
+    def default_retriever(self, namespace: str) -> Optional[RetrievalResource]:
+        record = self._orchestrator.get_default_retriever(
+            self._db, self._user.id, namespace
+        )
+        if not record:
+            return None
+        return RetrievalResource(
+            name=record["retriever_name"],
+            namespace=record.get("retriever_namespace") or "default",
+            kind=RETRIEVER_RESOURCE_KIND,
+        )
+
+    def default_embedding_model(self, namespace: str) -> Optional[RetrievalResource]:
+        record = self._orchestrator.get_default_embedding_model(
+            self._db, self._user.id, namespace
+        )
+        if not record:
+            return None
+        return RetrievalResource(
+            name=record["model_name"],
+            namespace=record.get("model_namespace") or "default",
+            kind=MODEL_RESOURCE_KIND,
+            category=EMBEDDING_RESOURCE_CATEGORY,
+        )
+
+    def resolve_retriever(
+        self, name: str, namespace: str
+    ) -> Optional[RetrievalResource]:
+        return resolve_retriever_resource(
+            self._db, user_id=self._user.id, name=name, namespace=namespace
+        )
+
+    def resolve_embedding_model(
+        self, name: str, namespace: str
+    ) -> Optional[RetrievalResource]:
+        return resolve_embedding_model_resource(
+            self._db, user_id=self._user.id, name=name, namespace=namespace
+        )
+
+
+class KnowledgeOrchestrator:
+    """
+    Knowledge base operations orchestrator.
+
+    This service layer unifies REST API and MCP tool implementations,
+    providing complete business workflows without FastAPI dependencies.
+
+    All async tasks (indexing, summary generation) are handled via Celery,
+    providing a unified approach across REST API and MCP tools.
+
+    Usage:
+        orchestrator = KnowledgeOrchestrator()
+
+        # Create document with indexing (uses Celery internally)
+        doc = orchestrator.create_document_with_content(
+            db=db,
+            user=user,
+            knowledge_base_id=123,
+            name="My Document",
+            source_type="text",
+            content="Document content...",
+            trigger_indexing=True,
+        )
+
+        # Update document content with re-indexing
+        result = orchestrator.update_document_content(
+            db=db,
+            user=user,
+            document_id=456,
+            content="Updated content...",
+            trigger_reindex=True,
+        )
+    """
+
+    def _get_available_models(
+        self,
+        db: Session,
+        user: User,
+        namespace: str,
+        model_category_type: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get available models for the user.
+
+        This is a shared helper method for both embedding and LLM model selection.
+
+        Args:
+            db: Database session
+            user: User object
+            namespace: Knowledge base namespace
+            model_category_type: Model category type (embedding, llm, etc.)
+
+        Returns:
+            List of available models
+        """
+        from app.services.model_aggregation_service import model_aggregation_service
+
+        scope = "personal" if namespace == "default" else "group"
+        group_name = None if namespace == "default" else namespace
+
+        return model_aggregation_service.list_available_models(
+            db=db,
+            current_user=user,
+            shell_type=None,
+            include_config=False,
+            scope=scope,
+            group_name=group_name,
+            model_category_type=model_category_type,
+        )
+
+    def get_default_retriever(
+        self,
+        db: Session,
+        user_id: int,
+        namespace: str = "default",
+    ) -> Optional[Dict[str, str]]:
+        """
+        Get default retriever following frontend auto-selection logic.
+
+        Priority:
+        - Personal scope (namespace="default"): user > public
+        - Group scope: group > public
+
+        Args:
+            db: Database session
+            user_id: User ID
+            namespace: Knowledge base namespace
+
+        Returns:
+            Dict with retriever_name and retriever_namespace, or None if not found
+        """
+        from app.services.adapters.retriever_kinds import retriever_kinds_service
+
+        scope = "personal" if namespace == "default" else "group"
+        group_name = None if namespace == "default" else namespace
+
+        retrievers = retriever_kinds_service.list_retrievers(
+            db=db,
+            user_id=user_id,
+            scope=scope,
+            group_name=group_name,
+        )
+
+        if not retrievers:
+            logger.warning(
+                f"[Orchestrator] No retrievers found: user_id={user_id}, namespace={namespace}"
+            )
+            return None
+
+        # Frontend sorts by type: user > group > public
+        # The service already returns sorted results, take the first one
+        first = retrievers[0]
+        logger.info(
+            f"[Orchestrator] Auto-selected retriever: name={first['name']}, "
+            f"namespace={first['namespace']}, type={first.get('type', 'unknown')}"
+        )
+        return {
+            "retriever_name": first["name"],
+            "retriever_namespace": first["namespace"],
+        }
+
+    def get_default_embedding_model(
+        self,
+        db: Session,
+        user_id: int,
+        namespace: str = "default",
+    ) -> Optional[Dict[str, str]]:
+        """
+        Get default embedding model following frontend auto-selection logic.
+
+        Priority: user > public
+
+        Args:
+            db: Database session
+            user_id: User ID
+            namespace: Knowledge base namespace
+
+        Returns:
+            Dict with model_name and model_namespace, or None if not found
+        """
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            logger.warning(f"[Orchestrator] User not found: user_id={user_id}")
+            return None
+
+        models = self._get_available_models(db, user, namespace, "embedding")
+
+        if not models:
+            logger.warning(
+                f"[Orchestrator] No embedding models found: user_id={user_id}, namespace={namespace}"
+            )
+            return None
+
+        # Take the first available embedding model
+        first = models[0]
+        logger.info(
+            f"[Orchestrator] Auto-selected embedding model: name={first['name']}, "
+            f"namespace={first.get('namespace', 'default')}, type={first.get('type', 'unknown')}"
+        )
+        return {
+            "model_name": first["name"],
+            "model_namespace": first.get("namespace", "default"),
+        }
+
+    def _resolve_retrieval_config(
+        self,
+        *,
+        db: Session,
+        user: User,
+        namespace: str,
+        retrieval_config: Optional[Dict[str, Any]],
+        rag_config_mode: Literal["auto", "disabled"] = "auto",
+        retriever_name: Optional[str] = None,
+        retriever_namespace: Optional[str] = None,
+        embedding_model_name: Optional[str] = None,
+        embedding_model_namespace: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Compose the retrieval config through the shared knowledge module.
+
+        The module owns the composition priority (explicit input, valid system
+        profile, authorized candidates) and the validation rules, so Wegent and a
+        second service resolve one configuration the same way. This method only
+        supplies the records Wegent has authorized.
+        """
+        resolved_config = prepare_knowledge_config(
+            _WegentRetrievalConfigAdapter(self, db, user),
+            namespace=namespace,
+            retrieval_config=retrieval_config,
+            retriever_name=retriever_name,
+            retriever_namespace=retriever_namespace,
+            embedding_model_name=embedding_model_name,
+            embedding_model_namespace=embedding_model_namespace,
+            rag_config_mode=rag_config_mode,
+        )
+        if resolved_config is None:
+            logger.warning(
+                "[Orchestrator] Could not build retrieval_config: "
+                "retriever=%s, embedding=%s",
+                retriever_name,
+                embedding_model_name,
+            )
+            return None
+
+        embedding_config = resolved_config.get("embedding_config") or {}
+        logger.info(
+            "[Orchestrator] Built retrieval_config: retriever=%s, embedding=%s",
+            resolved_config.get("retriever_name"),
+            embedding_config.get("model_name"),
+        )
+        return resolved_config
+
+    def get_task_model_as_summary_model(
+        self,
+        db: Session,
+        task_id: int,
+        user_id: int,
+    ) -> Optional[Dict[str, str]]:
+        """
+        Get the model used by a Task for use as summary model.
+
+        Resolution priority:
+        1. Task.metadata.labels.modelId (runtime model override)
+        2. Task → Team → Bot → modelRef (static configuration)
+
+        Args:
+            db: Database session
+            task_id: Task ID
+            user_id: User ID
+
+        Returns:
+            Dict with name, namespace, and type, or None if not found
+        """
+        from app.schemas.kind import Bot, Task, Team
+
+        logger.debug(
+            f"[Orchestrator] Resolving summary model from task: task_id={task_id}, user_id={user_id}"
+        )
+
+        # 1. Get Task
+        task = task_store.get_by_id(db, task_id=task_id)
+        if task and task.kind != "Task":
+            task = None
+        if not task:
+            logger.warning(f"[Orchestrator] Task not found: task_id={task_id}")
+            return None
+
+        try:
+            task_crd = Task.model_validate(task.json)
+
+            # 2. Try to get model from Task.metadata.labels (runtime override)
+            model_from_labels = self._get_model_from_task_labels(db, task_crd, user_id)
+            if model_from_labels:
+                logger.info(
+                    f"[Orchestrator] Resolved summary model from task labels: task_id={task_id}, "
+                    f"model={model_from_labels['name']}, type={model_from_labels['type']}"
+                )
+                return model_from_labels
+
+            # 3. Fallback: resolve from Task → Team → Bot → Model chain
+            model_from_chain = self._get_model_from_bot_chain(
+                db, task_crd, task_id, user_id
+            )
+            if model_from_chain:
+                return model_from_chain
+
+            logger.warning(
+                f"[Orchestrator] Could not resolve model from task: task_id={task_id}"
+            )
+            return None
+
+        except Exception as e:
+            logger.warning(
+                f"[Orchestrator] Failed to resolve model from task: task_id={task_id}, error={e}"
+            )
+            return None
+
+    def _get_model_from_task_labels(
+        self,
+        db: Session,
+        task_crd: Any,
+        user_id: int,
+    ) -> Optional[Dict[str, str]]:
+        """
+        Extract model info from Task.metadata.labels.
+
+        Labels used:
+        - modelId: Model name
+        - forceOverrideBotModelType: Model type (user/public/group)
+
+        Args:
+            db: Database session
+            task_crd: Task CRD object
+            user_id: User ID
+
+        Returns:
+            Dict with name, namespace, and type, or None if not found in labels
+        """
+        if not task_crd.metadata or not task_crd.metadata.labels:
+            return None
+
+        labels = task_crd.metadata.labels
+        model_id = labels.get("modelId")
+
+        if not model_id:
+            return None
+
+        # Get model type from labels, default to "public"
+        model_type = labels.get("forceOverrideBotModelType", "public")
+        namespace = task_crd.metadata.namespace or "default"
+
+        logger.debug(
+            f"[Orchestrator] Found model in task labels: modelId={model_id}, "
+            f"type={model_type}, namespace={namespace}"
+        )
+
+        # Validate the model exists in DB
+        validated_type = self._determine_model_type(db, user_id, model_id, namespace)
+        if not validated_type:
+            # Model not found with task namespace, try "default" namespace
+            validated_type = self._determine_model_type(
+                db, user_id, model_id, "default"
+            )
+
+        if not validated_type:
+            logger.warning(
+                f"[Orchestrator] Model from task labels not found in DB: "
+                f"modelId={model_id}, user_id={user_id}"
+            )
+            return None
+
+        return {
+            "name": model_id,
+            "namespace": namespace if validated_type != "public" else "default",
+            "type": validated_type,
+        }
+
+    def _get_model_from_bot_chain(
+        self,
+        db: Session,
+        task_crd: Any,
+        task_id: int,
+        user_id: int,
+    ) -> Optional[Dict[str, str]]:
+        """
+        Resolve model from Task → Team → Bot → modelRef chain.
+
+        Args:
+            db: Database session
+            task_crd: Task CRD object
+            task_id: Task ID (for logging)
+            user_id: User ID
+
+        Returns:
+            Dict with name, namespace, and type, or None if not found
+        """
+        from app.schemas.kind import Bot, Team
+
+        if not task_crd.spec or not task_crd.spec.teamRef:
+            logger.debug(f"[Orchestrator] Task {task_id} has no teamRef")
+            return None
+
+        team_ref = task_crd.spec.teamRef
+        logger.debug(
+            f"[Orchestrator] Task {task_id} -> teamRef: name={team_ref.name}, "
+            f"namespace={team_ref.namespace}"
+        )
+
+        # Get Team
+        team = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == user_id,
+                Kind.kind == "Team",
+                Kind.name == team_ref.name,
+                Kind.namespace == (team_ref.namespace or "default"),
+                Kind.is_active == True,
+            )
+            .first()
+        )
+        if not team:
+            logger.debug(
+                f"[Orchestrator] Team not found: name={team_ref.name}, "
+                f"namespace={team_ref.namespace}"
+            )
+            return None
+
+        # Get Bot from Team
+        team_crd = Team.model_validate(team.json)
+        if not team_crd.spec or not team_crd.spec.members:
+            logger.debug(f"[Orchestrator] Team {team_ref.name} has no members")
+            return None
+
+        bot_ref = team_crd.spec.members[0].botRef
+        if not bot_ref:
+            logger.debug(f"[Orchestrator] Team {team_ref.name} member has no botRef")
+            return None
+
+        logger.debug(
+            f"[Orchestrator] Team {team_ref.name} -> botRef: name={bot_ref.name}, "
+            f"namespace={bot_ref.namespace}"
+        )
+
+        # Get Bot
+        bot = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == user_id,
+                Kind.kind == "Bot",
+                Kind.name == bot_ref.name,
+                Kind.namespace == (bot_ref.namespace or "default"),
+                Kind.is_active == True,
+            )
+            .first()
+        )
+        if not bot:
+            logger.debug(
+                f"[Orchestrator] Bot not found: name={bot_ref.name}, "
+                f"namespace={bot_ref.namespace}"
+            )
+            return None
+
+        # Get Model from Bot
+        bot_crd = Bot.model_validate(bot.json)
+        if not bot_crd.spec or not bot_crd.spec.modelRef:
+            logger.debug(f"[Orchestrator] Bot {bot_ref.name} has no modelRef")
+            return None
+
+        model_ref = bot_crd.spec.modelRef
+        model_name = model_ref.name
+        model_namespace = model_ref.namespace or "default"
+
+        logger.debug(
+            f"[Orchestrator] Bot {bot_ref.name} -> modelRef: name={model_name}, "
+            f"namespace={model_namespace}"
+        )
+
+        # Validate model exists
+        model_type = self._determine_model_type(
+            db, user_id, model_name, model_namespace
+        )
+        if not model_type:
+            logger.warning(
+                f"[Orchestrator] Model from bot chain not found in DB: "
+                f"name={model_name}, namespace={model_namespace}"
+            )
+            return None
+
+        logger.info(
+            f"[Orchestrator] Resolved summary model from bot chain: task_id={task_id}, "
+            f"model={model_name}, namespace={model_namespace}, type={model_type}"
+        )
+        return {
+            "name": model_name,
+            "namespace": model_namespace,
+            "type": model_type,
+        }
+
+    def _determine_model_type(
+        self,
+        db: Session,
+        user_id: int,
+        model_name: str,
+        model_namespace: str,
+    ) -> Optional[str]:
+        """
+        Determine the type of a model by checking where it exists.
+
+        Priority: user > group > public
+
+        Args:
+            db: Database session
+            user_id: User ID
+            model_name: Model name
+            model_namespace: Model namespace
+
+        Returns:
+            Model type ('user', 'group', 'public') or None if not found
+        """
+        # Check user model first
+        user_model = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == user_id,
+                Kind.kind == "Model",
+                Kind.name == model_name,
+                Kind.namespace == model_namespace,
+                Kind.is_active == True,
+            )
+            .first()
+        )
+        if user_model:
+            # Determine if it's a user model or group model based on namespace
+            if model_namespace == "default":
+                return "user"
+            else:
+                return "group"
+
+        # Check public model (user_id = 0)
+        public_model = (
+            db.query(Kind)
+            .filter(
+                Kind.user_id == 0,
+                Kind.kind == "Model",
+                Kind.name == model_name,
+                Kind.is_active == True,
+            )
+            .first()
+        )
+        if public_model:
+            return "public"
+
+        return None
+
+    def list_knowledge_bases(
+        self,
+        db: Session,
+        user: User,
+        scope: str = "all",
+        group_name: Optional[str] = None,
+        *,
+        offset: int = 0,
+        limit: int = DEFAULT_KNOWLEDGE_LIST_LIMIT,
+    ) -> KnowledgeBaseListResponse:
+        """
+        List knowledge bases accessible to the user.
+
+        Args:
+            db: Database session
+            user: Current user
+            scope: Resource scope (personal, group, all)
+            group_name: Group name for group scope
+
+        Returns:
+            KnowledgeBaseListResponse with knowledge base list
+        """
+        try:
+            resource_scope = ResourceScope(scope)
+        except ValueError:
+            resource_scope = ResourceScope.ALL
+        offset = max(0, offset)
+        limit = min(max(1, limit), MAX_KNOWLEDGE_LIST_LIMIT)
+
+        knowledge_bases, total = KnowledgeService.list_knowledge_bases_paginated(
+            db=db,
+            user_id=user.id,
+            scope=resource_scope,
+            group_name=group_name,
+            offset=offset,
+            limit=limit,
+        )
+
+        # Use cached document_count from spec to avoid N+1 query problem
+        return KnowledgeBaseListResponse(
+            total=total,
+            returned_count=len(knowledge_bases),
+            limit=limit,
+            offset=offset,
+            has_more=offset + len(knowledge_bases) < total,
+            items=[
+                KnowledgeBaseResponse.from_kind(
+                    kb, kb.json.get("spec", {}).get("document_count", 0)
+                )
+                for kb in knowledge_bases
+            ],
+        )
+
+    def list_documents(
+        self,
+        db: Session,
+        user: User,
+        knowledge_base_id: int,
+        folder_id: int | None = None,
+        *,
+        offset: int = 0,
+        limit: int = DEFAULT_KNOWLEDGE_LIST_LIMIT,
+        include_subfolders: bool = False,
+        keyword: str | None = None,
+        sort_by: str = "createdAt",
+        sort_order: str = "desc",
+        content_origin: str | None = None,
+    ) -> KnowledgeDocumentListResponse:
+        """
+        List documents in a knowledge base.
+
+        Args:
+            db: Database session
+            user: Current user
+            knowledge_base_id: Knowledge base ID
+            folder_id: Optional folder ID to filter by
+            include_subfolders: Whether to include descendant folders when folder_id is set
+            keyword: Optional document name keyword filter
+            sort_by: Sort field (name, size, createdAt, updatedAt)
+            sort_order: Sort order (asc or desc)
+
+        Returns:
+            KnowledgeDocumentListResponse with document list.
+            Each document's created_by field is populated with the
+            creator's username from the users table (None if user not found).
+
+        Raises:
+            ValueError: If knowledge base not found or access denied
+        """
+        # Verify access
+        kb, has_access = KnowledgeService.get_knowledge_base(
+            db=db,
+            knowledge_base_id=knowledge_base_id,
+            user_id=user.id,
+        )
+        if not kb or not has_access:
+            raise ValueError("Knowledge base not found or access denied")
+        offset = max(0, offset)
+        limit = min(max(1, limit), MAX_KNOWLEDGE_LIST_LIMIT)
+
+        documents, total = KnowledgeService.list_documents_paginated(
+            db=db,
+            knowledge_base_id=knowledge_base_id,
+            user_id=user.id,
+            folder_id=folder_id,
+            offset=offset,
+            limit=limit,
+            include_subfolders=include_subfolders,
+            keyword=keyword,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            content_origin=content_origin,
+        )
+
+        # Batch query user names for created_by field
+        user_ids = list({doc.user_id for doc in documents if doc.user_id})
+        user_name_map: dict[int, str] = {}
+        if user_ids:
+            user_rows = (
+                db.query(User.id, User.user_name).filter(User.id.in_(user_ids)).all()
+            )
+            user_name_map = {uid: uname for uid, uname in user_rows}
+
+        items = []
+        for doc in documents:
+            item = KnowledgeDocumentResponse.model_validate(doc)
+            item.created_by = user_name_map.get(doc.user_id)
+            items.append(item)
+
+        return KnowledgeDocumentListResponse(
+            total=total,
+            returned_count=len(items),
+            limit=limit,
+            offset=offset,
+            has_more=offset + len(items) < total,
+            items=items,
+        )
+
+    def get_document(
+        self,
+        db: Session,
+        user: User,
+        document_id: int,
+    ) -> KnowledgeDocumentResponse:
+        """Return one accessible document with its current processing state."""
+        document = self._get_document_with_access_or_raise(db, user, document_id)
+        response = KnowledgeDocumentResponse.model_validate(document)
+        creator = db.query(User.user_name).filter(User.id == document.user_id).first()
+        response.created_by = creator[0] if creator else None
+        return response
+
+    def _get_document_with_access_or_raise(
+        self,
+        db: Session,
+        user: User,
+        document_id: int,
+    ) -> KnowledgeDocument:
+        """Fetch a document and validate its knowledge-base level access."""
+        document = (
+            db.query(KnowledgeDocument)
+            .filter(KnowledgeDocument.id == document_id)
+            .first()
+        )
+        if not document:
+            raise ValueError("Document not found")
+
+        knowledge_base, has_access = KnowledgeService.get_knowledge_base(
+            db=db,
+            knowledge_base_id=document.kind_id,
+            user_id=user.id,
+        )
+        if not knowledge_base:
+            raise ValueError("Knowledge base not found")
+        if not has_access:
+            raise ValueError("Access denied to this document")
+
+        return document
+
+    @staticmethod
+    def _assert_external_document_previewable(document: KnowledgeDocument) -> None:
+        """Reject placeholders; stored content does not depend on index health."""
+        if document.source_type != DocumentSourceType.EXTERNAL.value:
+            return
+        if not document.attachment_id:
+            raise ValueError("Document content is not ready for preview")
+
+    def read_document_content(
+        self,
+        db: Session,
+        user: User,
+        document_id: int,
+        offset: int = 0,
+        limit: int = MAX_DOCUMENT_READ_LIMIT,
+    ) -> DocumentContentReadResponse:
+        """
+        Read raw document content with offset/limit pagination.
+
+        Args:
+            db: Database session
+            user: Current user
+            document_id: Document ID
+            offset: Read start offset
+            limit: Maximum number of characters to return
+
+        Returns:
+            DocumentContentReadResponse
+
+        Raises:
+            ValueError: If paging is invalid, the document is missing, or access fails
+        """
+        _validate_document_read_paging(offset=offset, limit=limit)
+
+        document = self._get_document_with_access_or_raise(
+            db=db,
+            user=user,
+            document_id=document_id,
+        )
+        self._assert_external_document_previewable(document)
+
+        results = document_read_service.read_documents(
+            db=db,
+            document_ids=[document_id],
+            offset=offset,
+            limit=limit,
+            knowledge_base_ids=[document.kind_id],
+            searchable_only=False,
+        )
+        result = results[0] if results else None
+
+        if not result or result.get("error_code") == DOCUMENT_READ_ERROR_NOT_FOUND:
+            raise ValueError("Document not found")
+        if result.get("error"):
+            raise ValueError(result["error"])
+        _validate_document_read_result_payload(result)
+
+        # An attachment ID alone does not prove that stored text is readable.
+        # Use total length, not page length: a valid EOF page can be empty.
+        if document.source_type == "external" and result["total_length"] == 0:
+            raise ValueError("Document content is not ready for preview")
+
+        return DocumentContentReadResponse(
+            document_id=result["id"],
+            name=result["name"],
+            content=result["content"],
+            total_length=result["total_length"],
+            offset=result["offset"],
+            returned_length=result["returned_length"],
+            has_more=result["has_more"],
+            kb_id=result["kb_id"],
+            index_status=document.index_status,
+        )
+
+    async def get_document_detail(
+        self,
+        db: Session,
+        user: User,
+        document_id: int,
+        include_content: bool = True,
+        include_summary: bool = True,
+        offset: int = 0,
+        limit: int = MAX_DOCUMENT_READ_LIMIT,
+    ) -> DocumentDetailResponse:
+        """Aggregate optional document content and summary into a detail response."""
+        document = self._get_document_with_access_or_raise(
+            db=db,
+            user=user,
+            document_id=document_id,
+        )
+
+        content = None
+        content_length = None
+        truncated = None
+        summary = None
+
+        if include_content:
+            paged = self.read_document_content(
+                db=db,
+                user=user,
+                document_id=document_id,
+                offset=offset,
+                limit=limit,
+            )
+            content = paged.content
+            content_length = paged.total_length
+            truncated = (paged.offset > 0) or paged.has_more
+
+        if include_summary:
+            from app.services.knowledge.summary_service import get_summary_service
+
+            summary_service = get_summary_service(db)
+            summary_result = await summary_service.get_document_summary(document_id)
+            summary = (
+                summary_result.model_dump()
+                if hasattr(summary_result, "model_dump")
+                else summary_result
+            )
+
+        return DocumentDetailResponse(
+            document_id=document_id,
+            content=content,
+            content_length=content_length,
+            truncated=truncated,
+            summary=summary,
+        )
+
+    def get_knowledge_base(
+        self,
+        db: Session,
+        user: User,
+        knowledge_base_id: int,
+    ) -> KnowledgeBaseResponse:
+        """
+        Get a knowledge base by ID.
+
+        Args:
+            db: Database session
+            user: Current user
+            knowledge_base_id: Knowledge base ID
+
+        Returns:
+            KnowledgeBaseResponse
+
+        Raises:
+            ValueError: If knowledge base not found or access denied
+        """
+        knowledge_base, has_access = KnowledgeService.get_knowledge_base(
+            db=db,
+            knowledge_base_id=knowledge_base_id,
+            user_id=user.id,
+        )
+
+        if not knowledge_base:
+            raise ValueError("Knowledge base not found")
+        if not has_access:
+            raise ValueError("Access denied to knowledge base")
+
+        return KnowledgeBaseResponse.from_kind(
+            knowledge_base, KnowledgeService.get_document_count(db, knowledge_base.id)
+        )
+
+    def update_knowledge_base(
+        self,
+        db: Session,
+        user: User,
+        knowledge_base_id: int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        direct_access_requirement: Optional[Literal["read", "edit"]] = None,
+        allow_document_download: Optional[bool] = None,
+        retrieval_config: Optional[Dict[str, Any]] = None,
+        summary_enabled: Optional[bool] = None,
+        summary_model_ref: Optional[Dict[str, str]] = None,
+        execution_model_ref: Optional[Dict[str, str]] = None,
+        execution_model_ref_is_set: bool = False,
+        show_generation_task: Optional[bool] = None,
+        generation_strategy: Optional[str] = None,
+        generation_strategy_is_set: bool = False,
+        guided_questions: Optional[List[str]] = None,
+        max_calls_per_conversation: Optional[int] = None,
+        exempt_calls_before_check: Optional[int] = None,
+        multimodal_update_fields: Optional[Dict[str, Any]] = None,
+        dingtalk_auto_sync_enabled: Optional[bool] = None,
+    ) -> KnowledgeBaseResponse:
+        """
+        Update a knowledge base.
+
+        Args:
+            db: Database session
+            user: Current user
+            knowledge_base_id: Knowledge base ID
+            name: New name (optional)
+            description: New description (optional)
+            retrieval_config: New retrieval config (optional)
+            summary_enabled: New summary enabled flag (optional)
+            summary_model_ref: New summary model reference (optional)
+            execution_model_ref: Code Wiki execution model reference. Explicit null
+                clears the override, so its presence is tracked separately.
+            show_generation_task: Whether Code Wiki generation tasks are visible.
+            generation_strategy: Default Code Wiki orchestration strategy.
+            guided_questions: New guided questions list (optional)
+            max_calls_per_conversation: Max calls per conversation (optional)
+            exempt_calls_before_check: Exempt calls before check (optional)
+            multimodal_update_fields: Explicitly-set multimodal spec fields (only
+                keys the client sent are present; a ``None`` value means clear).
+                When None the multimodal spec is left untouched.
+
+        Returns:
+            KnowledgeBaseResponse
+
+        Raises:
+            ValueError: If knowledge base not found, access denied, or validation fails
+        """
+        from app.schemas.knowledge import KnowledgeBaseUpdate
+
+        # Build update data with only provided fields to preserve unset-vs-clear semantics
+        # Only include fields that were explicitly provided (not None)
+        update_fields = {}
+        if name is not None:
+            update_fields["name"] = name
+        if description is not None:
+            update_fields["description"] = description
+        if direct_access_requirement is not None:
+            update_fields["direct_access_requirement"] = direct_access_requirement
+        if allow_document_download is not None:
+            update_fields["allow_document_download"] = allow_document_download
+        if retrieval_config is not None:
+            # An edit only writes the fields the caller sent, so only those are
+            # validated; a stored configuration that predates the current limits
+            # keeps its values until the caller changes them.
+            update_fields["retrieval_config"] = validate_retrieval_config_update(
+                retrieval_config
+            )
+        if dingtalk_auto_sync_enabled is not None:
+            update_fields["dingtalk_auto_sync_enabled"] = dingtalk_auto_sync_enabled
+        if summary_enabled is not None:
+            update_fields["summary_enabled"] = summary_enabled
+        if summary_model_ref is not None:
+            update_fields["summary_model_ref"] = summary_model_ref
+        if execution_model_ref_is_set:
+            update_fields["execution_model_ref"] = execution_model_ref
+        if show_generation_task is not None:
+            update_fields["show_generation_task"] = show_generation_task
+        if generation_strategy_is_set:
+            from app.services.knowledge.code_wiki.generation_policy import (
+                ready_strategy_for_new_wiki,
+            )
+
+            if generation_strategy is None:
+                raise ValueError("A code wiki generation strategy cannot be cleared")
+            update_fields["generation_strategy"] = ready_strategy_for_new_wiki(
+                db, user=user, requested_id=generation_strategy
+            )
+        if guided_questions is not None:
+            update_fields["guided_questions"] = guided_questions
+        if max_calls_per_conversation is not None:
+            update_fields["max_calls_per_conversation"] = max_calls_per_conversation
+        if exempt_calls_before_check is not None:
+            update_fields["exempt_calls_before_check"] = exempt_calls_before_check
+
+        update_data = KnowledgeBaseUpdate(**update_fields)
+
+        knowledge_base = KnowledgeService.update_knowledge_base(
+            db=db,
+            knowledge_base_id=knowledge_base_id,
+            user_id=user.id,
+            data=update_data,
+            multimodal_update_fields=multimodal_update_fields,
+        )
+
+        if not knowledge_base:
+            raise ValueError("Knowledge base not found or access denied")
+
+        return KnowledgeBaseResponse.from_kind(
+            knowledge_base, KnowledgeService.get_document_count(db, knowledge_base.id)
+        )
+
+    # Parameters every knowledge base has, forwarded by both public methods below.
+    # Long because the API is long; the two wrappers stay thin by passing them
+    # straight through rather than each growing their own resolution logic.
+    def _create(
+        self,
+        db: Session,
+        user: User,
+        *,
+        name: str,
+        kb_type: str,
+        description: Optional[str] = None,
+        namespace: str = "default",
+        direct_access_requirement: Literal["read", "edit"] = "read",
+        allow_document_download: Optional[bool] = None,
+        dingtalk_auto_sync_enabled: bool = False,
+        summary_enabled: bool = False,
+        rag_config_mode: Literal["auto", "disabled"] = "auto",
+        # REST API scenario: pass complete config
+        retrieval_config: Optional[Dict[str, Any]] = None,
+        # MCP scenario: auto-select or explicitly specify
+        retriever_name: Optional[str] = None,
+        retriever_namespace: Optional[str] = None,
+        embedding_model_name: Optional[str] = None,
+        embedding_model_namespace: Optional[str] = None,
+        summary_model_ref: Optional[Dict[str, str]] = None,
+        execution_model_ref: Optional[Dict[str, str]] = None,
+        # MCP context: for getting task's model as summary model
+        task_id: Optional[int] = None,
+        # Multimodal analysis config (KB create). Defaults: enabled=False when
+        # unset, prompts=None (system default).
+        multimodal_analysis_enabled: Optional[bool] = None,
+        multimodal_analysis_model_ref: Optional[Dict[str, str]] = None,
+        multimodal_analysis_video_prompt: Optional[str] = None,
+        multimodal_analysis_image_prompt: Optional[str] = None,
+        # Code wiki only. Private, so being able to express both shapes here is not a
+        # hazard -- no caller outside this class can reach it, and the two public
+        # methods each fix these. That is the whole point of the split: one
+        # implementation underneath, and a public surface that cannot say "code wiki"
+        # unless you called the method that also registers the repository.
+        source: Optional[SourceRepository] = None,
+        show_generation_task: bool = False,
+        language: str = "",
+        generation_strategy: Optional[str] = None,
+    ) -> int:
+        """Resolve defaults, persist a knowledge base, and return its id.
+
+        **Does not commit.** The caller owns the transaction, because a code wiki is
+        not complete until its repository is registered and the two have to land
+        together.
+        """
+        logger.info(
+            f"[Orchestrator] create_knowledge_base called: name={name}, namespace={namespace}, "
+            f"kb_type={kb_type}, summary_enabled={summary_enabled}, task_id={task_id}, "
+            f"rag_config_mode={rag_config_mode}, "
+            f"user_id={user.id}, has_retrieval_config={retrieval_config is not None}, "
+            f"has_summary_model_ref={summary_model_ref is not None}"
+        )
+
+        resolved_retrieval_config = self._resolve_retrieval_config(
+            db=db,
+            user=user,
+            namespace=namespace,
+            retrieval_config=retrieval_config,
+            rag_config_mode=rag_config_mode,
+            retriever_name=retriever_name,
+            retriever_namespace=retriever_namespace,
+            embedding_model_name=embedding_model_name,
+            embedding_model_namespace=embedding_model_namespace,
+        )
+
+        # Auto-select summary model if summary_enabled and not specified
+        resolved_summary_model_ref = summary_model_ref
+        if summary_enabled and not resolved_summary_model_ref:
+            logger.info(
+                f"[Orchestrator] Auto-selecting summary model: task_id={task_id}"
+            )
+            if task_id:
+                task_model = self.get_task_model_as_summary_model(db, task_id, user.id)
+                if task_model:
+                    resolved_summary_model_ref = task_model
+            # Fallback: use first available LLM model
+            if not resolved_summary_model_ref:
+                logger.info(
+                    f"[Orchestrator] Task model not found, falling back to first available LLM"
+                )
+                models = self._get_available_models(db, user, namespace, "llm")
+                if models:
+                    first_model = models[0]
+                    resolved_summary_model_ref = {
+                        "name": first_model["name"],
+                        "namespace": first_model.get("namespace", "default"),
+                        "type": first_model.get("type", "public"),  # Include model type
+                    }
+                    logger.info(
+                        f"[Orchestrator] Auto-selected summary model from available LLMs: "
+                        f"name={resolved_summary_model_ref['name']}, "
+                        f"type={resolved_summary_model_ref['type']}"
+                    )
+                else:
+                    logger.warning(
+                        f"[Orchestrator] No LLM models available for user_id={user.id}, "
+                        f"namespace={namespace}"
+                    )
+
+        # Fallback: if summary_enabled but no model found, disable summary
+        if summary_enabled and not resolved_summary_model_ref:
+            logger.warning(
+                f"[Orchestrator] No LLM model available for summary generation, "
+                f"disabling summary for KB: name={name}"
+            )
+            summary_enabled = False
+
+        data = KnowledgeBaseCreate(
+            name=name,
+            description=description,
+            namespace=namespace,
+            direct_access_requirement=direct_access_requirement,
+            allow_document_download=allow_document_download,
+            kb_type=KnowledgeBaseType(kb_type),
+            source=source.to_spec() if source else None,
+            language=language or None,
+            show_generation_task=show_generation_task,
+            generation_strategy=generation_strategy,
+            retrieval_config=resolved_retrieval_config,
+            dingtalk_auto_sync_enabled=dingtalk_auto_sync_enabled,
+            summary_enabled=summary_enabled,
+            summary_model_ref=resolved_summary_model_ref,
+            execution_model_ref=execution_model_ref,
+            multimodal_analysis_enabled=(
+                multimodal_analysis_enabled
+                if multimodal_analysis_enabled is not None
+                else False
+            ),
+            multimodal_analysis_model_ref=multimodal_analysis_model_ref,
+            multimodal_analysis_video_prompt=multimodal_analysis_video_prompt,
+            multimodal_analysis_image_prompt=multimodal_analysis_image_prompt,
+        )
+
+        return KnowledgeService.create_knowledge_base(
+            db=db,
+            user_id=user.id,
+            data=data,
+        )
+
+    def _created(self, db: Session, user: User, kb_id: int) -> KnowledgeBaseResponse:
+        """Read back what was just written, in the shape the API returns."""
+        knowledge_base, has_access = KnowledgeService.get_knowledge_base(
+            db=db,
+            knowledge_base_id=kb_id,
+            user_id=user.id,
+        )
+        if not knowledge_base:
+            raise ValueError("Knowledge base not found")
+        if not has_access:
+            raise ValueError("Access denied to knowledge base")
+
+        return KnowledgeBaseResponse.from_kind(
+            knowledge_base, KnowledgeService.get_document_count(db, knowledge_base.id)
+        )
+
+    def create_knowledge_base(
+        self,
+        db: Session,
+        user: User,
+        name: str,
+        description: Optional[str] = None,
+        namespace: str = "default",
+        direct_access_requirement: Literal["read", "edit"] = "read",
+        allow_document_download: Optional[bool] = None,
+        kb_type: str = KnowledgeBaseType.NOTEBOOK.value,
+        summary_enabled: bool = False,
+        rag_config_mode: Literal["auto", "disabled"] = "auto",
+        retrieval_config: Optional[Dict[str, Any]] = None,
+        retriever_name: Optional[str] = None,
+        retriever_namespace: Optional[str] = None,
+        embedding_model_name: Optional[str] = None,
+        embedding_model_namespace: Optional[str] = None,
+        summary_model_ref: Optional[Dict[str, str]] = None,
+        task_id: Optional[int] = None,
+        multimodal_analysis_enabled: Optional[bool] = None,
+        multimodal_analysis_model_ref: Optional[Dict[str, str]] = None,
+        multimodal_analysis_video_prompt: Optional[str] = None,
+        multimodal_analysis_image_prompt: Optional[str] = None,
+        dingtalk_auto_sync_enabled: bool = False,
+    ) -> KnowledgeBaseResponse:
+        """
+        Create a knowledge base with auto-configuration support.
+
+        Supports two RAG modes:
+        1. auto: Use a complete provided config or auto-select missing defaults.
+        2. disabled: Create a knowledge base without RAG retrieval config.
+
+        Auto-selection logic:
+        1. retriever: If not specified, auto-select using get_default_retriever()
+        2. embedding: If not specified, auto-select using get_default_embedding_model()
+        3. summary_model: If not specified and summary_enabled=True:
+           - If task_id provided, use get_task_model_as_summary_model()
+           - Otherwise use first available LLM model
+
+        Args:
+            db: Database session
+            user: Current user
+            name: Knowledge base name
+            description: Optional description
+            namespace: Namespace (default for personal, group name for group)
+            kb_type: Type (notebook or classic)
+            summary_enabled: Enable summary generation
+            rag_config_mode: RAG configuration mode
+            retrieval_config: Complete retrieval config dict (REST API mode)
+            retriever_name: Optional retriever name (MCP mode)
+            retriever_namespace: Optional retriever namespace (MCP mode)
+            embedding_model_name: Optional embedding model name (MCP mode)
+            embedding_model_namespace: Optional embedding model namespace (MCP mode)
+            summary_model_ref: Optional summary model reference
+            task_id: Optional task ID for resolving summary model
+
+        Returns:
+            KnowledgeBaseResponse
+
+        Raises:
+            ValueError: If validation fails, or if a code wiki is asked for.
+        """
+        # A code wiki cannot be made here, and refusing rather than ignoring the type
+        # is what makes this a gate. It is bound to a repository the caller must be
+        # able to read, and it is not complete until that repository is registered --
+        # neither of which this method knows how to do. Checked once, here, rather
+        # than in each caller: MCP was missing the check the REST endpoint had, and a
+        # rollout flag that only some entrances honour is not a flag.
+        if kb_type not in (
+            KnowledgeBaseType.NOTEBOOK.value,
+            KnowledgeBaseType.CLASSIC.value,
+        ):
+            raise ValueError(
+                f"'{kb_type}' knowledge bases cannot be created here; use the "
+                "dedicated code wiki endpoint"
+            )
+
+        kb_id = self._create(
+            db,
+            user,
+            name=name,
+            kb_type=kb_type,
+            description=description,
+            namespace=namespace,
+            direct_access_requirement=direct_access_requirement,
+            allow_document_download=allow_document_download,
+            dingtalk_auto_sync_enabled=dingtalk_auto_sync_enabled,
+            summary_enabled=summary_enabled,
+            rag_config_mode=rag_config_mode,
+            retrieval_config=retrieval_config,
+            retriever_name=retriever_name,
+            retriever_namespace=retriever_namespace,
+            embedding_model_name=embedding_model_name,
+            embedding_model_namespace=embedding_model_namespace,
+            summary_model_ref=summary_model_ref,
+            task_id=task_id,
+            multimodal_analysis_enabled=multimodal_analysis_enabled,
+            multimodal_analysis_model_ref=multimodal_analysis_model_ref,
+            multimodal_analysis_video_prompt=multimodal_analysis_video_prompt,
+            multimodal_analysis_image_prompt=multimodal_analysis_image_prompt,
+        )
+        db.commit()
+        return self._created(db, user, kb_id)
+
+    def create_code_wiki(
+        self,
+        db: Session,
+        user: User,
+        name: str,
+        *,
+        source: SourceRepository,
+        description: Optional[str] = None,
+        namespace: str = "default",
+        direct_access_requirement: Literal["read", "edit"] = "read",
+        allow_document_download: Optional[bool] = None,
+        # Empty is not "English", it is "fall back to the deployment default", which
+        # is also what a wiki created before this field existed does.
+        language: str = "",
+        # Whether this wiki's generation runs are listed as conversations.
+        show_generation_task: bool = False,
+        generation_strategy: Optional[str] = None,
+        summary_enabled: bool = False,
+        rag_config_mode: Literal["auto", "disabled"] = "auto",
+        retrieval_config: Optional[Dict[str, Any]] = None,
+        summary_model_ref: Optional[Dict[str, str]] = None,
+        execution_model_ref: Optional[Dict[str, str]] = None,
+        multimodal_analysis_enabled: Optional[bool] = None,
+        multimodal_analysis_model_ref: Optional[Dict[str, str]] = None,
+        multimodal_analysis_video_prompt: Optional[str] = None,
+        multimodal_analysis_image_prompt: Optional[str] = None,
+    ) -> KnowledgeBaseResponse:
+        """Create a knowledge base bound to a source repository.
+
+        ``source`` is required rather than optional, which is what stops a code wiki
+        with no repository from being expressible at all -- the shape that used to be
+        reachable through any generic caller, and that regenerating can only answer
+        with "this code wiki has no source repository recorded".
+
+        The registration in ``wiki_projects`` happens in the same transaction as the
+        knowledge base. It used to follow a commit, so a failure between the two left
+        a committed code wiki that no run could ever start and no list would show.
+
+        Whether code wikis may be created at all, and whether this caller may read
+        the repository, are decided by the endpoint: they are about who is asking,
+        not about what a code wiki is.
+        """
+        from app.services.knowledge.code_wiki.generation_policy import (
+            ready_strategy_for_new_wiki,
+        )
+        from app.services.knowledge.code_wiki.registry import claim_repository
+
+        generation_strategy = ready_strategy_for_new_wiki(
+            db, user=user, requested_id=generation_strategy
+        )
+
+        kb_id = self._create(
+            db,
+            user,
+            name=name,
+            kb_type=KnowledgeBaseType.CODE_WIKI.value,
+            description=description,
+            namespace=namespace,
+            direct_access_requirement=direct_access_requirement,
+            allow_document_download=allow_document_download,
+            summary_enabled=summary_enabled,
+            rag_config_mode=rag_config_mode,
+            retrieval_config=retrieval_config,
+            summary_model_ref=summary_model_ref,
+            execution_model_ref=execution_model_ref,
+            multimodal_analysis_enabled=multimodal_analysis_enabled,
+            multimodal_analysis_model_ref=multimodal_analysis_model_ref,
+            multimodal_analysis_video_prompt=multimodal_analysis_video_prompt,
+            multimodal_analysis_image_prompt=multimodal_analysis_image_prompt,
+            source=source,
+            show_generation_task=show_generation_task,
+            language=language,
+            generation_strategy=generation_strategy,
+        )
+        claim_repository(db, source, kb_id)
+        db.commit()
+        return self._created(db, user, kb_id)
+
+    def create_document_with_content(
+        self,
+        db: Session,
+        user: User,
+        knowledge_base_id: int,
+        name: str,
+        source_type: str,
+        folder_id: int = 0,
+        content: Optional[str] = None,
+        file_base64: Optional[str] = None,
+        file_extension: Optional[str] = None,
+        url: Optional[str] = None,
+        attachment_id: Optional[int] = None,
+        trigger_indexing: bool = True,
+        trigger_summary: bool = True,
+        splitter_config: Optional[Dict[str, Any]] = None,
+    ) -> KnowledgeDocumentResponse:
+        """
+        Create a document with complete workflow.
+
+        Flow: Upload attachment → Create document → Schedule indexing via Celery
+
+        Args:
+            db: Database session
+            user: Current user
+            knowledge_base_id: Target knowledge base ID
+            name: Document name
+            source_type: Source type (text, file, web, attachment)
+            folder_id: Optional folder ID to place the document in (0 means root)
+            content: Text content for source_type="text"
+            file_base64: Base64 encoded file for source_type="file"
+            file_extension: File extension for source_type="file"
+            url: URL for source_type="web"
+            attachment_id: Existing attachment ID for source_type="attachment"
+            trigger_indexing: Whether to trigger RAG indexing
+            trigger_summary: Whether to trigger summary generation
+            splitter_config: Optional splitter configuration dict
+
+        Returns:
+            KnowledgeDocumentResponse
+
+        Raises:
+            ValueError: If validation fails or access denied
+        """
+        from app.services.context import context_service
+
+        # Verify access
+        kb, has_access = KnowledgeService.get_knowledge_base(
+            db=db,
+            knowledge_base_id=knowledge_base_id,
+            user_id=user.id,
+        )
+        if not kb:
+            raise ValueError("Knowledge base not found")
+        if not has_access:
+            raise ValueError("Access denied to knowledge base")
+        if not KnowledgeService.can_manage_knowledge_base_documents(
+            db, knowledge_base_id, user.id
+        ):
+            raise ValueError(
+                "You do not have permission to add documents to this knowledge base"
+            )
+
+        # Validate input based on source_type
+        normalized_ext: str = DEFAULT_TEXT_FILE_EXTENSION
+        binary_data: bytes = b""
+
+        if source_type == "text":
+            if not content:
+                raise ValueError("content is required for source_type='text'")
+            normalized_ext = _normalize_file_extension(file_extension)
+            binary_data = content.encode("utf-8")
+
+        elif source_type == "file":
+            if not file_base64 or not file_extension:
+                raise ValueError(
+                    "file_base64 and file_extension are required for source_type='file'"
+                )
+            normalized_ext = _normalize_file_extension(file_extension)
+            try:
+                binary_data = base64.b64decode(file_base64)
+            except Exception as e:
+                raise ValueError(f"Invalid base64 encoding: {e}")
+
+        elif source_type == "web":
+            if not url:
+                raise ValueError("url is required for source_type='web'")
+            # Scrape URL content
+            binary_data, normalized_ext = self._scrape_url_content(url)
+
+        elif source_type == "attachment":
+            if not attachment_id:
+                raise ValueError(
+                    "attachment_id is required for source_type='attachment'"
+                )
+
+            source_context = self._get_import_attachment(db, user, attachment_id)
+
+            doc_data = KnowledgeDocumentCreate(
+                name=name or source_context.original_filename,
+                source_type="file",
+                attachment_id=attachment_id,
+                file_extension=source_context.file_extension,
+                file_size=source_context.file_size,
+                folder_id=folder_id,
+                splitter_config=splitter_config,
+            )
+            return self.create_document_from_attachment(
+                db=db,
+                user=user,
+                knowledge_base_id=knowledge_base_id,
+                data=doc_data,
+                trigger_indexing=trigger_indexing,
+                trigger_summary=trigger_summary,
+            )
+
+        else:
+            raise ValueError(f"Invalid source_type: {source_type}")
+
+        # Upload attachment (for text, file, web source types)
+        filename = _build_filename(name, normalized_ext)
+        attachment, _ = context_service.upload_attachment(
+            db=db,
+            user_id=user.id,
+            filename=filename,
+            binary_data=binary_data,
+            subtask_id=0,
+        )
+
+        # Create document using shared helper
+        doc_data = KnowledgeDocumentCreate(
+            name=name,
+            source_type=source_type,
+            attachment_id=attachment.id,
+            file_extension=normalized_ext,
+            file_size=len(binary_data),
+            folder_id=folder_id,
+        )
+
+        return self._create_and_index_document(
+            db=db,
+            user=user,
+            knowledge_base=kb,
+            knowledge_base_id=knowledge_base_id,
+            data=doc_data,
+            trigger_indexing=trigger_indexing,
+            trigger_summary=trigger_summary,
+            splitter_config=splitter_config,
+        )
+
+    def create_document_from_attachment(
+        self,
+        db: Session,
+        user: User,
+        knowledge_base_id: int,
+        data: KnowledgeDocumentCreate,
+        trigger_indexing: bool = True,
+        trigger_summary: bool = True,
+    ) -> KnowledgeDocumentResponse:
+        """
+        Create a document from an already uploaded attachment.
+
+        This method is used by REST API where attachment is uploaded separately
+        via /api/attachments/upload endpoint.
+
+        Flow: Verify source access → Copy attachment → Create document → Schedule indexing
+
+        Args:
+            db: Database session
+            user: Current user
+            knowledge_base_id: Target knowledge base ID
+            data: Document creation data with attachment_id
+            trigger_indexing: Whether to trigger RAG indexing
+            trigger_summary: Whether to trigger summary generation
+
+        Returns:
+            KnowledgeDocumentResponse
+
+        Raises:
+            ValueError: If validation fails or access denied
+        """
+        # Verify access
+        kb, has_access = KnowledgeService.get_knowledge_base(
+            db=db,
+            knowledge_base_id=knowledge_base_id,
+            user_id=user.id,
+        )
+        if not kb:
+            raise ValueError("Knowledge base not found")
+        if not has_access:
+            raise ValueError("Access denied to knowledge base")
+        if not KnowledgeService.can_manage_knowledge_base_documents(
+            db, knowledge_base_id, user.id
+        ):
+            raise ValueError(
+                "You do not have permission to add documents to this knowledge base"
+            )
+
+        from app.services.context import context_service
+
+        source = self._get_import_attachment(db, user, data.attachment_id)
+        attachment = context_service.copy_attachment_for_user(db, source, user.id)
+        data = data.model_copy(
+            update={
+                "attachment_id": attachment.id,
+                "file_extension": normalize_document_extension(
+                    attachment.file_extension
+                ),
+                "file_size": attachment.file_size,
+            }
+        )
+
+        # Get splitter config from data if provided
+        splitter_config_dict = None
+        if data.splitter_config:
+            splitter_config_dict = data.splitter_config.model_dump(exclude_none=True)
+
+        return self._create_and_index_document(
+            db=db,
+            user=user,
+            knowledge_base=kb,
+            knowledge_base_id=knowledge_base_id,
+            data=data,
+            trigger_indexing=trigger_indexing,
+            trigger_summary=trigger_summary,
+            splitter_config=splitter_config_dict,
+        )
+
+    @staticmethod
+    def _get_import_attachment(
+        db: Session, user: User, attachment_id: Optional[int]
+    ) -> SubtaskContext:
+        """Authorize the caller's source before reading any attachment content."""
+        from app.models.subtask_context import ContextStatus, ContextType
+        from app.services.context import context_service
+
+        source = context_service.get_context_optional(
+            db=db, context_id=attachment_id, user_id=user.id
+        )
+        if source is None:
+            raise ValueError(f"Attachment {attachment_id} not found or access denied")
+        if source.context_type != ContextType.ATTACHMENT.value:
+            raise ValueError(f"Context {attachment_id} is not an attachment")
+        if source.status != ContextStatus.READY.value:
+            raise ValueError(f"Attachment {attachment_id} is not ready")
+        return source
+
+    def attach_external_document_content(
+        self,
+        db: Session,
+        document: KnowledgeDocument,
+        user: User,
+        content: ExternalDocumentContent,
+        generation: int,
+    ) -> Dict[str, Any]:
+        """
+        Attach fetched external content to an external document and index it.
+
+        Creates the attachment from the provider-fetched body, then lands it on
+        the document through a guarded write (see ``_land_external_content``).
+        The user's own folder is never overwritten; a DingTalk copy's name
+        follows its source title (see ``_land_external_content``).
+
+        Args:
+            db: Database session
+            document: External KnowledgeDocument with external identity
+            user: Document owner (used for indexing dispatch metadata)
+            content: Fetched external document content
+            generation: The import attempt's claimed index generation
+
+        Returns:
+            Dispatch result dict from the indexing scheduler
+
+        Raises:
+            ExternalImportLostWriteError: The attempt lost its write right.
+        """
+        from app.services.context import context_service
+
+        # The import entry point checks the caller's KB permission. The source
+        # credential owner need not belong to the KB after a document is moved.
+        kb = (
+            db.query(Kind)
+            .filter(
+                Kind.id == document.kind_id,
+                Kind.kind == "KnowledgeBase",
+                Kind.is_active.is_(True),
+            )
+            .first()
+        )
+        if kb is None:
+            raise ValueError(
+                f"Knowledge base {document.kind_id} not found for external "
+                f"document {document.id}"
+            )
+
+        # Upload commits can expire the document, including after its deletion.
+        document_id = document.id
+        owner_user_id = document.user_id
+        previous_attachment_id = document.attachment_id
+        previous_converted_id = document.converted_attachment_id
+        retry_orphan_cleanup = document.external_provider == WIKI_PROVIDER_ID
+        has_refresh_snapshot = (
+            get_external_refresh_snapshot(document, generation) is not None
+        )
+        attachment, _ = context_service.upload_attachment(
+            db=db,
+            user_id=owner_user_id,
+            filename=_build_filename(content.name, content.file_extension),
+            binary_data=content.content,
+            subtask_id=0,
+            lifecycle_owner=(
+                EXTERNAL_WIKI_ATTACHMENT_LIFECYCLE_OWNER
+                if retry_orphan_cleanup
+                else None
+            ),
+        )
+
+        attachment_id = attachment.id
+        try:
+            if retry_orphan_cleanup:
+                mark_attachments_for_orphan_cleanup(
+                    db,
+                    {
+                        value
+                        for value in (
+                            previous_attachment_id,
+                            previous_converted_id,
+                        )
+                        if value
+                    },
+                )
+            self._land_external_content(db, document, content, attachment, generation)
+        except Exception as exc:
+            # A failed commit can have an uncertain outcome; keep any linked body.
+            db.rollback()
+            linked_attachment_id = (
+                db.query(KnowledgeDocument.attachment_id)
+                .filter(KnowledgeDocument.id == document_id)
+                .scalar()
+            )
+            if linked_attachment_id != attachment_id:
+                delete_attachment_best_effort(
+                    db,
+                    owner_user_id,
+                    attachment_id,
+                    retry_orphan_cleanup=retry_orphan_cleanup,
+                )
+            if isinstance(exc, ObjectDeletedError):
+                raise ExternalImportLostWriteError(
+                    f"Document {document_id} was deleted while importing"
+                ) from exc
+            raise
+
+        if not has_refresh_snapshot:
+            for previous_id in {previous_attachment_id, previous_converted_id}:
+                if previous_id and previous_id != attachment_id:
+                    delete_attachment_best_effort(
+                        db,
+                        owner_user_id,
+                        previous_id,
+                        retry_orphan_cleanup=retry_orphan_cleanup,
+                    )
+
+        db.refresh(document)
+
+        result = self._schedule_indexing_celery(
+            db=db,
+            knowledge_base=kb,
+            document=document,
+            user=user,
+            trigger_summary=True,
+            replace_active=True,
+            expected_generation=generation,
+        )
+        if not result["scheduled"]:
+            from app.schemas.knowledge import DocumentProcessingStage
+            from app.services.knowledge.index_state_machine import (
+                mark_document_index_enqueue_failed,
+            )
+            from app.services.knowledge.processing_errors import build_processing_error
+
+            mark_document_index_enqueue_failed(
+                db=db,
+                document_id=document.id,
+                generation=generation,
+                error=build_processing_error(
+                    stage=DocumentProcessingStage.DISPATCH,
+                    code="external_import_index_not_scheduled",
+                    message="External document indexing could not be started. Please retry.",
+                    retryable=True,
+                    generation=generation,
+                ),
+            )
+            db.refresh(document)
+        return result
+
+    def _land_external_content(
+        self,
+        db: Session,
+        document: KnowledgeDocument,
+        content: ExternalDocumentContent,
+        attachment: Any,
+        generation: int,
+    ) -> None:
+        """
+        Land fetched content on the document through a guarded write.
+
+        Only this attempt's generation may land the content, and only while
+        the document still exists with its external identity. Losing that
+        race (user deleted the document, or a newer attempt superseded this
+        one) raises ExternalImportLostWriteError. The caller cleans up the
+        unlinked attachment without accessing the possibly deleted document.
+
+        """
+        document_id = document.id
+
+        existing_external = document.external_source_config
+        incoming_external = dict(content.metadata or {})
+        existing_sync = existing_external.get("sync")
+        incoming_sync = incoming_external.get("sync")
+        if isinstance(existing_sync, dict) and isinstance(incoming_sync, dict):
+            incoming_external["sync"] = {**existing_sync, **incoming_sync}
+        merged_external = {
+            **existing_external,
+            **incoming_external,
+            "status": "accessible",
+        }
+        # Reading the source succeeded even if later conversion/indexing fails.
+        merged_external.pop("last_error", None)
+        merged_sync = merged_external.get("sync")
+        if isinstance(merged_sync, dict):
+            merged_sync = dict(merged_sync)
+            merged_sync.pop("last_error_code", None)
+            merged_external["sync"] = merged_sync
+        merged_source_config = dict(document.source_config or {})
+        merged_source_config["external"] = merged_external
+        # A conversion belongs to the previous body, never to its replacement.
+        merged_source_config.pop("converted_attachment_id", None)
+        stage_external_refresh_attachment(
+            merged_source_config,
+            generation=generation,
+            attachment_id=attachment.id,
+        )
+
+        update_fields = {
+            KnowledgeDocument.attachment_id: attachment.id,
+            KnowledgeDocument.file_extension: content.file_extension,
+            KnowledgeDocument.file_size: len(content.content),
+            KnowledgeDocument.source_config: merged_source_config,
+        }
+        sync_config = merged_external.get("sync")
+        follows_source_title = document.external_provider == "dingtalk" or (
+            isinstance(sync_config, dict) and sync_config.get("enabled")
+        )
+        if follows_source_title and content.name.strip():
+            # A copy's name follows its source title on every landed body; a
+            # blank source title never replaces the current name, and the
+            # folder always stays the user's own.
+            update_fields[KnowledgeDocument.name] = content.name[:255]
+
+        updated = (
+            db.query(KnowledgeDocument)
+            .filter(
+                KnowledgeDocument.id == document_id,
+                KnowledgeDocument.external_source.has(
+                    external_provider=document.external_provider,
+                    external_resource_id=document.external_resource_id,
+                ),
+                KnowledgeDocument.index_generation == generation,
+            )
+            .update(update_fields, synchronize_session=False)
+        )
+        db.commit()
+
+        if not updated:
+            raise ExternalImportLostWriteError(
+                f"Document {document_id} was deleted or superseded while "
+                f"importing at generation {generation}"
+            )
+
+    def _create_and_index_document(
+        self,
+        db: Session,
+        user: User,
+        knowledge_base: Kind,
+        knowledge_base_id: int,
+        data: KnowledgeDocumentCreate,
+        trigger_indexing: bool = True,
+        trigger_summary: bool = True,
+        splitter_config: Optional[Dict[str, Any]] = None,
+    ) -> KnowledgeDocumentResponse:
+        """
+        Shared helper to create document and schedule indexing.
+
+        This method contains the common logic for document creation and
+        indexing scheduling, used by both create_document_with_content
+        and create_document_from_attachment.
+
+        Args:
+            db: Database session
+            user: Current user
+            knowledge_base: Knowledge base Kind object (already verified)
+            knowledge_base_id: Knowledge base ID
+            data: Document creation data
+            trigger_indexing: Whether to trigger RAG indexing
+            trigger_summary: Whether to trigger summary generation
+            splitter_config: Optional splitter configuration dict
+
+        Returns:
+            KnowledgeDocumentResponse
+        """
+        from app.schemas.knowledge import DocumentSourceType
+        from app.services.knowledge.indexing import get_rag_indexing_skip_reason
+        from app.services.knowledge.multimodal_pipeline import (
+            resolve_dispatch_or_none,
+        )
+
+        attachment_id = data.attachment_id
+        attachment_owner_id = user.id
+        try:
+            # Multimodal pre-flight gate: resolves dispatch ctx for video/image files
+            # (model/api_key/download path) BEFORE document creation so a failure
+            # leaves no orphan. No-op for non-multimodal files (normal path proceeds).
+            # Skip when indexing is disabled — callers may store a video/image
+            # document without analyzing it immediately; the gate runs on reindex.
+            multimodal_dispatch_ctx = None
+            if trigger_indexing:
+                multimodal_dispatch_ctx = resolve_dispatch_or_none(
+                    db,
+                    knowledge_base,
+                    settings,
+                    file_extension=data.file_extension,
+                    attachment_id=data.attachment_id,
+                    uploader=user,
+                )
+
+            # Create document
+            document = KnowledgeService.create_document(
+                db=db,
+                knowledge_base_id=knowledge_base_id,
+                user_id=user.id,
+                data=data,
+            )
+        except Exception:
+            # Creation may commit before refresh fails. Only remove an unlinked
+            # body after rollback and a fresh reference check; dispatch is outside
+            # this cleanup boundary because the document already owns its body.
+            db.rollback()
+            referenced = (
+                db.query(KnowledgeDocument.id)
+                .filter(KnowledgeDocument.attachment_id == attachment_id)
+                .first()
+            )
+            if attachment_id and referenced is None:
+                delete_attachment_best_effort(db, attachment_owner_id, attachment_id)
+            raise
+
+        logger.info(
+            f"[Orchestrator] Created document {document.id} in KB {knowledge_base_id}"
+        )
+
+        skip_reason = get_rag_indexing_skip_reason(
+            data.file_extension,
+            data.file_size,
+        )
+
+        if trigger_indexing and not skip_reason:
+            self._schedule_indexing_celery(
+                db=db,
+                knowledge_base=knowledge_base,
+                document=document,
+                user=user,
+                caller_user_id=user.id,
+                trigger_summary=trigger_summary,
+                splitter_config=splitter_config,
+                multimodal_dispatch_ctx=multimodal_dispatch_ctx,
+            )
+        elif trigger_indexing and skip_reason:
+            logger.info(
+                f"[Orchestrator] Skipping indexing for document {document.id}: "
+                f"{skip_reason}"
+            )
+
+        return KnowledgeDocumentResponse.model_validate(document)
+
+    def update_document_content(
+        self,
+        db: Session,
+        user: User,
+        document_id: int,
+        content: str,
+        trigger_reindex: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Update document content and optionally trigger re-indexing via Celery.
+
+        Args:
+            db: Database session
+            user: Current user
+            document_id: Document ID
+            content: New content
+            trigger_reindex: Whether to trigger RAG re-indexing
+
+        Returns:
+            Dict with success status and document_id
+
+        Raises:
+            ValueError: If validation fails or access denied
+        """
+        # Update document content
+        document = KnowledgeService.update_document_content(
+            db=db,
+            document_id=document_id,
+            content=content,
+            user_id=user.id,
+        )
+
+        if not document:
+            raise ValueError("Document not found or access denied")
+
+        logger.info(f"[Orchestrator] Updated document {document_id} content")
+
+        # If the document has a converted attachment, clean it up.
+        # Content has been modified so the conversion result is stale.
+        # Drop the reference UNCONDITIONALLY: converted_attachment_id means
+        # "the current valid conversion result", and once the source content
+        # changes that semantics is void. Keeping the pointer (e.g. when
+        # delete_context returns False) would make the next reindex index the
+        # OLD converted Markdown (see tmp/2.md P1). If the physical attachment
+        # cannot be deleted now, leave it as an orphan for separate cleanup
+        # rather than holding onto the stale pointer.
+        old_converted_id = document.converted_attachment_id
+        if old_converted_id:
+            from app.services.context.context_service import context_service as _ctx_svc
+
+            document.converted_attachment_id = None
+            db.commit()
+            try:
+                deleted = _ctx_svc.delete_context(
+                    db=db,
+                    context_id=old_converted_id,
+                    user_id=document.user_id,
+                )
+                if deleted:
+                    logger.info(
+                        f"[Orchestrator] Cleaned up stale converted attachment "
+                        f"{old_converted_id} for document {document_id}"
+                    )
+                else:
+                    logger.warning(
+                        f"[Orchestrator] Converted attachment {old_converted_id} "
+                        f"not deleted for document {document_id} "
+                        f"(not found / owner mismatch / subtask-linked); "
+                        f"reference cleared, orphan left for cleanup"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[Orchestrator] Failed to delete old converted attachment "
+                    f"{old_converted_id}: {e}; reference cleared, orphan left for cleanup"
+                )
+
+        # Get knowledge base for indexing config
+        kb, has_access = KnowledgeService.get_knowledge_base(
+            db=db,
+            knowledge_base_id=document.kind_id,
+            user_id=user.id,
+        )
+
+        # Schedule re-indexing via Celery if enabled
+        if trigger_reindex and kb and has_access:
+            # Multimodal re-index gate: resolve dispatch preconditions (model/
+            # api_key, and for video the fid/download URL) before re-dispatch,
+            # so a content update on a multimodal document re-enters the
+            # multimodal pipeline. No-op for non-multimodal files.
+            from app.services.knowledge.multimodal_pipeline import (
+                resolve_dispatch_for_document_or_none,
+            )
+
+            multimodal_dispatch_ctx = resolve_dispatch_for_document_or_none(
+                db, kb, document, settings
+            )
+            self._schedule_indexing_celery(
+                db=db,
+                knowledge_base=kb,
+                document=document,
+                user=user,
+                caller_user_id=user.id,
+                trigger_summary=False,  # Don't re-generate summary on update
+                allow_if_success=True,
+                replace_active=True,
+                multimodal_dispatch_ctx=multimodal_dispatch_ctx,
+            )
+
+        return {
+            "success": True,
+            "document_id": document.id,
+            "message": "Document content updated successfully",
+        }
+
+    def _scrape_url_content(self, url: str) -> tuple[bytes, str]:
+        """
+        Scrape content from URL.
+
+        Args:
+            url: URL to scrape
+
+        Returns:
+            Tuple of (binary content, file extension)
+        """
+        import httpx
+        from bs4 import BeautifulSoup
+
+        try:
+            with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+                response = client.get(url)
+                response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "")
+            if "text/html" in content_type:
+                # Parse HTML and extract text
+                soup = BeautifulSoup(response.text, "html.parser")
+                # Remove script and style elements
+                for element in soup(["script", "style", "nav", "footer", "header"]):
+                    element.decompose()
+                text = soup.get_text(separator="\n", strip=True)
+                return text.encode("utf-8"), "txt"
+            else:
+                # Return raw content
+                return response.content, "txt"
+
+        except Exception as e:
+            logger.error(f"Failed to scrape URL {url}: {e}")
+            raise ValueError(f"Failed to scrape URL: {e}") from e
+
+    def _schedule_indexing_celery(
+        self,
+        db: Session,
+        knowledge_base: Kind,
+        document: Any,
+        user: User,
+        trigger_summary: bool = True,
+        splitter_config: Optional[Dict[str, Any]] = None,
+        allow_if_success: bool = False,
+        replace_active: bool = False,
+        expected_generation: Optional[int] = None,
+        multimodal_dispatch_ctx: Optional[Any] = None,
+        force_reconvert: bool = False,
+        caller_user_id: int | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Schedule RAG indexing for a document via Celery.
+
+        This method extracts the retrieval configuration from the knowledge base
+        and schedules the indexing task via Celery.
+
+        Args:
+            db: Database session
+            knowledge_base: Knowledge base Kind
+            document: Document model
+            user: Dispatch metadata user; not necessarily the manual caller
+            caller_user_id: Explicit manual caller; automatic dispatches omit it
+            trigger_summary: Whether to trigger summary after indexing
+            splitter_config: Optional splitter configuration dict
+            allow_if_success: Whether to re-queue a document that already succeeded
+            replace_active: Whether to supersede an in-flight indexing generation
+            expected_generation: Reject a stale handoff from an earlier import
+            multimodal_dispatch_ctx: Pre-resolved multimodal dispatch context
+                produced by resolve_dispatch_for_document_or_none before dispatch.
+                Required when the document is video/image.
+            force_reconvert: When True, a multimodal (video/image) document that
+                already has a converted Markdown attachment is re-converted
+                (re-analyzed via Gemini) instead of re-indexing the stale
+                Markdown. Used by the "modify prompt & re-analyze" flow so a
+                changed prompt actually takes effect. The conversion callback
+                swaps in the new Markdown attachment and deletes the old one.
+        """
+        from app.services.knowledge.index_runtime import get_kb_index_info_by_record
+        from app.services.knowledge.index_state_machine import (
+            mark_document_index_enqueue_failed,
+            prepare_document_index_enqueue,
+        )
+        from app.tasks.knowledge_tasks import index_document_task
+
+        spec = (knowledge_base.json or {}).get("spec", {})
+        retrieval_config = spec.get("retrievalConfig")
+
+        if not retrieval_config:
+            logger.info(
+                f"[Orchestrator] Skipping indexing for document {document.id}: no retrieval_config"
+            )
+            return {
+                "scheduled": False,
+                "reason": "missing_retrieval_config",
+            }
+
+        retriever_name = retrieval_config.get("retriever_name")
+        retriever_namespace = retrieval_config.get("retriever_namespace", "default")
+        embedding_config = retrieval_config.get("embedding_config")
+
+        if not retriever_name or not embedding_config:
+            logger.warning(
+                f"[Orchestrator] Incomplete retrieval_config for KB {knowledge_base.id}: "
+                f"retriever_name={retriever_name}, embedding_config={embedding_config}"
+            )
+            return {
+                "scheduled": False,
+                "reason": "incomplete_retrieval_config",
+            }
+
+        embedding_model_name = embedding_config.get("model_name")
+        embedding_model_namespace = embedding_config.get("model_namespace", "default")
+
+        if not embedding_model_name:
+            logger.warning(
+                f"[Orchestrator] Missing embedding model_name in KB {knowledge_base.id}"
+            )
+            return {
+                "scheduled": False,
+                "reason": "missing_embedding_model",
+            }
+
+        kb_index_info = get_kb_index_info_by_record(
+            db=db,
+            knowledge_base=knowledge_base,
+            current_user_id=user.id,
+        )
+        index_owner_user_id = kb_index_info.index_owner_user_id
+
+        logger.info(
+            f"[Orchestrator] Scheduling RAG indexing via Celery for document {document.id}: "
+            f"retriever={retriever_name}, embedding={embedding_model_name}, "
+            f"index_owner_user_id={index_owner_user_id}"
+        )
+
+        enqueue_decision = prepare_document_index_enqueue(
+            db=db,
+            document_id=document.id,
+            allow_if_success=allow_if_success,
+            replace_active=replace_active,
+            expected_generation=expected_generation,
+        )
+        if not enqueue_decision.should_enqueue:
+            logger.info(
+                f"[Orchestrator] Skipping Celery enqueue for document {document.id}: "
+                f"reason={enqueue_decision.reason}, previous_status={enqueue_decision.previous_status}"
+            )
+            return {
+                "scheduled": False,
+                "reason": enqueue_decision.reason,
+                "index_generation": enqueue_decision.generation,
+            }
+
+        generation = enqueue_decision.generation
+        if generation is None:
+            message = (
+                "[Orchestrator] prepare_document_index_enqueue returned "
+                f"should_enqueue=True but generation is None for document {document.id}"
+            )
+            logger.error(message)
+            raise RuntimeError(message)
+
+        try:
+            from app.services.knowledge.multimodal_pipeline import (
+                conversion_pipeline,
+            )
+
+            normalized_extension = _normalize_file_extension(document.file_extension)
+            converted_id = document.converted_attachment_id
+            # Actual attachment dispatched to the index/conversion task. Defaults
+            # to the source attachment; the converted branch may replace it so
+            # the enqueue log reflects what really enters the RAG pipeline.
+            source_attachment_id = document.attachment_id
+            dispatched_attachment_id = source_attachment_id
+            pipeline = conversion_pipeline(normalized_extension, settings)
+
+            if converted_id and not (force_reconvert and pipeline == "multimodal"):
+                # Already converted — index directly using the converted attachment,
+                # skip re-conversion even if the file type normally requires it.
+                # Exception: a multimodal doc being force-reconverted (e.g. the
+                # "modify prompt & re-analyze" action) must fall through to the
+                # multimodal branch so Gemini re-runs with the new prompt; the
+                # conversion callback will swap in the fresh Markdown and delete
+                # the stale one.
+                async_result = index_document_task.delay(
+                    knowledge_base_id=str(knowledge_base.id),
+                    attachment_id=converted_id,
+                    retriever_name=retriever_name,
+                    retriever_namespace=retriever_namespace,
+                    embedding_model_name=embedding_model_name,
+                    embedding_model_namespace=embedding_model_namespace,
+                    user_id=index_owner_user_id,
+                    caller_user_id=caller_user_id,
+                    user_name=user.user_name,
+                    document_id=document.id,
+                    index_generation=generation,
+                    splitter_config_dict=splitter_config,
+                    trigger_summary=trigger_summary,
+                )
+                dispatched_attachment_id = converted_id
+
+            elif pipeline == "multimodal":
+                # Multimodal (video/image → Gemini) conversion dispatch. The
+                # dispatch context is pre-resolved by the caller (create_document
+                # resolves before persist; reindex_document resolves before
+                # re-dispatch) and passed in as multimodal_dispatch_ctx.
+                from app.services.knowledge.multimodal_pipeline import (
+                    schedule_multimodal_indexing_or_none as _schedule_mm,
+                )
+
+                index_dispatch_payload = {
+                    "knowledge_base_id": str(knowledge_base.id),
+                    "attachment_id": document.attachment_id,
+                    "retriever_name": retriever_name,
+                    "retriever_namespace": retriever_namespace,
+                    "embedding_model_name": embedding_model_name,
+                    "embedding_model_namespace": embedding_model_namespace,
+                    "user_id": index_owner_user_id,
+                    "caller_user_id": caller_user_id,
+                    "user_name": user.user_name,
+                    "document_id": document.id,
+                    "index_generation": generation,
+                    "splitter_config_dict": splitter_config,
+                    "trigger_summary": trigger_summary,
+                }
+                async_result = _schedule_mm(
+                    db=db,
+                    knowledge_base=knowledge_base,
+                    document=document,
+                    user=user,
+                    multimodal_dispatch_ctx=multimodal_dispatch_ctx,
+                    normalized_extension=normalized_extension,
+                    generation=generation,
+                    index_dispatch_payload=index_dispatch_payload,
+                    app_settings=settings,
+                )
+                dispatched_attachment_id = document.attachment_id
+
+            elif settings.needs_conversion(normalized_extension):
+                # File type requires conversion before indexing
+                # Task is dispatched to knowledge_doc_converter microservice
+                # via the shared Celery broker (knowledge_conversion queue)
+
+                # Override QUEUED -> PENDING_CONVERSION: document is waiting
+                # for a conversion worker, not for direct indexing
+                document.index_status = DocumentIndexStatus.PENDING_CONVERSION
+                db.commit()
+
+                from app.core.celery_app import celery_app
+                from app.models.subtask_context import ContextType, SubtaskContext
+
+                attachment = (
+                    db.query(SubtaskContext)
+                    .filter(
+                        SubtaskContext.id == source_attachment_id,
+                        SubtaskContext.context_type == ContextType.ATTACHMENT.value,
+                    )
+                    .first()
+                )
+                original_filename = (
+                    attachment.original_filename if attachment else document.name
+                )
+
+                async_result = celery_app.send_task(
+                    "knowledge_doc_converter.convert_document",
+                    kwargs={
+                        "document_id": document.id,
+                        "attachment_id": source_attachment_id,
+                        "file_extension": normalized_extension,
+                        "original_filename": original_filename,
+                        "knowledge_base_name": knowledge_base.name,
+                        "index_generation": generation,
+                        "content_download_path": (
+                            f"/api/internal/attachments/{source_attachment_id}/download"
+                        ),
+                        "callback_status_path": "/api/internal/conversion/callback/status",
+                        "callback_completed_path": "/api/internal/conversion/callback/completed",
+                        "index_dispatch_payload": {
+                            "knowledge_base_id": str(knowledge_base.id),
+                            "attachment_id": source_attachment_id,
+                            "retriever_name": retriever_name,
+                            "retriever_namespace": retriever_namespace,
+                            "embedding_model_name": embedding_model_name,
+                            "embedding_model_namespace": embedding_model_namespace,
+                            "user_id": index_owner_user_id,
+                            "caller_user_id": caller_user_id,
+                            "user_name": user.user_name,
+                            "document_id": document.id,
+                            "index_generation": generation,
+                            "splitter_config_dict": splitter_config,
+                            "trigger_summary": trigger_summary,
+                        },
+                    },
+                    queue=settings.KNOWLEDGE_CONVERSION_QUEUE,
+                )
+
+                logger.info(
+                    f"[Orchestrator] Conversion task enqueued: "
+                    f"document_id={document.id}, file_ext={normalized_extension}, "
+                    f"index_generation={generation}, celery_task_id={async_result.id}"
+                )
+            else:
+                # Direct indexing (no conversion)
+                async_result = index_document_task.delay(
+                    knowledge_base_id=str(knowledge_base.id),
+                    attachment_id=source_attachment_id,
+                    retriever_name=retriever_name,
+                    retriever_namespace=retriever_namespace,
+                    embedding_model_name=embedding_model_name,
+                    embedding_model_namespace=embedding_model_namespace,
+                    user_id=index_owner_user_id,
+                    caller_user_id=caller_user_id,
+                    user_name=user.user_name,
+                    document_id=document.id,
+                    index_generation=generation,
+                    splitter_config_dict=splitter_config,
+                    trigger_summary=trigger_summary,
+                )
+        except Exception as exc:
+            from app.schemas.knowledge import DocumentProcessingStage
+            from app.services.knowledge.processing_errors import (
+                build_processing_error,
+            )
+
+            mark_document_index_enqueue_failed(
+                db=db,
+                document_id=document.id,
+                generation=generation,
+                error=build_processing_error(
+                    stage=DocumentProcessingStage.DISPATCH,
+                    code="index_dispatch_failed",
+                    message=(
+                        "The indexing task could not be submitted. "
+                        "Please retry later."
+                    ),
+                    retryable=True,
+                    generation=generation,
+                ),
+            )
+            logger.error(
+                f"[Orchestrator] Failed to enqueue RAG indexing task for document {document.id}: {exc}",
+                exc_info=True,
+            )
+            raise
+
+        logger.info(
+            f"[Orchestrator] RAG indexing task enqueued: "
+            f"document_id={document.id}, attachment_id={dispatched_attachment_id}, "
+            f"kb_id={knowledge_base.id}, index_generation={generation}, "
+            f"celery_task_id={async_result.id}"
+        )
+        return {
+            "scheduled": True,
+            "reason": "scheduled",
+            "index_generation": generation,
+            "task_id": async_result.id,
+        }
+
+    def reindex_document(
+        self,
+        db: Session,
+        user: User,
+        document_id: int,
+        trigger_summary: bool = False,
+        # Optional multimodal prompt override for the "modify prompt & re-analyze"
+        # flow. Apply semantics (see DocumentReindexRequest): a non-blank string
+        # persists a per-document override; a blank string clears it (revert to
+        # KB default); None = leave the stored prompt unchanged. The write happens
+        # AFTER the access check below so an unauthorized caller cannot poison
+        # the stored prompt (the prompt is only persisted once management access
+        # is confirmed).
+        multimodal_prompt_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Trigger re-indexing for a document via Celery.
+
+        Re-indexes the document using the knowledge base's configured retriever
+        and embedding model. Only works for documents in knowledge bases with
+        RAG configured.
+
+        Args:
+            db: Database session
+            user: Current user
+            document_id: Document ID to reindex
+            trigger_summary: Whether to trigger summary generation after indexing
+
+        Returns:
+            Dict with success status and message
+
+        Raises:
+            ValueError: If document not found, access denied, or RAG not configured
+        """
+        from app.models.knowledge import DocumentIndexStatus, KnowledgeDocument
+        from app.services.knowledge.indexing import (
+            extract_rag_config_from_knowledge_base,
+            get_rag_indexing_skip_reason,
+        )
+
+        # Get document with access check
+        document = (
+            db.query(KnowledgeDocument)
+            .filter(KnowledgeDocument.id == document_id)
+            .first()
+        )
+
+        if not document:
+            raise ValueError("Document not found")
+
+        # Check access permission via knowledge base
+        knowledge_base, has_access = KnowledgeService.get_knowledge_base(
+            db=db,
+            knowledge_base_id=document.kind_id,
+            user_id=user.id,
+        )
+
+        if not knowledge_base:
+            raise ValueError("Knowledge base not found")
+        if not has_access:
+            raise ValueError("Access denied to knowledge base")
+        if not KnowledgeService.can_manage_knowledge_document(
+            db, knowledge_base.id, user.id, document.user_id
+        ):
+            raise ValueError(
+                "You do not have permission to manage this document in this knowledge base"
+            )
+
+        from app.services.knowledge.content_scope import assert_user_content_is_mutable
+
+        assert_user_content_is_mutable(getattr(document, "origin", "user"))
+
+        # Documents whose source type is no longer supported (legacy rows from
+        # removed ingestion paths) cannot be reindexed.
+        from app.schemas.knowledge import DocumentSourceType
+
+        known_source_types = {source_type.value for source_type in DocumentSourceType}
+        if document.source_type not in known_source_types:
+            raise ValueError(
+                f"Unsupported document source type: {document.source_type}"
+            )
+
+        skip_reason = get_rag_indexing_skip_reason(
+            document.file_extension, document.file_size
+        )
+        if skip_reason:
+            raise ValueError(skip_reason)
+
+        # Apply an optional multimodal prompt override AFTER the access check so
+        # an unauthorized caller cannot poison the stored prompt. Powers the
+        # "modify prompt & re-analyze" action (non-multimodal docs ignore it).
+        from app.services.knowledge.multimodal_pipeline import (
+            apply_multimodal_prompt_override,
+        )
+
+        apply_multimodal_prompt_override(document, multimodal_prompt_override, db)
+
+        # Extract RAG config using shared helper
+        rag_params = extract_rag_config_from_knowledge_base(db, knowledge_base, user.id)
+
+        if not rag_params:
+            raise ValueError(
+                "Knowledge base has no or incomplete retrieval configuration"
+            )
+
+        # Multimodal re-index gate: re-validate dispatch preconditions
+        # (model/api_key) before re-dispatch, avoiding a task guaranteed to fail
+        # (e.g. the model config was removed since the first attempt). No-op for
+        # non-multimodal files.
+        from app.services.knowledge.multimodal_pipeline import (
+            resolve_dispatch_for_document_or_none,
+        )
+
+        multimodal_dispatch_ctx = resolve_dispatch_for_document_or_none(
+            db, knowledge_base, document, settings
+        )
+
+        schedule_result = self._schedule_indexing_celery(
+            db=db,
+            knowledge_base=knowledge_base,
+            document=document,
+            user=user,
+            caller_user_id=user.id,
+            # A multimodal re-analyze (force_reconvert) regenerates the document
+            # content via Gemini, so the summary must be regenerated too — the old
+            # summary no longer matches the new Markdown. The indexing task still
+            # gates on (SUMMARY_ENABLED and kb summary_enabled), so KBs with
+            # summaries disabled are unaffected. Plain (non-multimodal) reindex
+            # keeps trigger_summary=False (content unchanged).
+            trigger_summary=trigger_summary or multimodal_dispatch_ctx is not None,
+            splitter_config=document.splitter_config,
+            allow_if_success=True,
+            multimodal_dispatch_ctx=multimodal_dispatch_ctx,
+            # A multimodal re-index always re-analyzes via Gemini (e.g. after a
+            # prompt change) rather than re-indexing the stale converted Markdown.
+            force_reconvert=multimodal_dispatch_ctx is not None,
+        )
+        if not schedule_result["scheduled"]:
+            reason = schedule_result["reason"]
+            reason_messages = {
+                "already_in_progress": "Reindex already in progress",
+                "already_indexed": "Document is already indexed",
+                "document_not_found": "Document not found",
+            }
+            message = reason_messages.get(reason, f"Reindex skipped: {reason}")
+            return {
+                "success": True,
+                "document_id": document.id,
+                "message": message,
+                "skipped": True,
+                "reason": reason,
+            }
+
+        return {
+            "success": True,
+            "document_id": document.id,
+            "message": "Reindex started",
+            "skipped": False,
+            "index_generation": schedule_result["index_generation"],
+        }
+
+    async def create_web_document(
+        self,
+        db: Session,
+        user: User,
+        url: str,
+        knowledge_base_id: int,
+        name: Optional[str] = None,
+        folder_id: int = 0,
+        trigger_indexing: bool = True,
+        trigger_summary: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Create a document from a web page by scraping the URL.
+
+        Flow:
+        1. Scrape the web page and convert to Markdown
+        2. Save the content as an attachment using context_service
+        3. Create a document record in the knowledge base
+        4. Trigger RAG indexing via Celery
+
+        Args:
+            db: Database session
+            user: Current user
+            url: URL to scrape
+            knowledge_base_id: Knowledge base ID to add document to
+            name: Optional document name (uses page title if not provided)
+            trigger_indexing: Whether to trigger RAG indexing
+            trigger_summary: Whether to trigger summary generation
+
+        Returns:
+            Dict with success status and document info
+
+        Raises:
+            ValueError: If scraping fails, access denied, or creation fails
+        """
+        from urllib.parse import urlparse
+
+        from app.schemas.knowledge import DocumentSourceType, KnowledgeDocumentCreate
+        from app.services.context import context_service
+        from app.services.web_scraper import get_web_scraper_service
+
+        logger.info(
+            f"[Orchestrator] Creating web document from URL: {url} "
+            f"in knowledge base {knowledge_base_id}"
+        )
+
+        # Verify knowledge base access
+        knowledge_base, has_access = KnowledgeService.get_knowledge_base(
+            db=db,
+            knowledge_base_id=knowledge_base_id,
+            user_id=user.id,
+        )
+        if not knowledge_base:
+            raise ValueError("Knowledge base not found")
+        if not has_access:
+            raise ValueError("Access denied to knowledge base")
+        if not KnowledgeService.can_manage_knowledge_base_documents(
+            db, knowledge_base_id, user.id
+        ):
+            raise ValueError(
+                "You do not have permission to add documents to this knowledge base"
+            )
+
+        # Scrape the web page (async)
+        service = get_web_scraper_service()
+        result = await service.scrape_url(url)
+
+        if not result.success:
+            logger.warning(
+                f"[Orchestrator] Scrape failed for {url}: {result.error_code} - {result.error_message}"
+            )
+            return {
+                "success": False,
+                "document": None,
+                "error_code": result.error_code,
+                "error_message": result.error_message,
+            }
+
+        # Determine document name
+        doc_name = name
+        if not doc_name:
+            doc_name = result.title or urlparse(url).netloc
+        # Ensure name has .md extension for proper handling
+        if not doc_name.endswith(".md"):
+            doc_name = f"{doc_name}.md"
+
+        # Create attachment using context_service (handles storage_key and binary storage)
+        content_bytes = result.content.encode("utf-8")
+        content_size = len(content_bytes)
+
+        attachment, _ = context_service.upload_attachment(
+            db=db,
+            user_id=user.id,
+            filename=doc_name,
+            binary_data=content_bytes,
+            subtask_id=0,  # Unlinked attachment for knowledge base
+        )
+
+        logger.info(
+            f"[Orchestrator] Created attachment {attachment.id} for web document"
+        )
+
+        # Create document record
+        try:
+            doc_data = KnowledgeDocumentCreate(
+                attachment_id=attachment.id,
+                name=doc_name,
+                file_extension="md",
+                file_size=content_size,
+                folder_id=folder_id,
+                source_type=DocumentSourceType.WEB,
+                source_config={
+                    "url": result.url,
+                    "scraped_at": result.scraped_at.isoformat(),
+                    "title": result.title,
+                    "description": result.description,
+                },
+            )
+
+            document = KnowledgeService.create_document(
+                db=db,
+                knowledge_base_id=knowledge_base_id,
+                user_id=user.id,
+                data=doc_data,
+            )
+
+            logger.info(
+                f"[Orchestrator] Created web document {document.id} in knowledge base {knowledge_base_id}"
+            )
+
+            # Trigger RAG indexing via Celery if enabled
+            if trigger_indexing:
+                self._schedule_indexing_celery(
+                    db=db,
+                    knowledge_base=knowledge_base,
+                    document=document,
+                    user=user,
+                    caller_user_id=user.id,
+                    trigger_summary=trigger_summary,
+                    allow_if_success=True,
+                    replace_active=True,
+                )
+
+            return {
+                "success": True,
+                "document": KnowledgeDocumentResponse.model_validate(document),
+                "error_code": None,
+                "error_message": None,
+            }
+
+        except ValueError as e:
+            # Rollback attachment creation on error
+            db.rollback()
+            logger.error(f"[Orchestrator] Failed to create web document: {e}")
+            return {
+                "success": False,
+                "document": None,
+                "error_code": "CREATE_FAILED",
+                "error_message": str(e),
+            }
+
+    async def refresh_web_document(
+        self,
+        db: Session,
+        user: User,
+        document_id: int,
+        trigger_indexing: bool = True,
+        trigger_summary: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Refresh a web document by re-scraping its URL.
+
+        Flow:
+        1. Get the document and its source URL
+        2. Re-scrape the web page
+        3. Update the attachment content using context_service
+        4. Update the document metadata
+        5. Re-trigger RAG indexing via Celery
+
+        Args:
+            db: Database session
+            user: Current user
+            document_id: Document ID to refresh
+            trigger_indexing: Whether to trigger RAG re-indexing
+            trigger_summary: Whether to trigger summary generation
+
+        Returns:
+            Dict with success status and document info
+
+        Raises:
+            ValueError: If document not found, not a web document, or refresh fails
+        """
+        from app.models.knowledge import DocumentIndexStatus, KnowledgeDocument
+        from app.models.subtask_context import SubtaskContext
+        from app.schemas.knowledge import DocumentSourceType
+        from app.services.context import context_service
+        from app.services.web_scraper import get_web_scraper_service
+
+        logger.info(f"[Orchestrator] Refreshing web document {document_id}")
+
+        # Get the document and verify it's a web document
+        document = KnowledgeService.get_document(
+            db=db,
+            document_id=document_id,
+            user_id=user.id,
+        )
+
+        if not document:
+            return {
+                "success": False,
+                "document": None,
+                "error_code": "NOT_FOUND",
+                "error_message": "Document not found or access denied",
+            }
+
+        from app.services.knowledge.content_scope import assert_user_content_is_mutable
+
+        assert_user_content_is_mutable(getattr(document, "origin", "user"))
+
+        # Verify manage permission before mutating content
+        from app.models.kind import Kind
+
+        kb = (
+            db.query(Kind)
+            .filter(Kind.id == document.kind_id, Kind.kind == "KnowledgeBase")
+            .first()
+        )
+        if not kb:
+            return {
+                "success": False,
+                "document": None,
+                "error_code": "KB_NOT_FOUND",
+                "error_message": "Knowledge base not found for document",
+            }
+        KnowledgeService._assert_can_manage_document(db, kb, document, user.id)
+
+        if document.source_type != DocumentSourceType.WEB.value:
+            return {
+                "success": False,
+                "document": None,
+                "error_code": "INVALID_TYPE",
+                "error_message": "Only web documents can be refreshed",
+            }
+
+        # Get the source URL from source_config
+        source_config = document.source_config or {}
+        url = source_config.get("url")
+
+        if not url:
+            return {
+                "success": False,
+                "document": None,
+                "error_code": "NO_URL",
+                "error_message": "Document has no source URL",
+            }
+
+        # Re-scrape the web page (async)
+        service = get_web_scraper_service()
+        result = await service.scrape_url(url)
+
+        if not result.success:
+            logger.warning(
+                f"[Orchestrator] Scrape failed for {url}: {result.error_code} - {result.error_message}"
+            )
+            return {
+                "success": False,
+                "document": None,
+                "error_code": result.error_code,
+                "error_message": result.error_message,
+            }
+
+        # Update or create attachment using context_service
+        content_bytes = result.content.encode("utf-8")
+        content_size = len(content_bytes)
+
+        if document.attachment_id:
+            # Try to overwrite existing attachment
+            try:
+                attachment, _ = context_service.overwrite_attachment_internal(
+                    db=db,
+                    context_id=document.attachment_id,
+                    filename=document.name,
+                    reason="web_refresh",
+                    binary_data=content_bytes,
+                )
+                logger.info(
+                    f"[Orchestrator] Updated attachment {attachment.id} for web document"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Orchestrator] Failed to overwrite attachment {document.attachment_id}: {e}, "
+                    f"creating new one"
+                )
+                # Create new attachment if overwrite fails
+                attachment, _ = context_service.upload_attachment(
+                    db=db,
+                    user_id=user.id,
+                    filename=document.name,
+                    binary_data=content_bytes,
+                    subtask_id=0,
+                )
+                document.attachment_id = attachment.id
+                logger.info(
+                    f"[Orchestrator] Created new attachment {attachment.id} for web document"
+                )
+        else:
+            # Create new attachment if no attachment_id exists
+            attachment, _ = context_service.upload_attachment(
+                db=db,
+                user_id=user.id,
+                filename=document.name,
+                binary_data=content_bytes,
+                subtask_id=0,
+            )
+            document.attachment_id = attachment.id
+            logger.info(
+                f"[Orchestrator] Created new attachment {attachment.id} for web document"
+            )
+
+        # Update document metadata
+        document.file_size = content_size
+        source_config = dict(document.source_config or {})
+        source_config.update(
+            {
+                "url": result.url,
+                "scraped_at": result.scraped_at.isoformat(),
+                "title": result.title,
+                "description": result.description,
+            }
+        )
+        document.source_config = source_config
+        document.clear_processing_error_payload()
+        # Reset is_active to False, will be set to True after re-indexing
+        document.is_active = False
+
+        try:
+            db.commit()
+            db.refresh(document)
+            logger.info(f"[Orchestrator] Updated web document {document.id} metadata")
+
+            # Trigger RAG re-indexing via Celery if enabled
+            if trigger_indexing:
+                knowledge_base, has_access = KnowledgeService.get_knowledge_base(
+                    db=db,
+                    knowledge_base_id=document.kind_id,
+                    user_id=user.id,
+                )
+                if knowledge_base and has_access:
+                    self._schedule_indexing_celery(
+                        db=db,
+                        knowledge_base=knowledge_base,
+                        document=document,
+                        user=user,
+                        caller_user_id=user.id,
+                        trigger_summary=trigger_summary,
+                        allow_if_success=True,
+                        replace_active=True,
+                    )
+
+            return {
+                "success": True,
+                "document": KnowledgeDocumentResponse.model_validate(document),
+                "error_code": None,
+                "error_message": None,
+            }
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"[Orchestrator] Failed to refresh web document: {e}")
+            return {
+                "success": False,
+                "document": None,
+                "error_code": "REFRESH_FAILED",
+                "error_message": str(e),
+            }
+
+    @trace_async(span_name="knowledge.retrieve", tracer_name="backend.services")
+    async def retrieve_knowledge(
+        self,
+        *,
+        user_id: int,
+        knowledge_base_id: int,
+        query: str,
+        task_id: int | None = None,
+        max_results: int = 10,
+        document_ids: Optional[List[int]] = None,
+        folder_ids: Optional[List[int]] = None,
+        include_subfolders: bool = True,
+        route_mode: Literal["auto", "direct_injection", "rag_retrieval"] = "auto",
+        context_window: int = 128000,
+        used_context_tokens: int = 0,
+        reserved_output_tokens: int = 4096,
+        context_buffer_ratio: float = 0.1,
+        max_direct_chunks: int = 500,
+        search_hints: SearchHints | None = None,
+    ) -> Dict[str, Any]:
+        """Retrieve knowledge with automatic routing and gateway support.
+
+        Unified entry point for MCP tools and Open API. Direct injection is
+        resolved in the Backend; every other retrieval runs in knowledge_runtime.
+
+        Args:
+            user_id: Current user ID for access control.
+            knowledge_base_id: Target knowledge base ID.
+            query: Search query text.
+            task_id: Optional task context for resolving delegated read access.
+            max_results: Maximum number of results to return (default: 10, max: 50).
+            document_ids: Optional list of document IDs to restrict search scope.
+            folder_ids: Optional list of folder IDs to restrict search scope.
+            include_subfolders: Whether folder scope includes descendants.
+            route_mode: Routing strategy:
+                - "auto": Let Backend decide based on token budget (default).
+                - "direct_injection": Fetch all chunks for direct context injection.
+                - "rag_retrieval": Standard RAG search.
+            context_window: Model context window size in tokens (default: 100000).
+            used_context_tokens: Tokens already consumed in conversation.
+            reserved_output_tokens: Tokens reserved for model output.
+            context_buffer_ratio: Safety buffer ratio for context window.
+            max_direct_chunks: Maximum chunks allowed for direct injection.
+            search_hints: Optional dense and sparse query-planning hints.
+
+        Returns:
+            Dict with keys:
+                - mode: "rag_retrieval" | "direct_injection"
+                - records: List of matching chunks with content, score, title, metadata
+                - total: Total number of records returned
+                - total_estimated_tokens: Estimated token count
+
+        Raises:
+            ValueError: If knowledge base not found, access denied, or config invalid.
+        """
+        from app.services.knowledge.search_execution import knowledge_search_runner
+
+        if max_results < 1:
+            max_results = 10
+        if max_results > 50:
+            max_results = 50
+
+        return await knowledge_search_runner.retrieve(
+            user_id=user_id,
+            task_id=task_id,
+            knowledge_base_id=knowledge_base_id,
+            query=query,
+            max_results=max_results,
+            document_ids=document_ids,
+            folder_ids=folder_ids,
+            include_subfolders=include_subfolders,
+            route_mode=route_mode,
+            context_window=context_window,
+            used_context_tokens=used_context_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            context_buffer_ratio=context_buffer_ratio,
+            max_direct_chunks=max_direct_chunks,
+            search_hints=search_hints,
+        )
+
+
+# Singleton instance
+knowledge_orchestrator = KnowledgeOrchestrator()

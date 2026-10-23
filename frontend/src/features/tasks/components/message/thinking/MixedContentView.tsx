@@ -1,0 +1,813 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { memo, useEffect, useMemo, useState } from 'react'
+import { nestMessageBlocks } from '@wegent/chat-core'
+import type {
+  ThinkingStep,
+  MessageBlock,
+  SubagentBlock as SubagentBlockType,
+  ToolPair,
+} from './types'
+import { useToolExtraction } from './hooks/useToolExtraction'
+import { ToolBlock } from './components/ToolBlock'
+import { SubagentBlock } from './components/SubagentBlock'
+import { SubagentGroupBlock } from './components/SubagentGroupBlock'
+import { GuidanceBlock } from './components/GuidanceBlock'
+import ReasoningDisplay from './ReasoningDisplay'
+import EnhancedMarkdown from '@/components/common/EnhancedMarkdown'
+import { useTranslation } from '@/hooks/useTranslation'
+import { processCitePatterns } from '../../../utils/processCitePatterns'
+import type { GeminiAnnotation } from '@/types/socket'
+import VideoPlayer from '../VideoPlayer'
+import { ImageGallery } from '../ImageGallery'
+import StreamingWaitIndicator from '../StreamingWaitIndicator'
+import { AskUserForm } from '../../clarification'
+import type { AskUserFormData, InteractiveFormAnswerPayload } from '@/types/api'
+import { blockRendererRegistry } from '../block-registry'
+import {
+  SubscriptionPreviewCard,
+  type SubscriptionPreviewBlock,
+} from '../../subscription/SubscriptionPreviewCard'
+import { blockToToolPair } from './utils/blockToToolPair'
+import { resolveGeneratedImageDisplayLayout } from '@/features/tasks/utils/imageDisplaySize'
+import { CardRenderer } from '@/features/cards/CardRenderer'
+// Import to register prompt optimization block renderer
+import '@/features/prompt-optimization/block-renderer'
+
+const normalizeForComparison = (value: string): string =>
+  value.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '')
+
+const isInteractiveFormDuplicateContent = (text: string, forms: AskUserFormData[]): boolean => {
+  if (!text.trim()) return false
+
+  const normalizedText = normalizeForComparison(text)
+  return forms.some(form => {
+    const matchedQuestions = form.questions.filter(question => {
+      const normalizedQuestion = normalizeForComparison(question.question)
+      return normalizedQuestion && normalizedText.includes(normalizedQuestion)
+    }).length
+
+    if (matchedQuestions === 0) return false
+    if (form.questions.length === 1) return true
+    return matchedQuestions >= 2
+  })
+}
+
+const isRenderableInteractiveQuestion = (question: Record<string, unknown>): boolean => {
+  const questionText = typeof question.question === 'string' ? question.question.trim() : ''
+  if (questionText.length === 0) return false
+  if (question.input_type === 'text') return true
+
+  return (
+    question.input_type === 'choice' &&
+    Array.isArray(question.options) &&
+    question.options.length > 0
+  )
+}
+
+const parseRecord = (value: unknown): Record<string, unknown> | null => {
+  if (!value) return null
+
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null
+    } catch {
+      return null
+    }
+  }
+
+  return typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+const getRenderableInteractiveFormPayload = (
+  renderPayload: unknown
+): {
+  form: Record<string, unknown>
+  questions: Array<Record<string, unknown>>
+} | null => {
+  const form = parseRecord(renderPayload)
+  if (form?.type !== 'interactive_form_question') return null
+
+  const questions = Array.isArray(form.questions)
+    ? (form.questions as Array<Record<string, unknown>>).filter(isRenderableInteractiveQuestion)
+    : []
+
+  if (questions.length === 0) return null
+
+  return {
+    form,
+    questions,
+  }
+}
+
+interface MixedContentViewProps {
+  thinking: ThinkingStep[] | null
+  content: string
+  taskStatus?: string
+  theme: 'light' | 'dark'
+  blocks?: MessageBlock[] // NEW: Block-based rendering support
+  annotations?: GeminiAnnotation[]
+  /** Optional callback when user wants to use a generated image as reference for follow-up */
+  onUseAsReference?: (item: import('../ImageGallery').ImageItem) => void
+  /** Task ID for AskUserForm context */
+  taskId?: number
+  /** Subtask ID for AskUserForm context */
+  subtaskId?: number
+  /** Current message index for AskUserForm submission tracking */
+  currentMessageIndex?: number
+  /** Callback when user submits an ask_user_question form - receives pre-formatted message string */
+  onAskUserSubmit?: (
+    toolUseId: string,
+    formattedMessage: string,
+    answer: InteractiveFormAnswerPayload
+  ) => void
+  /** Send a follow-up message from an interactive card button. */
+  onCardChatButtonClick?: (message: string) => void | Promise<void>
+  /** Optional override for the running processing indicator text */
+  processingMessage?: string
+}
+
+const MEDIA_COMPLETION_MESSAGES = new Set([
+  'Image generation completed',
+  'Video generation completed',
+])
+
+function isMediaCompletionMessage(content: string): boolean {
+  return MEDIA_COMPLETION_MESSAGES.has(content.trim())
+}
+
+const IMAGE_GENERATION_PROGRESS_DURATION_MS = 120_000
+
+function ImageGenerationPlaceholder({
+  imageSize,
+  startedAt,
+}: {
+  imageSize?: string
+  startedAt?: number
+}) {
+  const { t } = useTranslation('chat')
+  const [progress, setProgress] = useState(0)
+  const layout = resolveGeneratedImageDisplayLayout(imageSize)
+
+  useEffect(() => {
+    const progressStartedAt = startedAt && startedAt > 0 ? startedAt : Date.now()
+    const updateProgress = () => {
+      const elapsed = Math.max(0, Date.now() - progressStartedAt)
+      setProgress(Math.min(99, Math.floor((elapsed / IMAGE_GENERATION_PROGRESS_DURATION_MS) * 99)))
+    }
+
+    updateProgress()
+    const timer = window.setInterval(updateProgress, 500)
+    return () => window.clearInterval(timer)
+  }, [startedAt])
+
+  return (
+    <div
+      className="image-generation-placeholder relative overflow-hidden rounded-2xl border border-primary/15 shadow-sm"
+      data-testid="image-generation-placeholder"
+      role="status"
+      aria-label={`${t('image.generating')} ${progress}%`}
+      style={layout}
+    >
+      <div className="image-generation-placeholder__blob-1 absolute" />
+      <div className="image-generation-placeholder__blob-2 absolute" />
+
+      <div className="image-generation-placeholder__stage" aria-hidden="true">
+        <div className="image-generation-placeholder__sheet image-generation-placeholder__sheet--back" />
+        <div className="image-generation-placeholder__sheet image-generation-placeholder__sheet--front" />
+        <div className="image-generation-placeholder__shine" />
+        <div className="image-generation-placeholder__particle image-generation-placeholder__particle--one" />
+        <div className="image-generation-placeholder__particle image-generation-placeholder__particle--two" />
+      </div>
+
+      <div className="absolute right-3 top-3 z-10 text-xs font-medium tabular-nums text-black">
+        {progress}%
+      </div>
+    </div>
+  )
+}
+
+/**
+ * MixedContentView Component
+ *
+ * Renders content and tool calls in chronological order.
+ * Supports two modes:
+ * 1. Block-based (new): Uses blocks array for chronological mixed rendering
+ * 2. Thinking-based (legacy): Extracts tools from thinking array
+ */
+const MixedContentView = memo(function MixedContentView({
+  thinking,
+  content,
+  taskStatus,
+  theme,
+  blocks,
+  annotations,
+  onUseAsReference,
+  taskId,
+  subtaskId,
+  currentMessageIndex,
+  onAskUserSubmit,
+  onCardChatButtonClick,
+  processingMessage,
+}: MixedContentViewProps) {
+  const { t } = useTranslation('chat')
+  const isTerminalFailure = ['FAILED', 'CANCELLED'].includes(taskStatus?.toUpperCase() || '')
+  // Extract tools from thinking (legacy mode)
+  const { toolGroups } = useToolExtraction(thinking)
+
+  // Create a map of tool_use_id to ToolPair for quick lookup (legacy mode)
+  const toolMap = useMemo(() => {
+    const map = new Map()
+    toolGroups.forEach(group => {
+      group.tools.forEach(tool => {
+        map.set(tool.toolUseId, tool)
+      })
+    })
+    return map
+  }, [toolGroups])
+
+  // Build mixed content array - prefer blocks if available
+  const mixedItems = useMemo(() => {
+    // NEW: Block-based rendering (preferred)
+    if (blocks && blocks.length > 0) {
+      const nestedBlocks = nestMessageBlocks(blocks)
+      const hasCompletedMediaResult = nestedBlocks.some(
+        block =>
+          (block.type === 'image' &&
+            !block.is_placeholder &&
+            Array.isArray(block.image_urls) &&
+            block.image_urls.length > 0) ||
+          (block.type === 'video' && !block.is_placeholder && Boolean(block.video_url))
+      )
+      const mapped = nestedBlocks
+        .map(block => {
+          const featureRenderer = blockRendererRegistry.findRenderer(block)
+          if (featureRenderer && block.type !== 'tool') {
+            return {
+              type: 'custom' as const,
+              blockId: block.id,
+              render: () =>
+                featureRenderer.render({
+                  block,
+                  isLastBlock: false,
+                  taskId,
+                  subtaskId,
+                  currentMessageIndex,
+                  onSendMessage: onCardChatButtonClick,
+                }),
+            }
+          }
+          if (block.type === 'text') {
+            // CRITICAL FIX: When page refreshes during streaming, block.content may be empty
+            // but the actual content is in the `content` prop (from cached_content).
+            // We need to use the `content` prop as fallback when block.content is empty.
+            let textContent = block.content || ''
+
+            // If block.content is empty but we have content prop, use it
+            // This handles the page refresh recovery case
+            if (!textContent && content) {
+              // Handle ${$$}$ separator - only show the result part (after separator)
+              if (content.includes('${$$}$')) {
+                const parts = content.split('${$$}$')
+                textContent = parts[1] || ''
+              } else {
+                textContent = content
+              }
+            }
+
+            return {
+              type: 'content' as const,
+              content: textContent,
+              blockId: block.id,
+            }
+          } else if (block.type === 'thinking') {
+            return {
+              type: 'thinking' as const,
+              content: block.content || '',
+              blockId: block.id,
+              status: block.status,
+            }
+          } else if (block.type === 'video') {
+            // Video block - render VideoPlayer component
+            return {
+              type: 'video' as const,
+              blockId: block.id,
+              isPlaceholder: block.is_placeholder ?? false,
+              videoUrl: block.video_url || '',
+              thumbnail: block.video_thumbnail,
+              coverUrl: block.cover_url,
+              duration: block.video_duration,
+              attachmentId: block.video_attachment_id,
+              progress: block.video_progress ?? 0,
+              status: block.status,
+              message: block.content, // Progress message
+            }
+          } else if (block.type === 'image') {
+            // Image block - render ImageGallery component
+            return {
+              type: 'image' as const,
+              blockId: block.id,
+              isPlaceholder: block.is_placeholder ?? false,
+              imageUrls: block.image_urls || [],
+              imageAttachmentIds: block.image_attachment_ids || [],
+              imageCount: block.image_count ?? 0,
+              imageSize: block.image_size,
+              startedAt: block.timestamp,
+              status: block.status,
+              message: block.content, // Progress message
+            }
+          } else if (block.type === 'subscription_preview') {
+            // Subscription preview block - render SubscriptionPreviewCard
+            return {
+              type: 'subscription_preview' as const,
+              data: block as unknown as SubscriptionPreviewBlock,
+              blockId: block.id,
+              status: block.status,
+            }
+          } else if (block.type === 'card') {
+            return {
+              type: 'card' as const,
+              data: block,
+              blockId: block.id,
+            }
+          } else if (block.type === 'guidance') {
+            return {
+              type: 'guidance' as const,
+              data: block,
+              blockId: block.id,
+            }
+          } else if (block.type === 'subagent') {
+            return {
+              type: 'subagent' as const,
+              data: block,
+              blockId: block.id,
+            }
+          } else if (block.type === 'tool') {
+            if (block.parent_tool_use_id) {
+              return null
+            }
+
+            const formPayload = getRenderableInteractiveFormPayload(block.render_payload)
+
+            // Only render an interactive form from the UI-only render payload.
+            if (block.tool_name?.includes('interactive_form_question') && formPayload) {
+              // Helper function to parse boolean values (handles string "True"/"False" from AI)
+              const parseBoolean = (value: unknown, defaultValue: boolean): boolean => {
+                if (typeof value === 'boolean') return value
+                if (typeof value === 'string') {
+                  const lower = value.toLowerCase()
+                  if (lower === 'true') return true
+                  if (lower === 'false') return false
+                }
+                return defaultValue
+              }
+
+              const toolUseId = block.tool_use_id || block.id
+              const formTaskId =
+                typeof formPayload.form.task_id === 'number'
+                  ? formPayload.form.task_id
+                  : taskId || 0
+              const formSubtaskId =
+                typeof formPayload.form.subtask_id === 'number'
+                  ? formPayload.form.subtask_id
+                  : subtaskId || 0
+
+              const parsedQuestions = formPayload.questions.map(q => {
+                const qHasOptions = Array.isArray(q.options) && (q.options as unknown[]).length > 0
+                const qInputType = qHasOptions ? 'choice' : 'text'
+                return {
+                  id: (q.id as string) || '',
+                  question: (q.question as string) || '',
+                  input_type: (q.input_type as 'choice' | 'text') || qInputType,
+                  options: qHasOptions
+                    ? (
+                        q.options as Array<{
+                          label: string
+                          value: string
+                          recommended?: unknown
+                        }>
+                      ).map(opt => ({
+                        label: opt.label,
+                        value: opt.value,
+                        recommended: parseBoolean(opt.recommended, false),
+                      }))
+                    : null,
+                  multi_select: parseBoolean(q.multi_select, false),
+                  required: parseBoolean(q.required, true),
+                  default: Array.isArray(q.default) ? (q.default as string[]) : null,
+                  placeholder: (q.placeholder as string) || null,
+                }
+              })
+
+              const askUserData: AskUserFormData = {
+                type: 'interactive_form_question',
+                tool_use_id: toolUseId,
+                task_id: formTaskId,
+                subtask_id: formSubtaskId,
+                questions: parsedQuestions,
+                tool_output:
+                  typeof block.tool_output === 'object' && block.tool_output !== null
+                    ? (block.tool_output as Record<string, unknown>)
+                    : null,
+              }
+              return {
+                type: 'interactive_form_question' as const,
+                data: askUserData,
+                blockId: block.id,
+                status: block.status,
+              }
+            }
+            if (block.tool_name?.includes('interactive_form_question')) {
+              return null
+            }
+            // Check for custom block renderers first (e.g., prompt optimization)
+            // This allows feature modules to register their own block renderers
+            const customRenderer = blockRendererRegistry.findRenderer(block)
+            if (customRenderer) {
+              return {
+                type: 'custom' as const,
+                blockId: block.id,
+                render: () =>
+                  customRenderer.render({
+                    block,
+                    isLastBlock: false,
+                    taskId,
+                    subtaskId,
+                    currentMessageIndex,
+                    onSendMessage: onCardChatButtonClick,
+                  }),
+              }
+            }
+            return {
+              type: 'tool' as const,
+              tool: blockToToolPair(block),
+              blockId: block.id,
+            }
+          }
+          return null
+        })
+        .filter(Boolean)
+
+      // CRITICAL FIX: When blocks exist but no text blocks, we need to also render
+      // the main content. This handles the case where:
+      // 1. chat:block_created creates a tool block
+      // 2. chat:chunk sends text content (accumulated in message.content)
+      // 3. Without this fix, only tool blocks are rendered, text content is lost
+      const hasTextBlock = nestedBlocks.some(b => b.type === 'text')
+      if (!hasTextBlock && content && content.trim()) {
+        // Handle ${$$}$ separator - only show the result part (after separator)
+        // This separator is used to split prompt and result in some message formats
+        let contentToRender = content
+        if (content.includes('${$$}$')) {
+          const parts = content.split('${$$}$')
+          contentToRender = parts[1] || ''
+        }
+
+        if (contentToRender && contentToRender.trim()) {
+          // Add main content at the end (after tool blocks)
+          mapped.push({
+            type: 'content' as const,
+            content: contentToRender,
+            blockId: 'main-content',
+          })
+        }
+      }
+
+      const visibleMapped = hasCompletedMediaResult
+        ? mapped.filter(
+            item => !item || item.type !== 'content' || !isMediaCompletionMessage(item.content)
+          )
+        : mapped
+
+      const dedupedMapped = visibleMapped.filter((item, index, items) => {
+        if (!item || item.type !== 'interactive_form_question') return true
+
+        const toolUseId = item.data.tool_use_id || item.blockId
+        return !items
+          .slice(index + 1)
+          .some(
+            next =>
+              next?.type === 'interactive_form_question' &&
+              (next.data.tool_use_id || next.blockId) === toolUseId
+          )
+      })
+
+      const interactiveForms = dedupedMapped
+        .filter(item => item?.type === 'interactive_form_question')
+        .map(item => item.data)
+
+      if (interactiveForms.length > 0) {
+        return dedupedMapped.filter(item => {
+          if (!item) return false
+          if (item.type !== 'content') return true
+          return !isInteractiveFormDuplicateContent(item.content, interactiveForms)
+        })
+      }
+
+      return dedupedMapped
+    }
+
+    // LEGACY: Thinking-based rendering (fallback for old messages)
+    if (!thinking?.length) {
+      // No thinking data, just show content if not empty
+      if (content && content.trim()) {
+        return [{ type: 'content' as const, content }]
+      }
+      return []
+    }
+
+    const items: Array<
+      | { type: 'content'; content: string }
+      | { type: 'tool'; tool: ToolPair }
+      | {
+          type: 'interactive_form_question'
+          data: AskUserFormData
+          blockId: string
+          status: string
+        }
+      | {
+          type: 'subscription_preview'
+          data: SubscriptionPreviewBlock
+          blockId: string
+          status: string
+        }
+    > = []
+
+    let hasShownMainContent = false
+
+    thinking.forEach(step => {
+      const stepType = step.details?.type
+
+      // Show main content before first tool if not shown yet
+      if (!hasShownMainContent && stepType === 'tool_use') {
+        if (content && content.trim()) {
+          items.push({ type: 'content', content })
+          hasShownMainContent = true
+        }
+      }
+
+      if (stepType === 'tool_use') {
+        // Find the tool pair
+        const toolUseId = step.tool_use_id || step.run_id
+        const tool = toolUseId ? toolMap.get(toolUseId) : null
+
+        if (tool) {
+          items.push({ type: 'tool', tool })
+        }
+      } else if (stepType === 'assistant' || stepType === 'user') {
+        // Text content from thinking steps
+        const text = step.details?.content || step.title
+        if (text && text.trim() && typeof text === 'string') {
+          items.push({ type: 'content', content: text })
+        }
+      }
+    })
+
+    // If main content wasn't shown yet (no tools), show it at the end
+    if (!hasShownMainContent && content && content.trim()) {
+      items.push({ type: 'content', content })
+    }
+
+    return items
+  }, [
+    blocks,
+    thinking,
+    content,
+    toolMap,
+    taskId,
+    subtaskId,
+    currentMessageIndex,
+    onCardChatButtonClick,
+  ])
+
+  // Check if we should show "Processing..." indicator
+  const shouldShowProcessing = useMemo(() => {
+    // Show processing indicator whenever task is running
+    // This ensures users always see feedback that the task is being processed
+    return taskStatus === 'RUNNING'
+  }, [taskStatus])
+
+  // Merge consecutive same tools into groups with count and collect all merged tools
+  const mergedItems = useMemo(() => {
+    type ToolItem = { type: 'tool'; tool: ToolPair; blockId: string }
+    type MergedToolItem = ToolItem & { count: number; mergedTools: ToolPair[] }
+    type MixedItem = NonNullable<(typeof mixedItems)[number]>
+    type SubagentGroupItem = {
+      type: 'subagent_group'
+      blocks: SubagentBlockType[]
+      blockId: string
+    }
+    type ResultItem = (MixedItem & { count?: number; mergedTools?: ToolPair[] }) | SubagentGroupItem
+
+    const result: ResultItem[] = []
+
+    for (let i = 0; i < mixedItems.length; i++) {
+      const item = mixedItems[i]
+      if (!item) continue
+
+      if (item.type === 'tool') {
+        // Check if we can merge with the previous item
+        const lastItem = result[result.length - 1]
+        if (lastItem && lastItem.type === 'tool' && lastItem.tool.toolName === item.tool.toolName) {
+          // Merge: increment count and add to mergedTools array
+          const mergedItem = lastItem as MergedToolItem
+          mergedItem.count = (mergedItem.count || 1) + 1
+          if (!mergedItem.mergedTools) {
+            mergedItem.mergedTools = [mergedItem.tool]
+          }
+          mergedItem.mergedTools.push(item.tool)
+        } else {
+          // New tool or different tool name
+          result.push({ ...item, count: 1, mergedTools: [item.tool] })
+        }
+      } else if (item.type === 'subagent') {
+        const subagents = [item]
+        let nextIndex = i + 1
+        while (nextIndex < mixedItems.length) {
+          const nextItem = mixedItems[nextIndex]
+          if (!nextItem || nextItem.type !== 'subagent') break
+          subagents.push(nextItem)
+          nextIndex += 1
+        }
+
+        if (subagents.length > 1) {
+          result.push({
+            type: 'subagent_group',
+            blocks: subagents.map(subagent => subagent.data),
+            blockId: `subagent-group-${subagents[0].blockId}`,
+          })
+        } else {
+          result.push(item)
+        }
+        i = nextIndex - 1
+      } else {
+        // Non-tool items are added as-is
+        result.push(item)
+      }
+    }
+
+    return result
+  }, [mixedItems])
+
+  return (
+    <div className="space-y-3">
+      {mergedItems.map((item, index) => {
+        // Null check after filter
+        if (!item) {
+          return null
+        }
+
+        if (item.type === 'content') {
+          // Skip empty content or non-string content
+          if (!item.content || typeof item.content !== 'string' || !item.content.trim()) {
+            return null
+          }
+          const key = 'blockId' in item ? item.blockId : `content-${index}`
+          const textContent =
+            annotations && annotations.length > 0
+              ? processCitePatterns(item.content, annotations)
+              : item.content
+          return (
+            <div key={key} className="text-sm">
+              <EnhancedMarkdown source={textContent} theme={theme} />
+            </div>
+          )
+        } else if (item.type === 'video') {
+          if (
+            item.status === 'error' ||
+            (item.isPlaceholder && isTerminalFailure) ||
+            (!item.isPlaceholder && !item.videoUrl)
+          ) {
+            return null
+          }
+
+          // Render video block using VideoPlayer component
+          return (
+            <div key={item.blockId} className="space-y-2">
+              <VideoPlayer
+                videoUrl={item.videoUrl}
+                thumbnail={item.thumbnail ?? undefined}
+                coverUrl={item.coverUrl ?? undefined}
+                duration={item.duration ?? undefined}
+                attachmentId={item.attachmentId ?? undefined}
+                useMessageDisplaySize
+                isPlaceholder={item.isPlaceholder}
+                progress={item.progress}
+              />
+            </div>
+          )
+        } else if (item.type === 'thinking') {
+          if (!item.content || typeof item.content !== 'string' || !item.content.trim()) {
+            return null
+          }
+          return (
+            <ReasoningDisplay
+              key={item.blockId}
+              reasoningContent={item.content}
+              isStreaming={item.status === 'streaming'}
+            />
+          )
+        } else if (item.type === 'image') {
+          if (item.isPlaceholder && (isTerminalFailure || item.status === 'error')) {
+            return null
+          }
+
+          // Render image block using ImageGallery component
+          return (
+            <div key={item.blockId} className="space-y-2">
+              {item.isPlaceholder ? (
+                // Show loading state for placeholder images
+                <ImageGenerationPlaceholder imageSize={item.imageSize} startedAt={item.startedAt} />
+              ) : item.imageUrls && item.imageUrls.length > 0 ? (
+                // Show generated images
+                <ImageGallery
+                  images={item.imageUrls.map((url: string, i: number) => ({
+                    url,
+                    attachmentId: item.imageAttachmentIds?.[i],
+                  }))}
+                  imageSize={item.imageSize}
+                  onUseAsReference={onUseAsReference}
+                />
+              ) : null}
+            </div>
+          )
+        } else if (item.type === 'custom') {
+          // Render custom block using the registered renderer
+          return <div key={item.blockId}>{item.render()}</div>
+        } else if (item.type === 'interactive_form_question') {
+          // Render ask_user_question form for interactive user input
+          // pb-4 ensures enough space between the form and the absolute-positioned BubbleTools below
+          return (
+            <div key={item.blockId} className="pb-4">
+              <AskUserForm
+                data={item.data}
+                taskId={taskId || 0}
+                currentMessageIndex={currentMessageIndex || 0}
+                blockStatus={item.status}
+                onSubmit={onAskUserSubmit}
+              />
+            </div>
+          )
+        } else if (item.type === 'subscription_preview') {
+          // Render subscription preview card with confirm/cancel buttons
+          return (
+            <div key={item.blockId} className="pb-4">
+              <SubscriptionPreviewCard data={item.data} />
+            </div>
+          )
+        } else if (item.type === 'card') {
+          return (
+            <CardRenderer
+              key={item.blockId}
+              block={item.data}
+              taskId={taskId}
+              subtaskId={subtaskId}
+              onChatButtonClick={onCardChatButtonClick}
+            />
+          )
+        } else if (item.type === 'guidance') {
+          return <GuidanceBlock key={item.blockId} block={item.data} />
+        } else if (item.type === 'subagent') {
+          return <SubagentBlock key={item.blockId} block={item.data} theme={theme} />
+        } else if (item.type === 'subagent_group') {
+          return <SubagentGroupBlock key={item.blockId} blocks={item.blocks} theme={theme} />
+        } else if (item.type === 'tool') {
+          const key = 'blockId' in item ? item.blockId : `tool-${item.tool.toolUseId}`
+          const count = 'count' in item ? item.count : 1
+          const mergedTools = 'mergedTools' in item ? item.mergedTools : undefined
+          return (
+            <ToolBlock
+              key={key}
+              tool={item.tool}
+              defaultExpanded={false}
+              count={count}
+              mergedTools={mergedTools}
+            />
+          )
+        }
+        return null
+      })}
+
+      {/* Show "Processing..." indicator when task is running and last block is complete */}
+      {shouldShowProcessing && (
+        <div className="px-2 py-1">
+          <StreamingWaitIndicator
+            isWaiting={true}
+            message={processingMessage || t('thinking.processing') || 'Processing...'}
+          />
+        </div>
+      )}
+    </div>
+  )
+})
+
+export default MixedContentView

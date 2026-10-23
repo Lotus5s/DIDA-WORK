@@ -1,0 +1,725 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Cloud project lifecycle and local execution bindings."""
+
+import logging
+import re
+import uuid
+
+from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.core.provider_credentials import store_provider_config
+from app.models.cloud_project import CloudProject
+from app.models.delivery import LoopItem, ProjectAutomationRun, loop_datetime_is_unset
+from app.models.kind import Kind
+from app.models.loop_item_execution import LoopItemExecution
+from app.models.resource_member import MemberStatus, ResourceMember
+from app.models.share_link import ResourceType
+from app.schemas.base_role import BaseRole
+from app.schemas.cloud_project import (
+    CloudProjectBoardConfig,
+    CloudProjectCreate,
+    CloudProjectUpdate,
+    normalize_provider_config,
+)
+from app.services.cloud_project_visibility import (
+    AUTHENTICATED_ENTITY_ID,
+    AUTHENTICATED_ENTITY_TYPE,
+    accessible_cloud_projects,
+    workspace_project_ids,
+)
+from app.services.cloud_projects.access import require_cloud_project_role
+from app.services.cloud_projects.members import CloudProjectMemberService
+from app.services.device.runtime_route import runtime_device_route_id
+from app.services.execution_environment_initialization import (
+    initialize_execution_environment,
+    merge_execution_environment_device_state,
+    preparing_execution_environment,
+)
+from app.services.loop_item_status_history import write_status_change
+from app.services.project_automation_domain import ACTIVE_RUN_STATUSES
+from app.services.workspaces import workspace_service
+from app.services.workspaces.access import require_workspace_role
+from app.services.workspaces.environment_status import execution_environment_statuses
+from app.services.workspaces.resource_mapping import execution_environment_values
+from app.services.workspaces.storage import (
+    WORKSPACE_ENTITY_TYPE,
+    resource_grant,
+    workspace_id_for_project,
+)
+from shared.telemetry.decorators import trace_async
+
+logger = logging.getLogger(__name__)
+
+
+class CloudProjectService(CloudProjectMemberService):
+    @staticmethod
+    def _lock_project(db: Session, cloud_project_id: int) -> CloudProject:
+        project = (
+            db.query(CloudProject)
+            .filter(CloudProject.id == cloud_project_id)
+            .populate_existing()
+            .with_for_update()
+            .one_or_none()
+        )
+        if project is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Project not found")
+        return project
+
+    @staticmethod
+    def _member_capabilities(project: CloudProject) -> dict[str, str]:
+        metadata = (
+            project.metadata_json if isinstance(project.metadata_json, dict) else {}
+        )
+        values = metadata.get("member_capabilities")
+        if not isinstance(values, dict):
+            return {}
+        return {
+            str(member_id): description.strip()
+            for member_id, description in values.items()
+            if isinstance(description, str) and description.strip()
+        }
+
+    @classmethod
+    def _set_member_capability(
+        cls, project: CloudProject, member_user_id: int, description: str
+    ) -> None:
+        metadata = dict(project.metadata_json or {})
+        capabilities = cls._member_capabilities(project)
+        normalized = description.strip()
+        if normalized:
+            capabilities[str(member_user_id)] = normalized
+        else:
+            capabilities.pop(str(member_user_id), None)
+        if capabilities:
+            metadata["member_capabilities"] = capabilities
+        else:
+            metadata.pop("member_capabilities", None)
+        project.metadata_json = metadata
+
+    def _generate_project_key(self, db: Session, name: str) -> str:
+        prefix = re.sub(r"[^A-Za-z0-9]", "", name).upper()[:8] or "PRJ"
+        for _ in range(10):
+            suffix = uuid.uuid4().hex[:6].upper()
+            candidate = f"{prefix}{suffix}"[:16]
+            exists = (
+                db.query(CloudProject.id)
+                .filter(CloudProject.project_key == candidate)
+                .first()
+            )
+            if exists is None:
+                return candidate
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Could not generate project key"
+        )
+
+    def create(
+        self, db: Session, user_id: int, values: CloudProjectCreate
+    ) -> CloudProject:
+        if values.workspace_id is None:
+            workspace = workspace_service.get_or_create_default(db, user_id)
+        else:
+            workspace = require_workspace_role(
+                db,
+                int(values.workspace_id),
+                user_id,
+                BaseRole.Developer,
+            ).workspace
+        public_id = str(uuid.uuid4())
+        try:
+            provider_config = store_provider_config(
+                values.task_provider, values.provider_config
+            )
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        project = CloudProject(
+            public_id=public_id,
+            project_key=values.project_key
+            or self._generate_project_key(db, values.name),
+            name=values.name,
+            description=values.description,
+            created_by_user_id=user_id,
+            storage_prefix=f"projects/{public_id}",
+            metadata_json={
+                "membership_mode": values.membership_mode,
+                "project_store": "backend",
+                "task_provider": values.task_provider,
+                "provider_config": provider_config,
+                "default_issue_security": values.default_issue_security,
+                "tags": [],
+                "board_config": CloudProjectBoardConfig().model_dump(),
+            },
+        )
+        db.add(project)
+        try:
+            db.flush()
+            # A new project has no grant to lock or reactivate.
+            db.add(
+                ResourceMember.create(
+                    resource_type=ResourceType.CLOUD_PROJECT.value,
+                    resource_id=int(project.id),
+                    entity_type=WORKSPACE_ENTITY_TYPE,
+                    entity_id=str(workspace.id),
+                    invited_by_user_id=user_id,
+                    role=BaseRole.Owner.value,
+                    status=MemberStatus.APPROVED.value,
+                )
+            )
+            workspace_service.ensure_human_member(
+                db,
+                workspace_id=workspace.id,
+                user_id=user_id,
+                role=BaseRole.Developer,
+            )
+            db.add(
+                ResourceMember.create(
+                    resource_type=ResourceType.CLOUD_PROJECT.value,
+                    resource_id=project.id,
+                    entity_id=str(user_id),
+                    role=BaseRole.Maintainer.value,
+                    status=MemberStatus.APPROVED.value,
+                )
+            )
+            if values.visibility == "public":
+                db.add(
+                    ResourceMember.create(
+                        resource_type=ResourceType.CLOUD_PROJECT.value,
+                        resource_id=int(project.id),
+                        entity_type=AUTHENTICATED_ENTITY_TYPE,
+                        entity_id=AUTHENTICATED_ENTITY_ID,
+                        role=(
+                            values.public_access.role
+                            if values.public_access
+                            else "Viewer"
+                        ),
+                        status=MemberStatus.APPROVED.value,
+                    )
+                )
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            logger.exception("Failed to create cloud project")
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "Cloud project could not be created"
+            ) from exc
+        db.refresh(project)
+        return project
+
+    def list_accessible(
+        self,
+        db: Session,
+        user_id: int,
+        *,
+        workspace_id: int | None = None,
+    ) -> list[CloudProject]:
+        query = accessible_cloud_projects(db, user_id)
+        if workspace_id is not None:
+            query = query.filter(
+                CloudProject.id.in_(workspace_project_ids(workspace_id))
+            )
+        return query.order_by(CloudProject.updated_at.desc()).all()
+
+    def get(self, db: Session, project_id: int, user_id: int) -> CloudProject:
+        return require_cloud_project_role(
+            db, project_id, user_id, BaseRole.Viewer
+        ).project
+
+    def access(self, db: Session, project_id: int, user_id: int):
+        return require_cloud_project_role(db, project_id, user_id, BaseRole.Viewer)
+
+    def update(
+        self,
+        db: Session,
+        project_id: int,
+        user_id: int,
+        values: CloudProjectUpdate,
+    ) -> CloudProject:
+        project = require_cloud_project_role(
+            db, project_id, user_id, BaseRole.Maintainer
+        ).project
+        updates = values.model_dump(exclude={"version"}, exclude_none=True)
+        if (
+            "membership_mode" in values.model_fields_set
+            or "tags" in values.model_fields_set
+            or "provider_config" in values.model_fields_set
+            or "card_display" in values.model_fields_set
+            or "board_config" in values.model_fields_set
+            or "ai_automation" in values.model_fields_set
+            or "pull_request_automation" in values.model_fields_set
+            or "workflow_definition" in values.model_fields_set
+            or "execution_environment" in values.model_fields_set
+            or "visibility" in values.model_fields_set
+            or "public_access" in values.model_fields_set
+            or "default_issue_security" in values.model_fields_set
+        ):
+            metadata = dict(project.metadata_json or {})
+            if values.membership_mode is not None:
+                metadata["membership_mode"] = updates.pop("membership_mode")
+            if "tags" in values.model_fields_set and values.tags is not None:
+                metadata["tags"] = updates.pop("tags")
+            if (
+                "card_display" in values.model_fields_set
+                and values.card_display is not None
+            ):
+                metadata["card_display"] = values.card_display.model_dump()
+                updates.pop("card_display", None)
+            if (
+                "board_config" in values.model_fields_set
+                and values.board_config is not None
+            ):
+                previous = metadata.get("board_config")
+                previous = previous if isinstance(previous, dict) else {}
+                previous_statuses = previous.get("statuses")
+                previous_statuses = (
+                    previous_statuses if isinstance(previous_statuses, list) else []
+                )
+                previous_ids = {
+                    str(item.get("id"))
+                    for item in previous_statuses
+                    if isinstance(item, dict) and item.get("id")
+                }
+                next_ids = {item.id for item in values.board_config.statuses}
+                removed_ids = previous_ids - next_ids
+                if removed_ids:
+                    affected = (
+                        db.query(LoopItem)
+                        .filter(
+                            LoopItem.cloud_project_id == project.id,
+                            LoopItem.status.in_(removed_ids),
+                            loop_datetime_is_unset(LoopItem.deleted_at),
+                        )
+                        .all()
+                    )
+                    for item in affected:
+                        item_metadata = (
+                            dict(item.metadata_json)
+                            if isinstance(item.metadata_json, dict)
+                            else {}
+                        )
+                        write_status_change(
+                            item_metadata,
+                            project=project,
+                            from_status=item.status,
+                            to_status="",
+                            trigger="status_removed",
+                            by_user_id=user_id,
+                        )
+                        item.metadata_json = item_metadata
+                        item.status = ""
+                        item.completed_at = None
+                        item.version += 1
+                metadata["board_config"] = values.board_config.model_dump()
+                updates.pop("board_config", None)
+            if (
+                "ai_automation" in values.model_fields_set
+                and values.ai_automation is not None
+            ):
+                metadata["ai_automation"] = values.ai_automation.model_dump()
+                updates.pop("ai_automation", None)
+            if (
+                "pull_request_automation" in values.model_fields_set
+                and values.pull_request_automation is not None
+            ):
+                metadata["pull_request_automation"] = (
+                    values.pull_request_automation.model_dump()
+                )
+                updates.pop("pull_request_automation", None)
+            if (
+                "workflow_definition" in values.model_fields_set
+                and values.workflow_definition is not None
+            ):
+                metadata["workflow_definition"] = (
+                    values.workflow_definition.model_dump()
+                )
+                updates.pop("workflow_definition", None)
+            if (
+                "execution_environment" in values.model_fields_set
+                and values.execution_environment is not None
+            ):
+                metadata["execution_environment"] = preparing_execution_environment(
+                    values.execution_environment.model_dump(),
+                    metadata.get("execution_environment"),
+                )
+                updates.pop("execution_environment", None)
+            if (
+                "provider_config" in values.model_fields_set
+                and values.provider_config is not None
+            ):
+                provider = metadata.get("task_provider", "local")
+                current_config = metadata.get("provider_config")
+                current_config = (
+                    current_config if isinstance(current_config, dict) else {}
+                )
+                try:
+                    provider_config = normalize_provider_config(
+                        str(provider), values.provider_config
+                    )
+                    metadata["provider_config"] = (
+                        {}
+                        if provider == "local"
+                        else store_provider_config(
+                            str(provider),
+                            provider_config,
+                            current_config,
+                        )
+                    )
+                except ValueError as exc:
+                    raise HTTPException(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)
+                    ) from exc
+                updates.pop("provider_config", None)
+            if values.default_issue_security is not None:
+                if (
+                    project.task_provider == "dingtalk_aitable"
+                    and values.default_issue_security != "open"
+                ):
+                    raise HTTPException(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        "DingTalk table records use DingTalk permissions",
+                    )
+                metadata["default_issue_security"] = values.default_issue_security
+            updates.pop("default_issue_security", None)
+            if (
+                "visibility" in values.model_fields_set
+                or "public_access" in values.model_fields_set
+            ):
+                grant = (
+                    db.query(ResourceMember)
+                    .filter(
+                        ResourceMember.resource_type
+                        == ResourceType.CLOUD_PROJECT.value,
+                        ResourceMember.resource_id == project.id,
+                        ResourceMember.entity_type == AUTHENTICATED_ENTITY_TYPE,
+                        ResourceMember.entity_id == AUTHENTICATED_ENTITY_ID,
+                    )
+                    .one_or_none()
+                )
+                visible = (
+                    values.visibility != "private"
+                    if values.visibility is not None
+                    else grant is not None
+                    and grant.status == MemberStatus.APPROVED.value
+                )
+                if not visible and values.public_access is not None:
+                    raise HTTPException(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        "Private projects cannot grant public access",
+                    )
+                if visible:
+                    role = (
+                        values.public_access.role
+                        if values.public_access
+                        else (grant.role if grant else "Viewer")
+                    )
+                    if grant is None:
+                        db.add(
+                            ResourceMember.create(
+                                resource_type=ResourceType.CLOUD_PROJECT.value,
+                                resource_id=int(project.id),
+                                entity_type=AUTHENTICATED_ENTITY_TYPE,
+                                entity_id=AUTHENTICATED_ENTITY_ID,
+                                role=role,
+                                status=MemberStatus.APPROVED.value,
+                            )
+                        )
+                    else:
+                        grant.role = role
+                        grant.status = MemberStatus.APPROVED.value
+                elif grant is not None:
+                    db.delete(grant)
+                updates.pop("visibility", None)
+                updates.pop("public_access", None)
+            updates["metadata_json"] = metadata
+        updated = (
+            db.query(CloudProject)
+            .filter(
+                CloudProject.id == project.id,
+                CloudProject.version == values.version,
+            )
+            .update({**updates, "version": CloudProject.version + 1})
+        )
+        if updated != 1:
+            db.rollback()
+            raise HTTPException(status.HTTP_409_CONFLICT, "Cloud project changed")
+        from app.services.collaboration_revocation import (
+            revoke_unauthorized_project_work,
+        )
+        from app.services.loop_item_executions.cancellation import (
+            request_execution_cancellations,
+        )
+
+        db.flush()
+        pending = revoke_unauthorized_project_work(db, project.id)
+        db.commit()
+        request_execution_cancellations(pending)
+        db.refresh(project)
+        return project
+
+    async def initialize_execution_environment(
+        self,
+        db: Session,
+        cloud_project_id: int,
+        device_id: int,
+        user_id: int,
+        version: int,
+    ) -> CloudProject:
+        require_cloud_project_role(db, cloud_project_id, user_id, BaseRole.Maintainer)
+        project = self._lock_project(db, cloud_project_id)
+        if project.version != version:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Project changed")
+        grant = (
+            db.query(ResourceMember)
+            .filter(
+                ResourceMember.resource_type == ResourceType.DEVICE.value,
+                ResourceMember.resource_id == device_id,
+                ResourceMember.entity_type == "project",
+                ResourceMember.entity_id == str(cloud_project_id),
+                ResourceMember.status == MemberStatus.APPROVED.value,
+            )
+            .first()
+        )
+        device = db.get(Kind, device_id)
+        if grant is None or device is None or device.kind != "Device":
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Execution device is not available in this Project",
+            )
+        definition = (project.metadata_json or {}).get("execution_environment")
+        definition = definition if isinstance(definition, dict) else {}
+        # Preparation runs on the device for minutes, so the project row must not
+        # stay locked while it runs; otherwise every concurrent project write
+        # blocks for the whole preparation and then fails the version check.
+        db.commit()
+        state = await initialize_execution_environment(
+            db=db,
+            device=device,
+            environment_id=f"project-{cloud_project_id}",
+            definition=definition,
+        )
+        project = self._lock_project(db, cloud_project_id)
+        if project.version != version:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Project changed")
+        metadata = dict(project.metadata_json or {})
+        environment = metadata.get("execution_environment")
+        metadata["execution_environment"] = merge_execution_environment_device_state(
+            environment if isinstance(environment, dict) else {},
+            device_key=runtime_device_route_id(device),
+            device_state=state,
+        )
+        project.metadata_json = metadata
+        # Recording a preparation result is not a configuration change, so the
+        # client keeps a usable version token and can retry after a failure.
+        db.commit()
+        db.refresh(project)
+        return project
+
+    def archive(self, db: Session, project_id: int, user_id: int, version: int) -> None:
+        """Archive a project and remove every future automation trigger."""
+
+        project = require_cloud_project_role(
+            db, project_id, user_id, BaseRole.Maintainer
+        ).project
+        active_run = (
+            db.query(ProjectAutomationRun.id)
+            .filter(
+                ProjectAutomationRun.cloud_project_id == str(project.id),
+                ProjectAutomationRun.status.in_(ACTIVE_RUN_STATUSES),
+                loop_datetime_is_unset(ProjectAutomationRun.deleted_at),
+            )
+            .first()
+        )
+        active_execution = (
+            db.query(LoopItemExecution.id)
+            .filter(
+                LoopItemExecution.cloud_project_id == str(project.id),
+                LoopItemExecution.status.notin_(("completed", "failed", "cancelled")),
+            )
+            .first()
+        )
+        if active_run is not None or active_execution is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Stop active automation runs before archiving this project",
+            )
+        updated = (
+            db.query(CloudProject)
+            .filter(
+                CloudProject.id == project.id,
+                CloudProject.version == version,
+                CloudProject.status == "active",
+            )
+            .update(
+                {
+                    "status": "archived",
+                    "version": CloudProject.version + 1,
+                }
+            )
+        )
+        if updated != 1:
+            db.rollback()
+            raise HTTPException(status.HTTP_409_CONFLICT, "Cloud project changed")
+        from app.services.project_automations import project_automation_service
+
+        deleted_rule_count = project_automation_service.delete_project_rules(
+            db,
+            project_id=str(project.id),
+            user_id=user_id,
+        )
+        db.commit()
+        logger.info(
+            "Archived cloud project project=%s deleted_automation_rules=%s user=%s",
+            project.id,
+            deleted_rule_count,
+            user_id,
+        )
+
+    @trace_async("project.list_execution_environments", tracer_name="backend")
+    async def list_execution_environments(
+        self, db: Session, cloud_project_id: int, user_id: int
+    ) -> list[dict[str, object]]:
+        require_cloud_project_role(db, cloud_project_id, user_id)
+        workspace_id = workspace_id_for_project(db, cloud_project_id)
+        if workspace_id is None:
+            return []
+        rows = (
+            db.query(ResourceMember, Kind)
+            .join(Kind, Kind.id == ResourceMember.resource_id)
+            .filter(
+                ResourceMember.resource_type == ResourceType.DEVICE.value,
+                ResourceMember.entity_type == "project",
+                ResourceMember.entity_id == str(cloud_project_id),
+                ResourceMember.status == MemberStatus.APPROVED.value,
+                Kind.kind == "Device",
+            )
+            .order_by(ResourceMember.created_at, ResourceMember.id)
+            .all()
+        )
+        connection_statuses = await execution_environment_statuses(
+            [device for _, device in rows]
+        )
+        from app.services.runner_routing import project_environment_ids
+
+        authorized_device_ids = project_environment_ids(db, str(cloud_project_id))
+        return [
+            execution_environment_values(
+                db,
+                grant,
+                device,
+                connection_status=connection_statuses[device.id],
+                workspace_id=str(workspace_id),
+                can_use=device.is_active and device.id in authorized_device_ids,
+            )
+            for grant, device in rows
+        ]
+
+    @trace_async("project.add_execution_environment", tracer_name="backend")
+    async def add_execution_environment(
+        self,
+        db: Session,
+        cloud_project_id: int,
+        device_id: int,
+        user_id: int,
+    ) -> dict[str, object]:
+        require_cloud_project_role(db, cloud_project_id, user_id, BaseRole.Maintainer)
+        workspace_id = workspace_id_for_project(db, cloud_project_id)
+        if workspace_id is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Project is not attached to a Workspace",
+            )
+        existing = (
+            db.query(ResourceMember)
+            .filter(
+                ResourceMember.resource_type == ResourceType.DEVICE.value,
+                ResourceMember.resource_id == device_id,
+                ResourceMember.entity_type == "project",
+                ResourceMember.entity_id == str(cloud_project_id),
+                ResourceMember.status == MemberStatus.APPROVED.value,
+            )
+            .first()
+        )
+        if existing is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Execution environment is already available in this Project",
+            )
+        device = db.get(Kind, device_id)
+        if device is None or device.kind != "Device" or not device.is_active:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "Execution environment not found"
+            )
+        workspace_grant = resource_grant(
+            db,
+            workspace_id=workspace_id,
+            resource_type=ResourceType.DEVICE.value,
+            resource_id=device_id,
+        )
+        if workspace_grant is None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Share the environment with this Workspace before authorizing it for a Project",
+            )
+        connection_statuses = await execution_environment_statuses([device])
+        grant = ResourceMember.create(
+            resource_type=ResourceType.DEVICE.value,
+            resource_id=device_id,
+            entity_type="project",
+            entity_id=str(cloud_project_id),
+            role=BaseRole.Developer.value,
+            status=MemberStatus.APPROVED.value,
+            invited_by_user_id=user_id,
+        )
+        db.add(grant)
+        db.commit()
+        db.refresh(grant)
+        return execution_environment_values(
+            db,
+            grant,
+            device,
+            connection_status=connection_statuses[device.id],
+            workspace_id=str(workspace_id),
+        )
+
+    def remove_execution_environment(
+        self,
+        db: Session,
+        cloud_project_id: int,
+        device_id: int,
+        user_id: int,
+    ) -> None:
+        require_cloud_project_role(db, cloud_project_id, user_id, BaseRole.Maintainer)
+        grant = (
+            db.query(ResourceMember)
+            .filter(
+                ResourceMember.resource_type == ResourceType.DEVICE.value,
+                ResourceMember.resource_id == device_id,
+                ResourceMember.entity_type == "project",
+                ResourceMember.entity_id == str(cloud_project_id),
+                ResourceMember.status == MemberStatus.APPROVED.value,
+            )
+            .first()
+        )
+        if grant is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "Project execution environment not found",
+            )
+        db.delete(grant)
+        db.flush()
+        from app.services.collaboration_revocation import (
+            revoke_unauthorized_project_work,
+        )
+        from app.services.loop_item_executions.cancellation import (
+            request_execution_cancellations,
+        )
+
+        pending = revoke_unauthorized_project_work(db, cloud_project_id)
+        db.commit()
+        request_execution_cancellations(pending)
+
+
+cloud_project_service = CloudProjectService()

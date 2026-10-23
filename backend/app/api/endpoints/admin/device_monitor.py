@@ -1,0 +1,962 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Admin device monitor endpoints for viewing all user devices."""
+
+import logging
+import time
+from typing import Any, Dict, List, Literal, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from packaging.version import InvalidVersion, Version
+from pydantic import BaseModel, Field
+from sqlalchemy import and_, func, or_
+from sqlalchemy.orm import Session
+
+from app.api.dependencies import get_db
+from app.core import security
+from app.core.cache import cache_manager
+from app.models.kind import Kind
+from app.models.user import User
+from app.schemas.device import BindShell, DeviceStatusEnum, DeviceType
+from app.services.device.admin_device_batch import (
+    AdminDeviceBatchTarget,
+    admin_device_batch_manager,
+)
+from app.services.device.admin_device_restart import restart_admin_device
+from app.services.device.local_provider import (
+    local_device_provider,
+    runtime_capacity_slot_values,
+)
+from app.services.device_service import DeviceService as device_service
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/device-monitor")
+
+# Stats cache configuration
+_STATS_CACHE = {"data": None, "timestamp": 0, "ttl": 30}  # 30 seconds cache
+VersionFilterOperator = Literal["gt", "gte", "eq", "lt", "lte"]
+
+
+# ==================== Request/Response Models ====================
+
+
+class AdminDeviceUpgradeRequest(BaseModel):
+    """Request schema for admin device upgrade."""
+
+    user_id: int = Field(..., description="Device owner user ID")
+    force_stop_tasks: bool = Field(
+        False, description="Force stop running tasks before upgrade"
+    )
+
+
+class AdminDeviceBatchUpgradeRequest(BaseModel):
+    """Request schema for batch admin device upgrade."""
+
+    force_stop_tasks: bool = Field(
+        False, description="Force stop running tasks before upgrade"
+    )
+
+
+class AdminDeviceRestartRequest(BaseModel):
+    """Request schema for admin device restart (cloud only)."""
+
+    user_id: int = Field(..., description="Device owner user ID")
+
+
+class AdminDeviceMigrateRequest(BaseModel):
+    """Request schema for admin device migration (cloud only)."""
+
+    user_id: int = Field(..., description="Device owner user ID")
+    target_host: Optional[str] = Field(
+        None, description="Target host for migration (future use)"
+    )
+
+
+class AdminDeviceActionResponse(BaseModel):
+    """Response schema for admin device actions."""
+
+    success: bool = Field(..., description="Whether the action was successful")
+    message: str = Field(..., description="Action result message")
+
+
+class AdminDeviceBatchStartResponse(BaseModel):
+    """Response schema for starting an admin device batch action."""
+
+    success: bool = Field(..., description="Whether the batch was accepted")
+    batch_id: str = Field(..., description="Batch action ID")
+    action: str = Field(..., description="Batch action type")
+    status: str = Field(..., description="Batch status")
+    total: int = Field(..., description="Total devices considered")
+    message: str = Field(..., description="Batch start message")
+
+
+class AdminDeviceBatchItemResponse(BaseModel):
+    """Response schema for one device inside an admin batch action."""
+
+    user_id: int = Field(..., description="Device owner user ID")
+    device_id: str = Field(..., description="Device unique identifier")
+    status: str = Field(..., description="Per-device batch status")
+    message: str = Field(..., description="Per-device batch message")
+
+
+class AdminDeviceBatchStatusResponse(AdminDeviceBatchStartResponse):
+    """Response schema for admin batch device action status."""
+
+    triggered: int = Field(..., description="Devices that accepted the action")
+    failed: int = Field(..., description="Devices that failed the action")
+    skipped: int = Field(..., description="Devices skipped as ineligible")
+    errors: List[str] = Field(default_factory=list, description="Per-device errors")
+    items: List[AdminDeviceBatchItemResponse] = Field(
+        default_factory=list,
+        description="Per-device batch action states",
+    )
+
+
+class AdminDeviceInfo(BaseModel):
+    """Device information for admin monitoring."""
+
+    id: int = Field(..., description="Device CRD ID in kinds table")
+    device_id: str = Field(..., description="Device unique identifier")
+    name: str = Field(..., description="Device name")
+    status: DeviceStatusEnum = Field(..., description="Device online status")
+    device_type: DeviceType = Field(
+        DeviceType.LOCAL, description="Device type (local, app, cloud, or remote)"
+    )
+    bind_shell: BindShell = Field(
+        BindShell.CLAUDECODE, description="Shell runtime binding"
+    )
+    user_id: int = Field(..., description="Owner user ID")
+    user_name: str = Field(..., description="Owner username")
+    client_ip: Optional[str] = Field(None, description="Device client IP")
+    executor_version: Optional[str] = Field(None, description="Executor version")
+    slot_used: int = Field(0, description="Number of slots in use")
+    slot_max: int = Field(0, description="Maximum slots")
+    created_at: Optional[str] = Field(None, description="Device creation timestamp")
+
+
+class AdminDeviceListResponse(BaseModel):
+    """Response schema for admin device list."""
+
+    items: List[AdminDeviceInfo]
+    total: int
+
+
+class AdminDeviceStats(BaseModel):
+    """Statistics for admin device monitoring."""
+
+    total: int = Field(..., description="Total device count")
+    user_count: int = Field(..., description="Total user count with devices")
+    by_status: Dict[str, int] = Field(
+        ..., description="Count by status (online, offline, busy)"
+    )
+    by_device_type: Dict[str, int] = Field(
+        ..., description="Count by device type (local, app, cloud, remote)"
+    )
+    by_bind_shell: Dict[str, int] = Field(
+        ..., description="Count by bind shell (claudecode, openclaw)"
+    )
+
+
+def _build_device_query(
+    db: Session,
+    device_type: Optional[str],
+    bind_shell: Optional[str],
+    search: Optional[str],
+    search_user_ids: Optional[List[int]] = None,
+):
+    """Build optimized query with SQL-level JSON filtering.
+
+    Args:
+        db: Database session
+        device_type: Filter by device type (local/app/cloud/remote)
+        bind_shell: Filter by bind shell (claudecode/openclaw)
+        search: Search by device name or device ID
+        search_user_ids: User IDs matching the search term (for username search)
+
+    Returns:
+        SQLAlchemy query object
+    """
+    query = db.query(Kind).filter(
+        and_(
+            Kind.kind == "Device",
+            Kind.namespace == "default",
+            Kind.is_active == True,
+        )
+    )
+
+    # Filter by device type using JSON_EXTRACT with COALESCE for default value
+    if device_type:
+        query = query.filter(
+            func.coalesce(
+                func.json_unquote(func.json_extract(Kind.json, "$.spec.deviceType")),
+                DeviceType.LOCAL.value,
+            )
+            == device_type
+        )
+
+    # Filter by bind shell using JSON_EXTRACT with COALESCE for default value
+    if bind_shell:
+        query = query.filter(
+            func.coalesce(
+                func.json_unquote(func.json_extract(Kind.json, "$.spec.bindShell")),
+                BindShell.CLAUDECODE.value,
+            )
+            == bind_shell
+        )
+
+    # Search filter: device name, device ID, or username
+    if search:
+        search_pattern = f"%{search}%"
+        search_conditions = [
+            # Search by displayName (with fallback to name column)
+            func.coalesce(
+                func.json_unquote(func.json_extract(Kind.json, "$.spec.displayName")),
+                Kind.name,
+            ).ilike(search_pattern),
+            # Search by deviceId (with fallback to name column)
+            func.coalesce(
+                func.json_unquote(func.json_extract(Kind.json, "$.spec.deviceId")),
+                Kind.name,
+            ).ilike(search_pattern),
+        ]
+        # Add user_id filter if there are matching users
+        if search_user_ids:
+            search_conditions.append(Kind.user_id.in_(search_user_ids))
+
+        query = query.filter(or_(*search_conditions))
+
+    return query
+
+
+async def _get_devices_redis_status(
+    device_kinds: List[Kind],
+) -> Dict[str, Any]:
+    """Get Redis status for devices in batch.
+
+    Args:
+        device_kinds: List of device Kind objects
+
+    Returns:
+        Dict mapping Redis keys to device status info
+    """
+    if not device_kinds:
+        return {}
+
+    # Build Redis keys for all devices
+    redis_keys = []
+    for kind in device_kinds:
+        spec = kind.json.get("spec", {}) if kind.json else {}
+        device_id = spec.get("deviceId", kind.name)
+        redis_key = local_device_provider.generate_online_key(kind.user_id, device_id)
+        redis_keys.append(redis_key)
+
+    # Batch get all Redis status (single round-trip)
+    return await cache_manager.mget_or_raise(redis_keys)
+
+
+def _build_device_info(
+    kind: Kind,
+    users_map: Dict[int, str],
+    online_info: Optional[Dict[str, Any]],
+) -> AdminDeviceInfo:
+    """Build AdminDeviceInfo from Kind and Redis status.
+
+    Args:
+        kind: Device Kind object
+        users_map: Map of user_id to user_name
+        online_info: Redis status info or None
+
+    Returns:
+        AdminDeviceInfo object
+    """
+    spec = kind.json.get("spec", {}) if kind.json else {}
+    device_id = spec.get("deviceId", kind.name)
+
+    # Determine status from Redis
+    if online_info:
+        status_val = online_info.get("status", DeviceStatusEnum.ONLINE.value)
+        executor_version = online_info.get("executor_version")
+        slot_used, slot_max = runtime_capacity_slot_values(online_info)
+    else:
+        status_val = DeviceStatusEnum.OFFLINE.value
+        executor_version = None
+        slot_used = 0
+        slot_max = 0
+
+    # Format created_at as ISO string
+    created_at_str = None
+    if kind.created_at:
+        created_at_str = kind.created_at.isoformat()
+
+    return AdminDeviceInfo(
+        id=kind.id,
+        device_id=device_id,
+        name=spec.get("displayName", device_id),
+        status=status_val,
+        device_type=spec.get("deviceType", DeviceType.LOCAL.value),
+        bind_shell=spec.get("bindShell", BindShell.CLAUDECODE.value),
+        user_id=kind.user_id,
+        user_name=users_map.get(kind.user_id, "Unknown"),
+        client_ip=spec.get("clientIp"),
+        executor_version=executor_version,
+        slot_used=slot_used,
+        slot_max=slot_max,
+        created_at=created_at_str,
+    )
+
+
+def _normalize_version_filter(
+    version_op: Optional[VersionFilterOperator], version: Optional[str]
+) -> Optional[tuple[VersionFilterOperator, Version]]:
+    """Normalize version filter query params."""
+    normalized_version = (version or "").strip()
+    if not normalized_version:
+        return None
+
+    try:
+        parsed_version = Version(normalized_version)
+    except InvalidVersion as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid version filter: {normalized_version}",
+        ) from exc
+
+    return (version_op or "gte", parsed_version)
+
+
+def _matches_version_filter(
+    executor_version: Optional[str],
+    version_filter: tuple[VersionFilterOperator, Version],
+) -> bool:
+    """Check whether an executor version matches the requested filter."""
+    if not executor_version:
+        return False
+
+    try:
+        parsed_executor_version = Version(executor_version.strip())
+    except InvalidVersion:
+        logger.warning(
+            f"[DeviceMonitor] Skipping device with invalid executor version: {executor_version}"
+        )
+        return False
+
+    version_op, target_version = version_filter
+    if version_op == "gt":
+        return parsed_executor_version > target_version
+    if version_op == "gte":
+        return parsed_executor_version >= target_version
+    if version_op == "eq":
+        return parsed_executor_version == target_version
+    if version_op == "lt":
+        return parsed_executor_version < target_version
+    return parsed_executor_version <= target_version
+
+
+@router.get("/devices", response_model=AdminDeviceListResponse)
+async def get_all_devices(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    status: Optional[DeviceStatusEnum] = Query(None, description="Filter by status"),
+    device_type: Optional[str] = Query(None, description="Filter by device type"),
+    bind_shell: Optional[str] = Query(None, description="Filter by bind shell"),
+    search: Optional[str] = Query(
+        None, description="Search by device name, ID or username"
+    ),
+    version_op: Optional[VersionFilterOperator] = Query(
+        None, description="Version comparison operator"
+    ),
+    version: Optional[str] = Query(
+        None, description="Filter online devices by executor version"
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_admin_user),
+):
+    """Get all devices across all users for admin monitoring (optimized).
+
+    This endpoint uses SQL-level JSON filtering for better performance:
+    1. Filters device_type and bind_shell using MySQL JSON_EXTRACT
+    2. Search uses SQL LIKE on JSON fields plus user_id lookup
+    3. Only queries Redis for the current page devices (batch mget)
+
+    Note: Status filter is removed for performance. Status is displayed
+    but cannot be used as a filter criterion.
+
+    Args:
+        page: Page number (1-indexed)
+        limit: Items per page
+        device_type: Filter by device type (local/app/cloud/remote)
+        bind_shell: Filter by bind shell (claudecode/openclaw)
+        search: Search by device name, device ID or username
+        db: Database session
+        current_user: Must be admin
+
+    Returns:
+        AdminDeviceListResponse with paginated devices
+    """
+    effective_version = None if status == DeviceStatusEnum.OFFLINE else version
+    normalized_version_filter = _normalize_version_filter(version_op, effective_version)
+
+    # Step 1: If search term provided, find matching user IDs first
+    search_user_ids: Optional[List[int]] = None
+    if search:
+        matching_users = (
+            db.query(User.id).filter(User.user_name.ilike(f"%{search}%")).all()
+        )
+        search_user_ids = [u.id for u in matching_users] if matching_users else []
+
+    # Step 2: Build optimized query with SQL-level filtering
+    query = _build_device_query(db, device_type, bind_shell, search, search_user_ids)
+
+    if normalized_version_filter is None and status is None:
+        # Step 3: Get total count and paginated results
+        total = query.count()
+        offset = (page - 1) * limit
+        page_kinds = query.offset(offset).limit(limit).all()
+
+        # Step 4: Build user map only for current page (not all devices)
+        page_user_ids = list({d.user_id for d in page_kinds})
+        users_map: Dict[int, str] = {}
+        if page_user_ids:
+            users = db.query(User).filter(User.id.in_(page_user_ids)).all()
+            users_map = {u.id: u.user_name for u in users}
+
+        # Step 5: Get Redis status for current page only (batch query)
+        online_info_map = await _get_devices_redis_status(page_kinds)
+
+        # Step 6: Build device info list
+        items = []
+        for kind in page_kinds:
+            spec = kind.json.get("spec", {}) if kind.json else {}
+            device_id = spec.get("deviceId", kind.name)
+            redis_key = local_device_provider.generate_online_key(
+                kind.user_id, device_id
+            )
+            online_info = online_info_map.get(redis_key)
+
+            device_info = _build_device_info(kind, users_map, online_info)
+            items.append(device_info)
+
+        return AdminDeviceListResponse(items=items, total=total)
+
+    # Version filtering requires live online info, so filter before pagination.
+    candidate_kinds = query.all()
+    online_info_map = await _get_devices_redis_status(candidate_kinds)
+    filtered_pairs: list[tuple[Kind, Dict[str, Any]]] = []
+
+    for kind in candidate_kinds:
+        spec = kind.json.get("spec", {}) if kind.json else {}
+        device_id = spec.get("deviceId", kind.name)
+        redis_key = local_device_provider.generate_online_key(kind.user_id, device_id)
+        online_info = online_info_map.get(redis_key)
+
+        status_val = (
+            online_info.get("status", DeviceStatusEnum.ONLINE.value)
+            if online_info
+            else DeviceStatusEnum.OFFLINE.value
+        )
+        if status is not None and status_val != status.value:
+            continue
+
+        if normalized_version_filter is not None and not _matches_version_filter(
+            online_info.get("executor_version") if online_info else None,
+            normalized_version_filter,
+        ):
+            continue
+
+        filtered_pairs.append((kind, online_info))
+
+    total = len(filtered_pairs)
+    offset = (page - 1) * limit
+    page_pairs = filtered_pairs[offset : offset + limit]
+    page_user_ids = list({kind.user_id for kind, _ in page_pairs})
+    users_map: Dict[int, str] = {}
+    if page_user_ids:
+        users = db.query(User).filter(User.id.in_(page_user_ids)).all()
+        users_map = {u.id: u.user_name for u in users}
+
+    items = []
+    for kind, online_info in page_pairs:
+        device_info = _build_device_info(kind, users_map, online_info)
+        items.append(device_info)
+
+    return AdminDeviceListResponse(items=items, total=total)
+
+
+@router.get("/stats", response_model=AdminDeviceStats)
+async def get_device_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_admin_user),
+):
+    """Get device statistics for admin monitoring (with caching).
+
+    Uses a 30-second in-memory cache to reduce Redis load for frequent requests.
+
+    Args:
+        db: Database session
+        current_user: Must be admin
+
+    Returns:
+        AdminDeviceStats with counts by status, type, and shell
+    """
+    global _STATS_CACHE
+
+    # Check cache
+    now = time.time()
+    if _STATS_CACHE["data"] and (now - _STATS_CACHE["timestamp"]) < _STATS_CACHE["ttl"]:
+        logger.debug("Returning cached device stats")
+        return _STATS_CACHE["data"]
+
+    # Get all Device CRDs
+    device_kinds = (
+        db.query(Kind)
+        .filter(
+            and_(
+                Kind.kind == "Device",
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )
+        )
+        .all()
+    )
+
+    # Initialize counters
+    by_status: Dict[str, int] = {
+        DeviceStatusEnum.ONLINE.value: 0,
+        DeviceStatusEnum.OFFLINE.value: 0,
+        DeviceStatusEnum.BUSY.value: 0,
+    }
+    by_device_type: Dict[str, int] = {
+        DeviceType.LOCAL.value: 0,
+        DeviceType.APP.value: 0,
+        DeviceType.CLOUD.value: 0,
+        DeviceType.REMOTE.value: 0,
+    }
+    by_bind_shell: Dict[str, int] = {
+        BindShell.CLAUDECODE.value: 0,
+        BindShell.OPENCLAW.value: 0,
+    }
+
+    # Count unique users with devices
+    user_ids = {d.user_id for d in device_kinds}
+
+    # Build Redis keys for all devices and collect static data
+    redis_keys = []
+    device_metadata = []
+
+    for kind in device_kinds:
+        spec = kind.json.get("spec", {}) if kind.json else {}
+        device_id = spec.get("deviceId", kind.name)
+        device_type_val = spec.get("deviceType", DeviceType.LOCAL.value)
+        bind_shell_val = spec.get("bindShell", BindShell.CLAUDECODE.value)
+
+        # Count by device type (static data)
+        if device_type_val in by_device_type:
+            by_device_type[device_type_val] += 1
+
+        # Count by bind shell (static data)
+        if bind_shell_val in by_bind_shell:
+            by_bind_shell[bind_shell_val] += 1
+
+        # Prepare for Redis batch query
+        redis_key = local_device_provider.generate_online_key(kind.user_id, device_id)
+        redis_keys.append(redis_key)
+        device_metadata.append({"type": device_type_val, "shell": bind_shell_val})
+
+    # Batch get all Redis status (single round-trip for all devices)
+    online_info_map = await cache_manager.mget_or_raise(redis_keys)
+
+    # Count by status
+    for i, metadata in enumerate(device_metadata):
+        redis_key = redis_keys[i]
+        online_info = online_info_map.get(redis_key)
+
+        if online_info:
+            status_val = online_info.get("status", DeviceStatusEnum.ONLINE.value)
+        else:
+            status_val = DeviceStatusEnum.OFFLINE.value
+
+        # Only count offline cloud devices (not all offline devices)
+        if status_val == DeviceStatusEnum.OFFLINE.value:
+            if metadata["type"] == DeviceType.CLOUD.value:
+                by_status[status_val] += 1
+        elif status_val in by_status:
+            by_status[status_val] += 1
+
+    result = AdminDeviceStats(
+        total=len(device_kinds),
+        user_count=len(user_ids),
+        by_status=by_status,
+        by_device_type=by_device_type,
+        by_bind_shell=by_bind_shell,
+    )
+
+    # Update cache
+    _STATS_CACHE["data"] = result
+    _STATS_CACHE["timestamp"] = now
+
+    return result
+
+
+# ==================== Device Action Endpoints ====================
+
+
+async def _get_device_for_action(
+    db: Session, device_id: str, user_id: int
+) -> tuple[Kind, Dict[str, Any]]:
+    """Get device and validate it exists and is online.
+
+    Args:
+        db: Database session
+        device_id: Device unique identifier
+        user_id: Device owner user ID
+
+    Returns:
+        Tuple of (device Kind, online_info dict)
+
+    Raises:
+        HTTPException: If device not found, offline, or socket_id missing
+    """
+    # Get device from database
+    device_kind = device_service.get_device_by_device_id(db, user_id, device_id)
+    if not device_kind:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Device not found: device_id={device_id}, user_id={user_id}",
+        )
+
+    # Get online info from Redis
+    online_info = await device_service.get_device_online_info(user_id, device_id)
+    if not online_info:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Device is offline",
+        )
+
+    if not online_info.get("socket_id"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Device socket information not found",
+        )
+
+    return device_kind, online_info
+
+
+def _get_device_id(kind: Kind) -> str:
+    """Resolve a Device CRD's public device ID."""
+    spec = kind.json.get("spec", {}) if kind.json else {}
+    return spec.get("deviceId", kind.name)
+
+
+def _get_active_devices_by_type(db: Session, device_type: DeviceType) -> List[Kind]:
+    """Return active Device CRDs for the requested device type."""
+    device_kinds = (
+        db.query(Kind)
+        .filter(
+            and_(
+                Kind.kind == "Device",
+                Kind.namespace == "default",
+                Kind.is_active == True,
+            )
+        )
+        .all()
+    )
+    return [
+        kind
+        for kind in device_kinds
+        if (kind.json.get("spec", {}) if kind.json else {}).get(
+            "deviceType", DeviceType.LOCAL.value
+        )
+        == device_type.value
+    ]
+
+
+def _get_local_claudecode_devices(db: Session) -> List[Kind]:
+    """Return local devices that use the ClaudeCode runtime binding."""
+    local_devices = _get_active_devices_by_type(db, DeviceType.LOCAL)
+    return [
+        kind
+        for kind in local_devices
+        if (kind.json.get("spec", {}) if kind.json else {}).get(
+            "bindShell", BindShell.CLAUDECODE.value
+        )
+        == BindShell.CLAUDECODE.value
+    ]
+
+
+def _get_upgrade_params(force_stop_tasks: bool) -> Dict[str, Any]:
+    """Build local executor upgrade command params."""
+    return {
+        "force": False,
+        "auto_confirm": True,
+        "verbose": False,
+        "force_stop_tasks": force_stop_tasks,
+    }
+
+
+@router.post(
+    "/devices/{device_id}/upgrade",
+    response_model=AdminDeviceActionResponse,
+)
+async def upgrade_device(
+    device_id: str = Path(..., description="Device unique identifier"),
+    request: AdminDeviceUpgradeRequest = ...,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_admin_user),
+):
+    """Trigger device upgrade for any user's device (admin only).
+
+    Args:
+        device_id: Device unique identifier
+        request: Upgrade request with user_id and options
+        db: Database session
+        current_user: Must be admin
+
+    Returns:
+        AdminDeviceActionResponse indicating success/failure
+    """
+    user_id = request.user_id
+
+    # Validate device exists and is online
+    device_kind, online_info = await _get_device_for_action(db, device_id, user_id)
+
+    # Check for running tasks
+    running_task_ids = online_info.get("running_task_ids", [])
+    if running_task_ids and not request.force_stop_tasks:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Device has {len(running_task_ids)} running task(s). "
+            f"Use force_stop_tasks=true to proceed.",
+        )
+
+    # Emit upgrade command via WebSocket
+    try:
+        from app.api.ws.device_namespace import device_namespace
+
+        socket_id = online_info["socket_id"]
+        upgrade_params = _get_upgrade_params(request.force_stop_tasks)
+
+        success = await device_namespace.emit_upgrade_command(socket_id, upgrade_params)
+
+        if success:
+            logger.info(
+                f"[Admin Device Upgrade] Command sent: "
+                f"admin={current_user.user_name}, user_id={user_id}, device_id={device_id}"
+            )
+            return AdminDeviceActionResponse(
+                success=True, message="Upgrade command sent to device"
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to send upgrade command",
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(
+            f"[Admin Device Upgrade] Error: device_id={device_id}, error={e}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to trigger upgrade: {str(e)}",
+        )
+
+
+@router.post(
+    "/devices/local/upgrade-all",
+    response_model=AdminDeviceBatchStartResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def upgrade_all_local_devices(
+    request: AdminDeviceBatchUpgradeRequest = AdminDeviceBatchUpgradeRequest(),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_admin_user),
+):
+    """Start a batch upgrade for all eligible local ClaudeCode devices."""
+    local_devices = _get_local_claudecode_devices(db)
+    targets = [
+        AdminDeviceBatchTarget(user_id=kind.user_id, device_id=_get_device_id(kind))
+        for kind in local_devices
+    ]
+    batch = admin_device_batch_manager.start_local_upgrade(
+        targets=targets,
+        force_stop_tasks=request.force_stop_tasks,
+        admin_name=current_user.user_name,
+    )
+    logger.info(
+        "[Admin Device Batch Upgrade] Started: admin=%s, batch_id=%s, total=%d",
+        current_user.user_name,
+        batch.batch_id,
+        batch.total,
+    )
+    return AdminDeviceBatchStartResponse(**batch.to_start_dict())
+
+
+@router.post(
+    "/devices/{device_id}/restart",
+    response_model=AdminDeviceActionResponse,
+)
+async def restart_device(
+    device_id: str = Path(..., description="Device unique identifier"),
+    request: AdminDeviceRestartRequest = ...,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_admin_user),
+):
+    """Restart a cloud device (admin only). Currently not implemented.
+
+    Args:
+        device_id: Device unique identifier
+        request: Restart request with user_id
+        db: Database session
+        current_user: Must be admin
+
+    Returns:
+        AdminDeviceActionResponse indicating the feature is not implemented
+    """
+    user_id = request.user_id
+
+    # Validate device exists
+    device_kind = device_service.get_device_by_device_id(db, user_id, device_id)
+    if not device_kind:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Device not found: device_id={device_id}, user_id={user_id}",
+        )
+
+    # Check device type - only cloud devices can be restarted
+    spec = device_kind.json.get("spec", {}) if device_kind.json else {}
+    device_type = spec.get("deviceType", DeviceType.LOCAL.value)
+    if device_type != DeviceType.CLOUD.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only cloud devices can be restarted",
+        )
+
+    try:
+        result = await restart_admin_device(db, user_id, device_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(
+            f"[Admin Device Restart] Error: device_id={device_id}, error={e}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to trigger restart: {str(e)}",
+        )
+
+    logger.info(
+        f"[Admin Device Restart] Completed: "
+        f"admin={current_user.user_name}, user_id={user_id}, "
+        f"device_id={device_id}, success={result.success}"
+    )
+    return AdminDeviceActionResponse(
+        success=result.success,
+        message=result.message,
+    )
+
+
+@router.post(
+    "/devices/cloud/restart-all",
+    response_model=AdminDeviceBatchStartResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def restart_all_cloud_devices(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_admin_user),
+):
+    """Start a batch restart for all cloud devices."""
+    cloud_devices = _get_active_devices_by_type(db, DeviceType.CLOUD)
+    targets = [
+        AdminDeviceBatchTarget(user_id=kind.user_id, device_id=_get_device_id(kind))
+        for kind in cloud_devices
+    ]
+    batch = admin_device_batch_manager.start_cloud_restart(
+        targets=targets,
+        admin_name=current_user.user_name,
+    )
+    logger.info(
+        "[Admin Device Batch Restart] Started: admin=%s, batch_id=%s, total=%d",
+        current_user.user_name,
+        batch.batch_id,
+        batch.total,
+    )
+    return AdminDeviceBatchStartResponse(**batch.to_start_dict())
+
+
+@router.get(
+    "/batches/{batch_id}",
+    response_model=AdminDeviceBatchStatusResponse,
+)
+async def get_device_batch_status(
+    batch_id: str = Path(..., description="Admin device batch action ID"),
+    current_user: User = Depends(security.get_admin_user),
+):
+    """Get status for an admin device batch action."""
+    batch = admin_device_batch_manager.get_batch(batch_id)
+    if batch is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Device batch not found: {batch_id}",
+        )
+
+    return AdminDeviceBatchStatusResponse(
+        **batch.to_status_dict(),
+    )
+
+
+@router.post(
+    "/devices/{device_id}/migrate",
+    response_model=AdminDeviceActionResponse,
+)
+async def migrate_device(
+    device_id: str = Path(..., description="Device unique identifier"),
+    request: AdminDeviceMigrateRequest = ...,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_admin_user),
+):
+    """Migrate a cloud device to another host (admin only). Currently not implemented.
+
+    Args:
+        device_id: Device unique identifier
+        request: Migrate request with user_id and optional target_host
+        db: Database session
+        current_user: Must be admin
+
+    Returns:
+        AdminDeviceActionResponse indicating the feature is not implemented
+    """
+    user_id = request.user_id
+
+    # Validate device exists
+    device_kind = device_service.get_device_by_device_id(db, user_id, device_id)
+    if not device_kind:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Device not found: device_id={device_id}, user_id={user_id}",
+        )
+
+    # Check device type - only cloud devices can be migrated
+    spec = device_kind.json.get("spec", {}) if device_kind.json else {}
+    device_type = spec.get("deviceType", DeviceType.LOCAL.value)
+    if device_type != DeviceType.CLOUD.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only cloud devices can be migrated",
+        )
+
+    logger.info(
+        f"[Admin Device Migrate] Stub called: "
+        f"admin={current_user.user_name}, user_id={user_id}, device_id={device_id}, "
+        f"target_host={request.target_host}"
+    )
+
+    # TODO: Implement actual migration logic for cloud devices
+    return AdminDeviceActionResponse(
+        success=False,
+        message="Device migration is not yet implemented. This feature will be available in a future release.",
+    )

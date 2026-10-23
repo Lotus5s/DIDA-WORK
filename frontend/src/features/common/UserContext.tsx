@@ -1,0 +1,279 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+import React, { createContext, useContext, useEffect, useState, ReactNode, useRef } from 'react'
+import { userApis } from '@/apis/user'
+import { ApiError } from '@/apis/client'
+import { User } from '@/types/api'
+import { useRouter } from 'next/navigation'
+import { paths } from '@/config/paths'
+import {
+  ADMIN_PASSWORD_SETUP_REQUIRED_ERROR_CODE,
+  POST_LOGIN_REDIRECT_KEY,
+  sanitizeRedirectPath,
+} from '@/features/login/constants'
+import { useToast } from '@/hooks/use-toast'
+
+interface UserContextType {
+  user: User | null
+  isLoading: boolean
+  adminPasswordSetupRequired: boolean
+  logout: () => void
+  refresh: () => Promise<void>
+  login: (data: { user_name: string; password: string }) => Promise<void>
+  setupAdminPassword: (password: string) => Promise<void>
+  /** Update user preferences (partial update) */
+  updatePreferences: (preferences: Partial<User['preferences']>) => Promise<void>
+}
+const UserContext = createContext<UserContextType>({
+  user: null,
+  isLoading: true,
+  adminPasswordSetupRequired: false,
+  logout: () => {},
+  refresh: async () => {},
+  login: async () => {},
+  setupAdminPassword: async () => {},
+  updatePreferences: async () => {},
+})
+
+function isAdminPasswordSetupRequiredError(error: unknown): boolean {
+  return error instanceof ApiError && error.errorCode === ADMIN_PASSWORD_SETUP_REQUIRED_ERROR_CODE
+}
+
+type RuntimeUserPreferences = NonNullable<User['preferences']> & {
+  quick_access?: unknown
+}
+
+function sanitizeUserPreferences(
+  preferences: NonNullable<User['preferences']>
+): NonNullable<User['preferences']> {
+  const runtimePreferences = preferences as RuntimeUserPreferences
+  const quickAccess = runtimePreferences.quick_access
+
+  if (quickAccess === undefined) {
+    return preferences
+  }
+
+  if (quickAccess === null || typeof quickAccess !== 'object' || Array.isArray(quickAccess)) {
+    const sanitizedPreferences = { ...runtimePreferences }
+    delete sanitizedPreferences.quick_access
+    return sanitizedPreferences as NonNullable<User['preferences']>
+  }
+
+  return preferences
+}
+
+export const UserProvider = ({ children }: { children: ReactNode }) => {
+  const { toast } = useToast()
+  const router = useRouter()
+  const [user, setUser] = useState<User | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
+  const [adminPasswordSetupRequired, setAdminPasswordSetupRequired] = useState(false)
+  // Use ref to avoid closure issues in setInterval callback
+  const userRef = useRef<User | null>(null)
+  // Using antd message.error for unified error handling, no local error state needed
+
+  // Keep userRef in sync with user state
+  useEffect(() => {
+    userRef.current = user
+  }, [user])
+
+  const redirectToLogin = () => {
+    const loginPath = paths.auth.login.getHref()
+    if (typeof window === 'undefined') {
+      router.replace(loginPath)
+      return
+    }
+    if (window.location.pathname === loginPath) {
+      return
+    }
+    const disallowedTargets = [loginPath, '/login/oidc']
+    const currentPathWithSearch = `${window.location.pathname}${window.location.search}`
+    const validRedirect = sanitizeRedirectPath(currentPathWithSearch, disallowedTargets)
+
+    if (validRedirect) {
+      sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, validRedirect)
+      router.replace(`${loginPath}?redirect=${encodeURIComponent(validRedirect)}`)
+      return
+    }
+
+    sessionStorage.removeItem(POST_LOGIN_REDIRECT_KEY)
+    router.replace(loginPath)
+  }
+
+  const isOnLoginPage = () => {
+    return typeof window !== 'undefined' && window.location.pathname === paths.auth.login.getHref()
+  }
+
+  const fetchAnonymousLoginHandshake = async () => {
+    setAdminPasswordSetupRequired(false)
+    try {
+      await userApis.getCurrentUserWithoutAuthRedirect()
+    } catch (error) {
+      if (isAdminPasswordSetupRequiredError(error)) {
+        setAdminPasswordSetupRequired(true)
+        return
+      }
+      if (error instanceof ApiError && error.status === 401) {
+        return
+      }
+      console.error('UserContext: Failed to fetch anonymous user handshake:', error as Error)
+      toast({
+        variant: 'destructive',
+        title: 'Failed to load user',
+      })
+    }
+  }
+
+  const fetchUser = async () => {
+    setIsLoading(true)
+
+    try {
+      const isAuth = userApis.isAuthenticated()
+
+      if (!isAuth) {
+        setUser(null)
+        if (isOnLoginPage()) {
+          await fetchAnonymousLoginHandshake()
+          return
+        }
+        setAdminPasswordSetupRequired(false)
+        redirectToLogin()
+        return
+      }
+
+      const userData = await userApis.getCurrentUser()
+      setUser(userData)
+      setAdminPasswordSetupRequired(false)
+    } catch (error) {
+      console.error('UserContext: Failed to fetch user information:', error as Error)
+      if (isAdminPasswordSetupRequiredError(error)) {
+        setUser(null)
+        setAdminPasswordSetupRequired(true)
+        return
+      }
+      toast({
+        variant: 'destructive',
+        title: 'Failed to load user',
+      })
+      setUser(null)
+      redirectToLogin()
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    fetchUser()
+
+    // Listen for OIDC login success event
+    const handleOidcLoginSuccess = () => {
+      fetchUser()
+    }
+
+    window.addEventListener('oidc-login-success', handleOidcLoginSuccess)
+
+    // Periodically check if token is expired (check every 10 seconds)
+    const tokenCheckInterval = setInterval(() => {
+      const isAuth = userApis.isAuthenticated()
+      // Use userRef.current to avoid closure capturing stale user state
+      if (!isAuth && userRef.current) {
+        setUser(null)
+        redirectToLogin()
+      }
+    }, 10000)
+
+    return () => {
+      window.removeEventListener('oidc-login-success', handleOidcLoginSuccess)
+      clearInterval(tokenCheckInterval)
+    }
+    // eslint-disable-next-line
+  }, [])
+
+  const logout = () => {
+    userApis.logout()
+    setUser(null)
+    setAdminPasswordSetupRequired(false)
+    redirectToLogin()
+  }
+
+  const login = async (data: { user_name: string; password: string }) => {
+    setIsLoading(true)
+    try {
+      const userData = await userApis.login(data)
+      setUser(userData)
+    } catch (error) {
+      if (isAdminPasswordSetupRequiredError(error)) {
+        setAdminPasswordSetupRequired(true)
+      } else {
+        toast({
+          variant: 'destructive',
+          title: (error as Error)?.message || 'Login failed',
+        })
+      }
+      setUser(null)
+      throw error
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const setupAdminPassword = async (password: string) => {
+    setIsLoading(true)
+    try {
+      const userData = await userApis.setupAdminPassword(password)
+      setUser(userData)
+      setAdminPasswordSetupRequired(false)
+    } catch (error) {
+      toast({
+        variant: 'destructive',
+        title: (error as Error)?.message || 'Failed to set admin password',
+      })
+      setUser(null)
+      throw error
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const updatePreferences = async (preferences: Partial<User['preferences']>) => {
+    if (!user) return
+
+    try {
+      // Merge with existing preferences, ensuring required fields have defaults
+      const mergedPreferences = {
+        send_key: user.preferences?.send_key || 'enter',
+        ...user.preferences,
+        ...preferences,
+      } as NonNullable<User['preferences']>
+      const updatedUser = await userApis.updateUser({
+        preferences: sanitizeUserPreferences(mergedPreferences),
+      })
+      setUser(updatedUser)
+    } catch (error) {
+      console.error('UserContext: Failed to update preferences:', error)
+      throw error
+    }
+  }
+
+  return (
+    <UserContext.Provider
+      value={{
+        user,
+        isLoading,
+        adminPasswordSetupRequired,
+        logout,
+        refresh: fetchUser,
+        login,
+        setupAdminPassword,
+        updatePreferences,
+      }}
+    >
+      {children}
+    </UserContext.Provider>
+  )
+}
+
+export const useUser = () => useContext(UserContext)

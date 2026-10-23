@@ -1,0 +1,889 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+import logging
+from typing import Literal, Optional
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from pydantic import BaseModel, ValidationError
+from sqlalchemy.orm import Session
+
+from app.api.dependencies import get_db
+from app.core import security
+from app.models.subtask_context import ContextStatus, ContextType
+from app.models.system_config import SystemConfig
+from app.models.user import User
+from app.schemas.admin import (
+    QuickAccessTeam,
+)
+from app.schemas.quick_launch import (
+    QuickLaunchFunctionConfig,
+    QuickLaunchPreparePresetRequest,
+    QuickLaunchPreparePresetResponse,
+)
+from app.schemas.subscription import NotificationChannelInfo
+from app.schemas.subtask_context import AttachmentDetailResponse
+from app.schemas.user import GitTokenOrderUpdate, UserCreate, UserInDB, UserUpdate
+from app.services.adapters.team_kinds import RecentTeamMode, team_kinds_service
+from app.services.auth import (
+    extract_token_from_header,
+    verify_task_token,
+)
+from app.services.context import context_service
+from app.services.kind import kind_service
+from app.services.subscription.notification_service import (
+    subscription_notification_service,
+)
+from app.services.user import user_service
+from app.services.user_mcp_service import user_mcp_service
+from app.services.user_runtime_config import (
+    UserRuntimeConfigError,
+    UserRuntimeConfigSyncError,
+    user_runtime_config_service,
+)
+from shared.telemetry.decorators import trace_sync
+from shared.utils.crypto import encrypt_sensitive_data_with_embedded_iv
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+# ==================== Feature Flags ====================
+
+
+class FeatureFlags(BaseModel):
+    """System-level feature flags for the frontend"""
+
+    memory_enabled: bool = False  # Whether long-term memory service is available
+
+
+class MCPProviderServiceConfigRequest(BaseModel):
+    """User-scoped MCP provider service configuration."""
+
+    enabled: bool = False
+    url: str = ""
+    # Optional so clients that predate OAuth keep the stored mode instead of
+    # silently resetting an OAuth-authorized service back to a personal URL.
+    auth_mode: Optional[Literal["url", "oauth"]] = None
+
+
+class MCPProviderServiceConfigResponse(BaseModel):
+    """Response model for an MCP provider service configuration."""
+
+    provider_id: str
+    service_id: str
+    server_name: str
+    detail_url: str
+    enabled: bool = False
+    url: str = ""
+    auth_mode: str = "url"
+    oauth_supported: bool = False
+    oauth_connected: bool = False
+    oauth_expires_at: Optional[int] = None
+    oauth_account: Optional[str] = None
+
+
+class UserRuntimeConfigResponse(BaseModel):
+    """Public status for a user-scoped runtime configuration."""
+
+    runtime: str
+    display_name: str
+    use_user_config: bool = False
+    use_proxy: bool = False
+    configured: bool = False
+    target_path: str
+    auth_json_sha256: Optional[str] = None
+    auth_json_updated_at: Optional[str] = None
+    proxy_configured: bool = False
+    proxy_url_masked: str = ""
+    proxy_updated_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class UserProxyConfigResponse(BaseModel):
+    """Public status for a user-scoped proxy configuration."""
+
+    configured: bool = False
+    proxy_url_masked: str = ""
+    proxy_updated_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class UserRuntimeConfigUpdateRequest(BaseModel):
+    """Update request for runtime config preferences."""
+
+    use_user_config: bool
+
+
+class UserRuntimeAuthJsonRequest(BaseModel):
+    """Request body for uploading runtime auth JSON."""
+
+    auth_json: str
+
+
+class UserProxyConfigRequest(BaseModel):
+    """Request body for saving a user proxy URL."""
+
+    proxy_url: str = ""
+
+
+class UserRuntimeConfigImportRequest(BaseModel):
+    """Request body for importing runtime auth JSON from one local device."""
+
+    device_id: str
+
+
+class WegentRuntimeUserResponse(BaseModel):
+    """Encrypted user information for sandbox runtime clients."""
+
+    user: str
+
+
+@router.get("/features", response_model=FeatureFlags)
+async def get_feature_flags(
+    _current_user: User = Depends(security.get_current_user),
+):
+    """
+    Get system-level feature flags.
+
+    These flags indicate which features are available based on backend configuration.
+    Used by frontend to conditionally enable/show features.
+    """
+    from app.services.memory import get_memory_manager
+
+    # Check if memory service is actually available
+    memory_manager = get_memory_manager()
+
+    return FeatureFlags(
+        memory_enabled=memory_manager.is_enabled,
+    )
+
+
+@router.get("/me/wegent-runtime", response_model=WegentRuntimeUserResponse)
+async def read_wegent_runtime_user(
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """Return encrypted user information for a Wegent task token."""
+
+    token = extract_token_from_header(authorization or "")
+    token_info = verify_task_token(token or "")
+    if not token_info:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Wegent token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = (
+        db.query(User)
+        .filter(User.id == token_info.user_id, User.is_active.is_(True))
+        .first()
+    )
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+        )
+
+    payload = {
+        "employee_id": "",
+        "email": user.email or "",
+        "name": user.user_name,
+        "uid": str(user.id),
+        "expire_at": int(token_info.expire_at or 0),
+    }
+    return WegentRuntimeUserResponse(
+        user=encrypt_sensitive_data_with_embedded_iv(
+            json.dumps(payload, ensure_ascii=False)
+        )
+    )
+
+
+@router.put("/me", response_model=UserInDB)
+async def update_current_user_endpoint(
+    user_update: UserUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """Update current user information"""
+    try:
+        user = user_service.update_current_user(
+            db=db,
+            user=current_user,
+            obj_in=user_update,
+        )
+        # Explicitly convert ORM object to Pydantic model to avoid
+        # session access during response serialization
+        return UserInDB(
+            id=user.id,
+            user_name=user.user_name,
+            email=user.email,
+            is_active=user.is_active,
+            git_info=user.git_info,
+            preferences=user.preferences,
+            role=user.role,
+            auth_source=user.auth_source,
+            created_at=user.created_at,
+            updated_at=user.updated_at,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.get(
+    "/me/runtime-configs/{runtime}",
+    response_model=UserRuntimeConfigResponse,
+)
+async def get_user_runtime_config(
+    runtime: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """Get current user's runtime config status."""
+    try:
+        return UserRuntimeConfigResponse(
+            **user_runtime_config_service.get_config(
+                db,
+                user_id=current_user.id,
+                runtime=runtime,
+                preferences=current_user.preferences,
+            )
+        )
+    except UserRuntimeConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
+@router.put(
+    "/me/runtime-configs/{runtime}",
+    response_model=UserRuntimeConfigResponse,
+)
+async def update_user_runtime_config(
+    runtime: str,
+    request: UserRuntimeConfigUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """Update whether a user runtime config is enabled."""
+    try:
+        return UserRuntimeConfigResponse(
+            **user_runtime_config_service.set_use_user_config(
+                db,
+                user=current_user,
+                runtime=runtime,
+                use_user_config=request.use_user_config,
+            )
+        )
+    except UserRuntimeConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
+@router.put(
+    "/me/proxy-config",
+    response_model=UserProxyConfigResponse,
+)
+async def update_user_proxy_config(
+    request: UserProxyConfigRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """Upload and encrypt current user's proxy URL."""
+    try:
+        return UserProxyConfigResponse(
+            **user_runtime_config_service.save_proxy_url(
+                db,
+                user=current_user,
+                proxy_url=request.proxy_url,
+            )
+        )
+    except UserRuntimeConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
+@router.get(
+    "/me/proxy-config",
+    response_model=UserProxyConfigResponse,
+)
+async def get_user_proxy_config(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """Get current user's proxy config status."""
+    return UserProxyConfigResponse(
+        **user_runtime_config_service.get_proxy_config(
+            db,
+            user_id=current_user.id,
+        )
+    )
+
+
+@router.post(
+    "/me/runtime-configs/{runtime}/auth-json",
+    response_model=UserRuntimeConfigResponse,
+)
+async def upload_user_runtime_auth_json(
+    runtime: str,
+    request: UserRuntimeAuthJsonRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """Upload and encrypt current user's runtime auth JSON."""
+    try:
+        return UserRuntimeConfigResponse(
+            **user_runtime_config_service.save_auth_json(
+                db,
+                user_id=current_user.id,
+                runtime=runtime,
+                auth_json=request.auth_json,
+                preferences=current_user.preferences,
+            )
+        )
+    except UserRuntimeConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
+@router.post(
+    "/me/runtime-configs/{runtime}/import-device",
+    response_model=UserRuntimeConfigResponse,
+)
+async def import_user_runtime_auth_json_from_device(
+    runtime: str,
+    request: UserRuntimeConfigImportRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """Import and encrypt current user's runtime auth JSON from a local device."""
+    try:
+        return UserRuntimeConfigResponse(
+            **await user_runtime_config_service.import_auth_json_from_device(
+                db,
+                user_id=current_user.id,
+                runtime=runtime,
+                device_id=request.device_id,
+                preferences=current_user.preferences,
+            )
+        )
+    except UserRuntimeConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except UserRuntimeConfigSyncError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+
+@router.get(
+    "/me/mcps/providers/{provider_id}/services/{service_id}",
+    response_model=MCPProviderServiceConfigResponse,
+)
+async def get_mcp_provider_service_config(
+    provider_id: str,
+    service_id: str,
+    current_user: User = Depends(security.get_current_user),
+):
+    """Get the current user's MCP provider service configuration."""
+    service = user_mcp_service.get_provider_service_definition(
+        current_user.preferences,
+        provider_id,
+        service_id,
+    )
+    if not service:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unsupported MCP provider service: {provider_id}/{service_id}",
+        )
+
+    config = user_mcp_service.get_provider_service_config(
+        current_user.preferences, provider_id, service_id
+    )
+    return MCPProviderServiceConfigResponse(
+        provider_id=provider_id, **service, **config
+    )
+
+
+@router.put(
+    "/me/mcps/providers/{provider_id}/services/{service_id}",
+    response_model=MCPProviderServiceConfigResponse,
+)
+async def update_mcp_provider_service_config(
+    provider_id: str,
+    service_id: str,
+    config: MCPProviderServiceConfigRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """Update the current user's MCP provider service configuration."""
+    service = user_mcp_service.get_provider_service_definition(
+        current_user.preferences,
+        provider_id,
+        service_id,
+    )
+    if not service:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unsupported MCP provider service: {provider_id}/{service_id}",
+        )
+
+    url = config.url.strip()
+    if config.enabled and not url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "url is required when MCP provider service "
+                f"'{provider_id}/{service_id}' is enabled"
+            ),
+        )
+
+    updated_preferences = user_mcp_service.set_provider_service_config(
+        current_user.preferences,
+        provider_id=provider_id,
+        service_id=service_id,
+        enabled=config.enabled,
+        url=url,
+        auth_mode=config.auth_mode,
+    )
+    current_user.preferences = user_mcp_service.dump_preferences(updated_preferences)
+
+    db.add(current_user)
+    db.commit()
+    db.refresh(current_user)
+
+    updated_config = user_mcp_service.get_provider_service_config(
+        current_user.preferences, provider_id, service_id
+    )
+    return MCPProviderServiceConfigResponse(
+        provider_id=provider_id, **service, **updated_config
+    )
+
+
+@router.delete("/me/git-token/{git_domain:path}", response_model=UserInDB)
+async def delete_git_token(
+    git_domain: str,
+    git_info_id: Optional[str] = Query(
+        None, description="Unique ID of the git_info entry to delete"
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """Delete a specific git token
+
+    Args:
+        git_domain: Git domain (required for backward compatibility)
+        git_info_id: Unique ID of the git_info entry (preferred, for precise deletion)
+
+    If git_info_id is provided, it will be used for precise deletion.
+    Otherwise, falls back to deleting by domain (may delete multiple tokens).
+    """
+    try:
+        user = user_service.delete_git_token(
+            db=db, user=current_user, git_info_id=git_info_id, git_domain=git_domain
+        )
+        # Explicitly convert ORM object to Pydantic model to avoid
+        # session access during response serialization
+        return UserInDB(
+            id=user.id,
+            user_name=user.user_name,
+            email=user.email,
+            is_active=user.is_active,
+            git_info=user.git_info,
+            preferences=user.preferences,
+            role=user.role,
+            auth_source=user.auth_source,
+            created_at=user.created_at,
+            updated_at=user.updated_at,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.put("/me/git-token-order", response_model=UserInDB)
+async def reorder_git_tokens(
+    order: GitTokenOrderUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """Persist the display and selection priority of Git tokens."""
+    return user_service.reorder_git_tokens(
+        db=db, user=current_user, ordered_keys=order.ordered_keys
+    )
+
+
+@router.post("", response_model=UserInDB, status_code=status.HTTP_201_CREATED)
+def create_user(
+    user_create: UserCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_admin_user),
+):
+    """Create new user (admin only)"""
+    user = user_service.create_user(db=db, obj_in=user_create)
+    # Explicitly convert ORM object to Pydantic model to avoid
+    # session access during response serialization
+    return UserInDB(
+        id=user.id,
+        user_name=user.user_name,
+        email=user.email,
+        is_active=user.is_active,
+        git_info=user.git_info,
+        preferences=user.preferences,
+        role=user.role,
+        auth_source=user.auth_source,
+        created_at=user.created_at,
+        updated_at=user.updated_at,
+    )
+
+
+QUICK_ACCESS_CONFIG_KEY = "quick_access_recommended"
+QUICK_LAUNCH_FUNCTIONS_CONFIG_KEY = "quick_launch_functions"
+
+
+def _get_system_config_value(db: Session, key: str) -> tuple[int, dict]:
+    config = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
+    if not config:
+        return 0, {}
+    return config.version, config.config_value or {}
+
+
+def _quick_access_team_from_data(team: dict) -> QuickAccessTeam:
+    return QuickAccessTeam(
+        id=int(team["id"]),
+        name=str(team.get("name") or f"Team {team['id']}"),
+        display_name=team.get("displayName") or team.get("display_name"),
+        is_system=int(team.get("user_id") or 0) == 0,
+        recommended_mode=team.get("recommended_mode") or "both",
+        agent_type=team.get("agent_type"),
+    )
+
+
+def _load_quick_launch_function_configs(
+    raw_functions: object,
+) -> list[QuickLaunchFunctionConfig]:
+    if not isinstance(raw_functions, list):
+        logger.warning(
+            "Skipping quick launch functions config because it is not a list"
+        )
+        return []
+
+    function_configs: list[QuickLaunchFunctionConfig] = []
+    for index, item in enumerate(raw_functions):
+        if not isinstance(item, dict):
+            logger.warning(
+                "Skipping invalid quick launch function config at index %s: expected object",
+                index,
+            )
+            continue
+
+        try:
+            function_configs.append(QuickLaunchFunctionConfig(**item))
+        except ValidationError as exc:
+            logger.warning(
+                "Skipping invalid quick launch function config at index %s: %s",
+                index,
+                exc,
+            )
+
+    return function_configs
+
+
+def _find_enabled_quick_launch_function(
+    function_configs: list[QuickLaunchFunctionConfig],
+    function_id: str,
+) -> Optional[QuickLaunchFunctionConfig]:
+    for config in function_configs:
+        if config.id == function_id and config.enabled:
+            return config
+    return None
+
+
+def _is_ready_attachment_context(context: object) -> bool:
+    return bool(
+        context
+        and getattr(context, "context_type", None) == ContextType.ATTACHMENT.value
+        and getattr(context, "status", None) == ContextStatus.READY.value
+    )
+
+
+@router.get("/recent-teams", response_model=list[QuickAccessTeam])
+@trace_sync("get_user_recent_teams", "users.api")
+def get_user_recent_teams(
+    is_code: bool = False,
+    include_fallback: bool = True,
+    mode: RecentTeamMode | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+) -> list[QuickAccessTeam]:
+    """Run synchronous recent-team queries in FastAPI's worker pool."""
+    teams = team_kinds_service.get_recent_accessible_teams(
+        db,
+        user_id=current_user.id,
+        is_code=is_code,
+        include_fallback=include_fallback,
+        mode=mode,
+    )
+    return [_quick_access_team_from_data(team) for team in teams]
+
+
+@router.post(
+    "/quick-launch/prepare-preset",
+    response_model=QuickLaunchPreparePresetResponse,
+)
+async def prepare_quick_launch_preset(
+    request: QuickLaunchPreparePresetRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """
+    Prepare a system quick launch preset for the current user.
+
+    Source attachments configured by admins are templates. They are copied into
+    current-user-owned, unlinked attachments before the normal send flow uses
+    them.
+    """
+    _, function_config = _get_system_config_value(db, QUICK_LAUNCH_FUNCTIONS_CONFIG_KEY)
+    function_configs = _load_quick_launch_function_configs(
+        function_config.get("functions", [])
+    )
+    config = _find_enabled_quick_launch_function(
+        function_configs,
+        request.function_id,
+    )
+    if not config:
+        raise HTTPException(status_code=404, detail="Quick launch function not found")
+
+    if not kind_service.get_team_by_id(config.team_id):
+        raise HTTPException(
+            status_code=404, detail="Quick launch target team not found"
+        )
+
+    preset = next(
+        (item for item in config.input_presets if item.id == request.preset_id),
+        None,
+    )
+    if not preset:
+        raise HTTPException(status_code=404, detail="Quick launch preset not found")
+
+    attachments: list[AttachmentDetailResponse] = []
+    for source_attachment_id in preset.source_attachment_ids:
+        source_context = context_service.get_context_optional(
+            db,
+            source_attachment_id,
+        )
+        if not _is_ready_attachment_context(source_context):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Quick launch preset attachment is unavailable",
+            )
+
+        copied_context = context_service.copy_attachment_for_user(
+            db=db,
+            source_context=source_context,
+            target_user_id=current_user.id,
+            source_metadata={
+                "source": "quick_launch_preset",
+                "quick_launch_function_id": config.id,
+                "quick_launch_preset_id": preset.id,
+            },
+        )
+        attachments.append(AttachmentDetailResponse.from_context(copied_context))
+
+    return QuickLaunchPreparePresetResponse(
+        function_id=config.id,
+        preset_id=preset.id,
+        attachments=attachments,
+    )
+
+
+# ==================== Welcome Config (Slogan & Tips) ====================
+
+CHAT_SLOGAN_TIPS_CONFIG_KEY = "chat_slogan_tips"
+
+# Default slogan and tips configuration
+DEFAULT_SLOGAN_TIPS_CONFIG = {
+    "slogans": [
+        {
+            "id": 1,
+            "zh": "今天有什么可以帮到你？",
+            "en": "What can I help you with today?",
+            "mode": "chat",
+        },
+        {
+            "id": 2,
+            "zh": "让我们一起写代码吧",
+            "en": "Let's code together",
+            "mode": "code",
+        },
+    ],
+    "tips": [
+        # Chat mode tips
+        {
+            "id": 1,
+            "zh": "试试问我任何问题，我会尽力帮助你",
+            "en": "Try asking me any question, I'll do my best to help",
+            "mode": "chat",
+        },
+        {
+            "id": 2,
+            "zh": "你可以上传文件让我帮你分析和处理",
+            "en": "You can upload files for me to analyze and process",
+            "mode": "chat",
+        },
+        {
+            "id": 3,
+            "zh": "我可以帮你总结文档、翻译内容或回答问题",
+            "en": "I can help you summarize documents, translate content, or answer questions",
+            "mode": "chat",
+        },
+        # Code mode tips
+        {
+            "id": 4,
+            "zh": "试试问我：帮我分析这段代码的性能问题",
+            "en": "Try asking: Help me analyze the performance issues in this code",
+            "mode": "code",
+        },
+        {
+            "id": 5,
+            "zh": "我可以帮你生成代码、修复 Bug 或重构现有代码",
+            "en": "I can help you generate code, fix bugs, or refactor existing code",
+            "mode": "code",
+        },
+        {
+            "id": 6,
+            "zh": "试试让我帮你编写单元测试或文档",
+            "en": "Try asking me to write unit tests or documentation",
+            "mode": "code",
+        },
+        {
+            "id": 7,
+            "zh": "我可以解释复杂的代码逻辑，帮助你理解代码库",
+            "en": "I can explain complex code logic and help you understand the codebase",
+            "mode": "code",
+        },
+        # Both modes tips
+        {
+            "id": 8,
+            "zh": "选择合适的智能体团队可以获得更好的回答",
+            "en": "Choosing the right agent team can get you better answers",
+            "mode": "both",
+        },
+    ],
+}
+
+
+# Config key for admin setup completion status
+ADMIN_SETUP_CONFIG_KEY = "admin_setup_completed"
+
+
+class UserSearchItem(BaseModel):
+    """User search result item"""
+
+    id: int
+    user_name: str
+    email: Optional[str] = None
+
+
+class SearchUsersResponse(BaseModel):
+    """User search response"""
+
+    users: list[UserSearchItem]
+    total: int
+
+
+# ==================== Default Teams Configuration ====================
+
+
+# ==================== User Search ====================
+
+
+@router.get("/search", response_model=SearchUsersResponse)
+async def search_users(
+    q: str = Query(..., min_length=1, description="Search query"),
+    limit: int = Query(
+        default=20, ge=1, le=100, description="Maximum results to return"
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """
+    Search users by username or email.
+    Used for adding members to group chats.
+    """
+    # Search users by username or email (case-insensitive)
+    query = db.query(User).filter(
+        User.is_active == True,
+        User.id != current_user.id,  # Exclude current user
+    )
+
+    # Search in username and email
+    search_pattern = f"%{q}%"
+    query = query.filter(
+        (User.user_name.ilike(search_pattern)) | (User.email.ilike(search_pattern))
+    )
+
+    # Get results with limit
+    users = query.limit(limit).all()
+
+    return SearchUsersResponse(
+        users=[
+            UserSearchItem(id=user.id, user_name=user.user_name, email=user.email)
+            for user in users
+        ],
+        total=len(users),
+    )
+
+
+@router.get("/by-ids", response_model=SearchUsersResponse)
+async def get_users_by_ids(
+    ids: list[int] = Query(..., description="User IDs to resolve"),
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(security.get_current_user),  # noqa: ARG001
+):
+    """Resolve active users by ID while preserving the requested order."""
+    unique_ids = list(dict.fromkeys(user_id for user_id in ids if user_id > 0))
+    users_by_id = {
+        user.id: user
+        for user in db.query(User)
+        .filter(User.id.in_(unique_ids), User.is_active == True)
+        .all()
+    }
+    users = [users_by_id[user_id] for user_id in unique_ids if user_id in users_by_id]
+
+    return SearchUsersResponse(
+        users=[
+            UserSearchItem(id=user.id, user_name=user.user_name, email=user.email)
+            for user in users
+        ],
+        total=len(users),
+    )
+
+
+# ==================== Available Notification Channels ====================
+
+
+@router.get("/me/available-channels", response_model=list[NotificationChannelInfo])
+async def get_user_available_channels(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user),
+):
+    """
+    Get available Messager channels for the current user.
+
+    Returns a list of all enabled Messager channels with their binding status.
+    This endpoint does not require an existing subscription, making it suitable
+    for new subscription creation scenarios.
+    """
+    return subscription_notification_service.get_available_channels(db, current_user.id)

@@ -1,0 +1,204 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import React, { useRef, useCallback } from 'react'
+import { Paperclip } from 'lucide-react'
+import { ActionButton } from '@/components/ui/action-button'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { SUPPORTED_EXTENSIONS, MAX_FILE_SIZE } from '@/apis/attachments'
+
+import { useTranslation } from '@/hooks/useTranslation'
+
+interface AttachmentButtonProps {
+  /** Callback when files are selected */
+  onFileSelect: (files: File | File[]) => void
+  /** Whether the button is disabled */
+  disabled?: boolean
+  /** Override the accepted file types (e.g. image-only for generation modes) */
+  accept?: string
+  /** Render style for the upload trigger */
+  triggerVariant?: 'icon' | 'menu-item'
+}
+
+const ACCEPT_LABELS: Record<string, string> = {
+  'image/*': 'Image',
+  'image/jpeg': 'JPG/JPEG',
+  'image/png': 'PNG',
+  'image/bmp': 'BMP',
+  'image/webp': 'WebP',
+  'image/gif': 'GIF',
+  'image/tiff': 'TIFF',
+  'video/*': 'Video',
+  'video/mp4': 'MP4',
+  'video/quicktime': 'MOV',
+  'audio/*': 'Audio',
+  'audio/wav': 'WAV',
+  'audio/mpeg': 'MP3',
+}
+
+function getAcceptLabels(accept?: string): string {
+  if (!accept) return '-'
+
+  return Array.from(
+    new Set(
+      accept
+        .split(',')
+        .map(rule => rule.trim().toLowerCase())
+        .filter(Boolean)
+        .map(rule => ACCEPT_LABELS[rule] ?? rule.replace(/^\./, '').toUpperCase())
+    )
+  ).join(', ')
+}
+
+/**
+ * Attachment upload button component
+ * Only responsible for showing the upload button and handling file selection
+ * Uses ActionButton for consistent 36px size with other control buttons
+ */
+export default function AttachmentButton({
+  onFileSelect,
+  disabled = false,
+  accept,
+  triggerVariant = 'icon',
+}: AttachmentButtonProps) {
+  const { t } = useTranslation()
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [tooltipOpen, setTooltipOpen] = React.useState(false)
+
+  const handleClick = useCallback(() => {
+    if (!disabled) {
+      // Close tooltip immediately when clicking
+      setTooltipOpen(false)
+      fileInputRef.current?.click()
+    }
+  }, [disabled])
+
+  // Build accept string for file input - use override if provided
+  const acceptString = accept ?? SUPPORTED_EXTENSIONS.join(',')
+
+  // Check if a file matches the accept criteria
+  const isFileAccepted = useCallback(
+    (file: File) => {
+      if (!accept) return true
+
+      return accept.split(',').some(rule => {
+        const token = rule.trim().toLowerCase()
+        if (!token) return false
+
+        if (token.endsWith('/*')) {
+          return file.type.toLowerCase().startsWith(token.slice(0, -1))
+        }
+
+        if (token.startsWith('.')) {
+          return file.name.toLowerCase().endsWith(token)
+        }
+
+        return file.type.toLowerCase() === token
+      })
+    },
+    [accept]
+  )
+
+  const handleFileChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = e.target.files
+      if (files && files.length > 0) {
+        const acceptedFiles = Array.from(files).filter(isFileAccepted)
+        if (acceptedFiles.length > 0) {
+          onFileSelect(acceptedFiles)
+        }
+      }
+      // Reset input so same file can be selected again
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ''
+      }
+    },
+    [isFileAccepted, onFileSelect]
+  )
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+  }, [])
+
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+
+      if (disabled) return
+
+      const files = e.dataTransfer.files
+      if (files && files.length > 0) {
+        const acceptedFiles = Array.from(files).filter(isFileAccepted)
+        if (acceptedFiles.length > 0) {
+          onFileSelect(acceptedFiles)
+        }
+      }
+    },
+    [disabled, isFileAccepted, onFileSelect]
+  )
+
+  const tooltipContent =
+    accept && accept !== 'image/*'
+      ? t('chat:upload.model_material_tooltip', {
+          formats: getAcceptLabels(accept),
+        })
+      : accept === 'image/*'
+        ? t('chat:upload.image_tooltip', {
+            maxSize: MAX_FILE_SIZE / (1024 * 1024),
+          })
+        : t('chat:upload.tooltip', {
+            maxSize: MAX_FILE_SIZE / (1024 * 1024),
+          })
+
+  return (
+    <div onDragOver={handleDragOver} onDrop={handleDrop}>
+      {/* Hidden file input with multiple support */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept={acceptString}
+        multiple
+        onChange={handleFileChange}
+        className="hidden"
+        disabled={disabled}
+      />
+
+      {triggerVariant === 'menu-item' ? (
+        <button
+          type="button"
+          onClick={handleClick}
+          disabled={disabled}
+          title={tooltipContent}
+          className="w-full flex items-center justify-between px-3 py-2.5 text-left transition-colors hover:bg-hover active:bg-hover disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <span className="flex items-center gap-3">
+            <Paperclip className="h-4 w-4 text-text-muted" />
+            <span className="text-sm">{t('chat:upload.attachment')}</span>
+          </span>
+        </button>
+      ) : (
+        <TooltipProvider delayDuration={300}>
+          <Tooltip open={tooltipOpen} onOpenChange={setTooltipOpen}>
+            <TooltipTrigger asChild>
+              <div>
+                <ActionButton
+                  onClick={handleClick}
+                  disabled={disabled}
+                  icon={<Paperclip className="h-4 w-4" />}
+                />
+              </div>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-xs whitespace-pre-line">
+              <p>{tooltipContent}</p>
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      )}
+    </div>
+  )
+}

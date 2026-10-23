@@ -1,0 +1,1383 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Tests for ModelAggregationService.
+
+Focuses on testing model compatibility filtering for custom shells.
+"""
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from app.models.kind import Kind
+from app.models.user import User
+from app.services.adapters.public_model import ModelAdapter
+from app.services.model_aggregation_service import (
+    ModelType,
+    UnifiedModel,
+    build_model_runtime_family,
+    model_aggregation_service,
+)
+from app.services.user_runtime_config import user_runtime_config_service
+
+
+def _referenced_model(
+    user: User,
+    model_id: str,
+    *,
+    model_type: str = "llm",
+) -> Kind:
+    return Kind(
+        user_id=user.id + 1,
+        kind="Model",
+        name="shared-embedding",
+        namespace="default",
+        json={
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {
+                "name": "shared-embedding",
+                "namespace": "default",
+            },
+            "spec": {
+                "modelType": model_type,
+                "modelConfig": {"env": {"model": "openai", "model_id": model_id}},
+            },
+        },
+        is_active=True,
+    )
+
+
+class TestModelAggregationService:
+    """Tests for model_aggregation_service methods."""
+
+    @pytest.mark.parametrize("mode", ["auto", "standard", "passthrough"])
+    def test_catalog_preserves_reasoning_and_policy_without_credentials(
+        self, mode: str
+    ) -> None:
+        model = _referenced_model(User(id=42), "glm-5.3-flash")
+        model.json["spec"]["modelConfig"].update(
+            {
+                "codex_request_mode": mode,
+                "env": {
+                    "model": "openai",
+                    "model_id": "glm-5.3-flash",
+                    "api_key": "private-provider-key",
+                    "thinking_config": {
+                        "reasoning": {"effort": "high", "summary": "detailed"},
+                        "secret": "private-provider-option",
+                    },
+                },
+            }
+        )
+
+        info = model_aggregation_service._extract_model_info_from_crd(model.json)
+        catalog = UnifiedModel(
+            name=model.name, model_type=ModelType.USER, config=info["config"]
+        ).to_dict()
+        public_catalog = ModelAdapter.to_model_dict(model)
+
+        for config in (catalog["config"], public_catalog["config"]):
+            assert config["reasoning"] == {"effort": "high", "summary": "detailed"}
+            assert config["codex_request_mode"] == mode
+            assert not config.get("env")
+            assert "private-provider-key" not in str(config)
+            assert "private-provider-option" not in str(config)
+            if mode != "auto":
+                assert config["native_tool_search"] is (mode == "passthrough")
+                assert config["native_namespace_tools"] is (mode == "passthrough")
+
+    def test_same_name_references_list_smallest_kind_id(
+        self,
+        test_db: Session,
+        test_user: User,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The model list must match runtime's smallest-id reference choice."""
+        smallest_id_model = _referenced_model(test_user, "smallest-id-model")
+        larger_id_model = _referenced_model(test_user, "larger-id-model")
+        test_db.add_all([smallest_id_model, larger_id_model])
+        test_db.commit()
+
+        monkeypatch.setattr(
+            "app.services.model_aggregation_service.kind_service.list_resources",
+            lambda user_id, kind, namespace: [],
+        )
+        monkeypatch.setattr(
+            "app.services.model_aggregation_service.list_referenced_capabilities_by_namespace",
+            lambda db, kind, user_id, namespaces: {
+                "default": [larger_id_model, smallest_id_model]
+            },
+        )
+
+        models = model_aggregation_service.list_available_models(
+            db=test_db,
+            current_user=test_user,
+            scope="personal",
+        )
+
+        shared_models = [
+            model for model in models if model["name"] == "shared-embedding"
+        ]
+        assert len(shared_models) == 1
+        assert shared_models[0]["modelId"] == "smallest-id-model"
+        assert shared_models[0]["listingId"] == smallest_id_model.id
+
+    def test_same_name_references_filter_the_smallest_kind_id_winner(
+        self,
+        test_db: Session,
+        test_user: User,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Category filters must not replace the runtime-selected Model."""
+        smallest_id_model = _referenced_model(test_user, "smallest-id-llm")
+        larger_id_model = _referenced_model(
+            test_user,
+            "larger-id-embedding",
+            model_type="embedding",
+        )
+        test_db.add_all([smallest_id_model, larger_id_model])
+        test_db.commit()
+
+        monkeypatch.setattr(
+            "app.services.model_aggregation_service.kind_service.list_resources",
+            lambda user_id, kind, namespace: [],
+        )
+        monkeypatch.setattr(
+            "app.services.model_aggregation_service.list_referenced_capabilities_by_namespace",
+            lambda db, kind, user_id, namespaces: {
+                "default": [larger_id_model, smallest_id_model]
+            },
+        )
+
+        models = model_aggregation_service.list_available_models(
+            db=test_db,
+            current_user=test_user,
+            scope="personal",
+            model_category_type="embedding",
+        )
+
+        assert all(model["name"] != "shared-embedding" for model in models)
+
+    def test_same_name_reference_cannot_replace_filtered_direct_model(
+        self,
+        test_db: Session,
+        test_user: User,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Display filters must not replace the direct-first runtime winner."""
+        direct_model = _referenced_model(test_user, "direct-llm")
+        direct_model.user_id = test_user.id
+        referenced_model = _referenced_model(
+            test_user,
+            "referenced-embedding",
+            model_type="embedding",
+        )
+        test_db.add_all([direct_model, referenced_model])
+        test_db.commit()
+
+        monkeypatch.setattr(
+            "app.services.model_aggregation_service.kind_service.list_resources",
+            lambda user_id, kind, namespace: [direct_model],
+        )
+        monkeypatch.setattr(
+            "app.services.model_aggregation_service.list_referenced_capabilities_by_namespace",
+            lambda db, kind, user_id, namespaces: {"default": [referenced_model]},
+        )
+
+        models = model_aggregation_service.list_available_models(
+            db=test_db,
+            current_user=test_user,
+            scope="personal",
+            model_category_type="embedding",
+        )
+
+        assert all(model["name"] != "shared-embedding" for model in models)
+
+    def test_wework_does_not_synthesize_runtime_codex_model_when_user_auth_enabled(
+        self, test_db: Session, test_user: User, monkeypatch
+    ):
+        """Wework model lists come from stored models and local Executor catalogs only."""
+        monkeypatch.setattr(
+            "app.services.model_aggregation_service.kind_service.list_resources",
+            lambda user_id, kind, namespace: [],
+        )
+        user_runtime_config_service.save_auth_json(
+            test_db,
+            user_id=test_user.id,
+            runtime="codex",
+            auth_json='{"token":"secret"}',
+        )
+        user_runtime_config_service.set_use_user_config(
+            test_db,
+            user=test_user,
+            runtime="codex",
+            use_user_config=True,
+        )
+        test_db.refresh(test_user)
+
+        models = model_aggregation_service.list_available_models(
+            db=test_db,
+            current_user=test_user,
+            scope="all",
+            model_category_type="llm",
+            client_origin="wework",
+        )
+
+        assert all(model["name"] != "codex-gpt-5.5" for model in models)
+
+    def test_runtime_codex_model_is_hidden_outside_wework(
+        self, test_db: Session, test_user: User, monkeypatch
+    ):
+        """The runtime-only Codex model must not leak into normal Wegent model lists."""
+        monkeypatch.setattr(
+            "app.services.model_aggregation_service.kind_service.list_resources",
+            lambda user_id, kind, namespace: [],
+        )
+        user_runtime_config_service.save_auth_json(
+            test_db,
+            user_id=test_user.id,
+            runtime="codex",
+            auth_json='{"token":"secret"}',
+        )
+        user_runtime_config_service.set_use_user_config(
+            test_db,
+            user=test_user,
+            runtime="codex",
+            use_user_config=True,
+        )
+        test_db.refresh(test_user)
+
+        models = model_aggregation_service.list_available_models(
+            db=test_db,
+            current_user=test_user,
+            scope="all",
+            model_category_type="llm",
+        )
+
+        assert all(model["name"] != "codex-gpt-5.5" for model in models)
+
+    def test_resolves_runtime_codex_model_by_explicit_type_when_user_auth_enabled(
+        self, test_db: Session, test_user: User
+    ):
+        """Runtime Codex model details should resolve for send/detail flows."""
+        user_runtime_config_service.save_auth_json(
+            test_db,
+            user_id=test_user.id,
+            runtime="codex",
+            auth_json='{"token":"secret"}',
+        )
+        user_runtime_config_service.set_use_user_config(
+            test_db,
+            user=test_user,
+            runtime="codex",
+            use_user_config=True,
+        )
+        test_db.refresh(test_user)
+
+        model = model_aggregation_service.resolve_model(
+            db=test_db,
+            current_user=test_user,
+            name="codex-gpt-5.5",
+            model_type="runtime",
+        )
+
+        assert model is not None
+        assert model["type"] == "runtime"
+        assert model["provider"] == "openai"
+        assert model["modelId"] == "gpt-5.5"
+        assert model["config"] == {
+            "protocol": "openai-responses",
+            "apiFormat": "responses",
+            "ui": {
+                "family": "gpt",
+                "modelLabel": "GPT-5.5",
+                "controls": ["speed"],
+                "sortOrder": 10,
+            },
+        }
+
+    def test_extract_model_info_includes_custom_group_fields(self):
+        """Test Model.spec grouping fields are exposed by aggregation metadata."""
+        model_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "generic-model", "namespace": "default"},
+            "spec": {
+                "modelConfig": {
+                    "modelCapabilities": {
+                        "supportsImage": False,
+                        "supportsVideo": False,
+                    },
+                    "env": {
+                        "model": "openai",
+                        "model_id": "generic-model-id",
+                        "api_key": "secret",
+                    },
+                    "context_window": 1048576,
+                    "max_output_tokens": 131072,
+                },
+                "modelGroup": "Primary Group",
+                "modelSubGroup": "Secondary Group",
+                "costIndex": 50,
+                "modelCapabilities": {
+                    "supportsImage": True,
+                    "supportsVideo": True,
+                },
+            },
+            "status": {"state": "Available"},
+        }
+
+        info = model_aggregation_service._extract_model_info_from_crd(model_crd)
+
+        assert info["model_group"] == "Primary Group"
+        assert info["model_sub_group"] == "Secondary Group"
+        assert info["provider"] == "openai"
+        assert info["context_window"] == 1048576
+        assert info["max_output_tokens"] == 131072
+        assert info["cost_index"] == "50"
+        assert info["model_capabilities"] == {
+            "supportsImage": True,
+            "supportsVideo": True,
+        }
+        assert "modelCapabilities" not in info["config"]
+
+    def test_model_limits_come_from_runtime_config(self):
+        """Runtime limits should be exposed as display metadata."""
+        model_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "claude-opus", "namespace": "default"},
+            "spec": {
+                "modelConfig": {
+                    "env": {
+                        "model": "claude",
+                        "model_id": "claude-opus-4-8",
+                    },
+                    "context_window": 1000000,
+                    "max_output_tokens": 128000,
+                }
+            },
+            "status": {"state": "Available"},
+        }
+        kind = Kind(
+            user_id=0,
+            kind="Model",
+            name="claude-opus",
+            namespace="default",
+            json=model_crd,
+            is_active=True,
+        )
+
+        info = model_aggregation_service._extract_model_info_from_crd(model_crd)
+        model_dict = ModelAdapter.to_model_dict(kind)
+
+        assert info["context_window"] == 1000000
+        assert info["max_output_tokens"] == 128000
+        assert model_dict["contextWindow"] == 1000000
+        assert model_dict["maxOutputTokens"] == 128000
+
+    def test_runtime_config_model_limits_override_legacy_top_level_values(self):
+        """Runtime modelConfig limits take precedence over legacy fields."""
+        model_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "claude-opus", "namespace": "default"},
+            "spec": {
+                "contextWindow": 200000,
+                "maxOutputTokens": 32000,
+                "modelConfig": {
+                    "context_window": 1000000,
+                    "max_output_tokens": 128000,
+                },
+            },
+            "status": {"state": "Available"},
+        }
+
+        info = model_aggregation_service._extract_model_info_from_crd(model_crd)
+
+        assert info["context_window"] == 1000000
+        assert info["max_output_tokens"] == 128000
+
+    def test_model_limits_fall_back_to_legacy_top_level_values(self):
+        """Legacy limits remain available when modelConfig omits them."""
+        model_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "legacy-claude", "namespace": "default"},
+            "spec": {
+                "contextWindow": 200000,
+                "maxOutputTokens": 32000,
+                "modelConfig": {},
+            },
+            "status": {"state": "Available"},
+        }
+
+        info = model_aggregation_service._extract_model_info_from_crd(model_crd)
+
+        assert info["context_window"] == 200000
+        assert info["max_output_tokens"] == 32000
+
+    def test_invalid_legacy_model_limits_are_ignored(self):
+        """Legacy limits must be actual integers rather than coerced values."""
+        model_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "invalid-legacy-limits", "namespace": "default"},
+            "spec": {
+                "contextWindow": True,
+                "maxOutputTokens": "32000",
+                "modelConfig": {},
+            },
+            "status": {"state": "Available"},
+        }
+
+        info = model_aggregation_service._extract_model_info_from_crd(model_crd)
+
+        assert info["context_window"] is None
+        assert info["max_output_tokens"] is None
+
+    def test_extract_model_info_exposes_only_safe_catalog_identity_from_env(
+        self,
+    ) -> None:
+        model_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "catalog-model", "namespace": "default"},
+            "spec": {
+                "protocol": "openai-responses",
+                "modelConfig": {
+                    "env": {
+                        "model": "openai",
+                        "model_id": "provider-model",
+                        "api_key": "secret",
+                        "codex_catalog_model_id": "  ",
+                        "codexCatalogModelId": " operator-catalog ",
+                    }
+                },
+            },
+            "status": {"state": "Available"},
+        }
+
+        info = model_aggregation_service._extract_model_info_from_crd(model_crd)
+        kind = Kind(
+            kind="Model",
+            name="catalog-model",
+            namespace="default",
+            user_id=0,
+            json=model_crd,
+            is_active=True,
+        )
+        public_model = ModelAdapter.to_model_dict(kind)
+        model = UnifiedModel(
+            name="catalog-model",
+            model_type=ModelType.PUBLIC,
+            config=info["config"],
+        ).to_dict()
+
+        assert model["config"]["codex_catalog_model_id"] == "operator-catalog"
+        assert "env" not in model["config"]
+        assert public_model["config"]["codex_catalog_model_id"] == "operator-catalog"
+        assert public_model["config"]["env"] == {}
+
+    def test_unified_model_preserves_picker_configuration(self) -> None:
+        picker_config = {
+            "family": "cloud-openai",
+            "defaultModel": True,
+            "reasoningEfforts": ["low", "medium", "high"],
+            "defaultReasoningEffort": "medium",
+            "sliderModelsConfig": {
+                "defaultPreset": "recommended",
+                "presets": [
+                    {
+                        "name": "recommended",
+                        "label": "Recommended",
+                        "description": "Default model set",
+                        "models": [
+                            {
+                                "modelName": "cloud-luna",
+                                "reasoningEfforts": ["high"],
+                            },
+                            {
+                                "modelName": "cloud-sol",
+                                "reasoningEfforts": ["low", "medium", "high"],
+                            },
+                        ],
+                    }
+                ],
+            },
+        }
+        model_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "cloud-sol", "namespace": "default"},
+            "spec": {
+                "modelConfig": {
+                    "env": {
+                        "model": "openai",
+                        "model_id": "cloud-sol-upstream",
+                        "api_key": "secret",
+                    },
+                    "ui": picker_config,
+                }
+            },
+            "status": {"state": "Available"},
+        }
+
+        info = model_aggregation_service._extract_model_info_from_crd(model_crd)
+        response = UnifiedModel(
+            name="cloud-sol",
+            model_type=ModelType.PUBLIC,
+            config=info["config"],
+        ).to_dict()
+
+        assert response["config"]["ui"] == picker_config
+        assert "env" not in response["config"]
+
+    def test_unified_model_exposes_runtime_family_without_env(self):
+        """Test API model data exposes runtime family without sensitive env."""
+        unified = UnifiedModel(
+            name="openai-gpt-5.4",
+            model_type=ModelType.PUBLIC,
+            provider="openai",
+            model_id="gpt-5.4",
+            resource_user_id=0,
+            context_window=1048576,
+            max_output_tokens=131072,
+            cost_index="50",
+            model_capabilities={"supportsImage": True, "supportsVideo": True},
+            config={
+                "env": {
+                    "model": "openai",
+                    "model_id": "gpt-5.4",
+                    "api_key": "secret",
+                },
+                "protocol": "openai-responses",
+                "visionSidecarModel": {
+                    "modelName": "vision-model",
+                    "modelType": "user",
+                    "namespace": "default",
+                    "resourceUserId": 42,
+                    "apiFormat": "openai-responses",
+                },
+                "modelCapabilities": {
+                    "supportsImage": False,
+                    "supportsVideo": False,
+                },
+            },
+        )
+
+        model_dict = unified.to_dict()
+        full_model_dict = unified.to_full_dict()
+
+        assert model_dict["runtime"] == {
+            "family": "openai.openai-responses",
+            "provider": "openai",
+        }
+        assert "env" not in model_dict["config"]
+        assert "env" not in full_model_dict["config"]
+        assert model_dict["resourceUserId"] == 0
+        assert model_dict["contextWindow"] == 1048576
+        assert model_dict["maxOutputTokens"] == 131072
+        assert model_dict["costIndex"] == "50"
+        assert model_dict["modelCapabilities"] == {
+            "supportsImage": True,
+            "supportsVideo": True,
+        }
+        assert model_dict["config"]["modelCapabilities"] == {
+            "supportsImage": True,
+            "supportsVideo": True,
+        }
+        assert full_model_dict["resourceUserId"] == 0
+        assert full_model_dict["runtime"] == {
+            "family": "openai.openai-responses",
+            "provider": "openai",
+        }
+        assert full_model_dict["config"] == {
+            "protocol": "openai-responses",
+            "visionSidecarModel": {
+                "modelName": "vision-model",
+                "modelType": "user",
+                "namespace": "default",
+                "resourceUserId": 42,
+                "apiFormat": "openai-responses",
+            },
+            "modelCapabilities": {
+                "supportsImage": True,
+                "supportsVideo": True,
+            },
+        }
+
+    def test_extract_model_info_normalizes_legacy_config_capabilities(self):
+        model_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "legacy-model", "namespace": "default"},
+            "spec": {
+                "modelConfig": {
+                    "env": {"model": "gemini", "model_id": "legacy-model"},
+                    "modelCapabilities": {
+                        "supportsImage": True,
+                        "supportsVideo": True,
+                    },
+                }
+            },
+            "status": {"state": "Available"},
+        }
+
+        info = model_aggregation_service._extract_model_info_from_crd(model_crd)
+
+        assert info["model_capabilities"] == {
+            "supportsImage": True,
+            "supportsVideo": True,
+        }
+        assert "modelCapabilities" not in info["config"]
+
+    def test_extract_model_info_rejects_malformed_legacy_capabilities(self):
+        model_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "legacy-model", "namespace": "default"},
+            "spec": {
+                "modelConfig": {
+                    "modelCapabilities": {
+                        "supportsImage": "true",
+                        "supportsVideo": False,
+                    }
+                }
+            },
+            "status": {"state": "Available"},
+        }
+
+        info = model_aggregation_service._extract_model_info_from_crd(model_crd)
+
+        assert info["model_capabilities"] is None
+        assert "modelCapabilities" not in info["config"]
+
+    def test_runtime_family_falls_back_to_provider_without_protocol(self):
+        """Test runtime family remains provider-only when spec.protocol is absent."""
+        assert (
+            build_model_runtime_family("openai", {"apiFormat": "responses"}) == "openai"
+        )
+        assert build_model_runtime_family(" Claude ", {"protocol": " claude "}) == (
+            "claude.claude"
+        )
+        assert (
+            build_model_runtime_family(None, {"protocol": "openai-responses"}) is None
+        )
+
+    def test_public_model_adapter_exposes_protocol_without_env(self):
+        """Test public model adapter preserves spec.protocol for runtime family."""
+        model_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {
+                "name": "openai-gpt-5.4",
+                "namespace": "default",
+                "displayName": "海外:GPT5.4",
+            },
+            "spec": {
+                "protocol": "openai-responses",
+                "apiFormat": "responses",
+                "costIndex": 50,
+                "modelCapabilities": {
+                    "supportsImage": True,
+                    "supportsVideo": True,
+                },
+                "modelConfig": {
+                    "modelCapabilities": {
+                        "supportsImage": False,
+                        "supportsVideo": False,
+                    },
+                    "env": {
+                        "model": "openai",
+                        "model_id": "gpt-5.4",
+                        "api_key": "secret",
+                    },
+                    "context_window": 1048576,
+                    "max_output_tokens": 131072,
+                },
+            },
+            "status": {"state": "Available"},
+        }
+        kind = Kind(
+            user_id=0,
+            kind="Model",
+            name="openai-gpt-5.4",
+            namespace="default",
+            json=model_crd,
+            is_active=True,
+        )
+
+        model_dict = ModelAdapter.to_model_dict(kind)
+
+        assert model_dict["provider"] == "openai"
+        assert model_dict["model_id"] == "gpt-5.4"
+        assert model_dict["config"]["protocol"] == "openai-responses"
+        assert model_dict["contextWindow"] == 1048576
+        assert model_dict["maxOutputTokens"] == 131072
+        assert model_dict["costIndex"] == "50"
+        assert model_dict["modelCapabilities"] == {
+            "supportsImage": True,
+            "supportsVideo": True,
+        }
+        assert model_dict["config"]["modelCapabilities"] == {
+            "supportsImage": True,
+            "supportsVideo": True,
+        }
+        assert model_dict["config"]["apiFormat"] == "responses"
+        assert model_dict["config"]["env"] == {}
+
+    def test_public_model_adapter_normalizes_legacy_config_capabilities(self):
+        model_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "legacy-public-model", "namespace": "default"},
+            "spec": {
+                "modelConfig": {
+                    "env": {"model": "gemini", "model_id": "legacy-public-model"},
+                    "modelCapabilities": {
+                        "supportsImage": True,
+                        "supportsVideo": True,
+                    },
+                }
+            },
+            "status": {"state": "Available"},
+        }
+        kind = Kind(
+            user_id=0,
+            kind="Model",
+            name="legacy-public-model",
+            namespace="default",
+            json=model_crd,
+            is_active=True,
+        )
+
+        model_dict = ModelAdapter.to_model_dict(kind)
+
+        assert model_dict["modelCapabilities"] == {
+            "supportsImage": True,
+            "supportsVideo": True,
+        }
+        assert model_dict["config"]["modelCapabilities"] == {
+            "supportsImage": True,
+            "supportsVideo": True,
+        }
+
+    def test_public_model_adapter_normalizes_direct_legacy_capabilities(self):
+        kind = Kind(
+            user_id=0,
+            kind="Model",
+            name="legacy-direct-model",
+            namespace="default",
+            json={
+                "env": {
+                    "model": "gemini",
+                    "model_id": "legacy-direct-model",
+                },
+                "modelCapabilities": {
+                    "supportsImage": True,
+                    "supportsVideo": False,
+                },
+            },
+            is_active=True,
+        )
+
+        model_dict = ModelAdapter.to_model_dict(kind)
+
+        assert model_dict["modelCapabilities"] == {
+            "supportsImage": True,
+            "supportsVideo": False,
+        }
+        assert model_dict["config"]["modelCapabilities"] == {
+            "supportsImage": True,
+            "supportsVideo": False,
+        }
+
+    def test_public_model_adapter_extracts_legacy_spec_model_limits(self):
+        kind = Kind(
+            user_id=0,
+            kind="Model",
+            name="legacy-limit-model",
+            namespace="default",
+            json={
+                "spec": {
+                    "modelConfig": {
+                        "context_window": 1000000,
+                        "max_output_tokens": 128000,
+                    }
+                }
+            },
+            is_active=True,
+        )
+
+        model_dict = ModelAdapter.to_model_dict(kind)
+
+        assert model_dict["contextWindow"] == 1000000
+        assert model_dict["maxOutputTokens"] == 128000
+
+    def _create_public_shell(
+        self,
+        db: Session,
+        name: str,
+        shell_type: str,
+        support_model: list = None,
+    ) -> Kind:
+        """Helper to create a public shell."""
+        shell_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Shell",
+            "metadata": {
+                "name": name,
+                "namespace": "default",
+                "labels": {"type": "local_engine"},
+            },
+            "spec": {
+                "shellType": shell_type,
+                "supportModel": support_model or [],
+                "baseImage": "test-image:latest",
+            },
+            "status": {"state": "Available"},
+        }
+        shell = Kind(
+            user_id=0,  # Public shell
+            kind="Shell",
+            name=name,
+            namespace="default",
+            json=shell_crd,
+            is_active=True,
+        )
+        db.add(shell)
+        db.commit()
+        db.refresh(shell)
+        return shell
+
+    def _create_custom_shell(
+        self,
+        db: Session,
+        user: User,
+        name: str,
+        base_shell_ref: str,
+        shell_type: str,
+        support_model: list = None,
+        namespace: str = "default",
+    ) -> Kind:
+        """Helper to create a user-defined custom shell."""
+        shell_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Shell",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": {"type": "local_engine"},
+            },
+            "spec": {
+                "shellType": shell_type,  # Inherited from base shell
+                "supportModel": support_model or [],
+                "baseImage": "custom-image:latest",
+                "baseShellRef": base_shell_ref,
+            },
+            "status": {"state": "Available"},
+        }
+        shell = Kind(
+            user_id=user.id,
+            kind="Shell",
+            name=name,
+            namespace=namespace,
+            json=shell_crd,
+            is_active=True,
+        )
+        db.add(shell)
+        db.commit()
+        db.refresh(shell)
+        return shell
+
+    def test_get_shell_support_model_public_shell(
+        self, test_db: Session, test_user: User
+    ):
+        """Test _get_shell_support_model returns correct data for public shell."""
+        # Create a public shell with specific support_model
+        self._create_public_shell(test_db, "ClaudeCode", "ClaudeCode", support_model=[])
+
+        support_model, shell_type = model_aggregation_service._get_shell_support_model(
+            test_db, "ClaudeCode", test_user
+        )
+
+        assert shell_type == "ClaudeCode"
+        assert support_model == []
+
+    def test_get_shell_support_model_custom_shell(
+        self, test_db: Session, test_user: User
+    ):
+        """Test _get_shell_support_model returns inherited shellType for custom shell."""
+        # Create base public shell
+        self._create_public_shell(test_db, "ClaudeCode", "ClaudeCode", support_model=[])
+
+        # Create custom shell based on ClaudeCode
+        self._create_custom_shell(
+            test_db,
+            test_user,
+            "my-custom-claude",
+            "ClaudeCode",
+            "ClaudeCode",  # Inherited shellType
+            support_model=[],
+        )
+
+        support_model, shell_type = model_aggregation_service._get_shell_support_model(
+            test_db, "my-custom-claude", test_user
+        )
+
+        # Custom shell should return the inherited shellType
+        assert shell_type == "ClaudeCode"
+
+    @pytest.mark.parametrize(
+        "support_model", [None, "claude", [""], [" "], ["claude", ""]]
+    )
+    def test_model_list_rejects_missing_or_invalid_shell(
+        self, test_db: Session, test_user: User, support_model: str | list[str] | None
+    ) -> None:
+        """Lookup failures must not be interpreted as an unrestricted allowlist."""
+        if support_model is not None:
+            shell = self._create_public_shell(test_db, "shell-a", "ClaudeCode")
+            shell.json = {
+                **shell.json,
+                "spec": {**shell.json["spec"], "supportModel": support_model},
+            }
+            test_db.commit()
+
+        with pytest.raises(HTTPException) as error:
+            model_aggregation_service.list_available_models(
+                db=test_db, current_user=test_user, shell_type="shell-a"
+            )
+
+        assert error.value.status_code == 400
+        assert error.value.detail == (
+            "Invalid shell configuration"
+            if support_model is not None
+            else "Shell not found"
+        )
+
+    @pytest.mark.parametrize("shell_type", ["ClaudeCode", "Codex"])
+    @pytest.mark.parametrize(
+        ("support_model", "expected_models"),
+        [
+            (None, {"model-a", "model-b", "model-c"}),
+            ([], {"model-a", "model-b", "model-c"}),
+            (["claude"], {"model-a"}),
+            (["openai"], {"model-b"}),
+        ],
+    )
+    def test_shell_model_filter_uses_only_support_model(
+        self,
+        test_db: Session,
+        test_user: User,
+        monkeypatch: pytest.MonkeyPatch,
+        shell_type: str,
+        support_model: list[str] | None,
+        expected_models: set[str],
+    ) -> None:
+        """Apply the configured allowlist equally to public and personal models."""
+        shell = self._create_public_shell(
+            test_db, shell_type, shell_type, support_model=support_model
+        )
+        if support_model is None:
+            shell_json = {**shell.json, "spec": dict(shell.json["spec"])}
+            shell_json["spec"].pop("supportModel")
+            shell.json = shell_json
+
+        personal_models = []
+        for name, provider in zip(
+            ["model-a", "model-b", "model-c"],
+            ["claude", "openai", "gemini"],
+            strict=True,
+        ):
+            for user_id, source in [(0, "public"), (test_user.id, "user")]:
+                model_name = f"{name}-{source}"
+                model = Kind(
+                    user_id=user_id,
+                    kind="Model",
+                    name=model_name,
+                    namespace="default",
+                    is_active=True,
+                    json={
+                        "kind": "Model",
+                        "metadata": {"name": model_name, "namespace": "default"},
+                        "spec": {
+                            "modelConfig": {
+                                "env": {"model": provider, "model_id": model_name}
+                            }
+                        },
+                    },
+                )
+                test_db.add(model)
+                if user_id == test_user.id:
+                    personal_models.append(model)
+        test_db.commit()
+        monkeypatch.setattr(
+            "app.services.model_aggregation_service.kind_service.list_resources",
+            lambda **kwargs: personal_models,
+        )
+
+        models = model_aggregation_service.list_available_models(
+            db=test_db,
+            current_user=test_user,
+            shell_type=shell_type,
+            scope="personal",
+            model_category_type="llm",
+        )
+
+        assert {(model["name"], model["type"]) for model in models} == {
+            (f"{name}-{source}", source)
+            for name in expected_models
+            for source in ["public", "user"]
+        }
+
+    def test_custom_shell_uses_its_support_model(
+        self, test_db: Session, test_user: User
+    ) -> None:
+        """A custom Shell's configured allowlist overrides its runtime's identity."""
+        self._create_public_shell(
+            test_db, "ClaudeCode", "ClaudeCode", support_model=["claude"]
+        )
+        self._create_custom_shell(
+            test_db,
+            test_user,
+            "shell-a",
+            "ClaudeCode",
+            "ClaudeCode",
+            support_model=["openai", "gemini"],
+        )
+        allowed, _ = model_aggregation_service._get_shell_support_model(
+            test_db, "shell-a", test_user
+        )
+
+        assert model_aggregation_service._is_model_compatible_with_shell(
+            "openai", allowed
+        )
+        assert model_aggregation_service._is_model_compatible_with_shell(
+            "gemini", allowed
+        )
+        assert not model_aggregation_service._is_model_compatible_with_shell(
+            "claude", allowed
+        )
+
+    def test_get_shell_support_model_with_group_shell(
+        self, test_db: Session, test_user: User
+    ):
+        """Test _get_shell_support_model with a group shell."""
+        from unittest.mock import patch
+
+        with patch(
+            "app.services.group_permission.get_user_groups",
+            return_value=["test-group"],
+        ):
+            # Create a group shell
+            shell_crd = {
+                "apiVersion": "agent.wecode.io/v1",
+                "kind": "Shell",
+                "metadata": {
+                    "name": "group-shell",
+                    "namespace": "test-group",
+                    "labels": {"type": "local_engine"},
+                },
+                "spec": {
+                    "shellType": "Agno",
+                    "supportModel": ["claude", "openai"],
+                    "baseImage": "test-image:latest",
+                },
+                "status": {"state": "Available"},
+            }
+            shell = Kind(
+                user_id=999,  # Different user
+                kind="Shell",
+                name="group-shell",
+                namespace="test-group",
+                json=shell_crd,
+                is_active=True,
+            )
+            test_db.add(shell)
+            test_db.commit()
+
+            # Get support_model and shell_type for group shell
+            support_model, shell_type = (
+                model_aggregation_service._get_shell_support_model(
+                    test_db, "group-shell", test_user
+                )
+            )
+
+            assert shell_type == "Agno"
+            assert set(support_model) == {"claude", "openai"}
+
+    def test_get_shell_support_model_public_shell_in_non_default_namespace(
+        self, test_db: Session, test_user: User
+    ):
+        """Test _get_shell_support_model finds public shells in non-default namespaces."""
+        # Create a public shell in non-default namespace
+        shell_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Shell",
+            "metadata": {
+                "name": "CustomPublicShell",
+                "namespace": "custom-ns",
+                "labels": {"type": "local_engine"},
+            },
+            "spec": {
+                "shellType": "CustomType",
+                "supportModel": ["custom-provider"],
+                "baseImage": "test-image:latest",
+            },
+            "status": {"state": "Available"},
+        }
+        shell = Kind(
+            user_id=0,  # Public shell
+            kind="Shell",
+            name="CustomPublicShell",
+            namespace="custom-ns",  # Non-default namespace
+            json=shell_crd,
+            is_active=True,
+        )
+        test_db.add(shell)
+        test_db.commit()
+
+        # Should find the shell even in non-default namespace
+        support_model, shell_type = model_aggregation_service._get_shell_support_model(
+            test_db, "CustomPublicShell", test_user
+        )
+
+        assert shell_type == "CustomType"
+        assert support_model == ["custom-provider"]
+
+    def test_get_shell_support_model_with_support_model_list(
+        self, test_db: Session, test_user: User
+    ):
+        """Test _get_shell_support_model correctly parses supportModel list."""
+        # Create a shell with specific supportModel
+        self._create_public_shell(
+            test_db,
+            "MultiProviderShell",
+            "MultiProvider",
+            support_model=["claude", "openai", "gemini"],
+        )
+
+        support_model, shell_type = model_aggregation_service._get_shell_support_model(
+            test_db, "MultiProviderShell", test_user
+        )
+
+        assert shell_type == "MultiProvider"
+        assert set(support_model) == {"claude", "openai", "gemini"}
+
+    def test_get_shell_support_model_precedence_order(
+        self, test_db: Session, test_user: User
+    ):
+        """Test that shell lookup follows correct precedence: public > personal > group."""
+        from unittest.mock import patch
+
+        # Create shells with same name in different scopes
+        # 1. Public shell
+        self._create_public_shell(
+            test_db,
+            "SharedShellName",
+            "PublicType",
+            support_model=["public-provider"],
+        )
+
+        # 2. Personal shell
+        self._create_custom_shell(
+            test_db,
+            test_user,
+            "SharedShellName",
+            "PublicType",
+            "PersonalType",
+            support_model=["personal-provider"],
+        )
+
+        # The function should return the public shell (precedence)
+        support_model, shell_type = model_aggregation_service._get_shell_support_model(
+            test_db, "SharedShellName", test_user
+        )
+
+        assert shell_type == "PublicType"  # From public shell
+        assert support_model == ["public-provider"]  # From public shell
+
+    def test_wework_filters_models_by_is_wework_available(
+        self, test_db: Session, test_user: User, monkeypatch
+    ):
+        """Only models with isWeworkAvailable=True are returned to wework."""
+        public_available_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "public-wework-model", "namespace": "default"},
+            "spec": {
+                "modelConfig": {
+                    "env": {"model": "openai", "model_id": "public-wework-model"}
+                },
+                "isWeworkAvailable": True,
+            },
+            "status": {"state": "Available"},
+        }
+        public_unavailable_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "public-no-wework", "namespace": "default"},
+            "spec": {
+                "modelConfig": {
+                    "env": {"model": "openai", "model_id": "public-no-wework"}
+                }
+            },
+            "status": {"state": "Available"},
+        }
+        public_available = Kind(
+            user_id=0,
+            kind="Model",
+            name="public-wework-model",
+            namespace="default",
+            json=public_available_crd,
+            is_active=True,
+        )
+        public_unavailable = Kind(
+            user_id=0,
+            kind="Model",
+            name="public-no-wework",
+            namespace="default",
+            json=public_unavailable_crd,
+            is_active=True,
+        )
+
+        user_available = Kind(
+            user_id=test_user.id,
+            kind="Model",
+            name="user-wework-model",
+            namespace="default",
+            json={
+                "apiVersion": "agent.wecode.io/v1",
+                "kind": "Model",
+                "metadata": {
+                    "name": "user-wework-model",
+                    "namespace": "default",
+                },
+                "spec": {
+                    "modelConfig": {
+                        "env": {"model": "claude", "model_id": "user-wework-model"}
+                    },
+                    "isWeworkAvailable": True,
+                },
+                "status": {"state": "Available"},
+            },
+            is_active=True,
+        )
+        user_unavailable = Kind(
+            user_id=test_user.id,
+            kind="Model",
+            name="user-no-wework",
+            namespace="default",
+            json={
+                "apiVersion": "agent.wecode.io/v1",
+                "kind": "Model",
+                "metadata": {"name": "user-no-wework", "namespace": "default"},
+                "spec": {
+                    "modelConfig": {
+                        "env": {"model": "claude", "model_id": "user-no-wework"}
+                    }
+                },
+                "status": {"state": "Available"},
+            },
+            is_active=True,
+        )
+
+        test_db.add_all(
+            [public_available, public_unavailable, user_available, user_unavailable]
+        )
+        test_db.commit()
+
+        def fake_list_resources(user_id, kind, namespace):
+            if user_id == test_user.id and kind == "Model" and namespace == "default":
+                return [user_available, user_unavailable]
+            return []
+
+        monkeypatch.setattr(
+            "app.services.model_aggregation_service.kind_service.list_resources",
+            fake_list_resources,
+        )
+
+        models = model_aggregation_service.list_available_models(
+            db=test_db,
+            current_user=test_user,
+            scope="all",
+            model_category_type="llm",
+            client_origin="wework",
+        )
+        names = {model["name"] for model in models}
+
+        assert "public-wework-model" in names
+        assert "user-wework-model" in names
+        assert "public-no-wework" not in names
+        assert "user-no-wework" not in names
+
+    def test_frontend_lists_models_regardless_of_wework_flag(
+        self, test_db: Session, test_user: User, monkeypatch
+    ):
+        """Non-wework clients should see models whether or not isWeworkAvailable is set."""
+        public_crd = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": "public-model", "namespace": "default"},
+            "spec": {
+                "modelConfig": {"env": {"model": "openai", "model_id": "public-model"}}
+            },
+            "status": {"state": "Available"},
+        }
+        public_model = Kind(
+            user_id=0,
+            kind="Model",
+            name="public-model",
+            namespace="default",
+            json=public_crd,
+            is_active=True,
+        )
+        user_model = Kind(
+            user_id=test_user.id,
+            kind="Model",
+            name="user-model",
+            namespace="default",
+            json={
+                "apiVersion": "agent.wecode.io/v1",
+                "kind": "Model",
+                "metadata": {"name": "user-model", "namespace": "default"},
+                "spec": {
+                    "modelConfig": {
+                        "env": {"model": "claude", "model_id": "user-model"}
+                    },
+                    "isWeworkAvailable": True,
+                },
+                "status": {"state": "Available"},
+            },
+            is_active=True,
+        )
+
+        test_db.add_all([public_model, user_model])
+        test_db.commit()
+
+        def fake_list_resources(user_id, kind, namespace):
+            if user_id == test_user.id and kind == "Model" and namespace == "default":
+                return [user_model]
+            return []
+
+        monkeypatch.setattr(
+            "app.services.model_aggregation_service.kind_service.list_resources",
+            fake_list_resources,
+        )
+
+        models = model_aggregation_service.list_available_models(
+            db=test_db,
+            current_user=test_user,
+            scope="all",
+            model_category_type="llm",
+            client_origin="frontend",
+        )
+        names = {model["name"] for model in models}
+
+        assert "public-model" in names
+        assert "user-model" in names

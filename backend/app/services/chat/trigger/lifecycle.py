@@ -1,0 +1,686 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared execution lifecycle helpers for chat and responses surfaces."""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from fastapi import HTTPException, status
+from sqlalchemy.orm import Session
+
+import app.stores.tasks as task_stores
+from app.db.session import SessionLocal
+from app.models.kind import Kind
+from app.models.subtask import Subtask, SubtaskRole
+from app.models.task import TaskResource
+from app.models.user import User
+from app.schemas.kind import Team
+from app.services.chat.storage.task_manager import (
+    TaskCreationParams,
+    build_user_subtask_result,
+    check_task_status,
+    create_new_task,
+    create_user_subtask,
+    get_bot_ids_from_team,
+    get_task_with_access_check,
+)
+from app.services.chat.task_device_resolution import ensure_task_device_id
+from app.services.readers.kinds import KindType, kindReader
+from app.services.task_fork_history import task_fork_history_resolver
+from app.services.task_status import mark_task_pending_payload
+from app.stores.tasks import subtask_store
+
+logger = logging.getLogger(__name__)
+
+_TERMINAL_CARD_STATUSES = {"populated", "error"}
+_NONTERMINAL_CARD_STATUSES = {"pending", "partial_ready"}
+
+
+@dataclass
+class ExecutionSessionSetup:
+    """Unified session setup result used before execution request building."""
+
+    task: TaskResource
+    task_id: int
+    user_subtask: Subtask
+    assistant_subtask: Optional[Subtask]
+    existing_subtasks: List[Subtask]
+    bot_ids: List[int]
+    bot_name: str
+    bot_namespace: str
+    subtask_user_id: int
+
+
+def _merge_blocks(
+    existing_blocks: Any,
+    new_blocks: Any,
+) -> list[dict[str, Any]]:
+    """Merge persisted and in-memory blocks while preserving first-seen order."""
+    merged: list[dict[str, Any]] = []
+    block_indexes: dict[str, int] = {}
+
+    for candidate in (existing_blocks, new_blocks):
+        if not isinstance(candidate, list):
+            continue
+        for block in candidate:
+            if not isinstance(block, dict):
+                continue
+            block_id = str(block.get("id") or "")
+            if block_id and block_id in block_indexes:
+                existing = merged[block_indexes[block_id]]
+                updated = {
+                    **existing,
+                    **{key: value for key, value in block.items() if value is not None},
+                }
+                if (
+                    existing.get("type") == "card"
+                    and existing.get("card_status") in _TERMINAL_CARD_STATUSES
+                    and block.get("card_status") in _NONTERMINAL_CARD_STATUSES
+                ):
+                    for key in (
+                        "status",
+                        "card_status",
+                        "card_data",
+                        "card_preview_data",
+                        "card_error",
+                    ):
+                        if key in existing:
+                            updated[key] = existing[key]
+                merged[block_indexes[block_id]] = updated
+                continue
+            if block_id:
+                block_indexes[block_id] = len(merged)
+            merged.append(block)
+
+    return merged
+
+
+def _is_blank_text_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return False
+
+
+def _extract_text_value_from_blocks(blocks: Any) -> str:
+    if not isinstance(blocks, list):
+        return ""
+
+    text_parts: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") not in {"text", "output_text"}:
+            continue
+        content = block.get("content")
+        if not isinstance(content, str) or not content.strip():
+            content = block.get("text")
+        if isinstance(content, str) and content.strip():
+            text_parts.append(content.strip())
+    return "\n".join(text_parts)
+
+
+def _decode_tool_output_payloads(tool_output: Any) -> list[dict[str, Any]]:
+    """Decode structured payloads returned through MCP text content."""
+    candidates = tool_output if isinstance(tool_output, list) else [tool_output]
+    payloads: list[dict[str, Any]] = []
+
+    for candidate in candidates:
+        value = candidate
+        if isinstance(candidate, dict) and isinstance(candidate.get("text"), str):
+            value = candidate["text"]
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        if isinstance(value, dict):
+            payloads.append(value)
+
+    return payloads
+
+
+def _extract_embedded_result_blocks(blocks: Any) -> list[dict[str, Any]]:
+    """Extract standard message blocks embedded in MCP tool results."""
+    if not isinstance(blocks, list):
+        return []
+
+    embedded_blocks: list[dict[str, Any]] = []
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "tool":
+            continue
+        for payload in _decode_tool_output_payloads(block.get("tool_output")):
+            result_data = payload.get("result_data")
+            if not isinstance(result_data, dict):
+                continue
+            result_blocks = result_data.get("blocks")
+            if isinstance(result_blocks, list):
+                embedded_blocks = _merge_blocks(embedded_blocks, result_blocks)
+
+    return embedded_blocks
+
+
+def _load_team_crd(team: Kind) -> Optional[Team]:
+    """Best-effort load of Team CRD from ORM or lightweight test doubles."""
+    team_json = getattr(team, "json", None)
+    if team_json is None:
+        return None
+    return Team.model_validate(team_json)
+
+
+def _build_pipeline_handoff_message(
+    db: Session,
+    *,
+    task_id: int,
+    existing_subtasks: List[Subtask],
+    context_passing: Optional[str],
+) -> str:
+    """Build the user-visible handoff message for a pipeline stage."""
+    if context_passing is None:
+        return ""
+
+    previous_stage = next(
+        (
+            subtask
+            for subtask in existing_subtasks
+            if subtask.role == SubtaskRole.ASSISTANT
+        ),
+        None,
+    )
+    if previous_stage is None:
+        return ""
+
+    from app.services.adapters.pipeline_context import build_pipeline_context_prompt
+
+    return build_pipeline_context_prompt(
+        db,
+        task_id=task_id,
+        current_subtask=previous_stage,
+        context_passing=context_passing,
+    )
+
+
+def prepare_execution_session(
+    db: Session,
+    user: User,
+    team: Kind,
+    input_text: str,
+    task_params: Optional[TaskCreationParams] = None,
+    model_info: Optional[Dict[str, Any]] = None,
+    tool_settings: Optional[Dict[str, Any]] = None,
+    task_id: Optional[int] = None,
+    source: str = "chat_shell",
+    is_api_call: bool = False,
+    api_key_name: Optional[str] = None,
+    should_trigger_ai: bool = True,
+    bot_ids_override: Optional[List[int]] = None,
+    video_config: Optional[Dict[str, Any]] = None,
+    image_config: Optional[Dict[str, Any]] = None,
+    prepared_task: Optional[TaskResource] = None,
+    commit: bool = True,
+) -> ExecutionSessionSetup:
+    """Create or reuse task/session state before building an execution request."""
+    resolved_task_params = task_params
+    if resolved_task_params is None:
+        if model_info is None:
+            model_info = {}
+        if tool_settings is None:
+            tool_settings = {}
+        workspace_data = tool_settings.get("workspace") or {}
+        resolved_task_params = TaskCreationParams(
+            message=input_text,
+            model_id=model_info.get("model_id"),
+            force_override_bot_model=model_info.get("model_id") is not None,
+            git_url=workspace_data.get("git_url"),
+            git_repo=workspace_data.get("git_repo"),
+            git_domain=workspace_data.get("git_domain"),
+            branch_name=workspace_data.get("branch"),
+            task_type="code" if workspace_data.get("git_url") else "chat",
+            source=source,
+            is_api_call=is_api_call,
+            api_key_name=api_key_name,
+        )
+
+    team_crd = _load_team_crd(team)
+    if team_crd is not None and not team_crd.spec.members:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Team has no members configured",
+        )
+
+    bot_ids = bot_ids_override or get_bot_ids_from_team(db, team)
+
+    first_bot_name = getattr(team, "name", "") or ""
+    first_bot_namespace = getattr(team, "namespace", "default") or "default"
+    if team_crd is not None:
+        first_bot_name = ""
+        first_bot_namespace = "default"
+        for member in team_crd.spec.members:
+            member_bot = kindReader.get_by_name_and_namespace(
+                db,
+                team.user_id,
+                KindType.BOT,
+                member.botRef.namespace,
+                member.botRef.name,
+            )
+            if member_bot:
+                first_bot_name = member.botRef.name
+                first_bot_namespace = member.botRef.namespace
+                break
+
+    if not first_bot_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid bots found in team",
+        )
+
+    task = None
+    subtask_user_id = user.id
+
+    if task_id:
+        task, subtask_user_id = get_task_with_access_check(db, task_id, user.id)
+        if not task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Task {task_id} not found",
+            )
+        if task.client_origin != resolved_task_params.client_origin:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Task {task_id} not found",
+            )
+        if not resolved_task_params.skip_status_check:
+            check_task_status(db, task)
+        if ensure_task_device_id(task, device_id=resolved_task_params.device_id):
+            task_stores.task_store.update_json(db, task=task, payload=task.json)
+        if should_trigger_ai:
+            task_stores.task_store.update_json(
+                db,
+                task=task,
+                payload=mark_task_pending_payload(task.json),
+            )
+        if (
+            resolved_task_params.model_id
+            or resolved_task_params.model_options
+            or resolved_task_params.auto_delete_executor is not None
+        ):
+            from app.schemas.kind import Task
+
+            task_crd = Task.model_validate(task.json)
+            if not task_crd.metadata.labels:
+                task_crd.metadata.labels = {}
+            if resolved_task_params.model_id:
+                task_crd.metadata.labels["modelId"] = resolved_task_params.model_id
+            if resolved_task_params.force_override_bot_model:
+                task_crd.metadata.labels["forceOverrideBotModel"] = "true"
+            if resolved_task_params.force_override_bot_model_type:
+                task_crd.metadata.labels["forceOverrideBotModelType"] = (
+                    resolved_task_params.force_override_bot_model_type
+                )
+            if resolved_task_params.model_options:
+                task_crd.metadata.labels["modelOptions"] = json.dumps(
+                    resolved_task_params.model_options
+                )
+            if resolved_task_params.auto_delete_executor is not None:
+                task_crd.metadata.labels["autoDeleteExecutor"] = (
+                    resolved_task_params.auto_delete_executor
+                )
+            task_stores.task_store.update_json(
+                db, task=task, payload=task_crd.model_dump(mode="json")
+            )
+            logger.info(
+                "[prepare_execution_session] Updated metadata for existing task %s to modelId=%s autoDeleteExecutor=%s",
+                task.id,
+                resolved_task_params.model_id,
+                resolved_task_params.auto_delete_executor,
+            )
+
+    if not task and prepared_task is not None:
+        task = prepared_task
+        subtask_user_id = user.id
+
+    if not task:
+        task = create_new_task(db, user, team, resolved_task_params)
+        subtask_user_id = user.id
+
+    existing_subtasks = [
+        item.subtask
+        for item in task_fork_history_resolver.resolve_for_task(
+            db,
+            task_id=task.id,
+            user_id=subtask_user_id,
+            current_task=task,
+        )
+    ]
+    next_message_id = task_fork_history_resolver.get_next_message_id(
+        db,
+        task_id=task.id,
+        user_id=subtask_user_id,
+        current_task=task,
+    )
+    parent_id = next_message_id - 1 if next_message_id > 1 else 0
+
+    handoff_message = input_text
+    if (
+        resolved_task_params.pipeline_context_passing is not None
+        and not input_text.strip()
+    ):
+        handoff_message = _build_pipeline_handoff_message(
+            db,
+            task_id=task.id,
+            existing_subtasks=existing_subtasks,
+            context_passing=resolved_task_params.pipeline_context_passing,
+        )
+
+    assistant_subtask = None
+    if should_trigger_ai:
+        user_subtask, assistant_subtask = (
+            task_stores.subtask_store.create_user_and_assistant_subtasks(
+                db,
+                user_id=subtask_user_id,
+                task_id=task.id,
+                team_id=team.id,
+                title="User message",
+                assistant_title="Assistant response",
+                bot_ids=bot_ids,
+                prompt=handoff_message,
+                user_message_id=next_message_id,
+                user_parent_id=parent_id,
+                assistant_message_id=next_message_id + 1,
+                assistant_parent_id=next_message_id,
+                sender_user_id=user.id,
+                result=build_user_subtask_result(
+                    video_config=video_config,
+                    image_config=image_config,
+                    message_source=resolved_task_params.message_source,
+                ),
+            )
+        )
+    else:
+        user_subtask = create_user_subtask(
+            db=db,
+            subtask_user_id=subtask_user_id,
+            sender_user_id=user.id,
+            task_id=task.id,
+            team_id=team.id,
+            bot_ids=bot_ids,
+            message=handoff_message,
+            next_message_id=next_message_id,
+            parent_id=parent_id,
+            video_config=video_config,
+            image_config=image_config,
+            message_source=resolved_task_params.message_source,
+        )
+
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    db.refresh(task)
+    db.refresh(user_subtask)
+    if assistant_subtask is not None:
+        db.refresh(assistant_subtask)
+
+    return ExecutionSessionSetup(
+        task=task,
+        task_id=task.id,
+        user_subtask=user_subtask,
+        assistant_subtask=assistant_subtask,
+        existing_subtasks=existing_subtasks,
+        bot_ids=bot_ids,
+        bot_name=first_bot_name,
+        bot_namespace=first_bot_namespace,
+        subtask_user_id=subtask_user_id,
+    )
+
+
+async def _get_existing_subtask_result(subtask_id: int) -> Dict[str, Any]:
+    """Load the stored subtask result so we can preserve existing fields."""
+    db = SessionLocal()
+    try:
+        subtask = subtask_store.get_by_id(db, subtask_id=subtask_id)
+        if subtask and isinstance(subtask.result, dict):
+            return dict(subtask.result)
+        return {}
+    except Exception as exc:
+        logger.warning(
+            "[CompletedResult] Failed to load existing subtask result for %s: %s",
+            subtask_id,
+            exc,
+        )
+        return {}
+    finally:
+        db.close()
+
+
+async def persist_result_without_status(
+    subtask_id: int,
+    result: Dict[str, Any],
+) -> None:
+    """Persist result data while leaving the current subtask status unchanged."""
+    db = SessionLocal()
+    try:
+        subtask = task_stores.subtask_store.get_by_id(db, subtask_id=subtask_id)
+        if not subtask:
+            raise ValueError(f"Subtask {subtask_id} not found")
+        task_stores.subtask_store.update_result(
+            db,
+            subtask=subtask,
+            result=result,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+async def collect_completed_result(
+    subtask_id: int,
+    *,
+    status: str,
+    result: Optional[Dict[str, Any]] = None,
+    error_message: Optional[str] = None,
+    error_code: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Collect the final terminal result payload for a subtask."""
+    import app.services.chat.storage as chat_storage
+
+    normalized_status = status.upper()
+
+    accumulated_content = await chat_storage.session_manager.get_accumulated_content(
+        subtask_id
+    )
+    existing_result = await _get_existing_subtask_result(subtask_id)
+
+    if result is not None and not isinstance(result, dict):
+        logger.warning(
+            "[CompletedResult] Ignoring non-dict runtime result for subtask %s: %s",
+            subtask_id,
+            type(result).__name__,
+        )
+
+    runtime_result = dict(result) if isinstance(result, dict) else {}
+    termination_reason = runtime_result.get("termination_reason")
+    if not isinstance(termination_reason, str) or not termination_reason:
+        existing_termination_reason = existing_result.get("termination_reason")
+        termination_reason = (
+            existing_termination_reason
+            if isinstance(existing_termination_reason, str)
+            and existing_termination_reason
+            else None
+        )
+    if termination_reason:
+        runtime_result["termination_reason"] = termination_reason
+    else:
+        runtime_result.pop("termination_reason", None)
+    blocks = await chat_storage.session_manager.finalize_and_get_blocks(
+        subtask_id,
+        termination_reason=termination_reason,
+        terminal_status=normalized_status,
+    )
+
+    has_payload = bool(
+        runtime_result
+        or existing_result
+        or accumulated_content
+        or blocks
+        or normalized_status == "COMPLETED"
+        or (normalized_status == "FAILED" and error_code)
+    )
+    if not has_payload:
+        return None
+
+    final_result: Dict[str, Any] = dict(runtime_result)
+
+    for key, value in existing_result.items():
+        if key == "blocks":
+            merged_blocks = _merge_blocks(value, final_result.get("blocks"))
+            if merged_blocks:
+                final_result["blocks"] = merged_blocks
+            continue
+        current_value = final_result.get(key)
+        if (
+            key not in final_result
+            or current_value is None
+            or (key == "blocks" and not current_value)
+        ):
+            final_result[key] = value
+
+    if blocks:
+        merged_blocks = _merge_blocks(final_result.get("blocks"), blocks)
+        if merged_blocks:
+            final_result["blocks"] = merged_blocks
+        logger.info(
+            "[CompletedResult] Added %d blocks to %s result for subtask %s",
+            len(blocks),
+            normalized_status.lower(),
+            subtask_id,
+        )
+
+    embedded_blocks = _extract_embedded_result_blocks(final_result.get("blocks"))
+    if embedded_blocks:
+        final_result["blocks"] = _merge_blocks(
+            final_result.get("blocks"),
+            embedded_blocks,
+        )
+        logger.info(
+            "[CompletedResult] Promoted %d embedded result blocks for subtask %s",
+            len(embedded_blocks),
+            subtask_id,
+        )
+
+    if _is_blank_text_value(final_result.get("value")) and (
+        normalized_status == "COMPLETED" or accumulated_content.strip()
+    ):
+        text_value = (
+            accumulated_content
+            if accumulated_content.strip()
+            else _extract_text_value_from_blocks(final_result.get("blocks"))
+        )
+        final_result["value"] = text_value
+
+    if normalized_status == "FAILED" and error_code:
+        final_result["error_type"] = error_code
+
+        from shared.utils.error_classifier import extract_http_status_code
+
+        http_code = extract_http_status_code(error_message or "")
+        if http_code is not None:
+            final_result["error_code"] = http_code
+
+    return final_result
+
+
+async def persist_completed_result(
+    *,
+    subtask_id: int,
+    task_id: int,
+    status: str,
+    result: Optional[Dict[str, Any]],
+    error: Optional[str] = None,
+    executor_name: Optional[str] = None,
+    executor_namespace: Optional[str] = None,
+) -> None:
+    """Persist a terminal result and clean up streaming state."""
+    import app.services.chat.storage as chat_storage
+    import app.services.chat.storage.db as chat_db
+
+    normalized_status = status.upper()
+
+    update_kwargs = {
+        "result": result,
+        "error": error,
+        "executor_name": executor_name,
+        "executor_namespace": executor_namespace,
+    }
+
+    await chat_db.db_handler.update_subtask_status(
+        subtask_id,
+        normalized_status,
+        **update_kwargs,
+    )
+    if normalized_status == "COMPLETED":
+        await _persist_standalone_workspace_path(task_id, result)
+    try:
+        await chat_storage.session_manager.cleanup_streaming_state(
+            subtask_id,
+            task_id=task_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[CompletedResult] Failed to cleanup streaming state for subtask %s: %s",
+            subtask_id,
+            exc,
+            exc_info=True,
+        )
+
+
+async def _persist_standalone_workspace_path(
+    task_id: int,
+    result: Optional[Dict[str, Any]],
+) -> None:
+    """Persist standalone chat workspace path returned by local executors."""
+
+    from app.db.session import SessionLocal
+    from app.services.chat.standalone_workspace import (
+        extract_workspace_path,
+        persist_standalone_workspace_path,
+    )
+
+    workspace_path = extract_workspace_path(result)
+    if not workspace_path:
+        return
+
+    db = SessionLocal()
+    try:
+        persist_standalone_workspace_path(
+            db,
+            task_id=task_id,
+            workspace_path=workspace_path,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[CompletedResult] Failed to persist standalone workspace path for task %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+    finally:
+        db.close()
+
+
+__all__ = [
+    "ExecutionSessionSetup",
+    "prepare_execution_session",
+    "collect_completed_result",
+    "persist_completed_result",
+]

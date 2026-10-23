@@ -1,0 +1,1720 @@
+import type { RunnerSelection } from '@wegent/collaboration'
+import { createRequestCache } from '@wegent/chat-core/request-cache'
+import type {
+  AgentExecutionPolicy,
+  AgentModelPolicy,
+  RunnerEnvironment,
+} from '@wegent/collaboration'
+import {
+  createProjectTaskTrackingSingleFlight,
+  DEFAULT_WORK_ITEM_PROJECT_ID,
+  enqueueTaskTrackingMutation,
+  type CloudLoopItemAttachment,
+  type CloudLoopItem,
+  type CloudLoopItemExecution,
+  type CloudProject,
+  type CloudProjectFile,
+  type CloudProjectId,
+  type CloudProjectMember,
+  type ProjectBoardSnapshot,
+  type ProjectTaskAttachment,
+  type Delivery,
+  type DeliveryAsset,
+  type DeliveryCreateInput,
+  type DeliveryDetail,
+  type DeliveryFinalizeInput,
+  type LoopItemTaskBinding,
+} from '@/api/deliveries'
+import type { LocalProjectSpaceApi } from '@/features/workbench/workbenchServices'
+import { openLocalFile } from '@/lib/local-terminal'
+import { readDroppedFiles } from '@/desktop/droppedFiles'
+import type {
+  Attachment,
+  ModelType,
+  ModelSelectionConfig,
+  RuntimeProjectPluginRef,
+  RuntimeTaskAddress,
+  UnifiedModel,
+} from '@/types/api'
+import type { UnifiedAgentSkillRef } from '@/api/agentDefinition'
+import {
+  localProjectAssociationFromTags,
+  localProjectAssociationTag,
+  visibleLoopItemTags,
+} from '@/api/localProjectAssociation'
+import { desktopFileUrl } from '@/components/chat/assistantMarkdownLinks'
+
+function localTaskUpdate(
+  data: Record<string, unknown> & { version: number }
+): Record<string, unknown> & { version: number } {
+  const position = data.position as { beforeItemId: string | null } | undefined
+  return { ...data, ...(position ? { position: { before_item_id: position.beforeItemId } } : {}) }
+}
+
+type LocalRequest = <T>(
+  method: string,
+  params?: Record<string, unknown>,
+  deviceId?: string
+) => Promise<T>
+
+export interface LocalAssignmentExecutionPayloadInput {
+  projectId: CloudProjectId
+  itemId: string
+  assigneeType: 'agent' | 'group'
+  assigneeId: string
+  runnerSelection?: RunnerSelection
+}
+
+interface LocalDeliveryApiOptions {
+  prepareAssignmentExecutionPayload?(
+    input: LocalAssignmentExecutionPayloadInput
+  ): Promise<Record<string, unknown>>
+}
+
+interface LocalLoopItemRecord {
+  id: string
+  resource_type: 'project' | 'task' | string
+  cloud_project_id: string | null
+  parent_id: string | null
+  public_id: string | null
+  project_key: string | null
+  name: string | null
+  title: string | null
+  description: string
+  created_by_user_id: number
+  sequence_number: number | null
+  status: string | null
+  priority: string | null
+  sort_order: number
+  current_delivery_id: string | null
+  metadata: Record<string, unknown>
+  version: number
+  created_at: string
+  updated_at: string
+  completed_at: string | null
+  archived_at?: string | null
+  assignee_user_id?: number | null
+  assignee_agent_id?: string | null
+  execution_id?: number | null
+  execution_state?: string | null
+}
+
+interface LocalTaskBindingRecord {
+  id: string
+  cloud_project_id: string
+  loop_item_id: string | null
+  task_user_id: number
+  device_id: string
+  task_id: string
+  task_title: string | null
+  backend_task_id: number | null
+  human_assignment_id?: string | null
+  dispatch_id?: string | null
+  dispatch_round_id?: string | null
+  assignment_id?: string | null
+  modelSelection?: ModelSelectionConfig | null
+  executionContext?: LoopItemTaskBinding['executionContext']
+  binding_type: 'system' | 'user'
+  linked_at: string
+}
+
+interface LocalProjectFileRecord {
+  id: string
+  cloud_project_id: string
+  path: string
+  name: string
+  kind: 'file' | 'folder' | string
+  content_type: string | null
+  size_bytes: number
+  sha256: string | null
+  description: string
+  created_by_user_id: number
+  updated_by_user_id: number
+  version: number
+  created_at: string
+  updated_at: string
+}
+
+interface LocalAccessRecord {
+  path: string
+}
+
+export interface LocalProjectChatAgent {
+  executionPolicy?: AgentExecutionPolicy
+  modelPolicy?: AgentModelPolicy
+  id: string
+  projectId: string
+  name: string
+  displayName: string
+  namespace: string
+  runtime: 'codex' | 'claude_code'
+  model: string | null
+  modelType: ModelType | null
+  modelNamespace: string
+  allowedModels?: LocalProjectChatAgentModel[]
+  capabilityDescription: string
+  capabilityMode: 'follow_device' | 'manual'
+  systemPrompt: string
+  additionalSkills: UnifiedAgentSkillRef[]
+  mcpServers: Record<string, unknown>
+  status: 'active' | 'archived'
+  visibility: 'private' | 'creator_admin' | 'public'
+  executionEnvironment: 'local' | 'cloud'
+  executionMode: 'auto' | 'manual_approval'
+  executionDeviceId: string | null
+  localProjectId: number | null
+  maxConcurrentExecutions: number
+  workspacePolicy: 'project' | 'git_worktree'
+  plugins: RuntimeProjectPluginRef[]
+  createdByUserId: number | null
+  createdByUserName?: string | null
+  version: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface LocalProjectChatAgentModel {
+  name: string
+  type?: ModelType | null
+  namespace?: string
+}
+
+export interface LocalProjectChatAgentCreateInput {
+  executionPolicy?: AgentExecutionPolicy
+  modelPolicy?: AgentModelPolicy
+  name: string
+  displayName?: string
+  namespace?: string
+  runtime: 'codex' | 'claude_code'
+  model?: string | null
+  modelType?: ModelType | null
+  modelNamespace?: string
+  allowedModels?: LocalProjectChatAgentModel[]
+  capabilityDescription?: string
+  capabilityMode?: LocalProjectChatAgent['capabilityMode']
+  systemPrompt?: string
+  additionalSkills?: UnifiedAgentSkillRef[]
+  mcpServers?: Record<string, unknown>
+  visibility?: LocalProjectChatAgent['visibility']
+  executionEnvironment?: LocalProjectChatAgent['executionEnvironment']
+  executionMode?: LocalProjectChatAgent['executionMode']
+  executionDeviceId?: string | null
+  localProjectId?: number | null
+  maxConcurrentExecutions?: number
+  workspacePolicy?: LocalProjectChatAgent['workspacePolicy']
+  plugins?: RuntimeProjectPluginRef[]
+}
+
+export interface LocalLoopItemExecution {
+  id: number
+  loop_item_id: string
+  cloud_project_id: string
+  task_title: string
+  task_status?: string | null
+  task_priority?: string | null
+  agent_id: string
+  assigner_user_id: number
+  execution_environment: string
+  execution_device_id?: string | null
+  runtime_instance_id?: string | null
+  status: string
+  display_state: string
+  observed_state: string
+  sync_state: string
+  priority_weight: number
+  queued_at?: string | null
+  started_at?: string | null
+  completed_at?: string | null
+  lease_expires_at?: string | null
+  heartbeat_at?: string | null
+  claimed_at?: string | null
+  start_requested_at?: string | null
+  observed_at?: string | null
+  cancel_requested_at?: string | null
+  attempt_no: number
+  previous_execution_id?: number | null
+  execution_scope: string
+  last_event_seq: number
+  termination_reason: string
+  retry_attempt: number
+  max_retries?: number
+  error_message: string
+  execution_note: string
+  approval_status?: string | null
+  approved_by_user_id?: number | null
+  rejected_reason?: string | null
+  runtime_device_id?: string | null
+  runtime_task_id?: string | null
+  version: number
+  created_at: string
+  updated_at: string
+  agent_name: string
+  agent_system_prompt: string
+  agent_model?: string | null
+  agent_max_concurrent_executions: number
+  agent_plugins?: RuntimeProjectPluginRef[]
+  /** Available only on a successful claim and never persisted with the queue row. */
+  runtime_payload?: Record<string, unknown> | null
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(item => typeof item === 'string') : []
+}
+
+function localProject(record: LocalLoopItemRecord): CloudProject {
+  const taskProvider =
+    record.metadata.task_provider === 'github' ||
+    record.metadata.task_provider === 'gitlab' ||
+    record.metadata.task_provider === 'dingtalk_aitable'
+      ? record.metadata.task_provider
+      : 'local'
+  return {
+    id: record.id,
+    public_id: record.public_id ?? record.id,
+    project_key: record.project_key ?? 'LOCAL',
+    name: record.name ?? '',
+    description: record.description,
+    project_store: 'local',
+    task_provider: taskProvider,
+    provider_config:
+      record.metadata.provider_config &&
+      typeof record.metadata.provider_config === 'object' &&
+      !Array.isArray(record.metadata.provider_config)
+        ? (record.metadata.provider_config as CloudProject['provider_config'])
+        : {},
+    board_config:
+      record.metadata.board_config &&
+      typeof record.metadata.board_config === 'object' &&
+      !Array.isArray(record.metadata.board_config)
+        ? (record.metadata.board_config as CloudProject['board_config'])
+        : undefined,
+    card_display:
+      record.metadata.card_display &&
+      typeof record.metadata.card_display === 'object' &&
+      !Array.isArray(record.metadata.card_display)
+        ? (record.metadata.card_display as CloudProject['card_display'])
+        : undefined,
+    pull_request_automation:
+      record.metadata.pull_request_automation &&
+      typeof record.metadata.pull_request_automation === 'object' &&
+      !Array.isArray(record.metadata.pull_request_automation)
+        ? (record.metadata.pull_request_automation as CloudProject['pull_request_automation'])
+        : undefined,
+    workflow_definition:
+      record.metadata.workflow_definition &&
+      typeof record.metadata.workflow_definition === 'object' &&
+      !Array.isArray(record.metadata.workflow_definition)
+        ? (record.metadata.workflow_definition as CloudProject['workflow_definition'])
+        : undefined,
+    collaboration_groups: Array.isArray(record.metadata.collaboration_groups)
+      ? (record.metadata.collaboration_groups as NonNullable<CloudProject['collaboration_groups']>)
+      : [],
+    automatic_processing_rules: Array.isArray(record.metadata.automatic_processing_rules)
+      ? (record.metadata.automatic_processing_rules as NonNullable<
+          CloudProject['automatic_processing_rules']
+        >)
+      : [],
+    execution_environment:
+      record.metadata.execution_environment &&
+      typeof record.metadata.execution_environment === 'object' &&
+      !Array.isArray(record.metadata.execution_environment)
+        ? (record.metadata.execution_environment as CloudProject['execution_environment'])
+        : undefined,
+    created_by_user_id: 0,
+    current_user_id: 0,
+    current_user_name: '',
+    access_role: 'Owner',
+    visibility: 'private',
+    status: record.status ?? 'active',
+    tags: stringList(record.metadata.tags),
+    metadata: record.metadata,
+    version: record.version,
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+  }
+}
+
+function externalProjectDescriptor(project: CloudProject, token?: string) {
+  return {
+    id: project.id,
+    public_id: project.public_id,
+    project_key: project.project_key,
+    name: project.name,
+    description: project.description,
+    project_store: project.project_store,
+    task_provider: project.task_provider,
+    provider_config: {
+      ...project.provider_config,
+      ...(token?.trim() ? { token: token.trim() } : {}),
+    },
+    version: project.version,
+  }
+}
+
+export function createExternalIssueApi(request: LocalRequest) {
+  return {
+    async configureProject(project: CloudProject, token?: string) {
+      await request('external_projects.configure', {
+        project: externalProjectDescriptor(project, token),
+      })
+    },
+    async removeProject(projectId: CloudProject['id']) {
+      await request('external_projects.remove', { project_id: projectId })
+    },
+    async retainProjects(projectIds: CloudProject['id'][]) {
+      await request('external_projects.retain', { project_ids: projectIds })
+    },
+    async listLoopItems(project: CloudProject) {
+      const records = await request<LocalLoopItemRecord[]>('external_todos.list', {
+        project: externalProjectDescriptor(project),
+      })
+      return { items: records.map(record => localTask(record, project)) }
+    },
+    async getLoopItem(project: CloudProject, itemId: string) {
+      const record = await request<LocalLoopItemRecord>('external_todos.get', {
+        project: externalProjectDescriptor(project),
+        task_id: itemId,
+      })
+      return localTask(record, project)
+    },
+    async createLoopItem(
+      project: CloudProject,
+      data: {
+        title: string
+        description?: string
+        status?: CloudLoopItem['status']
+        priority?: CloudLoopItem['priority']
+        start_at?: string
+        due_at?: string
+        parent_id?: string | null
+        tags?: string[]
+        creator_name?: string
+        local_project_id?: number | null
+        local_project_name?: string | null
+      }
+    ) {
+      // The creator label keeps the numeric id as the authoritative identity
+      // (`wegent:creator:<id>`); a best-effort display name is appended for
+      // humans browsing the provider UI (`wegent:creator:<id>:<name>`).
+      // Provider label separators (comma for GitLab) cannot appear in names.
+      const creatorName = data.creator_name?.replace(/[,:]/g, ' ').trim()
+      const creatorLabel =
+        (project.current_user_id ?? 0) > 0
+          ? [`wegent:creator:${project.current_user_id}${creatorName ? `:${creatorName}` : ''}`]
+          : []
+      const localProjectLabel =
+        data.local_project_id && data.local_project_name
+          ? [
+              localProjectAssociationTag({
+                id: data.local_project_id,
+                name: data.local_project_name,
+              }),
+            ]
+          : []
+      const record = await request<LocalLoopItemRecord>('external_todos.create', {
+        project: externalProjectDescriptor(project),
+        todo: {
+          title: data.title,
+          description: data.description ?? '',
+          status: data.status ?? 'inbox',
+          priority: data.priority ?? 'none',
+          start_at: data.start_at ?? null,
+          due_at: data.due_at ?? null,
+          parent_id: data.parent_id ?? null,
+          tags: [...(data.tags ?? []), ...creatorLabel, ...localProjectLabel],
+        },
+      })
+      return localTask(record, project)
+    },
+    async updateLoopItem(
+      project: CloudProject,
+      itemId: string,
+      data: Record<string, unknown> & { version: number }
+    ) {
+      let todo = localTaskUpdate(data)
+      if (Array.isArray(data.tags)) {
+        const current = await request<LocalLoopItemRecord>('external_todos.get', {
+          project: externalProjectDescriptor(project),
+          task_id: itemId,
+        })
+        const association = localProjectAssociationFromTags(stringList(current.metadata.tags))
+        todo = {
+          ...todo,
+          tags: association
+            ? [
+                ...visibleLoopItemTags(stringList(data.tags)),
+                localProjectAssociationTag(association),
+              ]
+            : data.tags,
+        }
+      }
+      const record = await request<LocalLoopItemRecord>('external_todos.update', {
+        project: externalProjectDescriptor(project),
+        task_id: itemId,
+        todo,
+      })
+      return localTask(record, project)
+    },
+  }
+}
+
+type LocalAgentRecord = Record<string, unknown> & {
+  execution_policy?: AgentExecutionPolicy
+  model_policy?: AgentModelPolicy
+  id: string
+  project_id?: string
+  name?: string
+  display_name?: string
+  namespace?: string
+  runtime?: string
+  model?: string | null
+  model_type?: ModelType | null
+  model_namespace?: string
+  allowed_models?: LocalProjectChatAgentModel[]
+  capability_description?: string
+  capability_mode?: 'follow_device' | 'manual'
+  system_prompt?: string
+  additional_skills?: UnifiedAgentSkillRef[]
+  mcp_servers?: Record<string, unknown>
+  status?: string
+  visibility?: string
+  execution_environment?: string
+  execution_mode?: string
+  execution_device_id?: string | null
+  local_project_id?: number | null
+  max_concurrent_executions?: number
+  workspace_policy?: 'project' | 'git_worktree'
+  plugins?: RuntimeProjectPluginRef[]
+  created_by_user_id?: number | null
+  version?: number
+  created_at?: string
+  updated_at?: string
+}
+
+function localAgent(record: LocalAgentRecord): LocalProjectChatAgent {
+  const maxConcurrentExecutions =
+    typeof record.max_concurrent_executions === 'number' &&
+    Number.isInteger(record.max_concurrent_executions) &&
+    record.max_concurrent_executions >= 1 &&
+    record.max_concurrent_executions <= 20
+      ? record.max_concurrent_executions
+      : 1
+  return {
+    id: record.id,
+    projectId: record.project_id ?? '',
+    name: record.name ?? 'AI',
+    displayName: record.display_name ?? record.name ?? 'AI',
+    namespace: record.namespace ?? 'default',
+    runtime: record.runtime === 'claude_code' ? 'claude_code' : 'codex',
+    executionPolicy: record.execution_policy,
+    modelPolicy: record.model_policy,
+    model: record.model ?? null,
+    modelType: record.model_type ?? null,
+    modelNamespace: record.model_namespace ?? 'default',
+    allowedModels: Array.isArray(record.allowed_models)
+      ? record.allowed_models.filter(
+          candidate =>
+            candidate &&
+            typeof candidate === 'object' &&
+            typeof candidate.name === 'string' &&
+            candidate.name.trim()
+        )
+      : record.model
+        ? [
+            {
+              name: record.model,
+              type: record.model_type ?? null,
+              namespace: record.model_namespace ?? 'default',
+            },
+          ]
+        : [],
+    capabilityDescription: record.capability_description ?? '',
+    capabilityMode:
+      record.capability_mode === 'manual'
+        ? 'manual'
+        : record.capability_mode === 'follow_device'
+          ? 'follow_device'
+          : (record.plugins?.length ?? 0) > 0 ||
+              (record.additional_skills?.length ?? 0) > 0 ||
+              Object.keys(record.mcp_servers ?? {}).length > 0
+            ? 'manual'
+            : 'follow_device',
+    systemPrompt: record.system_prompt ?? '',
+    additionalSkills: Array.isArray(record.additional_skills) ? record.additional_skills : [],
+    mcpServers:
+      record.mcp_servers &&
+      typeof record.mcp_servers === 'object' &&
+      !Array.isArray(record.mcp_servers)
+        ? record.mcp_servers
+        : {},
+    status: record.status === 'archived' ? 'archived' : 'active',
+    visibility: (record.visibility as LocalProjectChatAgent['visibility']) ?? 'creator_admin',
+    executionEnvironment:
+      (record.execution_environment as LocalProjectChatAgent['executionEnvironment']) ?? 'local',
+    executionMode: (record.execution_mode as LocalProjectChatAgent['executionMode']) ?? 'auto',
+    executionDeviceId: record.execution_device_id ?? null,
+    localProjectId: record.local_project_id ?? null,
+    maxConcurrentExecutions,
+    workspacePolicy: record.workspace_policy === 'git_worktree' ? 'git_worktree' : 'project',
+    plugins: record.plugins ?? [],
+    createdByUserId: record.created_by_user_id ?? null,
+    version: record.version ?? 1,
+    createdAt: record.created_at ?? '',
+    updatedAt: record.updated_at ?? '',
+  }
+}
+
+export function createLocalProjectChatAgentApi(
+  request: LocalRequest,
+  currentUserId?: number,
+  listRunnerEnvironments: (projectId?: string) => Promise<RunnerEnvironment[]> = async () => {
+    throw new Error('Runner catalog is unavailable')
+  },
+  listModels: () => Promise<UnifiedModel[]> = async () => [],
+  listEnvironments: (projectId?: string) => Promise<RunnerEnvironment[]> = async () => {
+    throw new Error('Runner inventory is unavailable')
+  },
+  listNativeModels: (
+    environment: RunnerEnvironment,
+    projectId?: string
+  ) => Promise<Pick<RunnerEnvironment, 'models' | 'catalog_error'>> = async () => {
+    throw new Error('Native model catalog is unavailable')
+  }
+) {
+  const createPayload = (input: LocalProjectChatAgentCreateInput) => ({
+    name: input.name,
+    display_name: input.displayName ?? input.name,
+    namespace: input.namespace ?? 'default',
+    runtime: input.runtime,
+    execution_policy: input.executionPolicy,
+    model_policy: input.modelPolicy,
+    model: input.model ?? null,
+    model_type: input.modelType ?? null,
+    model_namespace: input.modelNamespace ?? 'default',
+    allowed_models: input.allowedModels ?? [],
+    capability_description: input.capabilityDescription ?? '',
+    capability_mode: input.capabilityMode ?? 'follow_device',
+    system_prompt: input.systemPrompt ?? '',
+    additional_skills: input.additionalSkills ?? [],
+    mcp_servers: input.mcpServers ?? {},
+    visibility: input.visibility ?? 'creator_admin',
+    execution_environment: input.executionEnvironment ?? 'local',
+    execution_mode: input.executionMode ?? 'auto',
+    execution_device_id: input.executionDeviceId ?? null,
+    local_project_id: input.localProjectId ?? null,
+    max_concurrent_executions: input.maxConcurrentExecutions ?? 1,
+    workspace_policy: input.workspacePolicy ?? 'project',
+    plugins: input.plugins ?? [],
+    created_by_user_id: currentUserId ?? null,
+  })
+  const cache = createRequestCache()
+  return {
+    listRunnerEnvironments,
+    listEnvironments: (projectId?: string) =>
+      cache.get(`environments:${projectId ?? ''}`, () => listEnvironments(projectId)),
+    listNativeModels: (environment: RunnerEnvironment, projectId?: string) =>
+      cache.get(`native:${projectId ?? ''}:${environment.id}`, () =>
+        listNativeModels(environment, projectId)
+      ),
+    listModels,
+    async list(
+      projectId: string,
+      options?: { forceRefresh?: boolean }
+    ): Promise<LocalProjectChatAgent[]> {
+      if (options?.forceRefresh) cache.invalidate(`agents:${projectId}`)
+      return cache.get(
+        `agents:${projectId}`,
+        async () => {
+          const records = await request<LocalAgentRecord[]>('chat_agents.list', {
+            project_id: projectId,
+          })
+          return records.map(localAgent)
+        },
+        options?.forceRefresh ? 0 : 60_000
+      )
+    },
+    async create(
+      projectId: string,
+      input: LocalProjectChatAgentCreateInput
+    ): Promise<LocalProjectChatAgent> {
+      const record = await request<LocalAgentRecord>('chat_agents.create', {
+        project_id: projectId,
+        agent: createPayload(input),
+      })
+      cache.invalidate('agents:')
+      return localAgent(record)
+    },
+    async ensureDefault(
+      projectId: string,
+      input: LocalProjectChatAgentCreateInput
+    ): Promise<LocalProjectChatAgent | null> {
+      const record = await request<LocalAgentRecord | null>('chat_agents.ensure_default', {
+        project_id: projectId,
+        agent: createPayload(input),
+      })
+      cache.invalidate('agents:')
+      return record ? localAgent(record) : null
+    },
+    async update(
+      projectId: string,
+      agentId: string,
+      input: {
+        version: number
+        executionPolicy?: AgentExecutionPolicy
+        modelPolicy?: AgentModelPolicy
+        runtime?: 'codex' | 'claude_code'
+        name?: string
+        displayName?: string
+        namespace?: string
+        model?: string | null
+        modelType?: ModelType | null
+        modelNamespace?: string
+        allowedModels?: LocalProjectChatAgentModel[]
+        capabilityDescription?: string
+        capabilityMode?: LocalProjectChatAgent['capabilityMode']
+        systemPrompt?: string
+        additionalSkills?: UnifiedAgentSkillRef[]
+        mcpServers?: Record<string, unknown>
+        status?: 'active' | 'archived'
+        visibility?: LocalProjectChatAgent['visibility']
+        executionEnvironment?: LocalProjectChatAgent['executionEnvironment']
+        executionMode?: LocalProjectChatAgent['executionMode']
+        executionDeviceId?: string | null
+        localProjectId?: number | null
+        maxConcurrentExecutions?: number
+        workspacePolicy?: LocalProjectChatAgent['workspacePolicy']
+        plugins?: RuntimeProjectPluginRef[]
+      }
+    ): Promise<LocalProjectChatAgent> {
+      const record = await request<LocalAgentRecord>('chat_agents.update', {
+        project_id: projectId,
+        agent_id: agentId,
+        agent: {
+          version: input.version,
+          name: input.name,
+          display_name: input.displayName,
+          namespace: input.namespace,
+          runtime: input.runtime,
+          execution_policy: input.executionPolicy,
+          model_policy: input.modelPolicy,
+          model: input.model,
+          model_type: input.modelType,
+          model_namespace: input.modelNamespace,
+          allowed_models: input.allowedModels,
+          capability_description: input.capabilityDescription,
+          capability_mode: input.capabilityMode,
+          system_prompt: input.systemPrompt,
+          additional_skills: input.additionalSkills,
+          mcp_servers: input.mcpServers,
+          status: input.status,
+          visibility: input.visibility,
+          execution_environment: input.executionEnvironment,
+          execution_mode: input.executionMode,
+          execution_device_id: input.executionDeviceId,
+          local_project_id: input.localProjectId,
+          max_concurrent_executions: input.maxConcurrentExecutions,
+          workspace_policy: input.workspacePolicy,
+          plugins: input.plugins,
+        },
+      })
+      cache.invalidate('agents:')
+      return localAgent(record)
+    },
+    async archive(projectId: string, agentId: string, version: number) {
+      await request('chat_agents.archive', {
+        project_id: projectId,
+        agent_id: agentId,
+        version,
+      })
+      cache.invalidate('agents:')
+      return { deleted: true }
+    },
+  }
+}
+
+export function createLocalLoopItemExecutionApi(request: LocalRequest) {
+  return {
+    async list(
+      projectId: string,
+      options: { agent_id?: string; status?: string; include_terminal?: boolean } = {}
+    ): Promise<LocalLoopItemExecution[]> {
+      return request<LocalLoopItemExecution[]>('executions.list', {
+        project_id: projectId,
+        agent_id: options.agent_id ?? null,
+        status: options.status ?? null,
+        include_terminal: options.include_terminal ?? false,
+      })
+    },
+    async approve(executionId: number) {
+      return request<LocalLoopItemExecution>('executions.approve', {
+        execution_id: executionId,
+      })
+    },
+    async reject(executionId: number, reason?: string) {
+      return request<LocalLoopItemExecution>('executions.reject', {
+        execution_id: executionId,
+        reason: reason ?? null,
+      })
+    },
+    async cancel(executionId: number, note?: string) {
+      return request<LocalLoopItemExecution>('executions.cancel', {
+        execution_id: executionId,
+        note: note ?? null,
+      })
+    },
+    async heartbeat(
+      executionId: number,
+      runtimeDeviceId: string | null,
+      runtimeTaskId: string | null,
+      leaseSeconds = 300
+    ) {
+      return request<LocalLoopItemExecution>('executions.heartbeat', {
+        execution_id: executionId,
+        runtime_device_id: runtimeDeviceId,
+        runtime_task_id: runtimeTaskId,
+        lease_seconds: leaseSeconds,
+      })
+    },
+    async startRequested(
+      executionId: number,
+      runtimeDeviceId: string,
+      runtimeTaskId: string,
+      leaseSeconds = 300
+    ) {
+      return request<LocalLoopItemExecution | null>('executions.start_requested', {
+        execution_id: executionId,
+        runtime_device_id: runtimeDeviceId,
+        runtime_task_id: runtimeTaskId,
+        lease_seconds: leaseSeconds,
+      })
+    },
+    async runtimeStart(
+      executionId: number,
+      runtimeDeviceId: string,
+      runtimeTaskId: string,
+      leaseSeconds = 300
+    ) {
+      return request<LocalLoopItemExecution | null>('executions.runtime_start', {
+        execution_id: executionId,
+        runtime_device_id: runtimeDeviceId,
+        runtime_task_id: runtimeTaskId,
+        lease_seconds: leaseSeconds,
+      })
+    },
+    async dispatchUnknown(
+      executionId: number,
+      runtimeDeviceId: string,
+      runtimeTaskId: string,
+      error: string
+    ) {
+      return request<LocalLoopItemExecution | null>('executions.dispatch_unknown', {
+        execution_id: executionId,
+        runtime_device_id: runtimeDeviceId,
+        runtime_task_id: runtimeTaskId,
+        error,
+      })
+    },
+    async dispatchFailed(executionId: number, error: string) {
+      return request<LocalLoopItemExecution>('executions.dispatch_failed', {
+        execution_id: executionId,
+        error,
+      })
+    },
+    async recoverStale(): Promise<{ requeued: number; unknown: number }> {
+      return request<{ requeued: number; unknown: number }>('executions.recover_stale', {})
+    },
+    async listStale(): Promise<LocalLoopItemExecution[]> {
+      return request<LocalLoopItemExecution[]>('executions.list_stale', {})
+    },
+    async reconcile(
+      executionId: number,
+      snapshot: { runtime_status: string; running: boolean; turn_status?: string | null }
+    ) {
+      return request<LocalLoopItemExecution | null>('executions.reconcile', {
+        execution_id: executionId,
+        ...snapshot,
+      })
+    },
+  }
+}
+
+function localTask(record: LocalLoopItemRecord, project?: CloudProject): CloudLoopItem {
+  const role = project?.access_role ?? 'Owner'
+  const storedTags = stringList(record.metadata.tags)
+  const localProjectAssociation = localProjectAssociationFromTags(storedTags)
+  return {
+    runner_binding: record.metadata.runner_binding as CloudLoopItem['runner_binding'],
+    id: record.id,
+    cloud_project_id: record.cloud_project_id ?? '',
+    sequence_number: record.sequence_number ?? 0,
+    parent_id: record.parent_id,
+    created_by_user_id: record.created_by_user_id,
+    created_by_user_name:
+      typeof record.metadata.creator_label === 'string'
+        ? record.metadata.creator_label.split(':').slice(3).join(':').trim() || null
+        : null,
+    can_view_detail: true,
+    can_edit: ['Owner', 'Maintainer', 'Developer'].includes(role),
+    security_level: record.metadata.security_level === 'related' ? 'related' : 'open',
+    content_revision: record.version,
+    badges: Array.isArray(record.metadata.badges)
+      ? (record.metadata.badges as NonNullable<CloudLoopItem['badges']>)
+      : [],
+    activity_read_sequence:
+      typeof record.metadata.activity_read_sequence === 'number'
+        ? record.metadata.activity_read_sequence
+        : 0,
+    has_additional_context:
+      typeof record.metadata.has_additional_context === 'boolean'
+        ? record.metadata.has_additional_context
+        : true,
+    is_unread: record.metadata.is_unread === true,
+    assignment_history: Array.isArray(record.metadata.assignment_history)
+      ? (record.metadata.assignment_history as CloudLoopItem['assignment_history'])
+      : [],
+    status_history: Array.isArray(record.metadata.status_history)
+      ? (record.metadata.status_history as CloudLoopItem['status_history'])
+      : [],
+    assignee_user_id: record.assignee_user_id ?? null,
+    assignee_group_id:
+      typeof (record.metadata.collaboration_group as { id?: unknown } | null)?.id === 'string'
+        ? (record.metadata.collaboration_group as { id: string }).id
+        : null,
+    assignee_group_name:
+      typeof (record.metadata.collaboration_group as { name?: unknown } | null)?.name === 'string'
+        ? (record.metadata.collaboration_group as { name: string }).name
+        : null,
+    assignee_agent_id: record.assignee_agent_id ?? null,
+    execution_id: record.execution_id ?? null,
+    execution_state: record.execution_state ?? null,
+    local_project_id: localProjectAssociation?.id ?? null,
+    local_project_name: localProjectAssociation?.name || null,
+    assignee_name:
+      typeof record.metadata.assignee_label === 'string'
+        ? record.metadata.assignee_label || null
+        : null,
+    title: record.title ?? '',
+    description: record.description,
+    status: (record.status ?? 'inbox') as CloudLoopItem['status'],
+    priority: (record.priority ?? 'none') as CloudLoopItem['priority'],
+    start_at:
+      typeof record.metadata.start_at === 'string' ? record.metadata.start_at || null : null,
+    due_at: typeof record.metadata.due_at === 'string' ? record.metadata.due_at || null : null,
+    tags: visibleLoopItemTags(storedTags),
+    sort_order: record.sort_order,
+    current_delivery_id: record.current_delivery_id,
+    version: record.version,
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+    completed_at: record.completed_at,
+    archived_at: record.archived_at ?? null,
+    source_status:
+      typeof record.metadata.source_status === 'string' ? record.metadata.source_status : null,
+    source_record_id:
+      typeof record.metadata.record_id === 'string' ? record.metadata.record_id : null,
+    source_cells:
+      typeof record.metadata.source_cells === 'object' && record.metadata.source_cells !== null
+        ? (record.metadata.source_cells as Record<string, unknown>)
+        : {},
+  }
+}
+
+function localProjectFile(record: LocalProjectFileRecord): CloudProjectFile {
+  return {
+    ...record,
+    kind: record.kind === 'folder' ? 'folder' : 'file',
+  }
+}
+
+function fileBytesToBase64(bytes: Uint8Array): string {
+  const chunkSize = 0x8000
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize))
+  }
+  return btoa(binary)
+}
+
+async function fileInput(file: File) {
+  return {
+    display_name: file.name,
+    content_type: file.type || null,
+    base64: fileBytesToBase64(new Uint8Array(await file.arrayBuffer())),
+  }
+}
+
+function localAccess(record: LocalAccessRecord) {
+  return {
+    url: desktopFileUrl(record.path),
+    expires_in_seconds: 0,
+  }
+}
+
+function unsupported(name: string): never {
+  throw new Error(`${name} is not available for local projects yet`)
+}
+
+export function createLocalDeliveryApi(
+  request: LocalRequest,
+  options: LocalDeliveryApiOptions = {}
+): LocalProjectSpaceApi {
+  const taskProjects = new Map<string, CloudProjectId>()
+  const trackProjectTaskOnce = createProjectTaskTrackingSingleFlight()
+  let cachedProjectRecords: LocalLoopItemRecord[] | null = null
+  let projectCatalogGeneration = 0
+  let projectRecordsRequest: {
+    generation: number
+    promise: Promise<LocalLoopItemRecord[]>
+  } | null = null
+
+  function invalidateProjectRecords() {
+    projectCatalogGeneration += 1
+    cachedProjectRecords = null
+  }
+
+  function loadProjectRecords(refresh = false): Promise<LocalLoopItemRecord[]> {
+    if (!refresh && cachedProjectRecords) return Promise.resolve(cachedProjectRecords)
+    const generation = projectCatalogGeneration
+    if (projectRecordsRequest?.generation === generation) return projectRecordsRequest.promise
+    const promise = request<LocalLoopItemRecord[]>('projects.list')
+      .then(records => {
+        if (projectCatalogGeneration === generation) cachedProjectRecords = records
+        return records
+      })
+      .finally(() => {
+        if (projectRecordsRequest?.promise === promise) projectRecordsRequest = null
+      })
+    projectRecordsRequest = { generation, promise }
+    return promise
+  }
+
+  function rememberTasks(projectId: CloudProjectId, records: LocalLoopItemRecord[]) {
+    for (const record of records) taskProjects.set(record.id, projectId)
+  }
+
+  async function resolveProjectId(itemId: string): Promise<CloudProjectId> {
+    const known = taskProjects.get(itemId)
+    if (known) return known
+    const projectRecords = await loadProjectRecords()
+    const projects = projectRecords.map(localProject)
+    const prefixMatches = projects.filter(project => itemId.startsWith(`${project.project_key}-`))
+    if (prefixMatches.length === 1) return prefixMatches[0].id
+    for (const project of projects) {
+      try {
+        const record = await request<LocalLoopItemRecord>('todos.get', {
+          project_id: project.id,
+          task_id: itemId,
+        })
+        taskProjects.set(record.id, project.id)
+        return project.id
+      } catch {
+        // Read-only probing is safe when legacy projects reuse a project key.
+      }
+    }
+    throw new Error('Local task not found')
+  }
+
+  const api = {
+    async listCloudProjects() {
+      const records = await loadProjectRecords(true)
+      return {
+        items: records
+          .filter(record => record.metadata.project_store !== 'backend')
+          .map(localProject),
+      }
+    },
+    async createCloudProject(data: {
+      project_key?: string
+      name: string
+      description?: string
+      task_provider?: 'local' | 'github' | 'gitlab' | 'dingtalk_aitable'
+      provider_config?: {
+        repository?: string
+        domain?: string
+        api_base?: string
+        token?: string
+        base_id?: string
+        table_id?: string
+        sheet_id?: string
+        source_url?: string
+        view_id?: string
+        board_mapping?: Record<string, string>
+        status_mode?: 'mapped' | 'custom'
+        status_mapping?: Record<string, CloudLoopItem['status']>
+        custom_statuses?: string[]
+      }
+    }) {
+      const record = await request<LocalLoopItemRecord>('projects.create', {
+        ...data,
+        task_provider: data.task_provider ?? 'local',
+        provider_config: data.provider_config ?? {},
+      })
+      invalidateProjectRecords()
+      return localProject(record)
+    },
+    async importLocalCodeProject(data: {
+      runtimeProjectKey: string
+      name: string
+      roots: string[]
+    }) {
+      const record = await request<LocalLoopItemRecord>('projects.import_code_project', {
+        project_key: data.runtimeProjectKey,
+        name: data.name,
+        roots: data.roots,
+      })
+      invalidateProjectRecords()
+      return localProject(record)
+    },
+    async updateCloudProject(
+      projectId: CloudProjectId,
+      data: {
+        name?: string
+        description?: string
+        tags?: string[]
+        board_config?: CloudProject['board_config']
+        card_display?: CloudProject['card_display']
+        pull_request_automation?: CloudProject['pull_request_automation']
+        workflow_definition?: CloudProject['workflow_definition']
+        collaboration_groups?: CloudProject['collaboration_groups']
+        automatic_processing_rules?: CloudProject['automatic_processing_rules']
+        execution_environment?: CloudProject['execution_environment']
+        version: number
+      }
+    ) {
+      const record = await request<LocalLoopItemRecord>('projects.update', {
+        project_id: projectId,
+        project: data,
+      })
+      invalidateProjectRecords()
+      return localProject(record)
+    },
+    async archiveCloudProject(projectId: CloudProjectId, version: number) {
+      await request('projects.archive', {
+        project_id: projectId,
+        version,
+      })
+      invalidateProjectRecords()
+    },
+    async listMyWork() {
+      return { items: [] }
+    },
+    async listLoopItems(
+      projectId: CloudProjectId,
+      options: {
+        assigneeType?: 'user' | 'agent'
+        assigneeId?: string | number
+      } = {}
+    ) {
+      const records = await request<LocalLoopItemRecord[]>('todos.list', {
+        project_id: projectId,
+      })
+      rememberTasks(projectId, records)
+      let items = records.map(record => localTask(record))
+      if (options.assigneeType === 'agent' && options.assigneeId !== undefined) {
+        const agentId = String(options.assigneeId)
+        items = items.filter(item => item.assignee_agent_id === agentId)
+      } else if (options.assigneeType === 'user' && options.assigneeId !== undefined) {
+        const userId = Number(options.assigneeId)
+        items = items.filter(item => item.assignee_user_id === userId)
+      }
+      return { items }
+    },
+    async listLoopItemsPage(
+      projectId: CloudProjectId,
+      options: {
+        status: CloudLoopItem['status']
+        parentId: string | null
+        cursor?: string | null
+        limit?: number
+      }
+    ) {
+      const response = await api.listLoopItems(projectId)
+      const offset = Number(options.cursor ?? 0)
+      const limit = options.limit ?? 10
+      const matching = response.items.filter(
+        item => item.status === options.status && item.parent_id === options.parentId
+      )
+      const items = matching.slice(offset, offset + limit)
+      const nextOffset = offset + items.length
+      return {
+        items,
+        task_bindings: [],
+        next_cursor: nextOffset < matching.length ? String(nextOffset) : null,
+      }
+    },
+    async getBoardSnapshot(projectId: CloudProjectId): Promise<ProjectBoardSnapshot> {
+      const records = await request<LocalLoopItemRecord[]>('todos.list', {
+        project_id: projectId,
+      })
+      rememberTasks(projectId, records)
+      const items = records.map(record => localTask(record))
+      const taskBindings = await request<LocalTaskBindingRecord[]>('todos.bindings.batch', {
+        task_ids: items.map(item => item.id),
+      })
+      return {
+        items,
+        task_bindings: taskBindings.map(record => ({
+          ...record,
+          id: Number(record.id),
+        })),
+        members: [],
+        agents: [],
+      }
+    },
+    async listLoopItemExecutions(
+      projectId: CloudProjectId,
+      options: { agent_id?: string; status?: string; include_terminal?: boolean } = {}
+    ): Promise<{ items: CloudLoopItemExecution[] }> {
+      const records = await request<LocalLoopItemExecution[]>('executions.list', {
+        project_id: String(projectId),
+        agent_id: options.agent_id ?? null,
+        status: options.status ?? null,
+        include_terminal: options.include_terminal ?? false,
+      })
+      return {
+        items: records.map(record => ({
+          ...record,
+          executor_type: 'project_robot',
+          team_id: null,
+          backend_task_id: null,
+          automation_run_id: '',
+        })),
+      }
+    },
+    async getLoopItem(itemId: string) {
+      const projectId = await resolveProjectId(itemId)
+      const record = await request<LocalLoopItemRecord>('todos.get', {
+        project_id: projectId,
+        task_id: itemId,
+      })
+      taskProjects.set(record.id, projectId)
+      return localTask(record)
+    },
+    async createLoopItem(
+      projectId: CloudProjectId,
+      data: {
+        title: string
+        description?: string
+        status?: CloudLoopItem['status']
+        priority?: CloudLoopItem['priority']
+        start_at?: string
+        due_at?: string
+        parent_id?: string | null
+        tags?: string[]
+        local_project_id?: number | null
+        local_project_name?: string | null
+        automation_rule_id?: string | null
+        assignee_user_id?: number | null
+        assignee_group_id?: string | null
+        assignee_agent_id?: string | null
+        notify_assignee?: boolean
+      }
+    ) {
+      const localProjectLabel =
+        data.local_project_id && data.local_project_name
+          ? [
+              localProjectAssociationTag({
+                id: data.local_project_id,
+                name: data.local_project_name,
+              }),
+            ]
+          : []
+      const record = await request<LocalLoopItemRecord>('todos.create', {
+        project_id: projectId,
+        todo: {
+          title: data.title,
+          description: data.description ?? '',
+          status: data.status ?? 'inbox',
+          priority: data.priority ?? 'none',
+          ...(data.start_at !== undefined ? { start_at: data.start_at } : {}),
+          ...(data.due_at !== undefined ? { due_at: data.due_at } : {}),
+          parent_id: data.parent_id ?? null,
+          tags: [...(data.tags ?? []), ...localProjectLabel],
+          ...(data.assignee_user_id !== undefined
+            ? { assignee_user_id: data.assignee_user_id }
+            : {}),
+          ...(data.assignee_group_id !== undefined
+            ? { assignee_group_id: data.assignee_group_id }
+            : {}),
+          ...(data.assignee_agent_id !== undefined
+            ? { assignee_agent_id: data.assignee_agent_id }
+            : {}),
+        },
+      })
+      taskProjects.set(record.id, projectId)
+      return localTask(record)
+    },
+    async updateLoopItem(itemId: string, data: Record<string, unknown> & { version: number }) {
+      const projectId = await resolveProjectId(itemId)
+      let todo = localTaskUpdate(data)
+      if (Array.isArray(data.tags)) {
+        const current = await request<LocalLoopItemRecord>('todos.get', {
+          project_id: projectId,
+          task_id: itemId,
+        })
+        const association = localProjectAssociationFromTags(stringList(current.metadata.tags))
+        todo = {
+          ...todo,
+          tags: association
+            ? [
+                ...visibleLoopItemTags(stringList(data.tags)),
+                localProjectAssociationTag(association),
+              ]
+            : data.tags,
+        }
+      }
+      const assignedGroupId =
+        typeof data.assignee_group_id === 'string' ? data.assignee_group_id : null
+      const assignedAgentId =
+        typeof data.assignee_agent_id === 'string' ? data.assignee_agent_id : null
+      if (assignedGroupId || assignedAgentId) {
+        const executionPayload = await options.prepareAssignmentExecutionPayload?.({
+          projectId,
+          itemId,
+          assigneeType: assignedGroupId ? 'group' : 'agent',
+          assigneeId: assignedGroupId ?? assignedAgentId!,
+        })
+        if (executionPayload) todo = { ...todo, execution_payload: executionPayload }
+      }
+      const record = await request<LocalLoopItemRecord>('todos.update', {
+        project_id: projectId,
+        task_id: itemId,
+        todo,
+      })
+      taskProjects.set(record.id, projectId)
+      return localTask(record)
+    },
+    async assignLoopItem(
+      projectId: CloudProjectId,
+      itemId: string,
+      data: {
+        version: number
+        assigneeType: 'user' | 'agent' | 'team' | 'group'
+        assigneeId: string
+        runnerSelection?: RunnerSelection
+        notifyAssignee?: boolean
+        position?: { beforeItemId: string | null }
+      }
+    ) {
+      const assignment =
+        data.assigneeType === 'user'
+          ? { assignee_user_id: Number(data.assigneeId) }
+          : data.assigneeType === 'agent'
+            ? { assignee_agent_id: data.assigneeId }
+            : data.assigneeType === 'team'
+              ? { assignee_team_id: Number(data.assigneeId) }
+              : { assignee_group_id: data.assigneeId }
+      const executionPayload =
+        data.assigneeType === 'agent' || data.assigneeType === 'group'
+          ? await options.prepareAssignmentExecutionPayload?.({
+              projectId,
+              itemId,
+              assigneeType: data.assigneeType,
+              assigneeId: data.assigneeId,
+              runnerSelection: data.runnerSelection,
+            })
+          : null
+      const record = await request<LocalLoopItemRecord>('todos.update', {
+        project_id: projectId,
+        task_id: itemId,
+        todo: {
+          version: data.version,
+          ...assignment,
+          ...(data.position ? { position: { before_item_id: data.position.beforeItemId } } : {}),
+          ...(executionPayload ? { execution_payload: executionPayload } : {}),
+        },
+      })
+      taskProjects.set(record.id, projectId)
+      return localTask(record)
+    },
+    async markLoopItemRead(itemId: string, activitySequence?: number) {
+      const projectId = await resolveProjectId(itemId)
+      const record = await request<LocalLoopItemRecord>('todos.mark_read', {
+        project_id: projectId,
+        task_id: itemId,
+        ...(activitySequence == null ? {} : { activity_sequence: activitySequence }),
+      })
+      return localTask(record)
+    },
+    async approveLoopItemRun(projectId: CloudProjectId, itemId: string): Promise<CloudLoopItem> {
+      const executions = await request<LocalLoopItemExecution[]>('executions.list', {
+        project_id: String(projectId),
+        status: 'pending_approval',
+      })
+      const execution = executions.find(entry => entry.loop_item_id === String(itemId))
+      if (!execution) throw new Error('Run is not waiting for robot approval')
+      await request('executions.approve', { execution_id: execution.id })
+      return api.getLoopItem(String(itemId))
+    },
+    async rejectLoopItemRun(
+      projectId: CloudProjectId,
+      itemId: string,
+      _version: number,
+      reason?: string
+    ): Promise<CloudLoopItem> {
+      const executions = await request<LocalLoopItemExecution[]>('executions.list', {
+        project_id: String(projectId),
+        status: 'pending_approval',
+      })
+      const execution = executions.find(entry => entry.loop_item_id === String(itemId))
+      if (!execution) throw new Error('Run is not waiting for robot approval')
+      await request('executions.reject', {
+        execution_id: execution.id,
+        reason: reason ?? null,
+      })
+      return api.getLoopItem(String(itemId))
+    },
+    async archiveLoopItem(itemId: string) {
+      const projectId = await resolveProjectId(itemId)
+      await request('todos.archive', {
+        project_id: projectId,
+        task_id: itemId,
+      })
+      taskProjects.delete(itemId)
+    },
+    async listArchivedLoopItems(
+      projectId: CloudProjectId,
+      options: { cursor?: string | null; limit?: number } = {}
+    ) {
+      const response = await request<{
+        items: LocalLoopItemRecord[]
+        next_cursor: string | null
+      }>('todos.archived.list', {
+        project_id: projectId,
+        cursor: options.cursor ?? null,
+        limit: options.limit ?? 50,
+      })
+      rememberTasks(projectId, response.items)
+      return {
+        items: response.items.map(record => localTask(record)),
+        next_cursor: response.next_cursor,
+      }
+    },
+    async restoreLoopItem(itemId: string) {
+      const projectId = await resolveProjectId(itemId)
+      const records = await request<LocalLoopItemRecord[]>('todos.restore', {
+        project_id: projectId,
+        task_id: itemId,
+      })
+      rememberTasks(projectId, records)
+      return { items: records.map(record => localTask(record)) }
+    },
+    async reorderLoopItems(
+      projectId: CloudProjectId,
+      data: {
+        parent_id: string | null
+        status: CloudLoopItem['status'] | null
+        item_ids: string[]
+      }
+    ) {
+      const records = await request<LocalLoopItemRecord[]>('todos.reorder', {
+        project_id: projectId,
+        reorder: data,
+      })
+      rememberTasks(projectId, records)
+      return { items: records.map(record => localTask(record)) }
+    },
+    async listLoopItemAttachments(itemId: string) {
+      const projectId = await resolveProjectId(itemId)
+      return request<CloudLoopItemAttachment[]>('attachments.list', {
+        project_id: projectId,
+        item_id: itemId,
+      })
+    },
+    async listProjectTaskAttachments(projectId: CloudProjectId) {
+      const tasks = await api.listLoopItems(projectId)
+      const rows = await Promise.all(
+        tasks.items.map(async item => {
+          const attachments = await request<CloudLoopItemAttachment[]>('attachments.list', {
+            project_id: projectId,
+            item_id: item.id,
+          })
+          return attachments.map(attachment => ({
+            ...attachment,
+            loop_item_title: item.title,
+          }))
+        })
+      )
+      return {
+        items: rows
+          .flat()
+          .sort((left, right) =>
+            right.created_at.localeCompare(left.created_at)
+          ) as ProjectTaskAttachment[],
+      }
+    },
+    async importLoopItemAttachments(itemId: string, attachments: Attachment[]) {
+      const files = await readDroppedFiles(
+        attachments
+          .filter(attachment => Boolean(attachment.local_path?.trim()))
+          .map(attachment => attachment.local_path!)
+      )
+      const imported: CloudLoopItemAttachment[] = []
+      for (const file of files) {
+        imported.push(await api.addLoopItemAttachment(itemId, file))
+      }
+      return imported
+    },
+    async addLoopItemAttachment(itemId: string, file: File) {
+      const projectId = await resolveProjectId(itemId)
+      return request<CloudLoopItemAttachment>('attachments.add', {
+        project_id: projectId,
+        item_id: itemId,
+        file: await fileInput(file),
+      })
+    },
+    async accessLoopItemAttachment(attachmentId: string) {
+      return localAccess(
+        await request<LocalAccessRecord>('attachments.access', {
+          attachment_id: attachmentId,
+        })
+      )
+    },
+    async readLoopItemAttachment(attachmentId: string) {
+      const access = await request<LocalAccessRecord>('attachments.access', {
+        attachment_id: attachmentId,
+      })
+      const [file] = await readDroppedFiles([access.path])
+      return file
+    },
+    async downloadLoopItemAttachment(attachmentId: string) {
+      const access = await request<LocalAccessRecord>('attachments.access', {
+        attachment_id: attachmentId,
+      })
+      await openLocalFile(access.path)
+    },
+    async deleteLoopItemAttachment(attachmentId: string) {
+      await request('attachments.delete', { attachment_id: attachmentId })
+    },
+    async listTaskBindings(itemId: string) {
+      const records = await request<LocalTaskBindingRecord[]>('todos.bindings', {
+        task_id: itemId,
+      })
+      return records.map(record => ({ ...record, id: Number(record.id) }))
+    },
+    listLoopItemCollaborators: async () => [],
+    addLoopItemCollaborator: async () => unsupported('Task collaborators'),
+    removeLoopItemCollaborator: async () => unsupported('Task collaborators'),
+    async bindTask(
+      itemId: string,
+      task: RuntimeTaskAddress,
+      taskTitle?: string | null,
+      _workflowNodeId?: string | null,
+      dispatch?: {
+        humanAssignmentId: string
+        dispatchId: string
+        dispatchRoundId: string
+        assignmentId: string
+      } | null
+    ) {
+      const projectId = await resolveProjectId(itemId)
+      const modelSelection =
+        task.runtimeHandle?.modelSelection ?? task.runtimeHandle?.model_selection
+      const executionContext = {
+        runtime: task.runtime,
+        threadId: task.threadId,
+        workspacePath: task.workspacePath,
+        workspaceKind: task.workspaceKind,
+        worktreeId: task.worktreeId,
+      }
+      await request('todos.bind', {
+        project_id: projectId,
+        item_id: itemId,
+        task: {
+          ...task,
+          ...(taskTitle ? { taskTitle } : {}),
+          ...(modelSelection ? { modelSelection } : {}),
+          ...(Object.values(executionContext).some(value => value != null && value !== '')
+            ? { executionContext }
+            : {}),
+        },
+        ...(dispatch ? { dispatch } : {}),
+      })
+    },
+    async trackProjectTask(
+      projectId: CloudProjectId,
+      task: RuntimeTaskAddress,
+      taskTitle: string,
+      description: string
+    ) {
+      return trackProjectTaskOnce(projectId, task, async () => {
+        try {
+          const existing = await request<LocalTaskBindingRecord>(
+            String(projectId) === DEFAULT_WORK_ITEM_PROJECT_ID
+              ? 'runtime_tasks.system_context'
+              : 'runtime_tasks.user_context',
+            {
+              device_id: task.deviceId,
+              task_id: task.taskId,
+            }
+          )
+          if (existing.loop_item_id && String(existing.cloud_project_id) === String(projectId)) {
+            return { item: await api.getLoopItem(existing.loop_item_id) }
+          }
+        } catch {
+          // Missing context is the expected first-run path.
+        }
+        const item = await api.createLoopItem(projectId, {
+          title: taskTitle,
+          description,
+          status: String(projectId) === DEFAULT_WORK_ITEM_PROJECT_ID ? 'inbox' : 'pending',
+        })
+        await api.bindTask(item.id, task, taskTitle)
+        return { item }
+      })
+    },
+    async updateTaskTrackingTitle(task: RuntimeTaskAddress, title: string) {
+      return enqueueTaskTrackingMutation(task, async () => {
+        let binding: LocalTaskBindingRecord
+        try {
+          binding = await request<LocalTaskBindingRecord>('runtime_tasks.context', {
+            device_id: task.deviceId,
+            task_id: task.taskId,
+          })
+        } catch {
+          return null
+        }
+        if (!binding.loop_item_id) return null
+        const item = await api.getLoopItem(binding.loop_item_id)
+        return item.title === title
+          ? item
+          : api.updateLoopItem(item.id, { version: item.version, title })
+      })
+    },
+    async unbindCloudContext(task: RuntimeTaskAddress) {
+      await request('runtime_tasks.unbind', {
+        device_id: task.deviceId,
+        task_id: task.taskId,
+      })
+    },
+    async unbindTask(_itemId: string, task: RuntimeTaskAddress) {
+      await request('runtime_tasks.unbind', {
+        device_id: task.deviceId,
+        task_id: task.taskId,
+        item_id: _itemId,
+      })
+    },
+    async findLoopItemForTask(task: RuntimeTaskAddress) {
+      const binding = await request<LocalTaskBindingRecord>('runtime_tasks.context', {
+        device_id: task.deviceId,
+        task_id: task.taskId,
+      })
+      if (!binding.loop_item_id) throw new Error('Runtime task is linked to a project only')
+      taskProjects.set(binding.loop_item_id, binding.cloud_project_id)
+      return api.getLoopItem(binding.loop_item_id)
+    },
+    async findCloudContextForTask(task: RuntimeTaskAddress) {
+      const binding = await request<LocalTaskBindingRecord>('runtime_tasks.context', {
+        device_id: task.deviceId,
+        task_id: task.taskId,
+      })
+      const projectRecords = await loadProjectRecords()
+      const projectRecord = projectRecords.find(record => record.id === binding.cloud_project_id)
+      if (!projectRecord) throw new Error('Local project not found')
+      if (binding.loop_item_id) taskProjects.set(binding.loop_item_id, binding.cloud_project_id)
+      const loopItem = binding.loop_item_id ? await api.getLoopItem(binding.loop_item_id) : null
+      return {
+        ...binding,
+        id: binding.id,
+        project: localProject(projectRecord),
+        loop_item: loopItem,
+      }
+    },
+    listCloudProjectMembers: async (): Promise<CloudProjectMember[]> => [],
+    addCloudProjectMember: async () => unsupported('Project members'),
+    updateCloudProjectMember: async () => unsupported('Project members'),
+    removeCloudProjectMember: async () => unsupported('Project members'),
+    searchCloudProjectUsers: async () => ({ users: [], total: 0 }),
+    async listCloudFiles(projectId: CloudProjectId) {
+      const records = await request<LocalProjectFileRecord[]>('files.list', {
+        project_id: projectId,
+      })
+      return { items: records.map(localProjectFile) }
+    },
+    listProjectDeliveryFiles: async () => ({ items: [] }),
+    async createCloudFolder(projectId: CloudProjectId, path: string) {
+      const record = await request<LocalProjectFileRecord>('files.create_folder', {
+        project_id: projectId,
+        path,
+      })
+      return localProjectFile(record)
+    },
+    async uploadCloudFile(projectId: CloudProjectId, file: File, path = file.name) {
+      const record = await request<LocalProjectFileRecord>('files.upload', {
+        project_id: projectId,
+        path,
+        file: await fileInput(file),
+      })
+      return localProjectFile(record)
+    },
+    async accessCloudFile(fileId: string) {
+      return localAccess(await request<LocalAccessRecord>('files.access', { file_id: fileId }))
+    },
+    async readCloudFile(fileId: string) {
+      const access = await request<LocalAccessRecord>('files.access', { file_id: fileId })
+      const [file] = await readDroppedFiles([access.path])
+      return file
+    },
+    async accessDeliveryFile(assetId: string) {
+      return localAccess(
+        await request<LocalAccessRecord>('deliveries.access_asset', { asset_id: assetId })
+      )
+    },
+    async readDeliveryFile(assetId: string) {
+      const access = await request<LocalAccessRecord>('deliveries.access_asset', {
+        asset_id: assetId,
+      })
+      const [file] = await readDroppedFiles([access.path])
+      return file
+    },
+    async moveCloudFile(fileId: string, path: string, version: number) {
+      const record = await request<LocalProjectFileRecord>('files.move', {
+        file_id: fileId,
+        path,
+        version,
+      })
+      return localProjectFile(record)
+    },
+    async deleteCloudFile(fileId: string, recursive = false) {
+      await request('files.delete', { file_id: fileId, recursive })
+    },
+    async createDelivery(itemId: string, data: DeliveryCreateInput) {
+      const projectId = await resolveProjectId(itemId)
+      return request<Delivery>('deliveries.create', {
+        project_id: projectId,
+        item_id: itemId,
+        delivery: data,
+      })
+    },
+    async addAsset(deliveryId: string, file: File, relativePath: string) {
+      return request<DeliveryAsset>('deliveries.add_asset', {
+        delivery_id: deliveryId,
+        relative_path: relativePath,
+        file: await fileInput(file),
+      })
+    },
+    async finalizeDelivery(
+      deliveryId: string,
+      input: DeliveryFinalizeInput = { fulfillments: [] }
+    ) {
+      const delivery = await api.getDelivery(deliveryId)
+      const finalized = await request<Delivery>('deliveries.finalize', {
+        item_id: delivery.loop_item_id,
+        delivery_id: deliveryId,
+        finalize: input,
+      })
+      return finalized
+    },
+    async discardDraft(deliveryId: string) {
+      await request('deliveries.discard', { delivery_id: deliveryId })
+    },
+    async listDeliveries(itemId: string) {
+      const records = await request<Delivery[]>('deliveries.list', { item_id: itemId })
+      return { items: records }
+    },
+    async getDelivery(deliveryId: string) {
+      return request<DeliveryDetail>('deliveries.get', { delivery_id: deliveryId })
+    },
+  }
+  return api as unknown as LocalProjectSpaceApi
+}

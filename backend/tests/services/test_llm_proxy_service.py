@@ -1,0 +1,1195 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi import HTTPException, Request
+from sqlalchemy.orm import Session
+from starlette.datastructures import Headers
+
+from app.models.kind import Kind
+from app.models.user import User
+from app.services.chat.trigger.request_preparation import (
+    _build_codex_runtime_model_config,
+    build_wework_runtime_model_config,
+)
+from app.services.llm_proxy_service import (
+    _join_upstream_url,
+    proxy_llm_responses,
+    resolve_llm_proxy_model_config,
+)
+from shared.utils.crypto import CryptoConfigurationError
+
+
+def _model_kind(
+    user_id: int,
+    *,
+    name: str = "deepseek-v4-flash",
+    namespace: str = "default",
+    model_id: str = "gpt-4-turbo",
+    api_key: str = "sk-test-key",
+    base_url: str = "https://api.example.com/v1",
+    protocol: str | None = "openai-responses",
+    api_format: str | None = None,
+    env_model: str | None = None,
+    default_headers: dict[str, str] | None = None,
+) -> Kind:
+    env: dict[str, object] = {
+        "model_id": model_id,
+        "base_url": base_url,
+        "api_key": api_key,
+    }
+    if env_model is not None:
+        env["model"] = env_model
+    model_config: dict[str, object] = {"env": env}
+    if default_headers is not None:
+        model_config["DEFAULT_HEADERS"] = default_headers
+
+    spec: dict[str, object] = {
+        "provider": "openai",
+        "modelConfig": model_config,
+    }
+    if protocol is not None:
+        spec["protocol"] = protocol
+    if api_format is not None:
+        spec["apiFormat"] = api_format
+
+    return Kind(
+        user_id=user_id,
+        kind="Model",
+        name=name,
+        namespace=namespace,
+        json={
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": spec,
+        },
+        is_active=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("base_url", "endpoint_path", "expected"),
+    [
+        (
+            "https://api.anthropic.com",
+            "/v1/messages",
+            "https://api.anthropic.com/v1/messages",
+        ),
+        (
+            "https://api.anthropic.com/v1",
+            "/v1/messages",
+            "https://api.anthropic.com/v1/messages",
+        ),
+        (
+            "https://proxy.example.com/v1/messages",
+            "/v1/messages",
+            "https://proxy.example.com/v1/messages",
+        ),
+        (
+            "https://proxy.example.com/openai/v1",
+            "/responses",
+            "https://proxy.example.com/openai/v1/responses",
+        ),
+        (
+            "https://proxy.example.com/v1/chat/completions",
+            "/chat/completions",
+            "https://proxy.example.com/v1/chat/completions",
+        ),
+    ],
+)
+def test_join_upstream_url_appends_endpoint_once(
+    base_url: str,
+    endpoint_path: str,
+    expected: str,
+):
+    assert _join_upstream_url(base_url, endpoint_path) == expected
+
+
+@pytest.fixture
+def test_model_kind(test_db, test_user: User) -> Kind:
+    model = _model_kind(
+        test_user.id,
+        default_headers={"user": "${task_data.user.name}"},
+    )
+    test_db.add(model)
+    test_db.commit()
+    test_db.refresh(model)
+    return model
+
+
+def test_resolve_llm_proxy_model_config_uses_complete_identity(
+    test_db, test_user: User, test_model_kind: Kind
+):
+    public_model = _model_kind(
+        0,
+        name=test_model_kind.name,
+        model_id="public-provider-model",
+    )
+    test_db.add(public_model)
+    test_db.commit()
+
+    personal_config = resolve_llm_proxy_model_config(
+        test_db,
+        test_user,
+        model_name=test_model_kind.name,
+        model_type="user",
+        namespace="default",
+        resource_user_id=test_user.id,
+    )
+    public_config = resolve_llm_proxy_model_config(
+        test_db,
+        test_user,
+        model_name=public_model.name,
+        model_type="public",
+        namespace="default",
+        resource_user_id=0,
+    )
+
+    assert personal_config["model_id"] == "gpt-4-turbo"
+    assert public_config["model_id"] == "public-provider-model"
+
+
+def test_resolve_llm_proxy_model_config_rejects_spoofed_personal_owner(
+    test_db, test_user: User
+):
+    with pytest.raises(HTTPException) as exc_info:
+        resolve_llm_proxy_model_config(
+            test_db,
+            test_user,
+            model_name="private-model",
+            model_type="user",
+            namespace="default",
+            resource_user_id=test_user.id + 1,
+        )
+
+    assert exc_info.value.status_code == 403
+
+
+def test_resolve_llm_proxy_model_config_processes_custom_header_placeholders(
+    test_db, test_user: User
+):
+    model = _model_kind(
+        test_user.id,
+        name="custom-header-model",
+        default_headers={
+            "user": "${task_data.user.name}",
+            "x-custom-static": "static-value",
+            "wegent-agent-name": "${task_data.team.name}",
+        },
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    config = resolve_llm_proxy_model_config(
+        test_db,
+        test_user,
+        model_name=model.name,
+        model_type="user",
+        namespace="default",
+        resource_user_id=test_user.id,
+    )
+
+    assert config["default_headers"] == {
+        "user": test_user.user_name,
+        "x-custom-static": "static-value",
+    }
+
+
+def test_cloud_model_reports_unavailable_credentials(
+    test_db: Session,
+    test_user: User,
+    test_model_kind: Kind,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable_credentials(value: str) -> str:
+        raise CryptoConfigurationError("Invalid test encryption configuration")
+
+    monkeypatch.setattr(
+        "app.services.chat.config.model_resolver.decrypt_api_key",
+        unavailable_credentials,
+    )
+    with pytest.raises(HTTPException) as error:
+        resolve_llm_proxy_model_config(
+            test_db,
+            test_user,
+            model_name=test_model_kind.name,
+            model_type="user",
+            namespace="default",
+            resource_user_id=test_user.id,
+        )
+
+    assert error.value.status_code == 503
+    assert "credentials are unavailable" in error.value.detail
+
+
+async def test_proxy_llm_responses_forwards_to_provider(
+    test_db, test_user: User, test_model_kind: Kind
+):
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=b'{"model":"deepseek-v4-flash","input":"hello"}'
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+            "thread-id": "manager-thread",
+            "x-openai-subagent": "collab_spawn",
+        }
+    )
+
+    upstream_response_mock = MagicMock()
+    upstream_response_mock.status_code = 200
+    upstream_response_mock.headers = {"content-type": "text/event-stream"}
+
+    async def fake_aiter_raw():
+        yield b"data: ok\n\n"
+
+    upstream_response_mock.aiter_raw = fake_aiter_raw
+    client_mock = AsyncMock()
+    client_mock.send = AsyncMock(return_value=upstream_response_mock)
+    client_mock.aclose = AsyncMock()
+
+    with patch(
+        "app.services.llm_proxy_service.httpx.AsyncClient",
+        return_value=client_mock,
+    ):
+        response = await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert response.status_code == 200
+    assert response.media_type == "text/event-stream"
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    assert body == b"data: ok\n\n"
+
+    sent_request = client_mock.send.call_args[0][0]
+    assert str(sent_request.url) == "https://api.example.com/v1/responses"
+    assert sent_request.headers["Authorization"] == "Bearer sk-test-key"
+    assert sent_request.headers["Content-Type"] == "application/json"
+    assert sent_request.headers["Accept"] == "text/event-stream"
+    assert sent_request.headers["user"] == test_user.user_name
+    assert sent_request.headers["thread-id"] == "manager-thread"
+    assert sent_request.headers["x-openai-subagent"] == "collab_spawn"
+    assert b'"model": "gpt-4-turbo"' in sent_request.content
+    assert b'"input": "hello"' in sent_request.content
+    assert "x-wegent-model-type" not in sent_request.headers
+    client_mock.aclose.assert_awaited_once()
+
+
+async def test_proxy_llm_responses_omits_authorization_when_api_key_is_empty(
+    test_db, test_user: User
+):
+    model = _model_kind(
+        test_user.id,
+        name="custom-header-auth-model",
+        api_key="",
+        default_headers={
+            "wecode-user": "${task_data.user.name}",
+            "Wecode-Executor": "chat",
+            "wecode-action": "wegent",
+        },
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=b'{"model":"custom-header-auth-model","input":"hello"}'
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+            "authorization": "Bearer wegent-login-token",
+            "x-wegent-upstream-header-wecode-executor": "codex",
+            "x-wegent-upstream-header-wecode-action": "custom-action",
+        }
+    )
+
+    upstream_response_mock = MagicMock()
+    upstream_response_mock.status_code = 200
+    upstream_response_mock.headers = {"content-type": "text/event-stream"}
+
+    async def fake_aiter_raw():
+        yield b"data: ok\n\n"
+
+    upstream_response_mock.aiter_raw = fake_aiter_raw
+    client_mock = AsyncMock()
+    client_mock.send = AsyncMock(return_value=upstream_response_mock)
+    client_mock.aclose = AsyncMock()
+
+    with patch(
+        "app.services.llm_proxy_service.httpx.AsyncClient",
+        return_value=client_mock,
+    ):
+        response = await proxy_llm_responses(request_mock, test_db, test_user)
+
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    sent_request = client_mock.send.call_args[0][0]
+
+    assert response.status_code == 200
+    assert body == b"data: ok\n\n"
+    assert "Authorization" not in sent_request.headers
+    assert sent_request.headers["wecode-user"] == test_user.user_name
+    assert sent_request.headers["wecode-executor"] == "codex"
+    assert sent_request.headers["wecode-action"] == "custom-action"
+    assert (
+        sum(name == "wecode-executor" for name, _ in sent_request.headers.multi_items())
+        == 1
+    )
+    client_mock.aclose.assert_awaited_once()
+
+
+async def test_proxy_llm_responses_rejects_protected_custom_upstream_header(
+    test_db, test_user: User, test_model_kind: Kind
+):
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=b'{"model":"deepseek-v4-flash","input":"hello"}'
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+            "x-wegent-upstream-header-authorization": "Bearer caller-token",
+        }
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Custom upstream header is protected: authorization"
+
+
+async def test_proxy_llm_responses_requires_model_identity_headers(
+    test_db, test_user: User
+):
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(return_value=b'{"model":"model-1","input":"hello"}')
+    request_mock.headers = Headers({"content-type": "application/json"})
+
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert exc_info.value.status_code == 400
+
+
+def test_build_codex_runtime_model_config_returns_provider_credentials(
+    test_db, test_user: User, test_model_kind: Kind
+):
+    config = _build_codex_runtime_model_config(
+        test_model_kind.name,
+        db=test_db,
+        user_id=test_user.id,
+    )
+
+    assert config["model_id"] == "gpt-4-turbo"
+    assert config["base_url"] == "https://api.example.com/v1"
+    assert config["api_key"] == "sk-test-key"
+    assert config["upstream_api_format"] == "openai-responses"
+    assert "codex_responses_compat_proxy" not in config
+
+
+@pytest.mark.parametrize(
+    ("protocol", "api_format", "env_model"),
+    [
+        ("openai", None, None),
+        ("claude", None, None),
+        ("openai-responses", "chat/completions", None),
+        ("openai-responses", "messages", None),
+        (None, None, "openai"),
+        (None, None, "claude"),
+    ],
+)
+def test_direct_runtime_rejects_passthrough_for_other_protocols(
+    test_db: Session,
+    test_user: User,
+    protocol: str | None,
+    api_format: str | None,
+    env_model: str | None,
+) -> None:
+    """Reject incompatible explicit and inferred wire formats before dispatch."""
+    model = _model_kind(
+        test_user.id,
+        protocol=protocol,
+        api_format=api_format,
+        env_model=env_model,
+    )
+    model.json["spec"]["modelConfig"]["codex_request_mode"] = "passthrough"
+    test_db.add(model)
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as error:
+        _build_codex_runtime_model_config(model.name, db=test_db, user_id=test_user.id)
+
+    assert error.value.status_code == 400
+    assert "Responses" in error.value.detail
+
+
+@pytest.mark.parametrize(
+    ("protocol", "api_format"), [("openai-responses", None), (None, "responses")]
+)
+def test_direct_runtime_preserves_responses_passthrough(
+    test_db: Session,
+    test_user: User,
+    protocol: str | None,
+    api_format: str | None,
+) -> None:
+    """Keep valid direct Responses requests in passthrough mode."""
+    model = _model_kind(test_user.id, protocol=protocol, api_format=api_format)
+    model.json["spec"]["modelConfig"]["codex_request_mode"] = "passthrough"
+    test_db.add(model)
+    test_db.commit()
+
+    config = _build_codex_runtime_model_config(
+        model.name, db=test_db, user_id=test_user.id
+    )
+
+    assert config["codex_request_mode"] == "passthrough"
+    assert config["upstream_api_format"] == "openai-responses"
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected_catalog_model_id"),
+    [
+        ("deepseek-v4-flash", "wework-deepseek-v4-flash"),
+        ("deepseek-v4-pro", "wework-deepseek-v4-pro"),
+    ],
+)
+def test_build_codex_runtime_model_config_infers_deepseek_responses_catalog(
+    test_db: Session,
+    test_user: User,
+    model_id: str,
+    expected_catalog_model_id: str,
+) -> None:
+    model = _model_kind(
+        test_user.id,
+        name=f"{model_id}-profile",
+        model_id=model_id,
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    config = _build_codex_runtime_model_config(
+        model.name,
+        db=test_db,
+        user_id=test_user.id,
+    )
+
+    assert config["codex_catalog_model_id"] == expected_catalog_model_id
+
+
+def test_build_codex_runtime_model_config_does_not_infer_deepseek_chat_catalog(
+    test_db: Session,
+    test_user: User,
+) -> None:
+    model = _model_kind(
+        test_user.id,
+        name="deepseek-chat-profile",
+        model_id="deepseek-v4-pro",
+        protocol="openai",
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    config = _build_codex_runtime_model_config(
+        model.name,
+        db=test_db,
+        user_id=test_user.id,
+    )
+
+    assert "codex_catalog_model_id" not in config
+
+
+def test_build_codex_runtime_model_config_preserves_explicit_catalog(
+    test_db: Session,
+    test_user: User,
+) -> None:
+    model = _model_kind(
+        test_user.id,
+        name="deepseek-explicit-profile",
+        model_id="deepseek-v4-pro",
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    config = _build_codex_runtime_model_config(
+        model.name,
+        {"codex_catalog_model_id": "operator-selected-catalog"},
+        db=test_db,
+        user_id=test_user.id,
+    )
+
+    assert config["codex_catalog_model_id"] == "operator-selected-catalog"
+
+
+@pytest.mark.parametrize(
+    ("protocol", "api_format", "expected"),
+    [
+        ("openai-responses", None, "openai-responses"),
+        ("openai", "responses", "openai-responses"),
+        ("openai", None, "openai-chat-completions"),
+        ("openai-chat-completions", None, "openai-chat-completions"),
+        ("claude", None, "anthropic-messages"),
+        ("anthropic-messages", None, "anthropic-messages"),
+    ],
+)
+@pytest.mark.parametrize("client_protocol", [None, "openai-responses"])
+def test_cloud_runtime_protocol_comes_from_model_crd(
+    test_db, test_user, monkeypatch, protocol, api_format, expected, client_protocol
+):
+    from app.core.config import settings
+    from app.services.runtime_work_service import _runtime_model_override_values
+
+    model = _model_kind(0, protocol=protocol, api_format=api_format)
+    test_db.add(model)
+    test_db.commit()
+    monkeypatch.setattr(settings, "WEGENT_BACKEND_PUBLIC_URL", "https://wegent.example")
+    options = {
+        "weworkCloudModelNamespace": "default",
+        "weworkCloudModelResourceUserId": "0",
+    }
+    if client_protocol is not None:
+        options["weworkCloudModelUpstreamApiFormat"] = client_protocol
+
+    config, _, _ = _runtime_model_override_values(
+        db=test_db,
+        user_id=test_user.id,
+        runtime="codex",
+        model_id=model.name,
+        model_type="public",
+        model_options=options,
+    )
+    legacy_config = build_wework_runtime_model_config(
+        test_db, model_name=model.name, creator=test_user
+    )
+
+    for resolved in (config, legacy_config):
+        assert resolved["upstream_api_format"] == expected
+        assert resolved["model_id"] == model.name
+        assert resolved["protocol"] == "openai-responses"
+        assert resolved["api_key"] and resolved["api_key"] != "sk-test-key"
+        assert "sk-test-key" not in json.dumps(resolved)
+        assert resolved["base_url"] == (
+            "https://wegent.example/api/runtime-work/llm-responses-proxy"
+        )
+        assert resolved["default_headers"]["X-Wegent-Model-User-Id"] == "0"
+    assert config["native_tool_search"] is (expected == "openai-responses")
+    assert config["native_namespace_tools"] is (expected == "openai-responses")
+    assert config["tool_profile"] == "custom"
+
+
+def test_cloud_runtime_can_bridge_standard_responses_tools(
+    test_db, test_user, monkeypatch
+):
+    from app.core.config import settings
+    from app.services.runtime_work_service import _runtime_model_override_values
+
+    model = _model_kind(0, protocol="openai-responses")
+    test_db.add(model)
+    test_db.commit()
+    monkeypatch.setattr(settings, "WEGENT_BACKEND_PUBLIC_URL", "https://wegent.example")
+
+    config, _, _ = _runtime_model_override_values(
+        db=test_db,
+        user_id=test_user.id,
+        runtime="codex",
+        model_id=model.name,
+        model_type="public",
+        model_options={
+            "weworkCloudModelNamespace": "default",
+            "weworkCloudModelResourceUserId": "0",
+            "weworkCloudModelUpstreamApiFormat": "openai-responses",
+            "weworkCloudModelNativeToolSearch": "false",
+            "weworkCloudModelNativeNamespaceTools": "false",
+        },
+    )
+
+    assert config["native_tool_search"] is False
+    assert config["native_namespace_tools"] is False
+
+
+@pytest.mark.parametrize("mode", ["auto", "standard", "passthrough"])
+@pytest.mark.parametrize("reasoning", [{"effort": "high"}, {"summary": "detailed"}])
+def test_cloud_runtime_preserves_model_reasoning_and_request_policy(
+    test_db, test_user, monkeypatch, mode, reasoning
+) -> None:
+    from app.core.config import settings
+    from app.services.runtime_work_service import _runtime_model_override_values
+
+    model = _model_kind(0, protocol="openai-responses")
+    model.json["spec"]["modelConfig"]["codex_request_mode"] = mode
+    model.json["spec"]["modelConfig"]["env"]["thinking_config"] = {
+        "reasoning": reasoning
+    }
+    test_db.add(model)
+    test_db.commit()
+    monkeypatch.setattr(settings, "WEGENT_BACKEND_PUBLIC_URL", "https://wegent.example")
+
+    config, _, _ = _runtime_model_override_values(
+        db=test_db,
+        user_id=test_user.id,
+        runtime="codex",
+        model_id=model.name,
+        model_type="public",
+        model_options={
+            "weworkCloudModelNamespace": "default",
+            "weworkCloudModelResourceUserId": "0",
+            "weworkCloudModelNativeToolSearch": "true",
+        },
+    )
+    legacy = build_wework_runtime_model_config(
+        test_db, model_name=model.name, creator=test_user
+    )
+    for resolved in (config, legacy):
+        assert resolved["reasoning"] == reasoning
+        assert resolved["codex_request_mode"] == mode
+        assert "sk-test-key" not in json.dumps(resolved)
+        if mode != "auto":
+            assert resolved["native_tool_search"] is (mode == "passthrough")
+            assert resolved["native_namespace_tools"] is (mode == "passthrough")
+
+
+def test_cloud_runtime_rejects_passthrough_for_other_protocols(
+    test_db, test_user, monkeypatch
+) -> None:
+    from app.core.config import settings
+
+    model = _model_kind(0, protocol="openai")
+    model.json["spec"]["modelConfig"]["codex_request_mode"] = "passthrough"
+    test_db.add(model)
+    test_db.commit()
+    monkeypatch.setattr(settings, "WEGENT_BACKEND_PUBLIC_URL", "https://wegent.example")
+
+    with pytest.raises(HTTPException, match="OpenAI Responses"):
+        build_wework_runtime_model_config(
+            test_db, model_name=model.name, creator=test_user
+        )
+
+
+@pytest.mark.parametrize("resource_user_id", [0, -1])
+def test_runtime_rejects_invalid_request_policy_without_provider_fallback(
+    test_db, test_user, monkeypatch, resource_user_id
+) -> None:
+    from app.core.config import settings
+
+    owner = test_user.id if resource_user_id == -1 else resource_user_id
+    model = _model_kind(owner)
+    model.json["spec"]["modelConfig"]["codex_request_mode"] = "invalid"
+    test_db.add(model)
+    test_db.commit()
+    monkeypatch.setattr(settings, "WEGENT_BACKEND_PUBLIC_URL", "https://wegent.example")
+    with pytest.raises(HTTPException) as exc_info:
+        build_wework_runtime_model_config(
+            test_db, model_name=model.name, creator=test_user
+        )
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("protocol", "api_format"),
+    [(None, None), ("claude", "responses"), ("openai-responses", "chat/completions")],
+)
+def test_cloud_runtime_rejects_invalid_protocol_before_dispatch(
+    test_db: Session,
+    test_user: User,
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str | None,
+    api_format: str | None,
+) -> None:
+    from app.core.config import settings
+    from app.services.chat.trigger.request_preparation import (
+        _build_cloud_gateway_model_config,
+    )
+
+    model = _model_kind(0, protocol=protocol, api_format=api_format)
+    test_db.add(model)
+    test_db.commit()
+    monkeypatch.setattr(settings, "WEGENT_BACKEND_PUBLIC_URL", "https://wegent.example")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _build_cloud_gateway_model_config(
+            test_db,
+            model_name=model.name,
+            creator=test_user,
+            model_type="public",
+            namespace="default",
+            resource_user_id=0,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "protocol/apiFormat" in exc_info.value.detail
+
+
+def test_build_wework_runtime_model_config_preserves_explicit_cloud_catalog(
+    test_db: Session,
+    test_user: User,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import settings
+
+    model = _model_kind(
+        0,
+        name="deepseek-public-profile",
+        model_id="deepseek-v4-pro",
+    )
+    test_db.add(model)
+    test_db.commit()
+    monkeypatch.setattr(
+        settings,
+        "WEGENT_BACKEND_PUBLIC_URL",
+        "https://wegent.example.com",
+    )
+
+    config = build_wework_runtime_model_config(
+        test_db,
+        model_name=model.name,
+        creator=test_user,
+        model_options={"codex_catalog_model_id": "operator-selected-catalog"},
+    )
+
+    assert config["model_id"] == model.name
+    assert config["codex_catalog_model_id"] == "operator-selected-catalog"
+
+
+async def test_proxy_llm_responses_forwards_chat_completions_to_provider(
+    test_db, test_user: User
+):
+    model = _model_kind(
+        test_user.id,
+        name="chat-completions-model",
+        protocol="openai",
+        api_key="sk-chat-key",
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=b'{"model":"chat-completions-model","messages":[{"role":"user","content":"hello"}],"tool_choice":"auto"}'
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+        }
+    )
+
+    upstream_response_mock = MagicMock()
+    upstream_response_mock.status_code = 200
+    upstream_response_mock.headers = {"content-type": "text/event-stream"}
+
+    async def fake_aiter_raw():
+        yield b"data: ok\n\n"
+
+    upstream_response_mock.aiter_raw = fake_aiter_raw
+    client_mock = AsyncMock()
+    client_mock.send = AsyncMock(return_value=upstream_response_mock)
+    client_mock.aclose = AsyncMock()
+
+    with patch(
+        "app.services.llm_proxy_service.httpx.AsyncClient",
+        return_value=client_mock,
+    ):
+        response = await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert response.status_code == 200
+    sent_request = client_mock.send.call_args[0][0]
+    assert str(sent_request.url) == "https://api.example.com/v1/chat/completions"
+    assert sent_request.headers["Authorization"] == "Bearer sk-chat-key"
+    assert b'"model": "gpt-4-turbo"' in sent_request.content
+    assert json.loads(sent_request.content)["messages"] == [
+        {"role": "user", "content": "hello"}
+    ]
+    assert json.loads(sent_request.content)["tool_choice"] == "auto"
+
+
+async def test_proxy_llm_responses_prefers_responses_format_over_openai_protocol(
+    test_db, test_user: User
+):
+    model = _model_kind(
+        test_user.id,
+        name="responses-with-openai-protocol",
+        protocol="openai",
+        api_format="responses",
+        api_key="sk-responses-key",
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=b'{"model":"responses-with-openai-protocol","input":"hello"}'
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+        }
+    )
+
+    upstream_response_mock = MagicMock()
+    upstream_response_mock.status_code = 200
+    upstream_response_mock.headers = {"content-type": "text/event-stream"}
+
+    async def fake_aiter_raw():
+        yield b"data: ok\n\n"
+
+    upstream_response_mock.aiter_raw = fake_aiter_raw
+    client_mock = AsyncMock()
+    client_mock.send = AsyncMock(return_value=upstream_response_mock)
+    client_mock.aclose = AsyncMock()
+
+    with patch(
+        "app.services.llm_proxy_service.httpx.AsyncClient",
+        return_value=client_mock,
+    ):
+        response = await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert response.status_code == 200
+    sent_request = client_mock.send.call_args[0][0]
+    assert str(sent_request.url) == "https://api.example.com/v1/responses"
+    assert sent_request.headers["Authorization"] == "Bearer sk-responses-key"
+
+
+async def test_proxy_llm_responses_rejects_openai_responses_protocol_with_chat_completions_format(
+    test_db, test_user: User
+):
+    model = _model_kind(
+        test_user.id,
+        name="conflicting-responses-model",
+        protocol="openai-responses",
+        api_format="chat/completions",
+        api_key="sk-test-key",
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=b'{"model":"conflicting-responses-model","input":"hello"}'
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+        }
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert exc_info.value.status_code == 400
+    assert "conflicting" in exc_info.value.detail.lower()
+    assert "openai-responses" in exc_info.value.detail
+    assert "chat/completions" in exc_info.value.detail
+
+
+async def test_proxy_llm_responses_rejects_claude_protocol_with_responses_format(
+    test_db, test_user: User
+):
+    model = _model_kind(
+        test_user.id,
+        name="conflicting-anthropic-model",
+        protocol="claude",
+        api_format="responses",
+        api_key="sk-test-key",
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=b'{"model":"conflicting-anthropic-model","input":"hello"}'
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+        }
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert exc_info.value.status_code == 400
+    assert "conflicting" in exc_info.value.detail.lower()
+    assert "claude" in exc_info.value.detail
+    assert "responses" in exc_info.value.detail
+
+
+async def test_proxy_llm_responses_forwards_anthropic_messages_to_provider(
+    test_db, test_user: User
+):
+    model = _model_kind(
+        test_user.id,
+        name="anthropic-model",
+        protocol="claude",
+        api_key="sk-anthropic-key",
+        base_url="https://api.anthropic.com",
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=b'{"model":"anthropic-model","messages":[{"role":"user","content":"hello"}],"max_tokens":1024,"tool_choice":{"type":"auto"}}'
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+        }
+    )
+
+    upstream_response_mock = MagicMock()
+    upstream_response_mock.status_code = 200
+    upstream_response_mock.headers = {"content-type": "text/event-stream"}
+
+    async def fake_aiter_raw():
+        yield b"data: ok\n\n"
+
+    upstream_response_mock.aiter_raw = fake_aiter_raw
+    client_mock = AsyncMock()
+    client_mock.send = AsyncMock(return_value=upstream_response_mock)
+    client_mock.aclose = AsyncMock()
+
+    with patch(
+        "app.services.llm_proxy_service.httpx.AsyncClient",
+        return_value=client_mock,
+    ):
+        response = await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert response.status_code == 200
+    sent_request = client_mock.send.call_args[0][0]
+    assert str(sent_request.url) == "https://api.anthropic.com/v1/messages"
+    assert sent_request.headers["x-api-key"] == "sk-anthropic-key"
+    assert sent_request.headers["anthropic-version"] == "2023-06-01"
+    assert "Authorization" not in sent_request.headers
+    assert json.loads(sent_request.content) == {
+        "model": "gpt-4-turbo",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 1024,
+        "tool_choice": {"type": "auto"},
+    }
+
+
+async def test_proxy_llm_responses_does_not_duplicate_anthropic_version_path(
+    test_db, test_user: User
+):
+    model = _model_kind(
+        test_user.id,
+        name="anthropic-versioned-base-model",
+        protocol="claude",
+        api_key="sk-anthropic-key",
+        base_url="https://api.anthropic.com/v1",
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=b'{"model":"anthropic-versioned-base-model","input":"hello"}'
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+        }
+    )
+
+    upstream_response_mock = MagicMock()
+    upstream_response_mock.status_code = 200
+    upstream_response_mock.headers = {"content-type": "text/event-stream"}
+
+    async def fake_aiter_raw():
+        yield b"data: ok\n\n"
+
+    upstream_response_mock.aiter_raw = fake_aiter_raw
+    client_mock = AsyncMock()
+    client_mock.send = AsyncMock(return_value=upstream_response_mock)
+    client_mock.aclose = AsyncMock()
+
+    with patch(
+        "app.services.llm_proxy_service.httpx.AsyncClient",
+        return_value=client_mock,
+    ):
+        response = await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert response.status_code == 200
+    sent_request = client_mock.send.call_args[0][0]
+    assert str(sent_request.url) == "https://api.anthropic.com/v1/messages"
+
+
+async def test_proxy_llm_responses_infers_anthropic_endpoint_from_env_model(
+    test_db, test_user: User
+):
+    """Vision sidecars reference models that only declare env.model.
+
+    Most Model CRDs carry no spec.protocol, so the gateway must infer the upstream
+    endpoint from env.model. Without this, an anthropic-messages sidecar request is
+    rejected as an ambiguous protocol configuration.
+    """
+    model = _model_kind(
+        test_user.id,
+        name="kimi-k2.5-vision",
+        protocol=None,
+        env_model="claude",
+        api_key="sk-anthropic-key",
+        base_url="https://api.example.com",
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=(
+            b'{"model":"kimi-k2.5-vision","max_tokens":2000,'
+            b'"messages":[{"role":"user","content":[]}]}'
+        )
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+        }
+    )
+
+    upstream_response_mock = MagicMock()
+    upstream_response_mock.status_code = 200
+    upstream_response_mock.headers = {"content-type": "application/json"}
+
+    async def fake_aiter_raw():
+        yield b'{"content":[{"type":"text","text":"a screenshot"}]}'
+
+    upstream_response_mock.aiter_raw = fake_aiter_raw
+    client_mock = AsyncMock()
+    client_mock.send = AsyncMock(return_value=upstream_response_mock)
+    client_mock.aclose = AsyncMock()
+
+    with patch(
+        "app.services.llm_proxy_service.httpx.AsyncClient",
+        return_value=client_mock,
+    ):
+        response = await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert response.status_code == 200
+    sent_request = client_mock.send.call_args[0][0]
+    assert str(sent_request.url) == "https://api.example.com/v1/messages"
+    assert sent_request.headers["x-api-key"] == "sk-anthropic-key"
+    assert sent_request.headers["anthropic-version"] == "2023-06-01"
+
+
+async def test_proxy_llm_responses_forwards_responses_to_provider(
+    test_db, test_user: User
+):
+    model = _model_kind(
+        test_user.id,
+        name="responses-model",
+        protocol="openai-responses",
+        api_key="sk-responses-key",
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=b'{"model":"responses-model","input":"hello"}'
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+        }
+    )
+
+    upstream_response_mock = MagicMock()
+    upstream_response_mock.status_code = 200
+    upstream_response_mock.headers = {"content-type": "text/event-stream"}
+
+    async def fake_aiter_raw():
+        yield b"data: ok\n\n"
+
+    upstream_response_mock.aiter_raw = fake_aiter_raw
+    client_mock = AsyncMock()
+    client_mock.send = AsyncMock(return_value=upstream_response_mock)
+    client_mock.aclose = AsyncMock()
+
+    with patch(
+        "app.services.llm_proxy_service.httpx.AsyncClient",
+        return_value=client_mock,
+    ):
+        response = await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert response.status_code == 200
+    sent_request = client_mock.send.call_args[0][0]
+    assert str(sent_request.url) == "https://api.example.com/v1/responses"
+    assert sent_request.headers["Authorization"] == "Bearer sk-responses-key"
+
+
+async def test_proxy_llm_responses_rejects_unsupported_model_protocol(
+    test_db, test_user: User
+):
+    model = _model_kind(
+        test_user.id,
+        name="unsupported-model",
+        protocol="unsupported-protocol",
+        api_key="sk-test-key",
+    )
+    test_db.add(model)
+    test_db.commit()
+
+    request_mock = MagicMock(spec=Request)
+    request_mock.body = AsyncMock(
+        return_value=b'{"model":"unsupported-model","input":"hello"}'
+    )
+    request_mock.headers = Headers(
+        {
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+            "x-wegent-model-type": "user",
+            "x-wegent-model-namespace": "default",
+            "x-wegent-model-user-id": str(test_user.id),
+        }
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy_llm_responses(request_mock, test_db, test_user)
+
+    assert exc_info.value.status_code == 400
+    assert "unsupported-model" in exc_info.value.detail
+    assert "unsupported-protocol" in exc_info.value.detail
+    assert "Please update the Model CRD" in exc_info.value.detail

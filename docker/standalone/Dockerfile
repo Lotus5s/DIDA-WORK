@@ -1,0 +1,290 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Standalone Dockerfile - All services in one container
+# This builds a single image containing Backend, Frontend, Wework, Chat Shell, and Executor
+
+# ========== Stage 1: Build Frontend ==========
+FROM node:22-slim AS frontend-builder
+
+WORKDIR /app
+
+# Copy dependency files and postinstall scripts
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches ./patches
+COPY packages/chat-core/package.json ./packages/chat-core/package.json
+COPY packages/collaboration/package.json ./packages/collaboration/package.json
+COPY frontend/package.json ./frontend/package.json
+COPY frontend/scripts ./frontend/scripts
+
+# Font download configuration for internal deployments
+ARG GOOGLE_SANS_CSS_URLS=""
+ARG SKIP_UI_FONT_DOWNLOAD=""
+ARG SKIP_PDF_FONT_DOWNLOAD=""
+ENV GOOGLE_SANS_CSS_URLS=${GOOGLE_SANS_CSS_URLS}
+ENV SKIP_UI_FONT_DOWNLOAD=${SKIP_UI_FONT_DOWNLOAD}
+ENV SKIP_PDF_FONT_DOWNLOAD=${SKIP_PDF_FONT_DOWNLOAD}
+ENV HUSKY=0
+
+# Install workspace dependencies needed by the frontend.
+RUN corepack enable \
+    && corepack prepare pnpm@11.7.0 --activate \
+    && pnpm install --frozen-lockfile --filter wecode-ai-assistant...
+
+# Copy source code
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages ./packages
+COPY shared/assets/codex-models ./shared/assets/codex-models
+COPY frontend ./frontend
+
+# App version injected at build time (e.g. "0.1.5")
+ARG APP_VERSION="dev"
+ENV NEXT_PUBLIC_APP_VERSION=${APP_VERSION}
+
+# Disable Next.js telemetry
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV HUSKY=0
+
+# Build Next.js application
+WORKDIR /app/frontend
+RUN corepack enable \
+    && corepack prepare pnpm@11.7.0 --activate \
+    && pnpm --config.verify-deps-before-run=false run build
+
+# ========== Stage 2: Build Wework ==========
+FROM node:22-slim AS wework-builder
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches ./patches
+COPY packages/chat-core/package.json ./packages/chat-core/package.json
+COPY packages/collaboration/package.json ./packages/collaboration/package.json
+COPY wework/package.json ./wework/package.json
+
+ENV HUSKY=0
+
+RUN corepack enable \
+    && corepack prepare pnpm@11.7.0 --activate \
+    && pnpm install --frozen-lockfile --filter wework...
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages ./packages
+COPY shared/assets ./shared/assets
+COPY wework ./wework
+
+ARG WEWORK_APP_BASE_PATH="/wework"
+ARG WEWORK_SOURCE_SHA
+ENV VITE_APP_BASE_PATH=${WEWORK_APP_BASE_PATH}
+ENV WEWORK_SOURCE_SHA=${WEWORK_SOURCE_SHA}
+ENV HUSKY=0
+
+WORKDIR /app/wework
+RUN corepack enable \
+    && corepack prepare pnpm@11.7.0 --activate \
+    && pnpm --config.verify-deps-before-run=false run build
+
+# ========== Stage 3: Build Python Base with Tools ==========
+FROM ghcr.io/wecode-ai/wegent-base-python3.12:latest AS python-base
+
+WORKDIR /app
+
+# Verify Node.js is available (already installed in base image)
+RUN node --version && npm --version
+
+# Install system packages for document generation and embedded services.
+# AlmaLinux MySQL requests CAP_SYS_NICE as an effective file capability.
+# Default Docker containers exclude it, so execve rejects mysqld with EPERM.
+RUN dnf install -y \
+    # LibreOffice for document conversion and PDF operations
+    libreoffice-core libreoffice-writer libreoffice-calc libreoffice-impress \
+    # Document and PDF utilities
+    poppler-utils pandoc tesseract \
+    # Chromium dependencies for Playwright browser automation
+    atk at-spi2-atk libXcomposite libXdamage libXfixes libXrandr libxkbcommon \
+    # Skill-creator dependencies (JSON parsing and packaging)
+    jq zip \
+    # Public reverse proxy for the bundled frontend applications
+    nginx \
+    # Development environment and runtime diagnostics
+    procps-ng iproute lsof less tree unzip ripgrep libcap \
+    # Redis server for standalone mode (embedded)
+    redis \
+    # MySQL server for standalone mode (embedded)
+    mysql-server \
+    && npm install -g @anthropic-ai/claude-code@2.1.277 @openai/codex@0.155.1 \
+    && { ! getcap /usr/libexec/mysqld | grep -q . || setcap -r /usr/libexec/mysqld; } \
+    && test -z "$(getcap /usr/libexec/mysqld)" \
+    && /usr/sbin/mysqld --version \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf/*
+
+# Install Claude marketplace skills and npm packages for document generation
+RUN claude plugin marketplace add anthropics/skills \
+    && npm install -g pptxgenjs playwright sharp react react-dom react-icons docx pdf-lib \
+        mermaid@11.15.0 jsdom@29.1.1 \
+    && npx playwright install chromium \
+    && npm cache clean --force
+
+# Install Python packages for document generation
+RUN pip install python-pptx openpyxl python-docx reportlab Pillow pandas \
+    pypdf pdfplumber pytesseract \
+    "markitdown[pptx]" defusedxml weasyprint \
+    pyyaml \
+    && pip cache purge || true
+
+# Download Chinese fonts for document generation
+RUN mkdir -p /usr/share/fonts/truetype/noto && \
+    (curl -sL "https://github.com/googlefonts/noto-cjk/raw/main/Sans/Variable/TTF/NotoSansCJKsc-VF.ttf" \
+        -o /usr/share/fonts/truetype/noto/NotoSansCJKsc.ttf || \
+     curl -sL "https://github.com/adobe-fonts/source-han-sans/raw/release/Variable/TTF/SourceHanSansSC-VF.ttf" \
+        -o /usr/share/fonts/truetype/noto/SourceHanSansSC.ttf || \
+     curl -sL "https://fonts.gstatic.com/s/notosanssc/v36/k3kXo84MPvpLmixcA63oeALhL4Gxr9Ov.ttf" \
+        -o /usr/share/fonts/truetype/noto/NotoSansSC.ttf) && \
+    fc-cache -f -v
+
+# ========== Stage 4: Build Rust Executor ==========
+FROM python-base AS executor-builder
+ARG APP_VERSION=dev
+
+WORKDIR /app
+
+RUN dnf install -y gcc ca-certificates openssl-devel pkgconf-pkg-config \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf/*
+
+ENV PATH=/root/.cargo/bin:${PATH}
+
+COPY executor/Cargo.toml executor/Cargo.lock /app/executor/
+COPY executor/src /app/executor/src
+COPY sdk/plugin-auth /app/sdk/plugin-auth
+COPY sdk/plugin-creator /app/sdk/plugin-creator
+COPY shared/assets /app/shared/assets
+RUN cd /app/executor && APP_VERSION="${APP_VERSION}" cargo build --release --locked
+
+COPY backend-rs /app/backend-rs
+RUN cd /app/backend-rs && cargo build --release --locked --bin wegent-backend-rs
+
+# ========== Stage 5: Runtime ==========
+FROM python-base AS runtime
+ARG APP_VERSION=dev
+
+WORKDIR /app
+
+# Copy all Python modules to /app directory for consistent structure
+# All modules will be under /app: /app/shared, /app/chat_shell,
+# /app/knowledge_engine, /app/backend
+COPY shared /app/shared
+COPY chat_shell /app/chat_shell
+COPY knowledge_engine /app/knowledge_engine
+COPY --from=executor-builder /app/executor/target/release/wegent-executor /app/wegent-executor
+COPY --from=executor-builder /app/backend-rs/target/release/wegent-backend-rs /app/wegent-backend-rs
+COPY --from=executor-builder /app/backend-rs/config /app/backend-rs/config
+
+# Install shared module first
+RUN uv pip install --system --no-cache /app/shared
+
+# Install knowledge_engine (depends on shared via ../shared -> /app/shared)
+RUN uv pip install --system --no-cache "/app/knowledge_engine[retrieval]"
+
+# Install the required HTTP retrieval service using its own dependency manifest.
+COPY knowledge_runtime /app/knowledge_runtime
+RUN cd /app/knowledge_runtime && \
+    sed -i '/\[tool\.uv\.sources\]/,/^$/d' pyproject.toml && \
+    uv pip install --system --no-cache -r pyproject.toml
+
+# Install chat_shell (depends on shared via ../shared -> /app/shared)
+RUN cd /app/chat_shell && uv pip install --system --no-cache -r pyproject.toml
+
+RUN uv pip install --system --no-cache --no-deps openai-codex==0.1.0b3
+
+# Copy and install backend
+# Backend's pyproject.toml references:
+# - wegent-shared = { path = "../shared" } -> /app/shared
+# - wegent-chat-shell = { path = "../chat_shell" } -> /app/chat_shell
+# - wegent-knowledge-engine = { path = "../knowledge_engine" } -> /app/knowledge_engine
+COPY backend/pyproject.toml /app/backend/pyproject.toml
+COPY backend/.env.example /app/backend/.env.example
+RUN cd /app/backend && uv pip install --system --no-cache -r pyproject.toml
+
+# Copy backend application code
+COPY backend/app /app/backend/app
+COPY backend/alembic /app/backend/alembic
+COPY backend/alembic.ini /app/backend/alembic.ini
+
+# Copy frontend build (standalone output)
+COPY --from=frontend-builder /app/frontend/.next/standalone /app
+COPY --from=frontend-builder /app/frontend/.next/static /app/frontend/.next/static
+COPY --from=frontend-builder /app/frontend/public /app/frontend/public
+
+# Copy Wework web build
+COPY --from=wework-builder /app/wework/dist /app/wework/dist
+
+# Copy Nginx reverse proxy configuration
+COPY docker/standalone/nginx.conf /etc/nginx/conf.d/default.conf
+
+# Copy init_data directory with default resources and skills
+COPY backend/init_data /app/init_data
+
+# Copy startup script
+COPY docker/standalone/start.sh /app/start.sh
+RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
+
+# Environment variables for standalone mode
+ENV STANDALONE_MODE=true
+ENV STANDALONE_EXECUTOR_DEVICE_ID=standalone-admin-device
+ENV ENVIRONMENT=development
+ENV DATABASE_URL=mysql+pymysql://root@127.0.0.1:3306/task_manager
+ENV DB_AUTO_MIGRATE=false
+ENV INIT_DATA_ENABLED=true
+ENV INIT_DATA_DIR=/app/init_data
+ENV BUILTIN_PLUGINS_DIR=/app/init_data/plugins
+ENV CHAT_SHELL_MODE=package
+ENV CODEX_HOME=/app/data/codex
+ENV PYTHONPATH=/app:/app/backend:/app/chat_shell:/app/knowledge_runtime
+ENV NODE_PATH=/usr/lib/node_modules
+ENV WEGENT_EXECUTOR_VERSION=${APP_VERSION}
+
+# Redis configuration (embedded in standalone mode)
+ENV REDIS_URL=redis://localhost:6379/0
+ENV REDIS_DATA_DIR=/app/data/redis
+
+# MySQL configuration (embedded in standalone mode)
+ENV MYSQL_PORT=3306
+ENV MYSQL_DATA_DIR=/app/data/mysql
+
+# Hybrid Backend configuration
+ENV WEGENT_RS_ROUTES_FILE=/app/backend-rs/config/routes.toml
+ENV WEGENT_BACKEND_RS_ENV_FILE=/app/backend/.env.example
+ENV WEGENT_PYTHON_UPSTREAM_PORT=8004
+ENV LOG_DIR=/app/data/logs/backend
+
+# Server configuration
+ENV BACKEND_PORT=8000
+ENV FRONTEND_PORT=3002
+ENV GRACEFUL_SHUTDOWN_TIMEOUT=600
+ENV WEGENT_WORKSPACE_ROOT=/workspace
+
+# Expose the single browser-facing standalone port
+EXPOSE 3000
+
+# Data volume for service state and workspace artifacts
+VOLUME ["/app/data", "/workspace"]
+
+# Health check - verify main services are running
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health \
+      && curl -f http://127.0.0.1:8200/internal/rag/health \
+      && curl -f http://localhost:3000 \
+      && curl -f http://localhost:3000/wework/ \
+      || exit 1
+
+# Startup command
+CMD ["/app/start.sh"]

@@ -1,0 +1,232 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from contextlib import asynccontextmanager, contextmanager
+from typing import AsyncGenerator, Generator, Optional
+
+from sqlalchemy import create_engine, event
+from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.core.config import settings
+from app.db.pool_observability import (
+    ObservedAsyncQueuePool,
+    ObservedQueuePool,
+    register_pool,
+)
+from app.db.timezone import MYSQL_SESSION_TIMEZONE_OFFSET
+
+# Database connection URL (using sync driver)
+SQLALCHEMY_DATABASE_URL = settings.DATABASE_URL
+
+
+def _configure_sqlite_engine(sqlite_engine: Engine) -> Engine:
+    """Enable SQLite settings required by concurrent API and worker access."""
+
+    @event.listens_for(sqlite_engine, "connect")
+    def set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+        finally:
+            cursor.close()
+
+    return sqlite_engine
+
+
+def _create_engine():
+    """
+    Create database engine based on DATABASE_URL prefix.
+
+    Automatically selects appropriate configuration for SQLite or MySQL.
+    """
+    if SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
+        # SQLite configuration
+        # - check_same_thread=False: Required for SQLite to work with multiple threads
+        # - SQLite doesn't support connection pooling parameters like pool_size
+        return _configure_sqlite_engine(
+            create_engine(
+                SQLALCHEMY_DATABASE_URL,
+                connect_args={"check_same_thread": False, "timeout": 30},
+                pool_pre_ping=True,
+            )
+        )
+    else:
+        # Pool limits are per process. Production capacity planning must account
+        # for every Backend and Celery process that imports this engine.
+        mysql_engine = create_engine(
+            SQLALCHEMY_DATABASE_URL,
+            pool_pre_ping=True,
+            poolclass=ObservedQueuePool,
+            pool_size=settings.DB_POOL_SIZE,
+            max_overflow=settings.DB_MAX_OVERFLOW,
+            pool_timeout=settings.DB_POOL_TIMEOUT,
+            pool_recycle=settings.DB_POOL_RECYCLE,
+            connect_args={
+                "charset": "utf8mb4",
+                "init_command": f"SET time_zone = '{MYSQL_SESSION_TIMEZONE_OFFSET}'",
+            },
+        )
+        register_pool(
+            mysql_engine.pool,
+            engine_role="sync",
+            pool_size=settings.DB_POOL_SIZE,
+            max_overflow=settings.DB_MAX_OVERFLOW,
+            pool_timeout=settings.DB_POOL_TIMEOUT,
+            pool_recycle=settings.DB_POOL_RECYCLE,
+        )
+        return mysql_engine
+
+
+engine = _create_engine()
+
+# Sync session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Async database support (lazily initialized)
+_async_engine: Optional[AsyncEngine] = None
+_AsyncSessionLocal: Optional[sessionmaker] = None
+
+
+def _get_async_database_url() -> str:
+    """Convert sync DATABASE_URL to async driver URL."""
+    url = make_url(SQLALCHEMY_DATABASE_URL)
+    if url.drivername.startswith("mysql"):
+        return url.set(drivername="mysql+asyncmy").render_as_string(hide_password=False)
+    if url.drivername.startswith("sqlite"):
+        return url.set(drivername="sqlite+aiosqlite").render_as_string(
+            hide_password=False
+        )
+    return url.render_as_string(hide_password=False)
+
+
+def _configure_async_engine_dialect(async_engine: AsyncEngine) -> None:
+    """Apply async driver compatibility settings."""
+    dialect = async_engine.sync_engine.dialect
+    if dialect.name == "mysql" and dialect.driver == "asyncmy":
+        # SQLAlchemy's asyncmy dialect inherits PyMySQL ping detection, which may
+        # choose ping() based on the installed PyMySQL version. asyncmy requires
+        # the reconnect argument, so force pool_pre_ping to call ping(False).
+        dialect._send_false_to_ping = True
+
+
+def _create_async_engine() -> AsyncEngine:
+    """Create async database engine."""
+    async_url = _get_async_database_url()
+    if async_url.startswith("sqlite"):
+        async_engine = create_async_engine(
+            async_url,
+            connect_args={"timeout": 30},
+            pool_pre_ping=True,
+        )
+        _configure_sqlite_engine(async_engine.sync_engine)
+        return async_engine
+    async_engine = create_async_engine(
+        async_url,
+        connect_args={
+            "init_command": f"SET time_zone = '{MYSQL_SESSION_TIMEZONE_OFFSET}'",
+        },
+        pool_pre_ping=True,
+        poolclass=ObservedAsyncQueuePool,
+        pool_size=settings.DB_ASYNC_POOL_SIZE,
+        max_overflow=settings.DB_ASYNC_MAX_OVERFLOW,
+        pool_timeout=settings.DB_POOL_TIMEOUT,
+        pool_recycle=settings.DB_POOL_RECYCLE,
+    )
+    _configure_async_engine_dialect(async_engine)
+    register_pool(
+        async_engine.pool,
+        engine_role="async",
+        pool_size=settings.DB_ASYNC_POOL_SIZE,
+        max_overflow=settings.DB_ASYNC_MAX_OVERFLOW,
+        pool_timeout=settings.DB_POOL_TIMEOUT,
+        pool_recycle=settings.DB_POOL_RECYCLE,
+    )
+    return async_engine
+
+
+def get_async_engine() -> AsyncEngine:
+    """Get the async database engine, initializing if needed."""
+    global _async_engine
+    if _async_engine is None:
+        _async_engine = _create_async_engine()
+    return _async_engine
+
+
+def get_async_session_factory() -> sessionmaker:
+    """Get the async session factory, initializing if needed."""
+    global _AsyncSessionLocal
+    if _AsyncSessionLocal is None:
+        _AsyncSessionLocal = sessionmaker(
+            bind=get_async_engine(),
+            class_=AsyncSession,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+    return _AsyncSessionLocal
+
+
+# Convenience alias for direct use
+def AsyncSessionLocal() -> AsyncSession:
+    """Create a new async session."""
+    factory = get_async_session_factory()
+    return factory()
+
+
+async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
+    """Async database session dependency for FastAPI."""
+    session = AsyncSessionLocal()
+    try:
+        yield session
+    finally:
+        await session.close()
+
+
+# Import Base from shared package for consistency
+# All models should use the same Base for proper relationship resolution
+from app.db.base import Base
+
+# Wiki tables now use the main database (Base)
+# Alias for backward compatibility
+WikiBase = Base
+
+
+@contextmanager
+def get_db_session() -> Generator[Session, None, None]:
+    """
+    Context manager for database sessions.
+
+    Provides a clean way to manage database sessions with proper cleanup.
+    Use this instead of manually creating SessionLocal() and closing.
+
+    Usage:
+        with get_db_session() as db:
+            # use db...
+            pass
+        # session is automatically closed
+
+    Yields:
+        Database session
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_wiki_db():
+    """
+    Wiki database session dependency
+    Now uses main database session for wiki tables
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

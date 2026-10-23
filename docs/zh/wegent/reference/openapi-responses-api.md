@@ -1,0 +1,513 @@
+---
+sidebar_position: 1
+---
+
+# OpenAPI v1/responses API
+
+本文档描述 OpenAPI v1/responses 端点，该端点提供与 OpenAI Responses API 兼容的接口，用于与 Wegent 智能体（Team）进行交互。
+
+## 概述
+
+`/api/v1/responses` 端点允许外部应用程序使用与 OpenAI Responses API 兼容的格式与 Wegent 智能体进行交互。这使得将 Wegent 集成到已支持 OpenAI API 格式的现有应用程序中变得简单。
+
+## 认证
+
+所有端点都需要通过以下方式之一进行认证：
+
+- **Bearer Token**: `Authorization: Bearer <access_token>`
+- **API Key**: `X-API-Key: <api_key>`
+
+### 获取 API Key
+
+1. 登录 Wegent 前端界面
+2. 点击左下角 **设置** 图标
+3. 选择 **AI 密钥** 菜单
+4. 点击 **创建个人密钥** 按钮
+5. 复制生成的 API Key 用于 API 调用
+
+## 基础 URL
+
+```
+/api/v1/responses
+```
+
+## 端点
+
+### 创建响应
+
+创建新的响应（执行任务）。
+
+```
+POST /api/v1/responses
+```
+
+#### 请求体
+
+| 字段 | 类型 | 必填 | 描述 |
+|------|------|------|------|
+| `model` | string | 是 | 智能体标识符。格式：`namespace#team_name` 或 `namespace#team_name#model_id` |
+| `input` | string \| array | 是 | 用户输入提示或对话历史 |
+| `stream` | boolean | 否 | 启用流式输出（默认：`false`） |
+| `previous_response_id` | string | 否 | 用于后续对话的前一个响应 ID |
+| `reasoning` | object | 否 | 模型推理配置，包含 `effort` 和可选的 `summary` |
+| `tools` | array | 否 | Wegent 自定义工具配置 |
+| `omit_mcp_binary_output` | boolean | 否 | 将 MCP 工具输出中的图片、音频、视频等媒体负载（base64）替换为摘要占位符（默认：`false`，即返回原始内容） |
+
+#### MCP 二进制输出
+
+MCP 工具（例如抓取图片的工具）会以 base64 返回媒体内容，直接返回会让响应体变得很大，并可能导致调用方解析失败。把 `omit_mcp_binary_output` 设为 `true` 后，`mcp_call` 条目中的媒体负载会被替换为摘要占位符，例如 `<image/jpeg payload omitted: 2048 bytes>`：
+
+```json
+{
+  "model": "default#my-assistant",
+  "input": "下载这张图片并给出结论",
+  "omit_mcp_binary_output": true
+}
+```
+
+文本输出始终原样返回；模型调用时仍会拿到完整的原始内容，因此不影响模型判断。
+
+#### Model 格式
+
+`model` 字段指定要使用的智能体（Team）：
+
+- `namespace#team_name` - 使用 Team 的 Bot 中配置的默认模型
+- `namespace#team_name#model_id` - 使用指定的模型覆盖
+
+示例：
+- `default#my-assistant`
+- `my-group#coding-agent#gpt-4o`
+
+#### Input 格式
+
+`input` 字段支持两种格式：
+
+**简单字符串：**
+```json
+{
+  "input": "你好，最近怎么样？"
+}
+```
+
+**对话历史（用于多轮对话）：**
+```json
+{
+  "input": [
+    {"type": "message", "role": "user", "content": "2+2 等于多少？"},
+    {"type": "message", "role": "assistant", "content": "2+2 等于 4。"},
+    {"type": "message", "role": "user", "content": "那 3+3 呢？"}
+  ]
+}
+```
+
+#### 推理配置
+
+`reasoning.effort` 支持 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` 和 `ultra`。实际可用级别取决于所选模型；客户端应使用模型运行时返回的能力列表，不应为不支持的模型构造级别。
+
+`reasoning.summary` 可选值为 `auto`、`concise` 或 `detailed`。
+
+```json
+{
+  "reasoning": {
+    "effort": "ultra",
+    "summary": "auto"
+  }
+}
+```
+
+#### 工具配置
+
+`tools` 数组用于启用额外的服务端能力：
+
+```json
+{
+  "tools": [
+    {"type": "wegent_chat_bot"}
+  ]
+}
+```
+
+| 工具类型 | 描述 |
+|----------|------|
+| `wegent_chat_bot` | 启用所有服务端能力（深度思考、网络搜索、服务端 MCP 工具、消息增强） |
+| `wegent_code_bot` | 启用代码任务并指定 Git 仓库（用于 Executor 类型的 Team） |
+| `mcp` | 添加自定义 MCP 服务器 |
+| `skill` | 预加载特定技能 |
+| `knowledge_base` | 让 Chat Shell 智能体使用指定知识库，可按目录或文档限定访问范围 |
+
+**代码任务配置：**
+```json
+{
+  "tools": [
+    {
+      "type": "wegent_code_bot",
+      "workspace": {
+        "git_url": "https://github.com/user/repo.git",
+        "branch": "main",
+        "git_repo": "user/repo"
+      }
+    }
+  ]
+}
+```
+
+| 字段 | 类型 | 必填 | 描述 |
+|------|------|------|------|
+| `workspace.git_url` | string | 是 | Git 仓库 URL |
+| `workspace.branch` | string | 是 | Git 分支名 |
+| `workspace.git_repo` | string | 否 | 仓库名称（如 `user/repo`）。如未提供将从 `git_url` 自动提取 |
+
+**MCP 服务器配置：**
+```json
+{
+  "tools": [
+    {
+      "type": "mcp",
+      "mcp_servers": [
+        {
+          "my-server": {"url": "http://...", "type": "http"},
+          "another": {"url": "http://...", "type": "sse"}
+        }
+      ]
+    }
+  ]
+}
+```
+
+**技能预加载：**
+```json
+{
+  "tools": [
+    {"type": "skill", "preload_skills": ["skill_a", "skill_b"]}
+  ]
+}
+```
+
+**知识库配置：**
+
+整库访问继续使用 `knowledge_base_names`：
+
+```json
+{
+  "tools": [
+    {
+      "type": "knowledge_base",
+      "knowledge_base_names": ["default#产品文档"]
+    }
+  ]
+}
+```
+
+按目录或文档限定访问范围时，推荐使用 `knowledge_base_refs`：
+
+```json
+{
+  "tools": [
+    {
+      "type": "knowledge_base",
+      "knowledge_base_refs": [
+        {
+          "name": "default#产品文档",
+          "folder_ids": [10],
+          "document_ids": [101],
+          "include_subfolders": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+目录范围规则：
+
+- `folder_ids` 和 `document_ids` 同时传时，范围取并集。
+- `folder_ids: [0]` 表示知识库根目录直接文档，不表示整库。
+- 整库访问不要传 `folder_ids` 或 `document_ids`。
+- `folder_ids: []` 和 `document_ids: []` 是非法参数。
+- `knowledge_base_refs` 与 `knowledge_base_names` 不能同时使用。
+- 顶层 `folder_ids` / `document_ids` 只作为单知识库兼容写法；多知识库请求必须使用 `knowledge_base_refs`。
+
+范围是强访问边界。启用目录或文档范围后，智能体的 `knowledge_base_search`、`kb_ls`、`kb_head` 只能搜索、列出或读取范围内文档；越界读取会返回 `document_scope_violation`。
+
+当请求带有 `previous_response_id` 且本轮没有重新传入 `knowledge_base` tool 时，系统会继承该任务上一次绑定的知识库范围，并在本轮重新解析目录内文档。显式传入新的 `knowledge_base` tool 会覆盖之前的范围。
+
+#### 响应行为
+
+响应行为取决于 Team 的 Shell 类型：
+
+| Shell 类型 | 流式支持 | 响应模式 |
+|------------|----------|----------|
+| Chat Shell | 是 | 同步或 SSE 流式；设备任务的非流式请求返回排队状态 |
+| 其他（ClaudeCode、Codex、Agno、Dify） | 是 | 非流式请求排队；流式请求返回 SSE |
+
+**Chat Shell（stream=false）：**
+- 未绑定设备时，阻塞直到 LLM 完成并直接返回已完成的响应
+- 绑定设备时，立即返回状态为 `queued` 的响应
+
+**stream=true（Chat Shell 和非 Chat Shell）：**
+- 返回与 OpenAI v1/responses 兼容的 SSE 事件流
+- 设备或执行器的单条、批量回调均可传递文本和终态事件
+- 视频模型不支持流式请求，返回 HTTP 400
+
+**非 Chat Shell（stream=false）：**
+- 立即返回状态为 `queued` 的响应
+- 使用 `GET /api/v1/responses/{response_id}` 轮询获取完成状态
+
+#### 请求示例
+
+```bash
+curl -X POST "https://your-domain/api/v1/responses" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "default#my-assistant",
+    "input": "讲个笑话",
+    "stream": false
+  }'
+```
+
+#### 响应示例
+
+```json
+{
+  "id": "resp_123",
+  "object": "response",
+  "created_at": 1704067200,
+  "status": "completed",
+  "model": "default#my-assistant",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_456",
+      "status": "completed",
+      "role": "user",
+      "content": [{"type": "output_text", "text": "讲个笑话", "annotations": []}]
+    },
+    {
+      "type": "message",
+      "id": "msg_789",
+      "status": "completed",
+      "role": "assistant",
+      "content": [{"type": "output_text", "text": "程序员为什么不喜欢户外？因为有太多 bug！", "annotations": []}]
+    }
+  ],
+  "error": null,
+  "previous_response_id": null
+}
+```
+
+---
+
+### 获取响应
+
+根据 ID 获取响应。
+
+```
+GET /api/v1/responses/{response_id}
+```
+
+#### 路径参数
+
+| 参数 | 类型 | 描述 |
+|------|------|------|
+| `response_id` | string | 响应 ID，格式为 `resp_{task_id}` |
+
+#### 请求示例
+
+```bash
+curl "https://your-domain/api/v1/responses/resp_123" \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
+### 取消响应
+
+取消正在运行的响应。
+
+```
+POST /api/v1/responses/{response_id}/cancel
+```
+
+#### 路径参数
+
+| 参数 | 类型 | 描述 |
+|------|------|------|
+| `response_id` | string | 响应 ID，格式为 `resp_{task_id}` |
+
+#### 行为
+
+- **Chat Shell 任务**：停止模型请求并保存部分内容
+- **Executor 任务**：调用 executor_manager 进行取消
+
+#### 请求示例
+
+```bash
+curl -X POST "https://your-domain/api/v1/responses/resp_123/cancel" \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
+### 删除响应
+
+删除响应。
+
+```
+DELETE /api/v1/responses/{response_id}
+```
+
+#### 路径参数
+
+| 参数 | 类型 | 描述 |
+|------|------|------|
+| `response_id` | string | 响应 ID，格式为 `resp_{task_id}` |
+
+#### 请求示例
+
+```bash
+curl -X DELETE "https://your-domain/api/v1/responses/resp_123" \
+  -H "Authorization: Bearer <token>"
+```
+
+#### 响应示例
+
+```json
+{
+  "id": "resp_123",
+  "object": "response",
+  "deleted": true
+}
+```
+
+---
+
+## 流式事件
+
+当设置 `stream=true` 时，Chat Shell 和非 Chat Shell 均可返回 OpenAI v1/responses 格式的服务器推送事件（SSE）。视频模型不支持流式请求。
+
+### 事件类型
+
+| 事件类型 | 描述 |
+|----------|------|
+| `response.created` | 响应已创建 |
+| `response.output_item.added` | 添加了新的输出项（消息） |
+| `response.content_part.added` | 向消息添加了新的内容部分 |
+| `response.output_text.delta` | 收到文本块 |
+| `response.reasoning_summary_part.added` | 添加了新的推理摘要输出项 |
+| `response.reasoning_summary_text.delta` | 收到推理摘要文本块 |
+| `response.output_text.done` | 文本输出完成 |
+| `response.content_part.done` | 内容部分完成 |
+| `response.output_item.done` | 输出项完成 |
+| `response.completed` | 响应完全完成 |
+| `response.failed` | 响应失败并带有错误 |
+
+### 推理输出顺序
+
+启用深度思考或模型返回推理摘要时，流式输出可能包含多个独立的 `reasoning` 输出项。工具调用或普通文本输出会结束当前推理块；之后如果继续产生推理内容，会创建新的 `reasoning` 输出项。
+
+最终的 `response.completed.response.output` 会保留这些输出项的时间顺序，例如 `reasoning -> shell_call -> reasoning -> message`。客户端应按 `output` 数组顺序渲染，不应把多个 `reasoning` 内容合并成一个块。
+
+### SSE 流示例
+
+```
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_123","status":"in_progress",...}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant"}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"你好"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"世界！"}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"你好世界！"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_123","status":"completed",...}}
+```
+
+---
+
+## 响应状态
+
+| 状态 | 描述 |
+|------|------|
+| `queued` | 任务已排队等待执行（非 Chat Shell） |
+| `in_progress` | 任务正在运行 |
+| `completed` | 任务成功完成 |
+| `failed` | 任务失败并带有错误 |
+| `cancelled` | 任务已取消 |
+| `incomplete` | 任务部分完成 |
+
+---
+
+## 错误处理
+
+### HTTP 状态码
+
+| 状态码 | 描述 |
+|--------|------|
+| 200 | 成功 |
+| 400 | 请求错误（参数无效） |
+| 401 | 未授权（缺少或无效的认证） |
+| 404 | 资源未找到 |
+| 500 | 内部服务器错误 |
+
+### 错误响应格式
+
+```json
+{
+  "detail": "描述错误的消息"
+}
+```
+
+### 响应对象错误
+
+当任务失败时，`error` 字段包含：
+
+```json
+{
+  "id": "resp_123",
+  "status": "failed",
+  "error": {
+    "code": "task_failed",
+    "message": "详细错误消息"
+  },
+  ...
+}
+```
+
+---
+
+## 后续对话
+
+要继续对话，请使用 `previous_response_id`：
+
+```json
+{
+  "model": "default#my-assistant",
+  "input": "再讲一个",
+  "previous_response_id": "resp_123"
+}
+```
+
+这会追加到同一个任务，保持对话上下文。
+
+如果该任务绑定了设备，后续请求会继续发送到该设备。设备离线时返回 HTTP 503。
+
+---
+
+## 注意事项
+
+- 默认情况下，API 调用使用"干净模式"，不启用服务端增强功能
+- CRD 中配置的 Bot/Ghost MCP 工具始终可用
+- 使用 `wegent_chat_bot` 工具启用完整的服务端能力
+- 流式输出仅支持 Chat Shell 类型的 Team
+- 默认返回 `mcp_call` 的原始输出；将 `omit_mcp_binary_output` 设为 `true` 后，其中的图片、音频、视频等媒体负载（base64）会被替换为摘要占位符，例如 `<image/jpeg payload omitted: 2048 bytes>`，非媒体输出原样返回，模型调用时仍使用完整原始内容

@@ -1,0 +1,261 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Lint
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+  merge_group:
+    types:
+      - checks_requested
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect CI Changes
+    if: github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.classify.outputs.backend }}
+      knowledge_engine: ${{ steps.classify.outputs.knowledge_engine }}
+      frontend: ${{ steps.classify.outputs.frontend }}
+      wework: ${{ steps.classify.outputs.wework }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed paths
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          FORCE_ALL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:all') }}
+        run: |
+          if [[ "$FORCE_ALL" == "true" ]]; then
+            .github/scripts/classify-ci-changes.sh --all
+          else
+            git diff --name-only "$BASE_SHA...$HEAD_SHA" |
+              .github/scripts/classify-ci-changes.sh
+          fi
+
+  lint-backend:
+    name: Lint Backend (Black & isort)
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11 and uv
+        uses: ./.github/actions/setup-python-uv-cache
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        working-directory: ./backend
+        run: uv sync --dev
+
+      - name: Run Black format check
+        working-directory: ./backend
+        run: uv run black --check app/
+
+      - name: Run isort check
+        working-directory: ./backend
+        run: uv run isort --check-only --diff app/
+
+  lint-knowledge-engine:
+    name: Lint Knowledge Engine (Black & isort)
+    needs: changes
+    if: needs.changes.outputs.knowledge_engine == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12 and uv
+        uses: ./.github/actions/setup-python-uv-cache
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        working-directory: ./knowledge_engine
+        run: uv sync --dev
+
+      - name: Run Black format check
+        working-directory: ./knowledge_engine
+        run: uv run black --check knowledge_engine tests
+
+      - name: Run isort check
+        working-directory: ./knowledge_engine
+        run: uv run isort --check-only --diff knowledge_engine tests
+
+  lint-frontend:
+    name: Lint Frontend (ESLint & TypeScript)
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node workspace
+        uses: ./.github/actions/setup-node-workspace
+
+      - name: Run ESLint
+        run: pnpm --filter wecode-ai-assistant lint
+
+      - name: Run TypeScript check
+        run: pnpm --filter wecode-ai-assistant exec tsc --noEmit
+
+  lint-wework:
+    name: Lint Wework (ESLint & TypeScript)
+    needs: changes
+    if: needs.changes.outputs.wework == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node workspace
+        uses: ./.github/actions/setup-node-workspace
+
+      - name: Run ESLint
+        run: pnpm --filter wework lint
+
+      - name: Run TypeScript check
+        run: pnpm --filter wework typecheck
+
+  check-settings-config:
+    name: Check Settings Configuration
+    if: github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run settings configuration check
+        run: |
+          chmod +x ./scripts/hooks/check-settings-config.sh
+          ./scripts/hooks/check-settings-config.sh
+
+      - name: Test CI change classifier
+        run: .github/scripts/test-classify-ci-changes.sh
+
+      - name: Test CI cache policy
+        run: .github/scripts/test-ci-cache-policy.sh
+
+      - name: Test CI resource logging
+        run: node --test .github/scripts/run-with-resource-logging.test.mjs
+
+      - name: Test AI push gate
+        run: scripts/hooks/test-ai-push-gate.sh
+
+      - name: Test Wegent release policy
+        run: scripts/test-publish-image-release-policy.sh
+
+      - name: Set up Python for standalone regression checks
+        uses: ./.github/actions/setup-python-uv-cache
+        with:
+          python-version: "3.12"
+
+      - name: Test standalone Runtime lifecycle and image verification
+        # Command substitutes only; this does not build or run a container.
+        run: |
+          uv run --no-project python scripts/test-standalone-runtime.py
+          bash scripts/test-verify-standalone-image.sh
+
+      - name: Test repository policy
+        run: |
+          bash scripts/hooks/test-check-repository-policy.sh
+          bash scripts/test-repository-policy-workflow.sh
+
+      - name: Test binary asset policy workflow
+        run: bash .github/scripts/test-binary-asset-policy.sh
+
+      - name: Run repository policy check
+        # Fork PRs run this in repository-policy.yml using pull_request_target
+        # with the trusted base-branch script and the PR merge tree as data.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          REPOSITORY_POLICY_PATTERN_B64: ${{ vars.RESTRICTED_DOMAIN_PATTERN_B64 }}
+          REPOSITORY_POLICY_APPROVED_B64: ${{ vars.APPROVED_DOMAIN_REFERENCES_B64 }}
+        run: |
+          chmod +x ./scripts/hooks/check-repository-policy.sh
+          ./scripts/hooks/check-repository-policy.sh
+
+  check-alembic-heads:
+    name: Check Alembic Multi-Head
+    if: github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Alembic multi-head check
+        run: |
+          chmod +x ./scripts/hooks/check-alembic-heads.sh
+          ./scripts/hooks/check-alembic-heads.sh
+
+  lint-summary:
+    name: Lint Summary
+    runs-on: ubuntu-latest
+    needs: [changes, lint-backend, lint-knowledge-engine, lint-frontend, lint-wework, check-settings-config, check-alembic-heads]
+    if: always() && github.event_name != 'merge_group'
+
+    steps:
+      - name: Check lint results
+        run: |
+          echo "All lint jobs completed"
+          assert_result() {
+            local expected="$1"
+            local result="$2"
+            local name="$3"
+            if [[ "$expected" == "true" && "$result" != "success" ]]; then
+              echo "$name was required but completed with: $result"
+              exit 1
+            fi
+          }
+
+          [[ "${{ needs.changes.result }}" == "success" ]]
+          [[ "${{ needs.check-settings-config.result }}" == "success" ]]
+          [[ "${{ needs.check-alembic-heads.result }}" == "success" ]]
+          assert_result "${{ needs.changes.outputs.backend }}" "${{ needs.lint-backend.result }}" "Backend lint"
+          assert_result "${{ needs.changes.outputs.knowledge_engine }}" "${{ needs.lint-knowledge-engine.result }}" "Knowledge Engine lint"
+          assert_result "${{ needs.changes.outputs.frontend }}" "${{ needs.lint-frontend.result }}" "Frontend lint"
+          assert_result "${{ needs.changes.outputs.wework }}" "${{ needs.lint-wework.result }}" "Wework lint"
+
+  merge-queue-summary:
+    name: Lint Summary
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Confirm E2E-only merge queue
+        run: echo "Lint checks are completed before the merge queue"

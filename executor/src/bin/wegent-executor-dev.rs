@@ -1,0 +1,486 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus},
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
+
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+
+const DEBOUNCE_DELAY: Duration = Duration::from_millis(350);
+const EXIT_RESTART_DELAY: Duration = Duration::from_secs(1);
+const BUILD_TARGET_ENV: &str = "WEGENT_EXECUTOR_BUILD_TARGET";
+const PREBUILT_ENV: &str = "WEGENT_EXECUTOR_PREBUILT";
+
+enum DevEvent {
+    FileChanged,
+    Shutdown,
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("wegent-executor dev reload failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let manifest_dir = executor_source_dir();
+    let manifest_path = manifest_dir.join("Cargo.toml");
+    let executor_args = env::args().skip(1).collect::<Vec<_>>();
+    let parent_process_id = parent_process_id();
+    let (tx, rx) = mpsc::channel::<DevEvent>();
+    let _watcher = watch_executor_sources(&manifest_dir, tx.clone())?;
+    install_shutdown_handler(tx)?;
+
+    eprintln!(
+        "wegent-executor dev reload watching {}",
+        manifest_dir.display()
+    );
+
+    let mut child: Option<Child> = None;
+    let mut rebuild_requested = !executor_prebuilt();
+    let mut restart_requested = true;
+
+    loop {
+        if parent_process_exited(parent_process_id) {
+            eprintln!("wegent-executor dev reload parent exited; shutting down");
+            stop_child(&mut child);
+            return Ok(());
+        }
+
+        if restart_requested {
+            stop_child(&mut child);
+            child = if rebuild_requested {
+                rebuild_and_spawn(&manifest_dir, &manifest_path, &executor_args)?
+            } else {
+                Some(spawn_executor(&manifest_dir, &executor_args)?)
+            };
+            rebuild_requested = false;
+            restart_requested = false;
+        }
+
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(DevEvent::FileChanged) => {
+                if drain_debounced_events(&rx) {
+                    stop_child(&mut child);
+                    return Ok(());
+                }
+                eprintln!("executor source changed; restarting");
+                rebuild_requested = true;
+                restart_requested = true;
+            }
+            Ok(DevEvent::Shutdown) => {
+                stop_child(&mut child);
+                return Ok(());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                stop_child(&mut child);
+                return Err("dev reload event channel disconnected".to_owned());
+            }
+        }
+
+        if child_exited(&mut child)? {
+            thread::sleep(EXIT_RESTART_DELAY);
+            restart_requested = true;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn parent_process_id() -> u32 {
+    unsafe { libc::getppid() as u32 }
+}
+
+#[cfg(not(unix))]
+fn parent_process_id() -> u32 {
+    0
+}
+
+#[cfg(unix)]
+fn parent_process_exited(expected_parent_process_id: u32) -> bool {
+    parent_process_changed(expected_parent_process_id, unsafe {
+        libc::getppid() as u32
+    })
+}
+
+#[cfg(not(unix))]
+fn parent_process_exited(_expected_parent_process_id: u32) -> bool {
+    false
+}
+
+#[cfg(any(unix, test))]
+fn parent_process_changed(expected_parent_process_id: u32, current_parent_process_id: u32) -> bool {
+    expected_parent_process_id > 1 && current_parent_process_id != expected_parent_process_id
+}
+
+fn executor_source_dir() -> PathBuf {
+    env::var_os("WEGENT_EXECUTOR_SOURCE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn watch_executor_sources(
+    manifest_dir: &Path,
+    tx: mpsc::Sender<DevEvent>,
+) -> Result<RecommendedWatcher, String> {
+    let mut watcher = RecommendedWatcher::new(
+        move |event| {
+            if let Ok(event) = event {
+                if is_reload_event(&event) {
+                    let _ = tx.send(DevEvent::FileChanged);
+                }
+            }
+        },
+        Config::default(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    watch_path(
+        &mut watcher,
+        &manifest_dir.join("src"),
+        RecursiveMode::Recursive,
+    )?;
+    watch_path(
+        &mut watcher,
+        &manifest_dir.join("Cargo.toml"),
+        RecursiveMode::NonRecursive,
+    )?;
+    watch_path(
+        &mut watcher,
+        &manifest_dir.join("Cargo.lock"),
+        RecursiveMode::NonRecursive,
+    )?;
+    Ok(watcher)
+}
+
+fn watch_path(
+    watcher: &mut RecommendedWatcher,
+    path: &Path,
+    mode: RecursiveMode,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    watcher
+        .watch(path, mode)
+        .map_err(|error| format!("failed to watch {}: {error}", path.display()))
+}
+
+fn install_shutdown_handler(tx: mpsc::Sender<DevEvent>) -> Result<(), String> {
+    ctrlc::set_handler(move || {
+        let _ = tx.send(DevEvent::Shutdown);
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn rebuild_and_spawn(
+    manifest_dir: &Path,
+    manifest_path: &Path,
+    executor_args: &[String],
+) -> Result<Option<Child>, String> {
+    if !build_executor(manifest_path)? {
+        eprintln!("executor build failed; waiting for the next source change");
+        return Ok(None);
+    }
+
+    spawn_executor(manifest_dir, executor_args).map(Some)
+}
+
+fn spawn_executor(manifest_dir: &Path, executor_args: &[String]) -> Result<Child, String> {
+    let binary = debug_binary_path(manifest_dir);
+    Command::new(&binary)
+        .args(executor_args)
+        .current_dir(manifest_dir)
+        .spawn()
+        .map_err(|error| format!("failed to start {}: {error}", binary.display()))
+}
+
+fn build_executor(manifest_path: &Path) -> Result<bool, String> {
+    let manifest_dir = manifest_path
+        .parent()
+        .ok_or_else(|| "Invalid manifest path: no parent directory".to_owned())?;
+    let target_dir = cargo_target_dir(manifest_dir);
+    let output = executor_build_command(manifest_path, &target_dir)
+        .output()
+        .map_err(|error| format!("failed to run cargo build: {error}"))?;
+    if !output.stdout.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(output.status.success())
+}
+
+fn executor_build_command(manifest_path: &Path, target_dir: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .arg("--features")
+        .arg("dev-reload")
+        .arg("--bin")
+        .arg("wegent-executor")
+        .env("CARGO_TARGET_DIR", target_dir);
+    if let Some(target) = executor_build_target() {
+        command.arg("--target").arg(target);
+    }
+    command
+}
+
+fn debug_binary_path(manifest_dir: &Path) -> PathBuf {
+    let executable = if cfg!(windows) {
+        "wegent-executor.exe"
+    } else {
+        "wegent-executor"
+    };
+    let mut path = cargo_target_dir(manifest_dir);
+    if let Some(target) = executor_build_target() {
+        path.push(target);
+    }
+    path.join("debug").join(executable)
+}
+
+fn executor_build_target() -> Option<std::ffi::OsString> {
+    env::var_os(BUILD_TARGET_ENV).filter(|value| !value.is_empty())
+}
+
+fn executor_prebuilt() -> bool {
+    env::var(PREBUILT_ENV).is_ok_and(|value| value == "1")
+}
+
+fn cargo_target_dir(manifest_dir: &Path) -> PathBuf {
+    let target_dir = env::var_os("WEGENT_EXECUTOR_TARGET_DIR")
+        .filter(|value| !value.is_empty())
+        .or_else(|| env::var_os("CARGO_TARGET_DIR").filter(|value| !value.is_empty()));
+    match target_dir {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                env::current_dir()
+                    .unwrap_or_else(|_| manifest_dir.to_path_buf())
+                    .join(path)
+            }
+        }
+        None => manifest_dir.join("target"),
+    }
+}
+
+fn stop_child(child: &mut Option<Child>) {
+    let Some(mut process) = child.take() else {
+        return;
+    };
+    let _ = process.kill();
+    let _ = process.wait();
+}
+
+fn child_exited(child: &mut Option<Child>) -> Result<bool, String> {
+    let Some(process) = child.as_mut() else {
+        return Ok(false);
+    };
+    match process.try_wait() {
+        Ok(Some(status)) => {
+            report_exit(status);
+            *child = None;
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(error) => Err(format!("failed to inspect executor process: {error}")),
+    }
+}
+
+fn report_exit(status: ExitStatus) {
+    if status.success() {
+        eprintln!("executor exited; restarting");
+    } else {
+        eprintln!("executor exited with {status}; restarting");
+    }
+}
+
+fn drain_debounced_events(rx: &mpsc::Receiver<DevEvent>) -> bool {
+    thread::sleep(DEBOUNCE_DELAY);
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            DevEvent::FileChanged => {}
+            DevEvent::Shutdown => return true,
+        }
+    }
+    false
+}
+
+fn is_reload_event(event: &Event) -> bool {
+    !matches!(event.kind, EventKind::Access(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock should not be poisoned")
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn set_text(key: &'static str, value: &str) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                env::set_var(self.key, previous);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn debug_binary_path_uses_explicit_cargo_target_dir() {
+        let _guard = env_lock();
+        let target_dir = env::temp_dir().join("wegent-executor-dev-target");
+        let _env = EnvVarGuard::set("CARGO_TARGET_DIR", &target_dir);
+        let _target = EnvVarGuard::remove(BUILD_TARGET_ENV);
+
+        assert_eq!(
+            debug_binary_path(Path::new("/tmp/executor")),
+            target_dir.join("debug").join(executable_name())
+        );
+    }
+
+    #[test]
+    fn debug_binary_path_defaults_to_manifest_target_dir() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::remove("CARGO_TARGET_DIR");
+        let _target = EnvVarGuard::remove(BUILD_TARGET_ENV);
+        let manifest_dir = Path::new("/tmp/executor");
+
+        assert_eq!(
+            debug_binary_path(manifest_dir),
+            manifest_dir
+                .join("target")
+                .join("debug")
+                .join(executable_name())
+        );
+    }
+
+    #[test]
+    fn debug_binary_path_includes_explicit_build_target() {
+        let _guard = env_lock();
+        let target_dir = env::temp_dir().join("wegent-executor-dev-target");
+        let _env = EnvVarGuard::set("CARGO_TARGET_DIR", &target_dir);
+        let _target = EnvVarGuard::set_text(BUILD_TARGET_ENV, "x86_64-pc-windows-msvc");
+
+        assert_eq!(
+            debug_binary_path(Path::new("/tmp/executor")),
+            target_dir
+                .join("x86_64-pc-windows-msvc")
+                .join("debug")
+                .join(executable_name())
+        );
+    }
+
+    #[test]
+    fn executor_build_command_reuses_dev_reload_features_and_target() {
+        let _guard = env_lock();
+        let _target = EnvVarGuard::set_text(BUILD_TARGET_ENV, "x86_64-pc-windows-msvc");
+        let manifest_path = Path::new("/tmp/executor/Cargo.toml");
+        let target_dir = Path::new("/tmp/executor-target");
+
+        let command = executor_build_command(manifest_path, target_dir);
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            [
+                "build",
+                "--manifest-path",
+                "/tmp/executor/Cargo.toml",
+                "--features",
+                "dev-reload",
+                "--bin",
+                "wegent-executor",
+                "--target",
+                "x86_64-pc-windows-msvc",
+            ]
+        );
+    }
+
+    #[test]
+    fn executor_prebuilt_requires_explicit_one() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::remove(PREBUILT_ENV);
+        assert!(!executor_prebuilt());
+
+        env::set_var(PREBUILT_ENV, "0");
+        assert!(!executor_prebuilt());
+
+        env::set_var(PREBUILT_ENV, "1");
+        assert!(executor_prebuilt());
+    }
+
+    #[test]
+    fn executor_source_dir_uses_runtime_override() {
+        let _guard = env_lock();
+        let source_dir = PathBuf::from("/tmp/wegent-executor-source");
+        let _env = EnvVarGuard::set("WEGENT_EXECUTOR_SOURCE_DIR", &source_dir);
+
+        assert_eq!(executor_source_dir(), source_dir);
+    }
+
+    #[test]
+    fn parent_process_change_detects_orphaned_supervisor() {
+        assert!(parent_process_changed(42, 1));
+        assert!(parent_process_changed(42, 43));
+        assert!(!parent_process_changed(42, 42));
+        assert!(!parent_process_changed(1, 1));
+    }
+
+    fn executable_name() -> &'static str {
+        if cfg!(windows) {
+            "wegent-executor.exe"
+        } else {
+            "wegent-executor"
+        }
+    }
+}

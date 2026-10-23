@@ -1,0 +1,881 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import '@testing-library/jest-dom'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import type { ReactNode } from 'react'
+
+import BotEdit from '@/features/settings/components/BotEdit'
+import { botApis } from '@/apis/bots'
+import { knowledgeBaseApi } from '@/apis/knowledge-base'
+import { modelApis } from '@/apis/models'
+import { publicResourceApis } from '@/apis/publicResources'
+import { shellApis } from '@/apis/shells'
+import { fetchPublicSkillsList, fetchUnifiedSkillsList } from '@/apis/skills'
+import type { Bot } from '@/types/api'
+
+const mockTranslate = (key: string, options?: { count?: number }) => {
+  const translations: Record<string, string> = {
+    'bot.default_knowledge_bases_search_placeholder': 'Search knowledge bases',
+    'bot.default_knowledge_bases_used_for_new_chats':
+      'Used to initialize knowledge bases for new chats.',
+    'bot.default_knowledge_bases_append_hint':
+      'Manual chat-time selection appends additional knowledge bases later.',
+    'bot.default_knowledge_bases_selected_section': 'Selected default knowledge bases',
+    'bot.default_knowledge_bases_available_section': 'Available knowledge bases',
+    'bot.default_knowledge_bases_empty_selection': 'No default knowledge bases selected',
+    'bot.default_knowledge_bases_no_options': 'No available knowledge bases',
+    'bot.default_knowledge_bases_no_match': 'No matching knowledge bases',
+    'bot.default_knowledge_bases_loading': 'Loading knowledge bases...',
+    'bot.default_knowledge_bases_load_failed': 'Failed to load knowledge bases',
+    'bot.default_knowledge_bases_updated_at': 'Updated',
+    'bot.default_knowledge_bases_selected_badge': 'Selected',
+    'bot.default_knowledge_bases_selected_count': `${options?.count ?? 0} selected`,
+    'bot.default_knowledge_bases_group_personal': 'Personal knowledge bases',
+    'bot.default_knowledge_bases_group_group': 'Group knowledge bases',
+    'bot.default_knowledge_bases_group_organization': 'Organization knowledge bases',
+    'bot.default_knowledge_bases_source_personal': 'Personal',
+    'bot.default_knowledge_bases_source_group': 'Group',
+    'bot.default_knowledge_bases_source_organization': 'Organization',
+    'bot.default_knowledge_bases_source_shared': 'Shared',
+    'knowledge:document_count': `${options?.count ?? 0} document`,
+    'knowledge:documents_count': `${options?.count ?? 0} documents`,
+    'skills.preload_hint': 'Check skills to preload them.',
+    'skills.preload_skills_section': 'Preload Skills',
+    'settings:team.simple.core.video_model_label': 'Video model',
+    'settings:team.simple.core.secondary_llm_model_label': 'LLM model',
+  }
+
+  const normalizedKey = key.startsWith('common:') ? key.replace(/^common:/, '') : key
+
+  return translations[key] ?? translations[normalizedKey] ?? key
+}
+
+const mockI18n = { language: 'en' }
+
+jest.mock('@/hooks/useTranslation', () => ({
+  useTranslation: () => ({
+    t: mockTranslate,
+    i18n: mockI18n,
+  }),
+}))
+
+jest.mock('@/apis/knowledge-base', () => ({
+  knowledgeBaseApi: {
+    getAllGrouped: jest.fn(),
+  },
+}))
+
+jest.mock('@/apis/bots', () => {
+  const actual = jest.requireActual('@/apis/bots')
+  return {
+    ...actual,
+    botApis: {
+      ...actual.botApis,
+      updateBot: jest.fn(),
+      createBot: jest.fn(),
+    },
+  }
+})
+
+jest.mock('@/apis/models', () => ({
+  modelApis: {
+    getUnifiedModels: jest.fn(),
+  },
+}))
+
+jest.mock('@/apis/shells', () => {
+  const actual = jest.requireActual('@/apis/shells')
+  return {
+    ...actual,
+    shellApis: {
+      ...actual.shellApis,
+      getUnifiedShells: jest.fn(),
+    },
+  }
+})
+
+jest.mock('@/apis/skills', () => ({
+  fetchUnifiedSkillsList: jest.fn(),
+  fetchPublicSkillsList: jest.fn(),
+}))
+
+jest.mock('@/apis/publicResources', () => ({
+  publicResourceApis: {
+    getPublicShells: jest.fn(),
+    getPublicModels: jest.fn(),
+    updatePublicBot: jest.fn(),
+    createPublicBot: jest.fn(),
+    getPublicBots: jest.fn(),
+  },
+}))
+
+jest.mock('@/features/settings/components/McpConfigSection', () => {
+  function MockMcpConfigSection() {
+    return <div data-testid="mcp-config-section" />
+  }
+
+  return MockMcpConfigSection
+})
+jest.mock('@/features/settings/components/skills/SkillManagementModal', () => {
+  function MockSkillManagementModal() {
+    return null
+  }
+
+  return MockSkillManagementModal
+})
+jest.mock('@/features/settings/components/skills/RichSkillSelector', () => ({
+  RichSkillSelector: function MockRichSkillSelector({
+    skills,
+  }: {
+    skills: Array<{ name: string; displayName?: string }>
+  }) {
+    return (
+      <div data-testid="rich-skill-selector">
+        {skills.map(skill => (
+          <span key={skill.name}>{skill.displayName || skill.name}</span>
+        ))}
+      </div>
+    )
+  },
+}))
+jest.mock('@/features/settings/components/DifyBotConfig', () => {
+  function MockDifyBotConfig() {
+    return null
+  }
+
+  return MockDifyBotConfig
+})
+jest.mock('@/features/prompt-tune/components/PromptFineTuneDialog', () => {
+  function MockPromptFineTuneDialog() {
+    return null
+  }
+
+  return MockPromptFineTuneDialog
+})
+
+jest.mock('@/components/ui/select', () => ({
+  Select: ({
+    children,
+    disabled,
+  }: {
+    value?: string
+    onValueChange?: (value: string) => void
+    children: ReactNode
+    disabled?: boolean
+  }) => (
+    <div data-testid="mock-select" data-disabled={disabled ? 'true' : 'false'}>
+      {children}
+    </div>
+  ),
+  SelectTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectValue: ({ placeholder }: { placeholder?: string }) => <span>{placeholder}</span>,
+  SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+    <div data-testid={`mock-select-item-${value}`}>{children}</div>
+  ),
+}))
+
+jest.mock('@/components/ui/switch', () => ({
+  Switch: ({
+    checked,
+    onCheckedChange,
+    disabled,
+  }: {
+    checked?: boolean
+    onCheckedChange?: (checked: boolean) => void
+    disabled?: boolean
+  }) => (
+    <input
+      data-testid="mock-switch"
+      type="checkbox"
+      checked={checked}
+      onChange={event => onCheckedChange?.(event.target.checked)}
+      disabled={disabled}
+    />
+  ),
+}))
+
+const mockedUpdateBot = botApis.updateBot as jest.Mock
+const mockedKnowledgeBaseGrouped = knowledgeBaseApi.getAllGrouped as jest.Mock
+const mockedGetUnifiedModels = modelApis.getUnifiedModels as jest.Mock
+const mockedGetUnifiedShells = shellApis.getUnifiedShells as jest.Mock
+const mockedFetchUnifiedSkillsList = fetchUnifiedSkillsList as jest.Mock
+const mockedFetchPublicSkillsList = fetchPublicSkillsList as jest.Mock
+const mockedGetPublicShells = publicResourceApis.getPublicShells as jest.Mock
+const mockedGetPublicModels = publicResourceApis.getPublicModels as jest.Mock
+const mockedUpdatePublicBot = publicResourceApis.updatePublicBot as jest.Mock
+
+async function renderBotEdit(
+  botOverrides: Partial<Bot> = {},
+  props: {
+    scope?: 'personal' | 'group' | 'all' | 'public'
+    groupName?: string
+    modelCategoryType?: 'llm' | 'image' | 'video'
+    allowGenerationPrimaryModel?: boolean
+  } = {}
+) {
+  const bot = {
+    id: 7,
+    name: 'Bot Alpha',
+    namespace: 'default',
+    shell_name: 'ClaudeCode',
+    shell_type: 'ClaudeCode',
+    agent_config: {
+      bind_model: 'gpt-4.1',
+      bind_model_type: 'public',
+    },
+    system_prompt: 'helpful',
+    mcp_servers: {},
+    skills: [],
+    default_knowledge_base_refs: [{ id: 101, name: 'Product Docs' }],
+    is_active: true,
+    created_at: '2026-04-02T00:00:00Z',
+    updated_at: '2026-04-02T00:00:00Z',
+    ...botOverrides,
+  }
+
+  const setBots = jest.fn()
+  const onClose = jest.fn()
+  const toast = jest.fn()
+
+  await act(async () => {
+    render(
+      <BotEdit
+        bots={[bot]}
+        setBots={setBots}
+        editingBotId={7}
+        cloningBot={null}
+        onClose={onClose}
+        toast={toast}
+        scope={props.scope || 'personal'}
+        groupName={props.groupName}
+        modelCategoryType={props.modelCategoryType}
+        allowGenerationPrimaryModel={props.allowGenerationPrimaryModel}
+      />
+    )
+  })
+
+  return { setBots, onClose, toast }
+}
+
+describe('BotEdit default knowledge bases', () => {
+  beforeEach(() => {
+    mockedUpdateBot.mockReset()
+    mockedKnowledgeBaseGrouped.mockReset()
+    mockedGetUnifiedModels.mockReset()
+    mockedGetUnifiedShells.mockReset()
+    mockedFetchUnifiedSkillsList.mockReset()
+    mockedFetchPublicSkillsList.mockReset()
+    mockedGetPublicShells.mockReset()
+    mockedGetPublicModels.mockReset()
+    mockedUpdatePublicBot.mockReset()
+
+    mockedGetUnifiedShells.mockResolvedValue({
+      data: [{ name: 'ClaudeCode', type: 'public', shellType: 'ClaudeCode' }],
+    })
+    mockedGetPublicShells.mockResolvedValue([
+      { name: 'ClaudeCode', type: 'public', shellType: 'ClaudeCode' },
+      { name: 'Chat', type: 'public', shellType: 'Chat' },
+      { name: 'Dify', type: 'public', shellType: 'Dify' },
+    ])
+    mockedGetUnifiedModels.mockResolvedValue({
+      data: [{ name: 'gpt-4.1', type: 'public', namespace: 'default' }],
+    })
+    mockedGetPublicModels.mockResolvedValue([{ name: 'gpt-4.1', type: 'public' }])
+    mockedFetchUnifiedSkillsList.mockResolvedValue([])
+    mockedFetchPublicSkillsList.mockResolvedValue([])
+    mockedKnowledgeBaseGrouped.mockResolvedValue({
+      personal: {
+        created_by_me: [
+          {
+            id: 101,
+            name: 'Product Docs',
+            description: 'Product references',
+            kb_type: 'notebook',
+            namespace: 'default',
+            document_count: 3,
+            updated_at: '2026-04-02T00:00:00Z',
+            created_at: '2026-04-01T00:00:00Z',
+            user_id: 7,
+            group_id: 'default',
+            group_name: 'Personal',
+            group_type: 'personal',
+          },
+        ],
+        shared_with_me: [
+          {
+            id: 404,
+            name: 'Support FAQ',
+            description: 'Shared support answers',
+            kb_type: 'notebook',
+            namespace: 'default',
+            document_count: 2,
+            updated_at: '2026-04-01T08:00:00Z',
+            created_at: '2026-03-30T00:00:00Z',
+            user_id: 9,
+            group_id: 'default',
+            group_name: 'Shared with me',
+            group_type: 'personal-shared',
+          },
+        ],
+      },
+      groups: [
+        {
+          group_name: 'platform',
+          group_display_name: 'Platform',
+          kb_count: 1,
+          knowledge_bases: [
+            {
+              id: 202,
+              name: 'Runbooks',
+              description: 'Ops guides',
+              kb_type: 'notebook',
+              namespace: 'platform',
+              document_count: 4,
+              updated_at: '2026-04-02T12:30:00Z',
+              created_at: '2026-04-01T00:00:00Z',
+              user_id: 8,
+              group_id: 'platform',
+              group_name: 'Platform',
+              group_type: 'group',
+            },
+          ],
+        },
+        {
+          group_name: 'growth',
+          group_display_name: 'Growth',
+          kb_count: 1,
+          knowledge_bases: [
+            {
+              id: 505,
+              name: 'Growth Playbooks',
+              description: 'Growth experiments',
+              kb_type: 'notebook',
+              namespace: 'growth',
+              document_count: 5,
+              updated_at: '2026-04-02T13:30:00Z',
+              created_at: '2026-04-01T00:00:00Z',
+              user_id: 10,
+              group_id: 'growth',
+              group_name: 'Growth',
+              group_type: 'group',
+            },
+          ],
+        },
+      ],
+      organization: {
+        namespace: 'org',
+        display_name: 'Organization',
+        kb_count: 1,
+        knowledge_bases: [
+          {
+            id: 303,
+            name: 'Security Policies',
+            description: 'Company-wide security guidance',
+            kb_type: 'classic',
+            namespace: 'org',
+            document_count: 6,
+            updated_at: '2026-04-03T09:00:00Z',
+            created_at: '2026-04-01T00:00:00Z',
+            user_id: 1,
+            group_id: 'org',
+            group_name: 'Organization',
+            group_type: 'organization',
+          },
+        ],
+      },
+      summary: {
+        total_count: 3,
+        personal_count: 1,
+        group_count: 1,
+        organization_count: 1,
+      },
+    })
+    mockedUpdateBot.mockResolvedValue({
+      id: 7,
+      name: 'Bot Alpha',
+      namespace: 'default',
+      shell_name: 'ClaudeCode',
+      shell_type: 'ClaudeCode',
+      agent_config: {
+        bind_model: 'gpt-4.1',
+        bind_model_type: 'public',
+      },
+      system_prompt: 'helpful',
+      mcp_servers: {},
+      skills: [],
+      default_knowledge_base_refs: [{ id: 101, name: 'Product Docs' }],
+      is_active: true,
+      created_at: '2026-04-02T00:00:00Z',
+      updated_at: '2026-04-02T00:00:00Z',
+    })
+  })
+
+  test('loads existing bot default knowledge bases into the form', async () => {
+    await renderBotEdit()
+
+    expect(await screen.findByTestId('default-knowledge-base-chip-101')).toBeInTheDocument()
+    expect(screen.getByText('Product Docs')).toBeInTheDocument()
+  })
+
+  test('keeps a create-mode bot draft when the publish scope changes', async () => {
+    const shellData = {
+      data: [{ name: 'ClaudeCode', type: 'public', shellType: 'ClaudeCode' }],
+    }
+    let resolveInitialShells!: (value: typeof shellData) => void
+    let resolveRefreshShells!: (value: typeof shellData) => void
+    mockedGetUnifiedShells.mockReset()
+    mockedGetUnifiedShells
+      .mockImplementationOnce(() => new Promise(resolve => (resolveInitialShells = resolve)))
+      .mockImplementationOnce(() => new Promise(resolve => (resolveRefreshShells = resolve)))
+
+    const agentSelect = () => screen.getAllByTestId('mock-select')[0]
+    let view: ReturnType<typeof render>
+    await act(async () => {
+      view = render(
+        <BotEdit
+          bots={[]}
+          setBots={jest.fn()}
+          editingBotId={0}
+          cloningBot={null}
+          onClose={jest.fn()}
+          toast={jest.fn()}
+          scope="personal"
+          embedded
+          hideActions
+        />
+      )
+    })
+    await act(async () => {
+      resolveInitialShells(shellData)
+    })
+    await waitFor(() => {
+      expect(agentSelect()).not.toHaveAttribute('data-disabled', 'true')
+    })
+
+    const nameInput = await screen.findByPlaceholderText('common:bot.name_placeholder')
+    fireEvent.change(nameInput, { target: { value: 'draft-bot' } })
+    const promptTextarea = screen.getByPlaceholderText('common:bot.prompt_placeholder')
+    fireEvent.change(promptTextarea, { target: { value: 'Draft prompt' } })
+    expect(nameInput).toHaveValue('draft-bot')
+    expect(promptTextarea).toHaveValue('Draft prompt')
+
+    await act(async () => {
+      view.rerender(
+        <BotEdit
+          bots={[]}
+          setBots={jest.fn()}
+          editingBotId={0}
+          cloningBot={null}
+          onClose={jest.fn()}
+          toast={jest.fn()}
+          scope="group"
+          groupName="engineering"
+          embedded
+          hideActions
+        />
+      )
+    })
+
+    await waitFor(() => {
+      expect(mockedGetUnifiedShells).toHaveBeenCalledTimes(2)
+    })
+    await act(async () => {
+      resolveRefreshShells(shellData)
+    })
+    await waitFor(() => {
+      expect(agentSelect()).not.toHaveAttribute('data-disabled', 'true')
+    })
+
+    const nameAfter = screen.getByPlaceholderText('common:bot.name_placeholder')
+    expect(nameAfter).toHaveValue('draft-bot')
+    expect(screen.getByPlaceholderText('common:bot.prompt_placeholder')).toHaveValue('Draft prompt')
+  })
+
+  test('renders selected hidden skill display name without exposing it as selectable', async () => {
+    mockedFetchUnifiedSkillsList.mockResolvedValue([
+      {
+        id: 909,
+        name: 'interactive-form-question',
+        namespace: 'default',
+        description: 'Hidden skill',
+        displayName: '交互式表单提问',
+        visible: false,
+        is_active: true,
+        is_public: true,
+        user_id: 0,
+      },
+    ])
+
+    await renderBotEdit({
+      skills: ['interactive-form-question'],
+      skill_refs: {
+        'interactive-form-question': {
+          skill_id: 909,
+          namespace: 'default',
+          is_public: true,
+        },
+      },
+    })
+
+    expect(await screen.findByText('交互式表单提问')).toBeInTheDocument()
+    expect(screen.queryByTestId('rich-skill-selector')).not.toBeInTheDocument()
+  })
+
+  test('shows preload controls for selected Claude Code skills', async () => {
+    mockedFetchUnifiedSkillsList.mockResolvedValue([
+      {
+        id: 5,
+        name: 'repo-reader',
+        namespace: 'default',
+        description: 'Read repository context',
+        displayName: 'Repo Reader',
+        visible: true,
+        is_active: true,
+        is_public: false,
+        user_id: 7,
+      },
+    ])
+
+    await renderBotEdit({
+      skills: ['repo-reader'],
+      skill_refs: {
+        'repo-reader': {
+          skill_id: 5,
+          namespace: 'default',
+          is_public: false,
+        },
+      },
+    })
+
+    expect((await screen.findAllByText('Repo Reader')).length).toBeGreaterThan(0)
+    expect(screen.getByTitle('Preload Skills')).toBeInTheDocument()
+    expect(screen.getByText('Check skills to preload them.')).toBeInTheDocument()
+  })
+
+  test('shows hidden public skills as selectable when editing public bots', async () => {
+    mockedFetchPublicSkillsList.mockResolvedValue([
+      {
+        id: 910,
+        name: 'hidden-public-skill',
+        namespace: 'default',
+        description: 'Hidden public skill',
+        displayName: '隐藏公共技能',
+        visible: false,
+        is_active: true,
+        is_public: true,
+        user_id: 0,
+      },
+    ])
+
+    await renderBotEdit({}, { scope: 'public' })
+
+    expect(await screen.findByTestId('rich-skill-selector')).toBeInTheDocument()
+    expect(screen.getByText('隐藏公共技能')).toBeInTheDocument()
+  })
+
+  test('loads public image models for image-bound teams', async () => {
+    await renderBotEdit({}, { scope: 'public', modelCategoryType: 'image' })
+
+    await waitFor(() => {
+      expect(mockedGetPublicModels).toHaveBeenCalledWith('ClaudeCode', 'image')
+    })
+  })
+
+  test('loads LLM and video models together for video Bot configuration', async () => {
+    await renderBotEdit(
+      {},
+      {
+        scope: 'public',
+        modelCategoryType: 'video',
+      }
+    )
+
+    await waitFor(() => {
+      expect(mockedGetPublicModels).toHaveBeenCalledWith('ClaudeCode', undefined)
+    })
+  })
+
+  test('shows the required secondary LLM selector when the Bot primary model is video', async () => {
+    mockedGetPublicModels.mockResolvedValue([
+      {
+        name: 'seedance-video',
+        displayName: 'Seedance Video',
+        type: 'public',
+        namespace: 'default',
+        modelCategoryType: 'video',
+      },
+      {
+        name: 'planning-llm',
+        displayName: 'Planning LLM',
+        type: 'public',
+        namespace: 'default',
+        modelCategoryType: 'llm',
+      },
+    ])
+
+    await renderBotEdit(
+      {
+        shell_name: 'Chat',
+        shell_type: 'Chat',
+        agent_config: {
+          bind_model: 'seedance-video',
+          bind_model_type: 'public',
+          bind_model_namespace: 'default',
+        },
+        secondary_model_name: 'planning-llm',
+        secondary_model_namespace: 'default',
+      },
+      {
+        scope: 'public',
+        modelCategoryType: 'video',
+      }
+    )
+
+    expect(await screen.findByText('Video model')).toBeInTheDocument()
+    expect(screen.getByText('LLM model')).toBeInTheDocument()
+    expect(await screen.findByTestId('bot-secondary-model-select')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByText('Planning LLM')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByTestId('save-button'))
+
+    await waitFor(() => {
+      expect(mockedUpdatePublicBot).toHaveBeenCalledWith(
+        7,
+        expect.objectContaining({
+          agent_config: expect.objectContaining({
+            bind_model: 'seedance-video',
+          }),
+          secondary_model_name: 'planning-llm',
+          secondary_model_namespace: 'default',
+        })
+      )
+    })
+  })
+
+  test('rejects a video Bot without a secondary LLM', async () => {
+    mockedGetPublicModels.mockResolvedValue([
+      {
+        name: 'seedance-video',
+        displayName: 'Seedance Video',
+        type: 'public',
+        namespace: 'default',
+        modelCategoryType: 'video',
+      },
+      {
+        name: 'planning-llm',
+        displayName: 'Planning LLM',
+        type: 'public',
+        namespace: 'default',
+        modelCategoryType: 'llm',
+      },
+    ])
+
+    await renderBotEdit(
+      {
+        shell_name: 'Chat',
+        shell_type: 'Chat',
+        agent_config: {
+          bind_model: 'seedance-video',
+          bind_model_type: 'public',
+          bind_model_namespace: 'default',
+        },
+        secondary_model_name: null,
+      },
+      {
+        scope: 'public',
+        modelCategoryType: 'video',
+      }
+    )
+
+    expect(await screen.findByTestId('bot-secondary-model-select')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByTestId('bot-secondary-model-select')).not.toBeDisabled()
+    })
+    fireEvent.click(screen.getByTestId('save-button'))
+
+    await waitFor(() => {
+      expect(mockedUpdatePublicBot).not.toHaveBeenCalled()
+    })
+  })
+
+  test('hides knowledge base selector for public Dify bots', async () => {
+    await renderBotEdit(
+      {
+        shell_name: 'Dify',
+        shell_type: 'Dify',
+        agent_config: {},
+      },
+      { scope: 'public' }
+    )
+
+    await waitFor(() => {
+      expect(mockedGetPublicShells).toHaveBeenCalled()
+    })
+    expect(screen.queryByTestId('default-knowledge-base-trigger')).not.toBeInTheDocument()
+  })
+
+  test('shows only organization knowledge bases for public non-Dify bots', async () => {
+    await renderBotEdit({}, { scope: 'public' })
+
+    fireEvent.click(await screen.findByTestId('default-knowledge-base-trigger'))
+
+    expect(screen.getByTestId('default-knowledge-base-group-organization')).toBeInTheDocument()
+    expect(screen.queryByTestId('default-knowledge-base-group-personal')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('default-knowledge-base-group-group')).not.toBeInTheDocument()
+    expect(screen.getByText('Company-wide security guidance')).toBeInTheDocument()
+  })
+
+  test('shows only current group and organization knowledge bases for group bots', async () => {
+    await renderBotEdit(
+      {
+        namespace: 'platform',
+        default_knowledge_base_refs: [],
+      },
+      { scope: 'group', groupName: 'platform' }
+    )
+
+    fireEvent.click(await screen.findByTestId('default-knowledge-base-trigger'))
+
+    expect(screen.queryByTestId('default-knowledge-base-group-personal')).not.toBeInTheDocument()
+    expect(screen.getByTestId('default-knowledge-base-group-group')).toBeInTheDocument()
+    expect(screen.getByTestId('default-knowledge-base-group-organization')).toBeInTheDocument()
+    expect(screen.getByText('Ops guides')).toBeInTheDocument()
+    expect(screen.getByText('Company-wide security guidance')).toBeInTheDocument()
+    expect(screen.queryByText('Growth experiments')).not.toBeInTheDocument()
+  })
+
+  test('renders popover-based selector with grouped metadata', async () => {
+    await renderBotEdit()
+
+    fireEvent.click(await screen.findByTestId('default-knowledge-base-trigger'))
+
+    expect(screen.queryByTestId('default-knowledge-base-selected-section')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('default-knowledge-base-available-section')).not.toBeInTheDocument()
+    expect(screen.getByTestId('default-knowledge-base-popover')).toBeInTheDocument()
+    expect(screen.getByTestId('default-knowledge-base-search-input')).toBeInTheDocument()
+
+    expect(screen.getByTestId('default-knowledge-base-group-personal')).toBeInTheDocument()
+    expect(screen.getAllByTestId('default-knowledge-base-group-group')).toHaveLength(2)
+    expect(screen.getByTestId('default-knowledge-base-group-organization')).toBeInTheDocument()
+
+    expect(screen.getByText('Ops guides')).toBeInTheDocument()
+    expect(screen.getByText('Company-wide security guidance')).toBeInTheDocument()
+    expect(screen.getByText('Shared support answers')).toBeInTheDocument()
+    expect(screen.getAllByText('Group').length).toBeGreaterThan(0)
+    expect(screen.getByText('Organization')).toBeInTheDocument()
+    expect(screen.getByText('Shared')).toBeInTheDocument()
+    expect(screen.getByText('Platform')).toBeInTheDocument()
+    expect(screen.getByText('4 documents')).toBeInTheDocument()
+    expect(screen.getByText('6 documents')).toBeInTheDocument()
+    expect(screen.getAllByText(/Updated 2026-04-02/).length).toBeGreaterThan(0)
+  })
+
+  test('allows adding and removing multiple knowledge bases', async () => {
+    await renderBotEdit()
+
+    fireEvent.click(await screen.findByTestId('default-knowledge-base-trigger'))
+
+    const searchInput = await screen.findByTestId('default-knowledge-base-search-input')
+    fireEvent.change(searchInput, { target: { value: 'Runbooks' } })
+
+    fireEvent.click(await screen.findByTestId('default-knowledge-base-option-202'))
+
+    expect(screen.getByTestId('default-knowledge-base-chip-101')).toBeInTheDocument()
+    expect(screen.getByTestId('default-knowledge-base-chip-202')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId('default-knowledge-base-remove-101'))
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('default-knowledge-base-chip-101')).not.toBeInTheDocument()
+    })
+    expect(screen.getByTestId('default-knowledge-base-chip-202')).toBeInTheDocument()
+  })
+
+  test('includes default_knowledge_base_refs in save payload', async () => {
+    await renderBotEdit()
+
+    fireEvent.click(await screen.findByTestId('default-knowledge-base-trigger'))
+
+    const searchInput = await screen.findByTestId('default-knowledge-base-search-input')
+    fireEvent.change(searchInput, { target: { value: 'Runbooks' } })
+    fireEvent.click(await screen.findByTestId('default-knowledge-base-option-202'))
+
+    fireEvent.click(screen.getByTestId('save-button'))
+
+    await waitFor(() => {
+      expect(mockedUpdateBot).toHaveBeenCalledWith(
+        7,
+        expect.objectContaining({
+          default_knowledge_base_refs: [
+            { id: 101, name: 'Product Docs' },
+            { id: 202, name: 'Runbooks' },
+          ],
+        })
+      )
+    })
+  })
+
+  test('preserves an existing model binding when the model is hidden from selection', async () => {
+    mockedGetUnifiedModels.mockResolvedValue({
+      data: [{ name: 'replacement-model', type: 'public', namespace: 'default' }],
+    })
+
+    await renderBotEdit({
+      agent_config: {
+        bind_model: 'hidden-model',
+        bind_model_type: 'public',
+        bind_model_namespace: 'default',
+      },
+    })
+
+    expect(await screen.findByText('hidden-model')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId('save-button'))
+
+    await waitFor(() => {
+      expect(mockedUpdateBot).toHaveBeenCalledWith(
+        7,
+        expect.objectContaining({
+          agent_config: expect.objectContaining({
+            bind_model: 'hidden-model',
+            bind_model_type: 'public',
+          }),
+        })
+      )
+    })
+  })
+
+  test('does not replace a saved model namespace with a same-name model', async () => {
+    mockedGetUnifiedModels.mockResolvedValue({
+      data: [{ name: 'shared-name', type: 'public', namespace: 'default' }],
+    })
+
+    await renderBotEdit({
+      agent_config: {
+        bind_model: 'shared-name',
+        bind_model_type: 'public',
+        bind_model_namespace: 'archived',
+      },
+    })
+
+    fireEvent.click(screen.getByTestId('save-button'))
+
+    await waitFor(() => {
+      expect(mockedUpdateBot).toHaveBeenCalledWith(
+        7,
+        expect.objectContaining({
+          agent_config: expect.objectContaining({
+            bind_model: 'shared-name',
+            bind_model_type: 'public',
+            bind_model_namespace: 'archived',
+          }),
+        })
+      )
+    })
+  })
+})

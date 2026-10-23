@@ -1,0 +1,863 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Celery tasks for Knowledge Base background operations.
+
+This module provides Celery tasks for:
+1. RAG document indexing
+2. Document summary generation
+3. Knowledge base summary update
+
+These tasks are the unified async mechanism used by both REST API and MCP tools.
+"""
+
+import asyncio
+import logging
+from typing import Optional
+
+from celery import Task
+from celery.exceptions import Retry
+
+from app.core.celery_app import celery_app
+from app.core.config import settings
+from app.core.distributed_lock import distributed_lock
+from app.db.session import SessionLocal
+from app.schemas.knowledge import DocumentProcessingError, DocumentProcessingStage
+from app.services.knowledge.processing_errors import (
+    build_processing_error,
+    map_indexing_exception,
+)
+from shared.telemetry.decorators import trace_sync
+
+logger = logging.getLogger(__name__)
+
+
+class LateIndexCleanupError(RuntimeError):
+    """Raised when a late-index cleanup failed on its last allowed attempt.
+
+    The document row is already gone, so this failure cannot be retried through
+    any product entry: it has to surface as the task's own failure.
+    """
+
+
+def _delete_late_index_if_document_was_deleted(
+    *,
+    db,
+    document_id: int,
+    knowledge_base_id: str,
+    user_id: int,
+) -> bool:
+    """Compensate a RAG write that completed after its document was deleted."""
+    from app.models.knowledge import KnowledgeDocument
+    from app.services.knowledge.indexing import get_kb_index_info
+    from app.services.rag.gateway_factory import get_rag_gateway
+    from app.services.rag.runtime_resolver import RagRuntimeResolver
+
+    exists = (
+        db.query(KnowledgeDocument.id)
+        .filter(KnowledgeDocument.id == document_id)
+        .first()
+    )
+    if exists is not None:
+        return False
+
+    kb_info = get_kb_index_info(
+        db=db,
+        knowledge_base_id=int(knowledge_base_id),
+        current_user_id=user_id,
+    )
+    delete_spec = RagRuntimeResolver().build_delete_runtime_spec(
+        db=db,
+        knowledge_base_id=int(knowledge_base_id),
+        document_ref=str(document_id),
+        index_owner_user_id=kb_info.index_owner_user_id,
+    )
+    asyncio.run(get_rag_gateway().delete_document_index(delete_spec, db=db))
+    return True
+
+
+def _cleanup_late_index_or_retry(
+    task: Task,
+    *,
+    document_id: int,
+    knowledge_base_id: str,
+    user_id: int,
+) -> bool:
+    """Remove chunks a late write left for a deleted document.
+
+    The document row is already gone, so no product entry can trigger this
+    removal again: a failed cleanup retries the task, and the retried task comes
+    back here - a task whose document no longer exists only cleans up - until the
+    removal succeeds. Exhausted retries re-raise, so the failure stays visible
+    instead of ending as a clean skip.
+    """
+    try:
+        with SessionLocal() as cleanup_db:
+            return _delete_late_index_if_document_was_deleted(
+                db=cleanup_db,
+                document_id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                user_id=user_id,
+            )
+    except Exception as exc:
+        retries = getattr(task.request, "retries", 0)
+        max_retries = getattr(task, "max_retries", 0) or 0
+        if retries >= max_retries:
+            logger.error(
+                f"[Celery RAG Indexing] Late index cleanup retries exhausted: "
+                f"document_id={document_id}, retries={retries}, error={exc}",
+                exc_info=True,
+            )
+            raise LateIndexCleanupError(
+                f"Late index cleanup failed after {retries} retries for document "
+                f"{document_id}: {exc}"
+            ) from exc
+        logger.warning(
+            f"[Celery RAG Indexing] Late index cleanup failed, scheduling retry: "
+            f"document_id={document_id}, retry={retries + 1}/{max_retries}, "
+            f"countdown={KNOWLEDGE_INDEX_LOCK_RETRY_DELAY_SECONDS}s, error={exc}"
+        )
+        try:
+            task.retry(exc=exc, countdown=KNOWLEDGE_INDEX_LOCK_RETRY_DELAY_SECONDS)
+        except Retry:
+            raise
+        except Exception as retry_error:
+            # Outside a worker Celery re-raises the original error instead of
+            # Retry. The removal still owns its failure, so it must not fall
+            # through to the indexing failure path and run again.
+            raise LateIndexCleanupError(
+                f"Late index cleanup failed for document {document_id}: "
+                f"{retry_error}"
+            ) from retry_error
+
+
+def _build_stale_processing_error(
+    index_status: object, *, generation: int
+) -> DocumentProcessingError:
+    """Expose a stable timeout code while keeping stale reasons internal."""
+    from app.models.knowledge import DocumentIndexStatus
+
+    conversion_stage = index_status in {
+        DocumentIndexStatus.PENDING_CONVERSION,
+        DocumentIndexStatus.CONVERTING,
+    }
+    return build_processing_error(
+        stage=(
+            DocumentProcessingStage.CONVERSION
+            if conversion_stage
+            else DocumentProcessingStage.INDEXING
+        ),
+        code="conversion_timeout" if conversion_stage else "indexing_timeout",
+        message=(
+            "Document conversion timed out. Please retry."
+            if conversion_stage
+            else "Document indexing timed out. Please retry."
+        ),
+        retryable=True,
+        generation=generation,
+    )
+
+
+KNOWLEDGE_INDEX_LOCK_TIMEOUT_SECONDS = settings.KNOWLEDGE_INDEX_LOCK_TIMEOUT_SECONDS
+KNOWLEDGE_INDEX_LOCK_EXTEND_INTERVAL_SECONDS = (
+    settings.KNOWLEDGE_INDEX_LOCK_EXTEND_INTERVAL_SECONDS
+)
+KNOWLEDGE_INDEX_LOCK_RETRY_DELAY_SECONDS = (
+    settings.KNOWLEDGE_INDEX_LOCK_RETRY_DELAY_SECONDS
+)
+
+
+def _enqueue_document_summary_task(
+    *,
+    document_id: int,
+    user_id: int,
+    user_name: str,
+) -> None:
+    """Enqueue document summary generation without blocking the indexing task."""
+    try:
+        generate_document_summary_task.delay(
+            document_id=document_id,
+            user_id=user_id,
+            user_name=user_name,
+        )
+        logger.info(
+            f"[Celery RAG Indexing] Enqueued document summary task: "
+            f"document_id={document_id}, user_id={user_id}"
+        )
+    except Exception as exc:
+        logger.warning(
+            f"[Celery RAG Indexing] Failed to enqueue document summary task for "
+            f"document {document_id}: {exc}",
+            exc_info=True,
+        )
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.knowledge_tasks.import_external_document",
+)
+@trace_sync(
+    span_name="knowledge.import_external_document",
+    tracer_name="knowledge.tasks",
+    extract_attributes=lambda self, document_id, expected_generation: {
+        "knowledge.document_id": document_id,
+        "knowledge.expected_generation": expected_generation,
+    },
+)
+def import_external_document_task(self, document_id: int, expected_generation: int):
+    """
+    Celery task for importing one external provider document.
+
+    Claims the queued generation once, fetches the external document body,
+    creates the attachment, and reuses the regular indexing pipeline.
+    Duplicate or older messages are skipped before contacting the provider.
+    Failures are recorded on the document as a structured processing error
+    instead of deleting the placeholder.
+
+    Args:
+        document_id: Placeholder KnowledgeDocument ID with external identity
+        expected_generation: Generation captured when this message was enqueued
+    """
+    from app.models.knowledge import KnowledgeDocument
+    from app.models.user import User
+    from app.services.knowledge.external_document_import import (
+        run_external_document_import,
+    )
+    from app.services.knowledge.index_state_machine import (
+        begin_external_import_attempt,
+    )
+
+    with SessionLocal() as db:
+        attempt = begin_external_import_attempt(db, document_id, expected_generation)
+        if not attempt.should_execute:
+            logger.info(
+                "[Celery External Import] Skipping document_id=%s "
+                "generation=%s reason=%s",
+                document_id,
+                expected_generation,
+                attempt.reason,
+            )
+            return
+        document = (
+            db.query(KnowledgeDocument)
+            .filter(KnowledgeDocument.id == document_id)
+            .first()
+        )
+        if document is None:
+            # Deleted between the claim and this read; nothing to revive.
+            logger.info(
+                "[Celery External Import] Document %s no longer exists; skipping",
+                document_id,
+            )
+            return
+        user = db.query(User).filter(User.id == document.user_id).first()
+        logger.info(
+            "[Celery External Import] Fetching body document_id=%s generation=%s "
+            "task_id=%s",
+            document_id,
+            attempt.generation,
+            getattr(self.request, "id", None) or "unavailable",
+        )
+        run_external_document_import(db, document, user, generation=attempt.generation)
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.knowledge_tasks.index_document",
+    max_retries=settings.KNOWLEDGE_INDEX_LOCK_MAX_RETRIES,
+    default_retry_delay=settings.KNOWLEDGE_INDEX_LOCK_RETRY_DELAY_SECONDS,
+)
+def index_document_task(
+    self,
+    knowledge_base_id: str,
+    attachment_id: int,
+    retriever_name: str,
+    retriever_namespace: str,
+    embedding_model_name: str,
+    embedding_model_namespace: str,
+    user_id: int,
+    user_name: str,
+    document_id: Optional[int] = None,
+    index_generation: int = 0,
+    splitter_config_dict: Optional[dict] = None,
+    trigger_summary: bool = True,
+    caller_user_id: int | None = None,
+):
+    """
+    Celery task for RAG document indexing.
+
+    This is the unified async task for document indexing, used by both
+    REST API and MCP tools.
+
+    Args:
+        knowledge_base_id: Knowledge base ID
+        attachment_id: Attachment ID
+        retriever_name: Retriever name
+        retriever_namespace: Retriever namespace
+        embedding_model_name: Embedding model name
+        embedding_model_namespace: Embedding model namespace
+        user_id: User ID
+        user_name: Username
+        document_id: Document ID
+        index_generation: Business generation for stale-task protection
+        splitter_config_dict: Optional splitter configuration as dict
+        trigger_summary: Whether to trigger document summary after indexing
+    """
+    from app.services.knowledge.index_state_machine import (
+        get_document_index_lock_name,
+        mark_document_index_failed,
+        mark_document_index_started,
+        mark_document_index_succeeded,
+    )
+    from app.services.knowledge.indexing import (
+        get_kb_index_info,
+        run_document_indexing,
+    )
+
+    task_id = getattr(self.request, "id", "unknown")
+    retry_count = getattr(self.request, "retries", 0)
+    worker_hostname = getattr(self.request, "hostname", "unknown")
+
+    logger.info(
+        f"[Celery RAG Indexing] Task started: task_id={task_id}, "
+        f"worker={worker_hostname}, retry={retry_count}/{self.max_retries}, "
+        f"kb_id={knowledge_base_id}, attachment_id={attachment_id}, "
+        f"document_id={document_id}, index_generation={index_generation}, "
+        f"trigger_summary={trigger_summary}"
+    )
+
+    if document_id is None:
+        result = run_document_indexing(
+            knowledge_base_id=knowledge_base_id,
+            attachment_id=attachment_id,
+            retriever_name=retriever_name,
+            retriever_namespace=retriever_namespace,
+            embedding_model_name=embedding_model_name,
+            embedding_model_namespace=embedding_model_namespace,
+            user_id=user_id,
+            user_name=user_name,
+            caller_user_id=caller_user_id,
+            splitter_config_dict=splitter_config_dict,
+            document_id=document_id,
+            trigger_summary=trigger_summary,
+        )
+        logger.info(
+            f"[Celery RAG Indexing] Completed without document guard: task_id={task_id}, "
+            f"attachment_id={attachment_id}, result={result}"
+        )
+        return result
+
+    lock_name = get_document_index_lock_name(document_id)
+    with distributed_lock.acquire_watchdog_context(
+        lock_name,
+        expire_seconds=KNOWLEDGE_INDEX_LOCK_TIMEOUT_SECONDS,
+        extend_interval_seconds=KNOWLEDGE_INDEX_LOCK_EXTEND_INTERVAL_SECONDS,
+    ) as acquired:
+        if not acquired:
+            if retry_count < self.max_retries:
+                logger.warning(
+                    f"[Celery RAG Indexing] Lock held, scheduling retry: "
+                    f"task_id={task_id}, document_id={document_id}, "
+                    f"index_generation={index_generation}, retry={retry_count + 1}/{self.max_retries}, "
+                    f"countdown={KNOWLEDGE_INDEX_LOCK_RETRY_DELAY_SECONDS}s"
+                )
+                raise self.retry(
+                    exc=RuntimeError(
+                        f"knowledge_index_lock_held:{document_id}:{index_generation}"
+                    ),
+                    countdown=KNOWLEDGE_INDEX_LOCK_RETRY_DELAY_SECONDS,
+                )
+
+            logger.warning(
+                f"[Celery RAG Indexing] Lock retry exhausted, marking failed: "
+                f"task_id={task_id}, document_id={document_id}, "
+                f"index_generation={index_generation}, retries={retry_count}"
+            )
+            with SessionLocal() as state_db:
+                mark_document_index_failed(
+                    db=state_db,
+                    document_id=document_id,
+                    generation=index_generation,
+                    error=build_processing_error(
+                        stage=DocumentProcessingStage.INDEXING,
+                        code="index_lock_timeout",
+                        message=(
+                            "The document indexing task waited too long. "
+                            "Please retry."
+                        ),
+                        retryable=True,
+                        generation=index_generation,
+                    ),
+                )
+            # A task that only ever waited cannot leave a write behind, but a
+            # retried cleanup may have lost the lock race: when its document is
+            # already gone, still remove the late reference instead of skipping.
+            deleted = _cleanup_late_index_or_retry(
+                self,
+                document_id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                user_id=user_id,
+            )
+            return {
+                "status": "skipped",
+                "reason": "lock_retry_exhausted",
+                "document_id": document_id,
+                "knowledge_base_id": knowledge_base_id,
+                "index_generation": index_generation,
+                "deleted_late_index": deleted,
+            }
+
+        with SessionLocal() as state_db:
+            start_decision = mark_document_index_started(
+                db=state_db,
+                document_id=document_id,
+                generation=index_generation,
+            )
+
+        if not start_decision.should_execute:
+            if start_decision.reason == "document_not_found":
+                # The document was deleted while this task waited for the index
+                # lock, so nothing may stay under its reference. Clean the
+                # reference up here as well, which is also the retry entry for a
+                # compensation that failed.
+                deleted = _cleanup_late_index_or_retry(
+                    self,
+                    document_id=document_id,
+                    knowledge_base_id=knowledge_base_id,
+                    user_id=user_id,
+                )
+                logger.info(
+                    f"[Celery RAG Indexing] Task skipped for a deleted document and "
+                    f"cleaned its late index: task_id={task_id}, "
+                    f"document_id={document_id}, deleted_late_index={deleted}"
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "document_not_found",
+                    "document_id": document_id,
+                    "knowledge_base_id": knowledge_base_id,
+                    "index_generation": index_generation,
+                    "deleted_late_index": deleted,
+                }
+            logger.info(
+                f"[Celery RAG Indexing] Task skipped: task_id={task_id}, "
+                f"document_id={document_id}, attachment_id={attachment_id}, "
+                f"index_generation={index_generation}, reason={start_decision.reason}"
+            )
+            return {
+                "status": "skipped",
+                "reason": start_decision.reason,
+                "document_id": document_id,
+                "knowledge_base_id": knowledge_base_id,
+                "index_generation": index_generation,
+            }
+
+        try:
+            result = run_document_indexing(
+                knowledge_base_id=knowledge_base_id,
+                attachment_id=attachment_id,
+                retriever_name=retriever_name,
+                retriever_namespace=retriever_namespace,
+                embedding_model_name=embedding_model_name,
+                embedding_model_namespace=embedding_model_namespace,
+                user_id=user_id,
+                user_name=user_name,
+                caller_user_id=caller_user_id,
+                splitter_config_dict=splitter_config_dict,
+                document_id=document_id,
+                trigger_summary=trigger_summary,
+            )
+
+            if result.get("status") == "skipped":
+                with SessionLocal() as finalize_db:
+                    finalized = mark_document_index_failed(
+                        db=finalize_db,
+                        document_id=document_id,
+                        generation=index_generation,
+                        error=build_processing_error(
+                            stage=DocumentProcessingStage.INDEXING,
+                            code="indexing_failed",
+                            message="Document indexing failed. Please retry.",
+                            retryable=True,
+                            generation=index_generation,
+                        ),
+                    )
+
+                if not finalized:
+                    # The skip left no chunks behind (the preparation stopped
+                    # before any write), so only supersession is reported here.
+                    logger.info(
+                        f"[Celery RAG Indexing] Task skip result was ignored after supersession: "
+                        f"task_id={task_id}, document_id={document_id}, "
+                        f"index_generation={index_generation}, reason={result.get('reason')}"
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": "stale_skip_result",
+                        "document_id": document_id,
+                        "knowledge_base_id": knowledge_base_id,
+                        "index_generation": index_generation,
+                    }
+
+                logger.info(
+                    f"[Celery RAG Indexing] Task finished with skip result and was marked failed: "
+                    f"task_id={task_id}, document_id={document_id}, "
+                    f"index_generation={index_generation}, reason={result.get('reason')}"
+                )
+                result["index_generation"] = index_generation
+                return result
+
+            with SessionLocal() as finalize_db:
+                finalized = mark_document_index_succeeded(
+                    db=finalize_db,
+                    document_id=document_id,
+                    generation=index_generation,
+                    chunks=result.get("chunks_data"),
+                    chunk_storage_enabled=settings.CHUNK_STORAGE_ENABLED,
+                )
+
+            if not finalized:
+                deleted = _cleanup_late_index_or_retry(
+                    self,
+                    document_id=document_id,
+                    knowledge_base_id=knowledge_base_id,
+                    user_id=user_id,
+                )
+                logger.info(
+                    f"[Celery RAG Indexing] Task completed but finalization was skipped: "
+                    f"task_id={task_id}, document_id={document_id}, "
+                    f"index_generation={index_generation}, "
+                    f"reason=stale_or_already_finalized, deleted_late_index={deleted}"
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "stale_or_already_finalized",
+                    "document_id": document_id,
+                    "knowledge_base_id": knowledge_base_id,
+                    "index_generation": index_generation,
+                }
+
+            if trigger_summary:
+                try:
+                    with SessionLocal() as summary_db:
+                        kb_info = get_kb_index_info(
+                            db=summary_db,
+                            knowledge_base_id=knowledge_base_id,
+                            current_user_id=user_id,
+                        )
+                    if settings.SUMMARY_ENABLED and kb_info.summary_enabled:
+                        _enqueue_document_summary_task(
+                            document_id=document_id,
+                            user_id=user_id,
+                            user_name=user_name,
+                        )
+                except Exception as summary_error:
+                    logger.warning(
+                        f"[Celery RAG Indexing] Failed to prepare document summary "
+                        f"for document {document_id}: {summary_error}",
+                        exc_info=True,
+                    )
+
+            logger.info(
+                f"[Celery RAG Indexing] Completed: task_id={task_id}, "
+                f"document_id={document_id}, attachment_id={attachment_id}, "
+                f"index_generation={index_generation}, result={result}"
+            )
+            result["index_generation"] = index_generation
+            return result
+
+        except (Retry, LateIndexCleanupError):
+            # A late-index cleanup owns its own retry and failure handling: it
+            # must reach Celery instead of being read as an indexing failure and
+            # running the removal a second time.
+            raise
+        except Exception as exc:
+            with SessionLocal() as finalize_db:
+                finalized = mark_document_index_failed(
+                    db=finalize_db,
+                    document_id=document_id,
+                    generation=index_generation,
+                    error=map_indexing_exception(
+                        exc,
+                        generation=index_generation,
+                    ),
+                )
+
+            if not finalized:
+                # The write failed after the document was deleted; the failed
+                # removal must retry rather than end as a clean skip.
+                deleted = _cleanup_late_index_or_retry(
+                    self,
+                    document_id=document_id,
+                    knowledge_base_id=knowledge_base_id,
+                    user_id=user_id,
+                )
+                logger.warning(
+                    f"[Celery RAG Indexing] Task failed after being superseded: "
+                    f"task_id={task_id}, document_id={document_id}, "
+                    f"index_generation={index_generation}, error={exc}, "
+                    f"deleted_late_index={deleted}",
+                    exc_info=True,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "stale_failure",
+                    "document_id": document_id,
+                    "knowledge_base_id": knowledge_base_id,
+                    "index_generation": index_generation,
+                }
+
+            logger.error(
+                f"[Celery RAG Indexing] Error: task_id={task_id}, "
+                f"document_id={document_id}, attachment_id={attachment_id}, "
+                f"index_generation={index_generation}, error={exc}",
+                exc_info=True,
+            )
+            raise
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.knowledge_tasks.generate_document_summary",
+    max_retries=3,
+    default_retry_delay=30,
+    retry_backoff=True,
+    retry_backoff_max=300,
+)
+def generate_document_summary_task(
+    self,
+    document_id: int,
+    user_id: int,
+    user_name: str,
+):
+    """
+    Celery task for document summary generation.
+
+    Args:
+        document_id: Document ID
+        user_id: User ID
+        user_name: Username
+    """
+    logger.info(
+        f"[Celery Summary] Task started: document_id={document_id}, user_id={user_id}"
+    )
+
+    db = SessionLocal()
+    try:
+        global_summary_enabled = getattr(settings, "SUMMARY_ENABLED", False)
+        if not global_summary_enabled:
+            logger.info(f"[Celery Summary] Skipping: global summary not enabled")
+            return {
+                "status": "skipped",
+                "reason": "global_summary_disabled",
+                "document_id": document_id,
+            }
+
+        from app.services.knowledge import get_summary_service
+
+        summary_service = get_summary_service(db)
+
+        # Run async summary code in event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(
+                summary_service.trigger_document_summary(
+                    document_id, user_id, user_name
+                )
+            )
+        finally:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+
+        logger.info(f"[Celery Summary] Summary generated for document {document_id}")
+
+        return {
+            "status": "success",
+            "document_id": document_id,
+        }
+
+    except Exception as e:
+        logger.error(
+            f"[Celery Summary] Error generating summary for document {document_id}: {e}",
+            exc_info=True,
+        )
+        raise self.retry(exc=e)
+
+    finally:
+        db.close()
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.knowledge_tasks.update_kb_summary",
+    max_retries=2,
+    default_retry_delay=30,
+)
+def update_kb_summary_task(
+    self,
+    knowledge_base_id: int,
+    user_id: int,
+    user_name: str,
+):
+    """
+    Celery task for updating knowledge base summary.
+
+    This is typically triggered after document deletion to update the KB summary.
+
+    Args:
+        knowledge_base_id: Knowledge base ID
+        user_id: User ID
+        user_name: Username
+    """
+    logger.info(
+        f"[Celery KB Summary] Task started: kb_id={knowledge_base_id}, user_id={user_id}"
+    )
+
+    db = SessionLocal()
+    try:
+        global_summary_enabled = getattr(settings, "SUMMARY_ENABLED", False)
+        if not global_summary_enabled:
+            logger.info(f"[Celery KB Summary] Skipping: global summary not enabled")
+            return {
+                "status": "skipped",
+                "reason": "global_summary_disabled",
+                "knowledge_base_id": knowledge_base_id,
+            }
+
+        from app.services.knowledge import get_summary_service
+
+        summary_service = get_summary_service(db)
+
+        # Run async summary code in event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(
+                summary_service.trigger_kb_summary(
+                    knowledge_base_id, user_id, user_name
+                )
+            )
+        finally:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+
+        logger.info(
+            f"[Celery KB Summary] Summary updated for knowledge base {knowledge_base_id}"
+        )
+
+        return {
+            "status": "success",
+            "knowledge_base_id": knowledge_base_id,
+        }
+
+    except Exception as e:
+        logger.error(
+            f"[Celery KB Summary] Error updating KB summary {knowledge_base_id}: {e}",
+            exc_info=True,
+        )
+        raise self.retry(exc=e)
+
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.tasks.knowledge_tasks.scan_stale_index_tasks")
+def scan_stale_index_tasks():
+    """Scan in-flight indexing states and mark stale ones as FAILED.
+
+    This is the safety net for scenarios where converter/indexing workers
+    crash, timeout, or become unreachable. Without this scan, documents
+    stay in CONVERTING/INDEXING/QUEUED indefinitely.
+
+    Include documents that have never completed indexing and are therefore
+    not yet active for retrieval. Index status, not retrieval activation,
+    identifies an attempt that needs timeout recovery.
+
+    Idempotency: mark_document_index_failed uses WHERE generation=N AND
+    status IN (ACTIVE), so normally completed documents are unaffected.
+    """
+    from app.models.knowledge import DocumentIndexStatus, KnowledgeDocument
+    from app.services.knowledge.index_state_machine import (
+        _get_active_index_stale_reason_for,
+        mark_document_index_failed,
+    )
+
+    with SessionLocal() as db:
+        active_docs = (
+            db.query(
+                KnowledgeDocument.id,
+                KnowledgeDocument.index_generation,
+                KnowledgeDocument.index_status,
+                KnowledgeDocument.updated_at,
+            )
+            .filter(
+                KnowledgeDocument.index_status.in_(
+                    [
+                        DocumentIndexStatus.QUEUED,
+                        DocumentIndexStatus.PENDING_CONVERSION,
+                        DocumentIndexStatus.CONVERTING,
+                        DocumentIndexStatus.INDEXING,
+                    ]
+                ),
+            )
+            .all()
+        )
+
+        marked_count = 0
+        for doc_id, generation, index_status, updated_at in active_docs:
+            stale_reason = _get_active_index_stale_reason_for(index_status, updated_at)
+            if stale_reason is not None:
+                finalized = mark_document_index_failed(
+                    db=db,
+                    document_id=doc_id,
+                    generation=generation,
+                    error=_build_stale_processing_error(
+                        index_status,
+                        generation=generation,
+                    ),
+                    require_stale=True,
+                )
+                if finalized:
+                    marked_count += 1
+                    logger.info(
+                        f"[StaleScanner] Marked document {doc_id} as FAILED, "
+                        f"reason={stale_reason}, status_was={index_status}"
+                    )
+
+        logger.info(
+            f"[StaleScanner] Scan complete, marked {marked_count} documents as FAILED"
+        )
+        return {"marked_count": marked_count, "scanned_count": len(active_docs)}
+
+
+@celery_app.task(name="app.tasks.knowledge_tasks.cleanup_knowledge_attachment_orphans")
+@trace_sync(
+    span_name="knowledge.cleanup_attachment_orphans",
+    tracer_name="knowledge.tasks",
+)
+def cleanup_knowledge_attachment_orphans_task() -> dict[str, object]:
+    """Reap aged attachments explicitly owned by external Wiki sync."""
+    from app.services.knowledge.attachment_cleanup import (
+        cleanup_orphaned_knowledge_attachments,
+    )
+
+    with distributed_lock.acquire_context(
+        "knowledge-attachment-orphan-cleanup",
+        expire_seconds=max(
+            60,
+            settings.KNOWLEDGE_ATTACHMENT_ORPHAN_SCAN_INTERVAL_SECONDS,
+        ),
+    ) as acquired:
+        if not acquired:
+            return {"status": "locked"}
+        with SessionLocal() as db:
+            report = cleanup_orphaned_knowledge_attachments(
+                db,
+                retention_hours=(settings.KNOWLEDGE_ATTACHMENT_ORPHAN_RETENTION_HOURS),
+                batch_size=settings.KNOWLEDGE_ATTACHMENT_ORPHAN_SCAN_BATCH_SIZE,
+            )
+    logger.info("[Knowledge] Attachment orphan cleanup: %s", report.as_dict())
+    return {"status": "completed", **report.as_dict()}

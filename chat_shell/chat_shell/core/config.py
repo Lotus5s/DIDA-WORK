@@ -1,0 +1,177 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Configuration settings for Chat Shell Service."""
+
+from pathlib import Path
+from typing import Tuple, Type
+
+from pydantic import Field
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
+
+
+class Settings(BaseSettings):
+    """Chat Shell Service configuration settings."""
+
+    # Project configuration
+    PROJECT_NAME: str = "Chat Shell Service"
+    API_PREFIX: str = "/api"
+    ENABLE_API_DOCS: bool = True
+
+    # Environment configuration
+    ENVIRONMENT: str = "development"  # development or production
+
+    # ========== Running Mode ==========
+    # "package" - used as a Python package imported by Backend
+    # "http" - runs as an independent HTTP service (default)
+    # "cli" - command-line interface mode
+    # Env: CHAT_SHELL_MODE
+    MODE: str = "http"
+
+    @property
+    def CHAT_SHELL_MODE(self) -> str:
+        """Backward compatibility property for MODE setting."""
+        return self.MODE
+
+    # ========== Storage Configuration ==========
+    # "memory" - in-memory storage (for testing)
+    # "sqlite" - local SQLite storage (for CLI)
+    # "remote" - calls Backend API (for production HTTP mode)
+    # Env: CHAT_SHELL_STORAGE_TYPE
+    STORAGE_TYPE: str = "remote"
+
+    # SQLite configuration (for CLI)
+    SQLITE_DB_PATH: str = "~/.chat_shell/history.db"
+
+    # Remote storage configuration (calls Backend API)
+    # Default: http://backend:8000/api/internal (Docker) or http://localhost:8000/api/internal (local)
+    REMOTE_STORAGE_URL: str = "http://localhost:8000/api/internal"
+    REMOTE_STORAGE_TOKEN: str = ""
+
+    # ========== HTTP Server Configuration ==========
+    HTTP_HOST: str = "0.0.0.0"
+    HTTP_PORT: int = 8001
+
+    # Database configuration (for package mode, shared with Backend)
+    DATABASE_URL: str = "mysql+asyncmy://user:password@localhost/task_manager"
+
+    # Internal service authentication
+    INTERNAL_SERVICE_TOKEN: str = ""
+
+    @property
+    def backend_internal_token(self) -> str:
+        """Return the token used for authenticated Backend internal API calls."""
+        return self.REMOTE_STORAGE_TOKEN or self.INTERNAL_SERVICE_TOKEN
+
+    # ========== LLM API Keys ==========
+    ANTHROPIC_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
+    GOOGLE_API_KEY: str = ""
+
+    # ========== Default Model Configuration ==========
+    DEFAULT_MODEL: str = "claude-3-5-sonnet-20241022"
+    DEFAULT_MAX_TOKENS: int = 4096
+
+    # ========== Chat Configuration ==========
+    MAX_CONCURRENT_CHATS: int = 50
+    CHAT_HISTORY_EXPIRE_SECONDS: int = 7200
+    CHAT_HISTORY_MAX_MESSAGES: int = 50
+    CHAT_API_TIMEOUT_SECONDS: int = 300
+
+    # Tool calling flow limits
+    CHAT_TOOL_MAX_REQUESTS: int = 30
+    CHAT_TOOL_MAX_TIME_SECONDS: float = 60.0
+
+    # Group chat history configuration
+    GROUP_CHAT_HISTORY_FIRST_MESSAGES: int = 10
+    GROUP_CHAT_HISTORY_LAST_MESSAGES: int = 20
+
+    # Message compression configuration
+    MESSAGE_COMPRESSION_ENABLED: bool = True
+    MESSAGE_COMPRESSION_FIRST_MESSAGES: int = 2
+    MESSAGE_COMPRESSION_LAST_MESSAGES: int = 10
+    MESSAGE_COMPRESSION_ATTACHMENT_LENGTH: int = 50000
+
+    # Phase 2 unified context guard
+    DISABLE_TOOL_OUTPUT_GUARD: bool = False
+    DISABLE_SUMMARY_COMPACT: bool = False
+    TOOL_OUTPUT_TOKEN_LIMIT: int = 15000
+    EMERGENCY_TOOL_OUTPUT_RATIO: float = 0.3
+    AUTO_COMPACT_TOKEN_LIMIT: int | None = None
+
+    # Web search configuration
+    WEB_SEARCH_ENABLED: bool = False
+    WEB_SEARCH_ENGINES: str = "{}"
+    WEB_SEARCH_DEFAULT_MAX_RESULTS: int = 50
+
+    # Workspace configuration
+    WORKSPACE_ROOT: str = "/workspace"
+    ENABLE_SKILLS: bool = True
+
+    # Attachment/Context configuration
+    MAX_EXTRACTED_TEXT_LENGTH: int = 100000
+    # Shared token budget for the inline attachment preview (all attachments in
+    # a message share one <attachment> block). The full content stays available
+    # via the sandbox file / read_attachment. The budget is split across
+    # per-attachment segments (head/tail each), every header is preserved.
+    ATTACHMENT_PREVIEW_TOKEN_LIMIT: int = 15000
+
+    # Backend RAG service configuration (for knowledge base HTTP fallback)
+    BACKEND_RAG_URL: str = "http://localhost:8000/api/knowledge/v1/retrieve"
+
+    # OpenTelemetry configuration
+    OTEL_ENABLED: bool = False
+
+    # Graceful shutdown
+    GRACEFUL_SHUTDOWN_TIMEOUT: int = 600
+
+    # Tool Display Configuration
+    # Comma-separated list of keywords to match tool names (uses substring matching)
+    # Empty string or "*" means all tools will display details
+    # Example: "read,write,search" will match "read_file", "write_file", "web_search", etc.
+    TOOL_DISPLAY_WHITELIST: str = "read,write,upload,exec"
+
+    # Truncation Recovery Configuration
+    # Maximum retry attempts when tool calls are truncated due to max_token limit
+    # Range: 0-5, Default: 3
+    # Setting to 0 disables retry (will show truncation warning immediately)
+    MAX_TRUNCATION_RETRIES: int = Field(
+        default=3,
+        ge=0,
+        le=5,
+        description="Maximum retry attempts when tool calls are truncated",
+    )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: Type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+        """Customize settings sources."""
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
+
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parents[2] / ".env",
+        env_file_encoding="utf-8",
+        env_prefix="CHAT_SHELL_",
+        extra="ignore",
+        populate_by_name=True,  # Allow reading from field name without prefix
+    )
+
+
+# Global configuration instance
+settings = Settings()

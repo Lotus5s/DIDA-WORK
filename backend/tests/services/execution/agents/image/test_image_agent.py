@@ -1,0 +1,638 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Tests for ImageAgent.
+
+Tests the image generation agent workflow including:
+- Normal execution flow
+- Cancellation handling
+- Error handling
+"""
+
+import asyncio
+from collections.abc import Generator
+from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlparse
+
+import pytest
+
+from app.services.attachment.public_link import verify_public_attachment_token
+from shared.models import EventType, ExecutionRequest
+
+
+def _make_no_followup_intent():
+    """Return a mock ImageIntentResult indicating no follow-up history."""
+    from app.services.execution.agents.image.intent_analyzer import ImageIntentResult
+
+    return ImageIntentResult(
+        merged_prompt="A beautiful sunset over the ocean",
+        should_use_image=False,
+        reference_image=None,
+        is_followup=False,
+    )
+
+
+class TestImageAgent:
+    """Tests for ImageAgent."""
+
+    @pytest.fixture
+    def mock_session_manager(self) -> Generator[MagicMock, None, None]:
+        """Create mock session manager."""
+        with patch("app.services.chat.storage.session.session_manager") as mock_manager:
+            mock_cancel_event = asyncio.Event()
+            mock_manager.register_stream = AsyncMock(return_value=mock_cancel_event)
+            mock_manager.unregister_stream = AsyncMock()
+            mock_manager.is_cancelled = AsyncMock(return_value=False)
+            yield mock_manager
+
+    @pytest.fixture(autouse=True)
+    def mock_shutdown_manager(self) -> Generator[MagicMock, None, None]:
+        """Create mock graceful shutdown manager."""
+        with patch(
+            "app.services.execution.agents.image.image_agent.shutdown_manager"
+        ) as mock_manager:
+            mock_manager.register_stream = AsyncMock(return_value=True)
+            mock_manager.unregister_stream = AsyncMock()
+            yield mock_manager
+
+    @pytest.fixture
+    def mock_emitter(self) -> AsyncMock:
+        """Create mock result emitter."""
+        emitter = AsyncMock()
+        emitter.emit_start = AsyncMock()
+        emitter.emit = AsyncMock()
+        return emitter
+
+    @pytest.fixture
+    def mock_intent_analyzer(self) -> Generator[AsyncMock, None, None]:
+        """Mock ImageIntentAnalyzer to prevent DB access in tests."""
+        with patch(
+            "app.services.execution.agents.image.image_agent.ImageIntentAnalyzer"
+        ) as mock_cls:
+            mock_instance = AsyncMock()
+            mock_instance.analyze = AsyncMock(return_value=_make_no_followup_intent())
+            mock_cls.return_value = mock_instance
+            yield mock_instance
+
+    @pytest.fixture
+    def sample_request(self) -> ExecutionRequest:
+        """Create sample execution request."""
+        return ExecutionRequest(
+            task_id=1,
+            subtask_id=100,
+            message_id=200,
+            prompt="A beautiful sunset over the ocean",
+            model_config={
+                "protocol": "seedream",
+                "base_url": "https://api.example.com",
+                "api_key": "test-api-key",
+                "model": "doubao-seedream-5.0-lite",
+                "imageConfig": {
+                    "size": "2048x2048",
+                    "response_format": "url",
+                    "watermark": False,
+                },
+            },
+            user={"id": 1, "name": "test_user"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_normal_flow(
+        self,
+        mock_session_manager,
+        mock_shutdown_manager,
+        mock_emitter,
+        mock_intent_analyzer,
+        sample_request,
+    ):
+        """Test normal execution flow."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+        from app.services.execution.agents.image.providers.base import (
+            ImageGenerationResult,
+            ImageResult,
+        )
+
+        # Arrange
+        mock_result = ImageGenerationResult(
+            images=[
+                ImageResult(url="https://example.com/image1.jpg", size="2048x2048"),
+            ],
+            model="doubao-seedream-5.0-lite",
+            usage={"prompt_tokens": 10, "total_tokens": 10},
+        )
+
+        with patch(
+            "app.services.execution.agents.image.image_agent.get_image_provider"
+        ) as mock_get_provider:
+            mock_provider = AsyncMock()
+            mock_provider.name = "Seedream"
+            mock_provider.generate = AsyncMock(return_value=mock_result)
+            mock_get_provider.return_value = mock_provider
+
+            with patch(
+                "app.services.execution.agents.image.image_agent.ImageAgent._upload_attachment"
+            ) as mock_upload:
+                mock_upload.return_value = 999  # attachment_id
+
+                agent = ImageAgent()
+
+                # Act
+                await agent.execute(sample_request, mock_emitter)
+
+        # Assert
+        # Verify emit_start was called
+        mock_emitter.emit_start.assert_called_once()
+        call_kwargs = mock_emitter.emit_start.call_args[1]
+        assert call_kwargs["task_id"] == 1
+        assert call_kwargs["subtask_id"] == 100
+        assert call_kwargs["message_id"] == 200
+
+        image_block_events = [
+            call[0][0]
+            for call in mock_emitter.emit.call_args_list
+            if call[0][0].type == EventType.CHUNK
+            and call[0][0].result
+            and call[0][0].result.get("blocks")
+        ]
+        assert image_block_events[0].result["blocks"][0]["image_size"] == "2048x2048"
+
+        # Verify provider was called with correct prompt
+        mock_get_provider.assert_called_once_with(
+            "seedream", sample_request.model_config
+        )
+        mock_provider.generate.assert_called_once()
+        call_kwargs = mock_provider.generate.call_args[1]
+        assert call_kwargs["prompt"] == "A beautiful sunset over the ocean"
+
+        # Verify DONE event was emitted
+        done_calls = [
+            call
+            for call in mock_emitter.emit.call_args_list
+            if call[0][0].type == EventType.DONE
+        ]
+        assert len(done_calls) == 1
+        done_event = done_calls[0][0][0]
+        assert done_event.task_id == 1
+        assert done_event.subtask_id == 100
+        assert done_event.result is not None
+        assert "blocks" in done_event.result
+        assert done_event.result["blocks"][0]["type"] == "image"
+        assert done_event.result["blocks"][0]["status"] == "done"
+
+        # Verify session was unregistered
+        mock_session_manager.unregister_stream.assert_called_once_with(100)
+        mock_shutdown_manager.register_stream.assert_awaited_once_with(100)
+        mock_shutdown_manager.unregister_stream.assert_awaited_once_with(100)
+
+    @pytest.mark.asyncio
+    async def test_execute_uses_prompt_image_as_direct_reference(
+        self,
+        mock_session_manager: MagicMock,
+        mock_shutdown_manager: MagicMock,
+        mock_emitter: AsyncMock,
+        mock_intent_analyzer: AsyncMock,
+        sample_request: ExecutionRequest,
+    ) -> None:
+        from app.services.execution.agents.image.image_agent import ImageAgent
+        from app.services.execution.agents.image.providers.base import (
+            ImageGenerationResult,
+            ImageResult,
+        )
+
+        reference_image = "data:image/png;base64,aW1hZ2U="
+        sample_request.attachments = [
+            {"mime_type": "image/png", "content": reference_image},
+        ]
+        sample_request.prompt = [
+            {
+                "type": "input_text",
+                "text": (
+                    "<attachment>[Image Attachment: reference.png | ID: 67]"
+                    "</attachment>"
+                ),
+            },
+            {"type": "input_image", "image_url": reference_image},
+            {"type": "input_text", "text": "Place it on Mars"},
+        ]
+        mock_result = ImageGenerationResult(
+            images=[
+                ImageResult(url="https://example.com/image1.jpg", size="2048x2048"),
+            ],
+            model="doubao-seedream-5.0-lite",
+        )
+
+        with (
+            patch(
+                "app.services.execution.agents.image.image_agent.get_image_provider"
+            ) as mock_get_provider,
+            patch(
+                "app.services.execution.agents.image.image_agent.ImageAgent._upload_attachment",
+                new=AsyncMock(return_value=999),
+            ),
+        ):
+            mock_provider = AsyncMock()
+            mock_provider.name = "Seedream"
+            mock_provider.generate = AsyncMock(return_value=mock_result)
+            mock_get_provider.return_value = mock_provider
+
+            await ImageAgent().execute(sample_request, mock_emitter)
+
+        mock_provider.generate.assert_awaited_once_with(
+            prompt="Place it on Mars",
+            reference_images=[reference_image],
+        )
+        mock_intent_analyzer.analyze.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_execute_with_cancellation(
+        self,
+        mock_session_manager,
+        mock_shutdown_manager,
+        mock_emitter,
+        mock_intent_analyzer,
+        sample_request,
+    ):
+        """Test execution with cancellation."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+
+        # Arrange - set cancellation flag
+        mock_session_manager.is_cancelled = AsyncMock(return_value=True)
+
+        agent = ImageAgent()
+
+        # Act
+        await agent.execute(sample_request, mock_emitter)
+
+        # Assert
+        # Verify CANCELLED event was emitted
+        cancelled_calls = [
+            call
+            for call in mock_emitter.emit.call_args_list
+            if call[0][0].type == EventType.CANCELLED
+        ]
+        assert len(cancelled_calls) == 1
+        cancelled_event = cancelled_calls[0][0][0]
+        assert cancelled_event.task_id == 1
+        assert cancelled_event.subtask_id == 100
+
+        # Verify session was unregistered
+        mock_session_manager.unregister_stream.assert_called_once_with(100)
+        mock_shutdown_manager.unregister_stream.assert_awaited_once_with(100)
+
+    @pytest.mark.asyncio
+    async def test_execute_with_cancel_event_set(
+        self, mock_session_manager, mock_emitter, mock_intent_analyzer, sample_request
+    ):
+        """Test execution when cancel event is already set."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+
+        # Arrange - set cancel event
+        cancel_event = asyncio.Event()
+        cancel_event.set()
+        mock_session_manager.register_stream = AsyncMock(return_value=cancel_event)
+
+        agent = ImageAgent()
+
+        # Act
+        await agent.execute(sample_request, mock_emitter)
+
+        # Assert
+        # Verify CANCELLED event was emitted
+        cancelled_calls = [
+            call
+            for call in mock_emitter.emit.call_args_list
+            if call[0][0].type == EventType.CANCELLED
+        ]
+        assert len(cancelled_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_execute_with_provider_error(
+        self,
+        mock_session_manager,
+        mock_shutdown_manager,
+        mock_emitter,
+        mock_intent_analyzer,
+        sample_request,
+    ):
+        """Test execution with provider error."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+
+        # Arrange
+        with patch(
+            "app.services.execution.agents.image.image_agent.get_image_provider"
+        ) as mock_get_provider:
+            mock_provider = AsyncMock()
+            mock_provider.name = "Seedream"
+            mock_provider.generate = AsyncMock(
+                side_effect=Exception("API rate limit exceeded")
+            )
+            mock_get_provider.return_value = mock_provider
+
+            agent = ImageAgent()
+
+            # Act
+            await agent.execute(sample_request, mock_emitter)
+
+        # Assert
+        # Verify ERROR event was emitted
+        error_calls = [
+            call
+            for call in mock_emitter.emit.call_args_list
+            if call[0][0].type == EventType.ERROR
+        ]
+        assert len(error_calls) == 1
+        error_event = error_calls[0][0][0]
+        assert error_event.task_id == 1
+        assert error_event.subtask_id == 100
+        assert "API rate limit exceeded" in error_event.error
+
+        image_block_events = [
+            call[0][0]
+            for call in mock_emitter.emit.call_args_list
+            if call[0][0].type == EventType.CHUNK
+            and call[0][0].result
+            and call[0][0].result.get("blocks")
+        ]
+        assert image_block_events[-1].result["blocks"][0]["status"] == "error"
+        assert image_block_events[-1].result["blocks"][0]["is_placeholder"] is False
+
+        # Verify session was unregistered
+        mock_session_manager.unregister_stream.assert_called_once_with(100)
+        mock_shutdown_manager.unregister_stream.assert_awaited_once_with(100)
+
+    @pytest.mark.asyncio
+    async def test_execute_with_no_images_generated(
+        self, mock_session_manager, mock_emitter, mock_intent_analyzer, sample_request
+    ):
+        """Test execution when no images are generated."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+        from app.services.execution.agents.image.providers.base import (
+            ImageGenerationResult,
+        )
+
+        # Arrange
+        mock_result = ImageGenerationResult(
+            images=[],  # No images
+            model="doubao-seedream-5.0-lite",
+        )
+
+        with patch(
+            "app.services.execution.agents.image.image_agent.get_image_provider"
+        ) as mock_get_provider:
+            mock_provider = AsyncMock()
+            mock_provider.name = "Seedream"
+            mock_provider.generate = AsyncMock(return_value=mock_result)
+            mock_get_provider.return_value = mock_provider
+
+            agent = ImageAgent()
+
+            # Act
+            await agent.execute(sample_request, mock_emitter)
+
+        # Assert
+        # Verify ERROR event was emitted
+        error_calls = [
+            call
+            for call in mock_emitter.emit.call_args_list
+            if call[0][0].type == EventType.ERROR
+        ]
+        assert len(error_calls) == 1
+        error_event = error_calls[0][0][0]
+        assert "No images generated" in error_event.error
+
+    @pytest.mark.asyncio
+    async def test_execute_with_base64_image(
+        self, mock_session_manager, mock_emitter, mock_intent_analyzer, sample_request
+    ):
+        """Test execution with base64 encoded image result."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+        from app.services.execution.agents.image.providers.base import (
+            ImageGenerationResult,
+            ImageResult,
+        )
+
+        # Arrange
+        mock_result = ImageGenerationResult(
+            images=[
+                ImageResult(
+                    url=None,
+                    b64_json="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+                    size="2048x2048",
+                ),
+            ],
+            model="doubao-seedream-5.0-lite",
+        )
+
+        with patch(
+            "app.services.execution.agents.image.image_agent.get_image_provider"
+        ) as mock_get_provider:
+            mock_provider = AsyncMock()
+            mock_provider.name = "Seedream"
+            mock_provider.generate = AsyncMock(return_value=mock_result)
+            mock_get_provider.return_value = mock_provider
+
+            with patch(
+                "app.services.execution.agents.image.image_agent.ImageAgent._upload_attachment"
+            ) as mock_upload:
+                mock_upload.return_value = 999
+
+                agent = ImageAgent()
+
+                # Act
+                await agent.execute(sample_request, mock_emitter)
+
+        # Assert
+        # Verify upload receives the provider data URL while DONE uses the attachment URL
+        done_calls = [
+            call
+            for call in mock_emitter.emit.call_args_list
+            if call[0][0].type == EventType.DONE
+        ]
+        assert len(done_calls) == 1
+        done_event = done_calls[0][0][0]
+        image_urls = done_event.result["blocks"][0]["image_urls"]
+        assert image_urls == ["/api/attachments/999/download"]
+        image_download_urls = done_event.result["blocks"][0]["image_download_urls"]
+        download_token = parse_qs(urlparse(image_download_urls[0]).query)["token"][0]
+        token_payload = verify_public_attachment_token(download_token)
+        assert token_payload["attachment_id"] == 999
+        assert token_payload["exp"] - token_payload["iat"] == 3600
+        assert (
+            done_event.result["blocks"][0]["image_download_url_expires_in_seconds"]
+            == 3600
+        )
+        uploaded_url = mock_upload.await_args.kwargs["image_url"]
+        assert uploaded_url.startswith("data:image/jpeg;base64,")
+
+    @pytest.mark.asyncio
+    async def test_execute_with_multiple_images(
+        self, mock_session_manager, mock_emitter, mock_intent_analyzer, sample_request
+    ):
+        """Test execution with multiple images generated."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+        from app.services.execution.agents.image.providers.base import (
+            ImageGenerationResult,
+            ImageResult,
+        )
+
+        # Arrange
+        mock_result = ImageGenerationResult(
+            images=[
+                ImageResult(url="https://example.com/image1.jpg", size="2048x2048"),
+                ImageResult(url="https://example.com/image2.jpg", size="2048x2048"),
+                ImageResult(url="https://example.com/image3.jpg", size="2048x2048"),
+            ],
+            model="doubao-seedream-5.0-lite",
+        )
+
+        with patch(
+            "app.services.execution.agents.image.image_agent.get_image_provider"
+        ) as mock_get_provider:
+            mock_provider = AsyncMock()
+            mock_provider.name = "Seedream"
+            mock_provider.generate = AsyncMock(return_value=mock_result)
+            mock_get_provider.return_value = mock_provider
+
+            with patch(
+                "app.services.execution.agents.image.image_agent.ImageAgent._upload_attachment"
+            ) as mock_upload:
+                mock_upload.side_effect = [1001, 1002, 1003]
+
+                agent = ImageAgent()
+
+                # Act
+                await agent.execute(sample_request, mock_emitter)
+
+        # Assert
+        # Verify DONE event was emitted with all images
+        done_calls = [
+            call
+            for call in mock_emitter.emit.call_args_list
+            if call[0][0].type == EventType.DONE
+        ]
+        assert len(done_calls) == 1
+        done_event = done_calls[0][0][0]
+        image_block = done_event.result["blocks"][0]
+        assert image_block["image_count"] == 3
+        assert image_block["image_urls"] == [
+            "/api/attachments/1001/download",
+            "/api/attachments/1002/download",
+            "/api/attachments/1003/download",
+        ]
+        assert image_block["image_attachment_ids"] == [1001, 1002, 1003]
+
+    def test_agent_name(self):
+        """Test agent name property."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+
+        agent = ImageAgent()
+        assert agent.name == "ImageAgent"
+
+
+class TestImageAgentExtractReferenceImages:
+    """Tests for ImageAgent._extract_reference_images method."""
+
+    def test_extract_no_attachments(self):
+        """Test extraction with no attachments."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+
+        request = ExecutionRequest(
+            task_id=1,
+            subtask_id=100,
+            prompt="test",
+            attachments=[],
+        )
+
+        agent = ImageAgent()
+        result = agent._extract_reference_images(request)
+
+        assert result == []
+
+    def test_extract_image_attachments(self):
+        """Test extraction with image attachments."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+
+        request = ExecutionRequest(
+            task_id=1,
+            subtask_id=100,
+            prompt="test",
+            attachments=[
+                {"mime_type": "image/jpeg", "url": "https://example.com/ref1.jpg"},
+                {"mime_type": "image/png", "url": "https://example.com/ref2.png"},
+            ],
+        )
+
+        agent = ImageAgent()
+        result = agent._extract_reference_images(request)
+
+        assert len(result) == 2
+        assert "https://example.com/ref1.jpg" in result
+        assert "https://example.com/ref2.png" in result
+
+    def test_extract_mixed_attachments(self):
+        """Test extraction with mixed attachment types."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+
+        request = ExecutionRequest(
+            task_id=1,
+            subtask_id=100,
+            prompt="test",
+            attachments=[
+                {"mime_type": "image/jpeg", "url": "https://example.com/ref1.jpg"},
+                {"mime_type": "application/pdf", "url": "https://example.com/doc.pdf"},
+                {"mime_type": "text/plain", "content": "some text"},
+            ],
+        )
+
+        agent = ImageAgent()
+        result = agent._extract_reference_images(request)
+
+        # Only image attachment should be extracted
+        assert len(result) == 1
+        assert "https://example.com/ref1.jpg" in result
+
+    def test_extract_with_content_field(self):
+        """Test extraction using content field when url is not present."""
+        from app.services.execution.agents.image.image_agent import ImageAgent
+
+        request = ExecutionRequest(
+            task_id=1,
+            subtask_id=100,
+            prompt="test",
+            attachments=[
+                {"mime_type": "image/jpeg", "content": "data:image/jpeg;base64,abc123"},
+            ],
+        )
+
+        agent = ImageAgent()
+        result = agent._extract_reference_images(request)
+
+        assert len(result) == 1
+        assert "data:image/jpeg;base64,abc123" in result
+
+
+class TestImageAgentNormalizePrompt:
+    def test_extracts_reference_image_without_attachment_metadata(self) -> None:
+        from app.services.execution.agents.image.image_agent import ImageAgent
+
+        prompt = [
+            {
+                "type": "input_text",
+                "text": (
+                    "<attachment>[Image Attachment: reference.png | ID: 67]"
+                    "</attachment>"
+                ),
+            },
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,aW1hZ2U=",
+            },
+            {"type": "input_text", "text": "让它出现在火星上"},
+        ]
+
+        text, images = ImageAgent()._normalize_prompt(prompt)
+
+        assert text == "让它出现在火星上"
+        assert images == ["data:image/png;base64,aW1hZ2U="]

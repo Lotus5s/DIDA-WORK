@@ -1,0 +1,157 @@
+import { subscribeOperationResults, type OperationResult } from '@/telemetry/operationBus'
+import { beforeEach, describe, expect, test, vi } from 'vitest'
+import { harnessAppsApi, type HarnessAppExport } from './harnessApps'
+
+const mocks = vi.hoisted(() => ({
+  businessTrack: vi.fn(),
+  desktopInvoke: vi.fn(),
+}))
+
+vi.mock('@/api/dsh/desktopHost', () => ({
+  invokeDesktopHost: (...args: unknown[]) => mocks.desktopInvoke(...args),
+}))
+
+vi.mock('@/telemetry/businessEvents', () => ({
+  trackBusinessEvent: (...args: unknown[]) => mocks.businessTrack(...args),
+}))
+
+const exported: HarnessAppExport = {
+  archivePath: '/tmp/exports/research-desk/1.2.0.zip',
+  sha256: 'a'.repeat(64),
+  sizeBytes: 1024,
+  manifest: {
+    name: 'research-desk',
+    displayName: '研究工作台',
+    version: '1.2.0',
+    type: 'deepseek-harness-plugin-bundle',
+    description: '整理本地研究资料',
+    entry: {
+      installPackage: 'packages/research-desk',
+      profile: 'research',
+    },
+    requirements: { dsh: '0.1.0-rc.8', node: '>=22' },
+  },
+}
+
+describe('harnessAppsApi', () => {
+  beforeEach(() => {
+    mocks.businessTrack.mockReset()
+    mocks.desktopInvoke.mockReset()
+  })
+
+  test('reports the runtime response rather than treating a resolved failed start as success', async () => {
+    const results: OperationResult[] = []
+    const stop = subscribeOperationResults(result => results.push(result))
+    try {
+      const failed = { state: 'failed', error: 'private runtime error' }
+      mocks.desktopInvoke.mockResolvedValueOnce(failed).mockResolvedValueOnce({ state: 'running' })
+      await expect(
+        harnessAppsApi.start({ installationId: 'private-app', modelBaseUrl: null })
+      ).resolves.toBe(failed)
+      await harnessAppsApi.start({ installationId: 'private-app', modelBaseUrl: null })
+      const firstStartupId = mocks.businessTrack.mock.calls[0]?.[1]?.startup_id
+      const secondStartupId = mocks.businessTrack.mock.calls[1]?.[1]?.startup_id
+      expect(firstStartupId).toMatch(/^[0-9a-f-]{36}$/)
+      expect(secondStartupId).toMatch(/^[0-9a-f-]{36}$/)
+      expect(firstStartupId).not.toBe(secondStartupId)
+      expect(mocks.businessTrack.mock.calls).toEqual([
+        ['smart_app_start_attempted', { startup_id: firstStartupId }],
+        ['smart_app_start_attempted', { startup_id: secondStartupId }],
+      ])
+      expect(results).toEqual([
+        {
+          key: 'smart_app.start',
+          outcome: 'failed',
+          failureStage: 'confirm',
+          properties: { startup_id: firstStartupId },
+        },
+        {
+          key: 'smart_app.start',
+          outcome: 'succeeded',
+          properties: { startup_id: secondStartupId },
+        },
+      ])
+    } finally {
+      stop()
+    }
+  })
+
+  test('forwards the decision route fields and defaults them to null', async () => {
+    mocks.desktopInvoke.mockResolvedValue({ state: 'running' })
+
+    await harnessAppsApi.start({
+      installationId: 'decision-app',
+      modelBaseUrl: 'http://127.0.0.1:9000',
+      contextBaseUrl: null,
+      contextToken: null,
+      decisionBaseUrl: 'http://127.0.0.1:9500/v1/decision-router/decision-token',
+      decisionProtocolVersion: 1,
+    })
+    await harnessAppsApi.start({ installationId: 'plain-app', modelBaseUrl: null })
+
+    expect(mocks.desktopInvoke).toHaveBeenNthCalledWith(1, 'smartApps.start', {
+      installationId: 'decision-app',
+      modelBaseUrl: 'http://127.0.0.1:9000',
+      contextBaseUrl: null,
+      contextToken: null,
+      decisionBaseUrl: 'http://127.0.0.1:9500/v1/decision-router/decision-token',
+      decisionProtocolVersion: 1,
+    })
+    expect(mocks.desktopInvoke).toHaveBeenNthCalledWith(2, 'smartApps.start', {
+      installationId: 'plain-app',
+      modelBaseUrl: null,
+      contextBaseUrl: null,
+      contextToken: null,
+      decisionBaseUrl: null,
+      decisionProtocolVersion: null,
+    })
+  })
+
+  test('exports an installation and copies the archive to Downloads', async () => {
+    const saved = {
+      ...exported,
+      destinationPath: '/Users/test/Downloads/research-desk-1.2.0.zip',
+    }
+    mocks.desktopInvoke.mockResolvedValue(saved)
+
+    await expect(harnessAppsApi.exportToDownloads('research-desk')).resolves.toEqual(saved)
+    expect(mocks.desktopInvoke).toHaveBeenCalledWith('smartApps.exportToDownloads', {
+      installationId: 'research-desk',
+    })
+  })
+
+  test('passes the selected capability template when creating a Smart App', async () => {
+    mocks.desktopInvoke.mockResolvedValue({})
+
+    await harnessAppsApi.createDirectory({
+      parentPath: '/tmp',
+      name: 'contract-app',
+      displayName: 'Contract App',
+      description: 'Generic app',
+      template: 'web-host-remote',
+    })
+
+    expect(mocks.desktopInvoke).toHaveBeenCalledWith('smartApps.createDirectory', {
+      parentPath: '/tmp',
+      name: 'contract-app',
+      displayName: 'Contract App',
+      description: 'Generic app',
+      template: 'web-host-remote',
+    })
+  })
+
+  test('uses the dedicated verification capabilities for linked Smart Apps', async () => {
+    const report = { status: 'passed' }
+    mocks.desktopInvoke.mockResolvedValue(report)
+
+    await expect(harnessAppsApi.inspectVerification('contract-app')).resolves.toBe(report)
+    await expect(harnessAppsApi.verify('contract-app')).resolves.toBe(report)
+
+    expect(mocks.desktopInvoke).toHaveBeenNthCalledWith(1, 'smartApps.inspectVerification', {
+      installationId: 'contract-app',
+    })
+    expect(mocks.desktopInvoke).toHaveBeenNthCalledWith(2, 'smartApps.verify', {
+      installationId: 'contract-app',
+    })
+  })
+})

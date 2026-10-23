@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "@wecode/*": ["./wecode/*"],
+      "@extensions/*": ["./wecode/extensions/*", "./src/extensions/*"],
+      "@wegent/process-explorer": ["../packages/process-explorer/src/index.ts"]
+    },
+    "ignoreDeprecations": "6.0",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM"],
+    "module": "esnext",
+    "types": ["vite/client"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src", "wecode", "dsh/*/src"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "dsh/**/*.test.ts", "dsh/**/*.test.tsx"]
+}

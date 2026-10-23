@@ -1,0 +1,60 @@
+import type { CloudLoopItem, CloudProject } from '@/api/deliveries'
+import type { RuntimeSendRequest } from '@/types/api'
+import {
+  projectSpaceChatRuntimeContext,
+  projectSpaceIssueRuntimeContext,
+} from './projectProviderConfig'
+
+export function buildWorkItemRuntimeContext(
+  project: CloudProject,
+  task?: CloudLoopItem
+): Pick<RuntimeSendRequest, 'cloudProjectId' | 'origin' | 'additionalContext'> {
+  return {
+    cloudProjectId: String(project.id),
+    ...(task
+      ? {
+          origin: {
+            type: 'board_task' as const,
+            cloudProjectId: String(project.id),
+            loopItemId: String(task.id),
+            projectStore: project.project_store,
+          },
+        }
+      : {}),
+    additionalContext: {
+      ...(task
+        ? projectSpaceIssueRuntimeContext(project, task)
+        : projectSpaceChatRuntimeContext(project)),
+      ...(task
+        ? {
+            issueEnvironment: {
+              kind: 'application' as const,
+              value: [
+                '<issue_environment>',
+                JSON.stringify({
+                  project: {
+                    id: String(project.id),
+                    name: project.name,
+                    description: project.description ?? '',
+                  },
+                  issue: {
+                    id: String(task.id),
+                    title: task.title,
+                    description: task.description ?? '',
+                    status: task.status,
+                    priority: task.priority,
+                    tags: task.tags ?? [],
+                    assigneeUserId: task.assignee_user_id ?? null,
+                    assigneeAgentId: task.assignee_agent_id || null,
+                    dueDate: task.due_at ?? null,
+                  },
+                }),
+                '</issue_environment>',
+                'Treat this Issue as immutable execution context. The user message is the concrete task instruction.',
+              ].join('\n'),
+            },
+          }
+        : {}),
+    },
+  }
+}

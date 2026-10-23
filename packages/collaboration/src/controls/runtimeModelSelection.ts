@@ -1,0 +1,375 @@
+import type { ModelSelectionConfig } from "@wegent/chat-core/runtime-stream-types";
+import type { RuntimeSendRequest } from "@wegent/chat-core/runtime-task-api-types";
+import {
+  getCloudModelReasoning,
+  getCloudModelUpstreamApiFormat,
+  resolveModelExecutionSelection,
+  supportsCloudExecution,
+} from "@wegent/chat-core/model-execution";
+import {
+  getDefaultModelOptions,
+  isModelPickerDefault,
+  normalizeModelOptionAliases,
+  resolveCodexCatalogModelId,
+} from "./model-ui";
+import type {
+  ModelOptions,
+  ModelType,
+  UnifiedModel,
+} from "@wegent/chat-core/models";
+
+export const CLOUD_MODEL_NAMESPACE_OPTION = "weworkCloudModelNamespace";
+export const CLOUD_MODEL_RESOURCE_USER_ID_OPTION =
+  "weworkCloudModelResourceUserId";
+export const CLOUD_MODEL_CONTEXT_WINDOW_OPTION =
+  "weworkCloudModelContextWindow";
+export const CLOUD_MODEL_MAX_OUTPUT_TOKENS_OPTION =
+  "weworkCloudModelMaxOutputTokens";
+export const CLOUD_MODEL_UPSTREAM_API_FORMAT_OPTION =
+  "weworkCloudModelUpstreamApiFormat";
+export const CLOUD_MODEL_CODEX_CATALOG_MODEL_ID_OPTION =
+  "weworkCloudModelCodexCatalogModelId";
+export const CLOUD_MODEL_VISION_SIDECAR_OPTION = "weworkCloudVisionSidecar";
+export const CLOUD_MODEL_NATIVE_TOOL_SEARCH_OPTION =
+  "weworkCloudModelNativeToolSearch";
+export const CLOUD_MODEL_NATIVE_NAMESPACE_TOOLS_OPTION =
+  "weworkCloudModelNativeNamespaceTools";
+export const CLOUD_MODEL_CODEX_REQUEST_MODE_OPTION =
+  "weworkCloudModelCodexRequestMode";
+
+const CLOUD_VISION_SIDECAR_CONFIG_KEY = "visionSidecarModel";
+
+export interface CloudVisionSidecarReference {
+  modelName: string;
+  modelType: ModelType;
+  namespace: string;
+  resourceUserId: number;
+  apiFormat:
+    | "openai-responses"
+    | "openai-chat-completions"
+    | "anthropic-messages";
+}
+
+/**
+ * Validate the shape of a cloud vision sidecar reference stored on a Model CRD.
+ *
+ * The reference is authoritative: the backend LLM gateway resolves it against the
+ * `kinds` table and enforces access with the same identity headers, so there is no
+ * client-side catalog lookup here. A reference that points at a missing or
+ * non-visual model fails per image inside the executor's vision sidecar with an
+ * inline diagnostic, instead of leaking the image to a text-only primary model.
+ */
+export function parseCloudVisionSidecarReference(
+  value: unknown,
+): CloudVisionSidecarReference | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.modelName !== "string" ||
+    !record.modelName.trim() ||
+    !["public", "user", "group"].includes(String(record.modelType)) ||
+    typeof record.namespace !== "string" ||
+    !record.namespace.trim() ||
+    typeof record.resourceUserId !== "number" ||
+    !Number.isInteger(record.resourceUserId) ||
+    record.resourceUserId < 0 ||
+    ![
+      "openai-responses",
+      "openai-chat-completions",
+      "anthropic-messages",
+    ].includes(String(record.apiFormat))
+  ) {
+    return null;
+  }
+  return {
+    modelName: record.modelName.trim(),
+    modelType: record.modelType as ModelType,
+    namespace: record.namespace.trim(),
+    resourceUserId: record.resourceUserId,
+    apiFormat: record.apiFormat as CloudVisionSidecarReference["apiFormat"],
+  };
+}
+
+function getStringConfigValue(
+  config: Record<string, unknown> | null | undefined,
+  key: string,
+): string {
+  const value = config?.[key];
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function getRawStringConfigValue(
+  config: Record<string, unknown> | null | undefined,
+  key: string,
+): string {
+  const value = config?.[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function getBooleanConfigValue(
+  config: Record<string, unknown> | null | undefined,
+  key: string,
+): boolean {
+  return config?.[key] === true;
+}
+
+function configuredBooleanValue(
+  config: Record<string, unknown> | null | undefined,
+  snakeCaseKey: string,
+  camelCaseKey: string,
+): boolean | null {
+  const value = config?.[snakeCaseKey] ?? config?.[camelCaseKey];
+  return typeof value === "boolean" ? value : null;
+}
+
+function cloudNativeToolCapabilities(
+  model: UnifiedModel,
+  upstreamApiFormat: string,
+): { nativeToolSearch: boolean; nativeNamespaceTools: boolean } {
+  const nativeByDefault = upstreamApiFormat === "openai-responses";
+  const mode = model.config?.codex_request_mode;
+  if (mode === "standard" || mode === "passthrough") {
+    return {
+      nativeToolSearch: mode === "passthrough",
+      nativeNamespaceTools: mode === "passthrough",
+    };
+  }
+  return {
+    nativeToolSearch:
+      configuredBooleanValue(
+        model.config,
+        "native_tool_search",
+        "nativeToolSearch",
+      ) ?? nativeByDefault,
+    nativeNamespaceTools:
+      configuredBooleanValue(
+        model.config,
+        "native_namespace_tools",
+        "nativeNamespaceTools",
+      ) ?? nativeByDefault,
+  };
+}
+
+function modelKind(model: UnifiedModel): string {
+  return (
+    getStringConfigValue(model.config, "weworkModelKind") ||
+    getStringConfigValue(
+      model.config?.ui as Record<string, unknown> | null,
+      "family",
+    )
+  );
+}
+
+function isLocalModel(model: UnifiedModel): boolean {
+  return model.provider === "local";
+}
+
+function isCloudModel(model: UnifiedModel): boolean {
+  return model.provider !== "local";
+}
+
+function selectionForModel(model: UnifiedModel): ModelSelectionConfig {
+  return {
+    modelName: model.name,
+    modelType: model.type,
+    options: {
+      ...getDefaultModelOptions(model),
+      ...modelSelectionIdentityOptions(model),
+    },
+  };
+}
+
+export function modelSelectionIdentityOptions(
+  model: UnifiedModel,
+): ModelOptions {
+  const options: ModelOptions = {};
+  const codexProviderId = getRawStringConfigValue(
+    model.config,
+    "codexProviderId",
+  );
+  if (codexProviderId) {
+    options.codexProviderId = codexProviderId;
+  }
+  if (model.namespace) {
+    options[CLOUD_MODEL_NAMESPACE_OPTION] = model.namespace;
+  }
+  if (typeof model.resourceUserId === "number") {
+    options[CLOUD_MODEL_RESOURCE_USER_ID_OPTION] = String(model.resourceUserId);
+  }
+  return options;
+}
+
+function isCodexCompatibleModel(model: UnifiedModel): boolean {
+  return supportsCloudExecution(model);
+}
+
+export function resolveAutomaticModel(
+  models: UnifiedModel[],
+): UnifiedModel | null {
+  return models.find((model) => !model.compatibilityDisabled) ?? null;
+}
+
+export function defaultNewChatModel(
+  models: UnifiedModel[],
+): UnifiedModel | null {
+  const candidates = models.filter((model) => !model.compatibilityDisabled);
+  return (
+    candidates.find(
+      (model) =>
+        isLocalModel(model) &&
+        modelKind(model) === "codex-official" &&
+        getBooleanConfigValue(model.config, "codexAuthConfigured") &&
+        getBooleanConfigValue(model.config, "codexIsDefault"),
+    ) ??
+    candidates.find(
+      (model) =>
+        isLocalModel(model) &&
+        modelKind(model) === "codex-official" &&
+        getBooleanConfigValue(model.config, "codexAuthConfigured"),
+    ) ??
+    candidates.find(
+      (model) => isLocalModel(model) && modelKind(model) === "codex-provider",
+    ) ??
+    candidates.find(
+      (model) => isLocalModel(model) && modelKind(model) === "model-interface",
+    ) ??
+    candidates.find(
+      (model) => isCloudModel(model) && isModelPickerDefault(model),
+    ) ??
+    candidates.find(isCloudModel) ??
+    null
+  );
+}
+
+export function defaultNewChatModelSelection(
+  models: UnifiedModel[],
+): ModelSelectionConfig | null {
+  const selected = defaultNewChatModel(models);
+  return selected ? selectionForModel(selected) : null;
+}
+
+export function inferRuntimeName(
+  model: UnifiedModel | null,
+): "codex" | "claude_code" {
+  if (model && isCodexCompatibleModel(model)) return "codex";
+  return "claude_code";
+}
+
+export function selectedModelExecutionFields(
+  selectedModel: UnifiedModel | null,
+  selectedModelOptions: ModelOptions,
+): Pick<RuntimeSendRequest, "modelId" | "modelType" | "modelOptions"> {
+  const normalizedSelectedModelOptions =
+    normalizeModelOptionAliases(selectedModelOptions);
+  const modelOptions: ModelOptions = {
+    ...normalizedSelectedModelOptions,
+    collaborationMode:
+      normalizedSelectedModelOptions.collaborationMode ?? "default",
+  };
+  if (!selectedModel) {
+    return { modelOptions };
+  }
+  const codexProviderId = getRawStringConfigValue(
+    selectedModel.config,
+    "codexProviderId",
+  );
+  const codexProviderName = getRawStringConfigValue(
+    selectedModel.config,
+    "codexProviderName",
+  );
+  const codexProviderType = getRawStringConfigValue(
+    selectedModel.config,
+    "codexProviderType",
+  );
+  if (codexProviderId) modelOptions.codexProviderId = codexProviderId;
+  if (codexProviderName) modelOptions.codexProviderName = codexProviderName;
+  if (codexProviderType) modelOptions.codexProviderType = codexProviderType;
+  const executionModel = resolveModelExecutionSelection(selectedModel);
+  if (
+    executionModel.modelType === "public" ||
+    executionModel.modelType === "user" ||
+    executionModel.modelType === "group"
+  ) {
+    const reasoning = getCloudModelReasoning(selectedModel);
+    if (reasoning.effort && modelOptions.reasoning == null) {
+      modelOptions.reasoning = reasoning.effort;
+    }
+    if (reasoning.summary && modelOptions.summary == null) {
+      modelOptions.summary = reasoning.summary;
+    }
+    const requestMode = selectedModel.config?.codex_request_mode;
+    if (
+      requestMode === "auto" ||
+      requestMode === "standard" ||
+      requestMode === "passthrough"
+    ) {
+      modelOptions[CLOUD_MODEL_CODEX_REQUEST_MODE_OPTION] = requestMode;
+    }
+    if (executionModel.modelNamespace) {
+      modelOptions[CLOUD_MODEL_NAMESPACE_OPTION] =
+        executionModel.modelNamespace;
+    }
+    if (typeof executionModel.resourceUserId === "number") {
+      modelOptions[CLOUD_MODEL_RESOURCE_USER_ID_OPTION] = String(
+        executionModel.resourceUserId,
+      );
+    }
+    const upstreamApiFormat = getCloudModelUpstreamApiFormat(selectedModel);
+    if (upstreamApiFormat) {
+      modelOptions[CLOUD_MODEL_UPSTREAM_API_FORMAT_OPTION] = upstreamApiFormat;
+      if (upstreamApiFormat === "openai-responses") {
+        const nativeCapabilities = cloudNativeToolCapabilities(
+          selectedModel,
+          upstreamApiFormat,
+        );
+        modelOptions[CLOUD_MODEL_NATIVE_TOOL_SEARCH_OPTION] = String(
+          nativeCapabilities.nativeToolSearch,
+        );
+        modelOptions[CLOUD_MODEL_NATIVE_NAMESPACE_TOOLS_OPTION] = String(
+          nativeCapabilities.nativeNamespaceTools,
+        );
+      }
+    }
+    const codexCatalogModelId = resolveCodexCatalogModelId(selectedModel);
+    if (codexCatalogModelId) {
+      modelOptions[CLOUD_MODEL_CODEX_CATALOG_MODEL_ID_OPTION] =
+        codexCatalogModelId;
+    }
+    const visionSidecar = parseCloudVisionSidecarReference(
+      selectedModel.config?.[CLOUD_VISION_SIDECAR_CONFIG_KEY],
+    );
+    if (visionSidecar) {
+      modelOptions[CLOUD_MODEL_VISION_SIDECAR_OPTION] =
+        JSON.stringify(visionSidecar);
+    }
+
+    const contextWindow =
+      selectedModel.contextWindow ??
+      selectedModel.config?.model_context_window ??
+      selectedModel.config?.context_window ??
+      selectedModel.config?.contextWindow;
+    if (
+      (typeof contextWindow === "number" && contextWindow > 0) ||
+      (typeof contextWindow === "string" && Number(contextWindow) > 0)
+    ) {
+      modelOptions[CLOUD_MODEL_CONTEXT_WINDOW_OPTION] = String(contextWindow);
+    }
+
+    const maxOutputTokens =
+      selectedModel.maxOutputTokens ??
+      selectedModel.config?.max_output_tokens ??
+      selectedModel.config?.maxOutputTokens;
+    if (
+      (typeof maxOutputTokens === "number" && maxOutputTokens > 0) ||
+      (typeof maxOutputTokens === "string" && Number(maxOutputTokens) > 0)
+    ) {
+      modelOptions[CLOUD_MODEL_MAX_OUTPUT_TOKENS_OPTION] =
+        String(maxOutputTokens);
+    }
+  }
+  return {
+    modelId: executionModel.modelName,
+    modelType: executionModel.modelType,
+    modelOptions,
+  };
+}

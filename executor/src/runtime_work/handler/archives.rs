@@ -1,0 +1,694 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+
+pub(super) async fn run_worktree_restore_blocking<F>(restore: F) -> Result<bool, String>
+where
+    F: FnOnce() -> Result<bool, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(restore)
+        .await
+        .map_err(|error| format!("Worktree restore task failed: {error}"))?
+}
+
+impl RuntimeWorkRpcHandler {
+    pub(super) async fn archive_task(&self, payload: Value) -> Result<Value, AppIpcError> {
+        log_executor_event(
+            "runtime task archive requested",
+            &[
+                (
+                    "payload_task_id",
+                    runtime_task_id(&payload).unwrap_or_else(|| "none".to_owned()),
+                ),
+                (
+                    "payload_workspace_path",
+                    workspace_path(&payload).unwrap_or_else(|| "none".to_owned()),
+                ),
+                (
+                    "payload_address_task_id",
+                    payload
+                        .get("address")
+                        .and_then(runtime_task_id)
+                        .unwrap_or_else(|| "none".to_owned()),
+                ),
+            ],
+        );
+        let mut link = self.task_link_from_payload(&payload, false).await?;
+        if !self
+            .wait_for_worktree_preparation_to_finish(&link.local_task_id)
+            .await
+        {
+            return Ok(json!({
+                "success": false,
+                "accepted": false,
+                "taskId": link.local_task_id,
+                "workspacePath": link.workspace_path,
+                "runtime": link.runtime,
+                "error": "runtime task worktree preparation did not stop within timeout",
+                "code": "worktree_runtime_stop_timeout",
+            }));
+        }
+        let stop_result = self
+            .cancel_task(json!({
+                "taskId": link.local_task_id,
+                "workspacePath": link.workspace_path,
+            }))
+            .await?;
+        if stop_result["accepted"] != true {
+            return Ok(stop_result);
+        }
+        link = self.task_link_from_payload(&payload, false).await?;
+        let archive_thread_id = runtime_session_id_from_link(&link);
+        log_runtime_archive_link("runtime task archive resolved link", &link, false);
+        if let Some(thread_id) = archive_thread_id.as_deref() {
+            if let Err(error) = self
+                .call_codex_thread_method("thread/archive", json!({"threadId": thread_id}))
+                .await
+            {
+                log_executor_event(
+                    "runtime task archive codex failed",
+                    &[
+                        ("local_task_id", link.local_task_id.clone()),
+                        ("thread_id", thread_id.to_owned()),
+                        ("error", error.clone()),
+                    ],
+                );
+                if codex_error_is_missing_rollout(&error, thread_id) {
+                    return Ok(self
+                        .cleanup_missing_rollout_task(&link, thread_id, error)
+                        .await);
+                }
+                return Ok(task_action_failure(&link, error));
+            }
+            log_executor_event(
+                "runtime task archive codex accepted",
+                &[
+                    ("local_task_id", link.local_task_id.clone()),
+                    ("thread_id", thread_id.to_owned()),
+                ],
+            );
+            self.codex_app_server.unsubscribe_thread(thread_id).await;
+            self.remove_thread_event_route(thread_id);
+        } else {
+            log_executor_event(
+                "runtime task archive skipped codex",
+                &[
+                    ("local_task_id", link.local_task_id.clone()),
+                    ("reason", "missing_thread_id".to_owned()),
+                ],
+            );
+        }
+
+        link.status = "archived".to_owned();
+        link.running = false;
+        link.continuable = false;
+        link.updated_at = now_ms();
+        self.upsert_local_task(link.clone());
+        log_runtime_archive_link("runtime task archive stored link", &link, true);
+        Ok(task_action_success(&link))
+    }
+
+    pub(super) async fn cleanup_missing_rollout_task(
+        &self,
+        link: &RuntimeTaskLink,
+        thread_id: &str,
+        archive_error: String,
+    ) -> Value {
+        let started_at = Instant::now();
+        let delete_result = self
+            .call_codex_thread_method_without_list_invalidation(
+                "thread/delete",
+                json!({"threadId": thread_id}),
+            )
+            .await;
+        match &delete_result {
+            Ok(_) => log_executor_event(
+                "runtime task archive missing rollout deleted codex thread",
+                &[
+                    ("local_task_id", link.local_task_id.clone()),
+                    ("thread_id", thread_id.to_owned()),
+                    ("elapsed_ms", started_at.elapsed().as_millis().to_string()),
+                ],
+            ),
+            Err(error) => log_executor_event(
+                "runtime task archive missing rollout codex delete failed",
+                &[
+                    ("local_task_id", link.local_task_id.clone()),
+                    ("thread_id", thread_id.to_owned()),
+                    ("elapsed_ms", started_at.elapsed().as_millis().to_string()),
+                    ("error", error.clone()),
+                ],
+            ),
+        }
+
+        self.mark_archived_link_deleted(link);
+        self.store.delete_task(&link.local_task_id);
+        let mut response = task_action_success(link);
+        response["cleaned"] = json!(true);
+        response["cleanupReason"] = json!("missing_rollout");
+        response["archiveError"] = json!(archive_error);
+        if let Err(error) = delete_result {
+            response["deleteError"] = json!(error);
+        }
+        response
+    }
+
+    pub(super) async fn archive_project_conversations(
+        &self,
+        payload: Value,
+    ) -> Result<Value, AppIpcError> {
+        let project_index = CodexGlobalProjectIndex::load();
+        let workspace_path = runtime_project_workspace_path(&payload, &project_index)
+            .ok_or_else(|| AppIpcError::new("bad_request", "runtimeProjectKey is required"))?;
+        let links =
+            self.visible_links_for_projects(self.collect_links(false).await, &project_index);
+        let project_links = links
+            .into_iter()
+            .filter(|link| {
+                let group_path = link
+                    .group_workspace_path
+                    .clone()
+                    .unwrap_or_else(|| workspace_group_path(&link.workspace_path));
+                group_path == workspace_path
+            })
+            .collect::<Vec<_>>();
+        self.archive_links_bulk(project_links).await
+    }
+
+    pub(super) async fn archive_all_conversations(&self) -> Result<Value, AppIpcError> {
+        let project_index = CodexGlobalProjectIndex::load();
+        let links =
+            self.visible_links_for_projects(self.collect_links(false).await, &project_index);
+        self.archive_links_bulk(links).await
+    }
+
+    pub(super) async fn archive_links_bulk(
+        &self,
+        links: Vec<RuntimeTaskLink>,
+    ) -> Result<Value, AppIpcError> {
+        let requested_count = links.len();
+        let mut accepted_count = 0_usize;
+        let mut results = Vec::new();
+        let archive_results = stream::iter(links)
+            .map(|link| {
+                let handler = self.clone();
+                async move {
+                    handler
+                        .archive_task(json!({
+                            "taskId": link.local_task_id,
+                            "workspacePath": link.workspace_path,
+                            "runtimeHandle": link.runtime_handle,
+                        }))
+                        .await
+                }
+            })
+            .buffered(8)
+            .collect::<Vec<_>>()
+            .await;
+        for result in archive_results {
+            let result = result?;
+            if result["accepted"].as_bool() == Some(true) {
+                accepted_count += 1;
+            }
+            results.push(result);
+        }
+
+        Ok(json!({
+            "success": accepted_count == requested_count,
+            "accepted": accepted_count == requested_count,
+            "requestedCount": requested_count,
+            "acceptedCount": accepted_count,
+            "results": results,
+        }))
+    }
+
+    pub(super) async fn unarchive_task(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let mut link = self.task_link_from_payload(&payload, true).await?;
+        let worktrees = self.worktrees.clone();
+        let workspace_path = PathBuf::from(&link.workspace_path);
+        if let Err(error) =
+            run_worktree_restore_blocking(move || worktrees.restore_if_known(&workspace_path)).await
+        {
+            return Ok(task_action_failure(&link, error));
+        }
+        if let Some(thread_id) = link.thread_id.as_deref() {
+            if let Err(error) = self
+                .call_codex_thread_method("thread/unarchive", json!({"threadId": thread_id}))
+                .await
+            {
+                return Ok(task_action_failure(&link, error));
+            }
+        }
+
+        link.status = "active".to_owned();
+        link.running = false;
+        link.continuable = true;
+        link.updated_at = now_ms();
+        self.upsert_local_task(link.clone());
+        Ok(task_action_success(&link))
+    }
+
+    pub(super) async fn rename_task(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let title = string_field(&payload, "title")
+            .or_else(|| string_field(&payload, "name"))
+            .ok_or_else(|| AppIpcError::new("bad_request", "title is required"))?;
+        let mut link = self.task_link_from_payload(&payload, false).await?;
+        if let Some(thread_id) = link.thread_id.as_deref() {
+            if let Err(error) = self
+                .call_codex_thread_method(
+                    "thread/name/set",
+                    json!({"threadId": thread_id, "name": title}),
+                )
+                .await
+            {
+                return Ok(task_action_failure(&link, error));
+            }
+        }
+
+        link.title = title;
+        link.updated_at = now_ms();
+        self.upsert_local_task(link.clone());
+        let mut response = task_action_success(&link);
+        response["codexRename"] = json!({"stateUpdated": true});
+        Ok(response)
+    }
+
+    pub(super) async fn get_task_goal(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let link = self.task_link_from_payload(&payload, false).await?;
+        if is_claude_runtime(&link.runtime) {
+            let mut response = task_action_success(&link);
+            response["goal"] = self.get_claude_goal(&link).unwrap_or(Value::Null);
+            return Ok(response);
+        }
+        let Some(thread_id) = codex_thread_id_from_link(&link) else {
+            return Ok(task_goal_missing_session(&link));
+        };
+
+        match self
+            .call_codex_thread_method("thread/goal/get", json!({"threadId": thread_id}))
+            .await
+        {
+            Ok(result) => {
+                let goal = result
+                    .get("goal")
+                    .cloned()
+                    .map(normalize_runtime_goal_timestamps)
+                    .unwrap_or(Value::Null);
+                self.hydrate_runtime_task_goal_status(
+                    &link.local_task_id,
+                    string_field(&goal, "status"),
+                );
+                let mut response = task_action_success(&link);
+                response["goal"] = goal;
+                Ok(response)
+            }
+            Err(error) => Ok(task_action_failure(&link, error)),
+        }
+    }
+
+    pub(super) async fn set_task_goal(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let link = self.task_link_from_payload(&payload, false).await?;
+        if is_claude_runtime(&link.runtime) {
+            let goal = self.set_claude_goal(&link, &payload);
+            let mut response = task_action_success(&link);
+            response["goal"] = goal;
+            return Ok(response);
+        }
+        let Some(thread_id) = codex_thread_id_from_link(&link) else {
+            return Ok(task_goal_missing_session(&link));
+        };
+
+        let mut params = Map::new();
+        params.insert("threadId".to_owned(), Value::String(thread_id));
+        if let Some(objective) = payload.get("objective").cloned() {
+            params.insert("objective".to_owned(), objective);
+        }
+        if let Some(status) = payload.get("status").cloned() {
+            params.insert("status".to_owned(), status);
+        }
+        if let Some(token_budget) = payload
+            .get("tokenBudget")
+            .or_else(|| payload.get("token_budget"))
+            .cloned()
+        {
+            params.insert("tokenBudget".to_owned(), token_budget);
+        }
+
+        match self
+            .call_codex_thread_method("thread/goal/set", Value::Object(params))
+            .await
+        {
+            Ok(result) => {
+                let goal = result
+                    .get("goal")
+                    .cloned()
+                    .map(normalize_runtime_goal_timestamps)
+                    .unwrap_or(Value::Null);
+                self.sync_runtime_task_goal_status(
+                    &link.local_task_id,
+                    string_field(&goal, "status"),
+                );
+                let resumed = if string_field(&goal, "status").as_deref() == Some("active") {
+                    self.resume_goal_needing_attention(&link.local_task_id)
+                        .await
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let mut response = task_action_success(&link);
+                response["goal"] = goal;
+                response["resumed"] = Value::Bool(resumed);
+                Ok(response)
+            }
+            Err(error) => Ok(task_action_failure(&link, error)),
+        }
+    }
+
+    pub(super) async fn clear_task_goal(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let link = self.task_link_from_payload(&payload, false).await?;
+        if is_claude_runtime(&link.runtime) {
+            let cleared = self.clear_claude_goal(&link);
+            let mut response = task_action_success(&link);
+            response["cleared"] = Value::Bool(cleared);
+            return Ok(response);
+        }
+        let Some(thread_id) = codex_thread_id_from_link(&link) else {
+            return Ok(task_goal_missing_session(&link));
+        };
+
+        match self
+            .call_codex_thread_method("thread/goal/clear", json!({"threadId": thread_id}))
+            .await
+        {
+            Ok(result) => {
+                self.sync_runtime_task_goal_status(&link.local_task_id, None);
+                let mut response = task_action_success(&link);
+                response["cleared"] = result.get("cleared").cloned().unwrap_or(Value::Bool(false));
+                Ok(response)
+            }
+            Err(error) => Ok(task_action_failure(&link, error)),
+        }
+    }
+
+    pub(super) async fn delete_archived_task(&self, payload: Value) -> Result<Value, AppIpcError> {
+        let link = self.task_link_from_payload(&payload, true).await?;
+        Ok(self.delete_archived_link(link).await)
+    }
+
+    pub(super) async fn delete_archived_link(&self, link: RuntimeTaskLink) -> Value {
+        self.store.upsert_task(link.clone());
+        self.mark_archived_link_deleted(&link);
+        let background = match self.archived_delete_tx.send(link.clone()) {
+            Ok(()) => true,
+            Err(error) => {
+                log_executor_event(
+                    "runtime archived conversation background enqueue failed",
+                    &[
+                        ("local_task_id", link.local_task_id.clone()),
+                        ("error", error.to_string()),
+                    ],
+                );
+                self.delete_archived_link_background(link.clone()).await;
+                false
+            }
+        };
+
+        let mut response = task_action_success(&link);
+        response["deleted"] = json!(true);
+        response["cleanup"] = json!({
+            "background": background,
+            "taskId": link.local_task_id,
+            "workspacePath": link.workspace_path,
+        });
+        response
+    }
+
+    pub(super) fn spawn_archived_delete_worker(
+        &self,
+        mut rx: mpsc::UnboundedReceiver<RuntimeTaskLink>,
+    ) {
+        let handler = self.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // Snapshot before accepting new requests so queued work is not replayed twice.
+        let interrupted = self
+            .store
+            .list_task_summaries(true)
+            .into_iter()
+            .filter(|link| link.status == "archived" && self.archived_link_is_deleted(link))
+            .collect::<Vec<_>>();
+        handle.spawn(async move {
+            for link in interrupted {
+                handler.delete_archived_link_background(link).await;
+            }
+            while let Some(link) = rx.recv().await {
+                handler.delete_archived_link_background(link).await;
+                sleep(ARCHIVED_BACKGROUND_DELETE_INTERVAL).await;
+            }
+        });
+    }
+
+    pub(super) async fn delete_archived_link_background(&self, link: RuntimeTaskLink) {
+        let mut errors = Vec::new();
+
+        let has_other_link = self.store.list_task_summaries(true).iter().any(|task| {
+            task.local_task_id != link.local_task_id
+                && normalize_workspace_path(&task.workspace_path)
+                    == normalize_workspace_path(&link.workspace_path)
+        });
+        let cleanup_link = link.clone();
+        let worktrees = self.worktrees.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            cleanup_task_files_response(&worktrees, &cleanup_link, true, false, !has_other_link)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            json!({
+                "taskId": link.local_task_id,
+                "workspacePath": link.workspace_path,
+                "targetCount": 0,
+                "cleanableCount": 0,
+                "skippedCount": 0,
+                "errorCount": 1,
+                "bytes": 0,
+                "items": [],
+                "error": error.to_string(),
+            })
+        });
+        log_executor_event(
+            "runtime archived conversation background cleanup finished",
+            &[
+                ("local_task_id", link.local_task_id.clone()),
+                (
+                    "error_count",
+                    cleanup
+                        .get("errorCount")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        .to_string(),
+                ),
+            ],
+        );
+        if let Some(error) = cleanup.get("error").and_then(Value::as_str) {
+            errors.push(error.to_owned());
+        }
+        if let Some(items) = cleanup.get("items").and_then(Value::as_array) {
+            errors.extend(items.iter().filter_map(|item| {
+                item.get("error").and_then(Value::as_str).map(|error| {
+                    format!(
+                        "{}: {error}",
+                        item["path"].as_str().unwrap_or(&link.workspace_path)
+                    )
+                })
+            }));
+        }
+        if let Some(thread_id) = link.thread_id.as_deref().filter(|_| errors.is_empty()) {
+            let started_at = Instant::now();
+            match self
+                .call_codex_thread_method_without_list_invalidation(
+                    "thread/delete",
+                    json!({"threadId": thread_id}),
+                )
+                .await
+            {
+                Ok(_) => {
+                    let elapsed = started_at.elapsed();
+                    if elapsed >= ARCHIVED_BACKGROUND_THREAD_DELETE_SLOW_THRESHOLD {
+                        log_executor_event(
+                            "runtime archived conversation background thread delete slow",
+                            &[
+                                ("local_task_id", link.local_task_id.clone()),
+                                ("thread_id", thread_id.to_owned()),
+                                ("elapsed_ms", elapsed.as_millis().to_string()),
+                            ],
+                        );
+                    }
+                }
+                Err(error) if codex_thread_is_already_deleted(&error, thread_id) => {}
+                Err(error) => {
+                    errors.push(error.clone());
+                    log_executor_event(
+                        "runtime archived conversation background thread delete failed",
+                        &[
+                            ("local_task_id", link.local_task_id.clone()),
+                            ("thread_id", thread_id.to_owned()),
+                            ("elapsed_ms", started_at.elapsed().as_millis().to_string()),
+                            ("error", error),
+                        ],
+                    );
+                }
+            }
+        }
+
+        if errors.is_empty() && !has_other_link {
+            let worktrees = self.worktrees.clone();
+            let workspace_path = PathBuf::from(&link.workspace_path);
+            let forgotten =
+                tokio::task::spawn_blocking(move || worktrees.forget_if_known(&workspace_path))
+                    .await;
+            if let Err(error) = forgotten
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()))
+            {
+                errors.push(error.clone());
+                log_executor_event(
+                    "runtime archived conversation worktree snapshot cleanup failed",
+                    &[
+                        ("local_task_id", link.local_task_id.clone()),
+                        ("error", error),
+                    ],
+                );
+            }
+        }
+        if errors.is_empty() {
+            self.store.delete_task(&link.local_task_id);
+        } else {
+            log_executor_event(
+                "runtime archived conversation background cleanup failed",
+                &[
+                    ("local_task_id", link.local_task_id.clone()),
+                    ("error", errors.join("; ")),
+                ],
+            );
+            // Preserve the archived task and worktree metadata so cleanup can be retried.
+            let mut ids = vec![link.local_task_id.clone()];
+            ids.extend(link.thread_id.iter().cloned());
+            self.store.unmark_deleted_archived_task_ids(&ids);
+        }
+        if let Some(event_tx) = &self.event_tx {
+            let _ = event_tx.send(json!({
+                "type": "event",
+                "event": "runtime.work.changed",
+                "payload": {
+                    "event_type": "runtime.work.changed",
+                    "taskId": link.local_task_id,
+                    "deviceId": self.device_id,
+                    "runtime": link.runtime,
+                    "eventSeq": next_runtime_event_sequence(),
+                    "data": {
+                        "archiveCleanup": {
+                            "workspacePath": link.workspace_path,
+                            "errors": errors,
+                        },
+                    },
+                },
+            }));
+        }
+    }
+
+    pub(super) async fn delete_archived_tasks_bulk(
+        &self,
+        payload: Value,
+    ) -> Result<Value, AppIpcError> {
+        let links = self.archived_cleanup_links(&payload).await?;
+        let results = stream::iter(links)
+            .map(|link| {
+                let handler = self.clone();
+                async move { handler.delete_archived_link(link).await }
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+        let deleted_count = results
+            .iter()
+            .filter(|result| result["deleted"] == true)
+            .count();
+
+        Ok(json!({
+            "success": true,
+            "accepted": true,
+            "requestedCount": results.len(),
+            "acceptedCount": deleted_count,
+            "deletedCount": deleted_count,
+            "results": results,
+        }))
+    }
+
+    pub(super) async fn preview_archived_conversation_cleanup(
+        &self,
+        payload: Value,
+    ) -> Result<Value, AppIpcError> {
+        let links = self.archived_cleanup_links(&payload).await?;
+        let previews = stream::iter(links)
+            .map(|link| {
+                let worktrees = self.worktrees.clone();
+                async move {
+                    let fallback = link.clone();
+                    tokio::task::spawn_blocking(move || {
+                        cleanup_task_files_preview(&worktrees, &link)
+                    })
+                    .await
+                    .unwrap_or_else(|error| cleanup_join_error_response(&fallback, error))
+                }
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>();
+        let previews = previews.await;
+        Ok(cleanup_summary_response(previews, false))
+    }
+
+    pub(super) async fn cleanup_archived_conversations(
+        &self,
+        payload: Value,
+    ) -> Result<Value, AppIpcError> {
+        let links = self.archived_cleanup_links(&payload).await?;
+        let results = stream::iter(links)
+            .map(|link| {
+                let worktrees = self.worktrees.clone();
+                async move {
+                    let fallback = link.clone();
+                    tokio::task::spawn_blocking(move || {
+                        cleanup_task_files_response(&worktrees, &link, true, false, true)
+                    })
+                    .await
+                    .unwrap_or_else(|error| cleanup_join_error_response(&fallback, error))
+                }
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>();
+        let results = results.await;
+        Ok(cleanup_summary_response(results, true))
+    }
+}
+
+fn codex_thread_is_already_deleted(error: &str, thread_id: &str) -> bool {
+    codex_error_is_missing_rollout(error, thread_id)
+        || error.contains(&format!("thread not found: {thread_id}"))
+}
+
+fn cleanup_join_error_response(link: &RuntimeTaskLink, error: tokio::task::JoinError) -> Value {
+    json!({
+        "taskId": link.local_task_id,
+        "workspacePath": link.workspace_path,
+        "targetCount": 0,
+        "cleanableCount": 0,
+        "skippedCount": 0,
+        "errorCount": 1,
+        "bytes": 0,
+        "items": [],
+        "error": error.to_string(),
+    })
+}

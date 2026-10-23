@@ -1,0 +1,706 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared cloud project endpoints."""
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
+from fastapi.responses import Response
+from sqlalchemy.orm import Session
+
+from app.api.dependencies import get_db
+from app.core.security import (
+    get_current_user,
+    get_current_user_jwt_apikey_tasktoken,
+)
+from app.models.user import User
+from app.schemas.cloud_file import (
+    CloudFileAccessResponse,
+    CloudFileListResponse,
+    CloudFileMove,
+    CloudFileResponse,
+    CloudFolderCreate,
+    ProjectDeliveryFileListResponse,
+    ProjectDeliveryFileResponse,
+    ProjectDeliveryItemPathResponse,
+)
+from app.schemas.cloud_project import (
+    CloudProjectCreate,
+    CloudProjectMemberCreate,
+    CloudProjectMemberResponse,
+    CloudProjectMemberUpdate,
+    CloudProjectResponse,
+    CloudProjectUpdate,
+    CollaborationMessageImportCreate,
+)
+from app.schemas.delivery import (
+    CollaborationMessageImportResponse,
+    LoopItemCommentResponse,
+    LoopItemCreate,
+    LoopItemResponse,
+    ProjectLoopItemAttachmentListResponse,
+    ProjectLoopItemAttachmentResponse,
+)
+from app.schemas.project_board import ProjectBoardSnapshotResponse
+from app.schemas.project_chat import (
+    LoopItemApproval,
+    LoopItemAssign,
+    ProjectChatAgentCreate,
+    ProjectChatAgentUpdate,
+    ProjectChatAgentView,
+)
+from app.schemas.work_queue import MessageContentSnapshot
+from app.schemas.workspace import (
+    ExecutionEnvironmentInitialize,
+    WorkspaceExecutionEnvironmentCreate,
+    WorkspaceExecutionEnvironmentResponse,
+)
+from app.services.cloud_files import cloud_file_service
+from app.services.cloud_projects import cloud_project_service
+from app.services.cloud_projects.responses import project_response as _project_response
+from app.services.loop_item_events import publish_loop_item_changed
+from app.services.loop_items.external_provider import external_loop_item_provider
+from app.services.loop_items.provider_router import loop_item_provider_router
+from app.services.loop_items.service import loop_item_service
+from app.services.message_forwarding_service import message_forwarding_service
+from app.services.project_board_snapshot import project_board_snapshot_service
+from app.services.project_chat.service import project_chat_service
+from app.stores.tasks import subtask_store, task_access_store, task_store
+
+router = APIRouter()
+legacy_router = APIRouter()
+
+
+def _collaboration_message_body(
+    task_name: str,
+    snapshots: list[MessageContentSnapshot],
+    note: str | None,
+) -> str:
+    sections = [f"来自聊天“{task_name}”的消息："]
+    for snapshot in snapshots:
+        role = "用户" if snapshot.role == "USER" else "智能体"
+        sender = f" · {snapshot.senderUserName}" if snapshot.senderUserName else ""
+        timestamp = f" · {snapshot.createdAt}" if snapshot.createdAt else ""
+        content = snapshot.content.strip() or "（空消息）"
+        quoted = content.replace("\n", "\n> ")
+        sections.append(f"> **{role}{sender}{timestamp}**\n>\n> {quoted}")
+        for attachment in snapshot.attachments or []:
+            name = (
+                attachment.get("name")
+                or attachment.get("filename")
+                or attachment.get("file_name")
+                or "附件"
+            )
+            sections.append(f"- 附件：{name}")
+    if note:
+        sections.append(f"备注：{note.strip()}")
+    return "\n\n".join(sections)
+
+
+@router.post(
+    "/{project_id}/message-imports",
+    response_model=CollaborationMessageImportResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def import_chat_messages(
+    project_id: int,
+    values: CollaborationMessageImportCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> CollaborationMessageImportResponse:
+    """Create or update an Issue from an immutable chat-message snapshot."""
+
+    project = cloud_project_service.get(db, project_id, current_user.id)
+    task = task_store.get_active_task(db, task_id=values.source_task_id)
+    if task is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Source task not found")
+    if not task_access_store.is_member(
+        db, task_id=values.source_task_id, user_id=current_user.id
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied")
+
+    subtasks = subtask_store.list_by_task_ordered(
+        db,
+        task_id=values.source_task_id,
+        owner_user_id=task.user_id,
+    )
+    if values.subtask_ids:
+        selected_ids = set(values.subtask_ids)
+        subtasks = [subtask for subtask in subtasks if subtask.id in selected_ids]
+        if len(subtasks) != len(selected_ids):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Source message not found")
+    if not subtasks:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No messages to import")
+
+    snapshots = [
+        message_forwarding_service.build_content_snapshot(subtask)
+        for subtask in subtasks
+    ]
+    body = _collaboration_message_body(task.name, snapshots, values.note)
+
+    if values.target.kind == "new_issue":
+        title = values.target.title or task.name or "聊天消息"
+        created = loop_item_provider_router.create(
+            db,
+            project,
+            current_user,
+            LoopItemCreate(title=title[:255], description=body, status="inbox"),
+        )
+        return CollaborationMessageImportResponse(
+            issue=LoopItemResponse.model_validate(created.values)
+        )
+
+    issue_id = values.target.issue_id or ""
+    is_external_issue = external_loop_item_provider.is_external_item(db, issue_id)
+    if is_external_issue:
+        issue = external_loop_item_provider.get(db, issue_id, current_user.id)
+        issue_project_id = issue.get("cloud_project_id")
+    else:
+        item = loop_item_service.get(db, issue_id, current_user.id)
+        issue_project_id = item.cloud_project_id
+        issue = loop_item_service.response_values(
+            db,
+            item,
+            current_user.id,
+        )
+    if str(issue_project_id) != str(project.id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Issue not found")
+    comment = (
+        external_loop_item_provider.add_comment(
+            db,
+            issue_id,
+            current_user.id,
+            body,
+        )
+        if is_external_issue
+        else loop_item_service.add_comment(db, issue_id, current_user.id, body)
+    )
+    return CollaborationMessageImportResponse(
+        issue=LoopItemResponse.model_validate(issue),
+        comment=LoopItemCommentResponse.model_validate(comment),
+    )
+
+
+@router.post(
+    "", response_model=CloudProjectResponse, status_code=status.HTTP_201_CREATED
+)
+def create_cloud_project(
+    values: CloudProjectCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> CloudProjectResponse:
+    """Create a cloud board using a user JWT, personal API key, or task token."""
+
+    project = cloud_project_service.create(db, current_user.id, values)
+    return _project_response(db, project, current_user)
+
+
+@legacy_router.get("/{project_id}", response_model=CloudProjectResponse)
+def get_cloud_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> CloudProjectResponse:
+    project = cloud_project_service.get(db, project_id, current_user.id)
+    return _project_response(db, project, current_user)
+
+
+@router.patch("/{project_id}", response_model=CloudProjectResponse)
+def update_cloud_project(
+    project_id: int,
+    values: CloudProjectUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> CloudProjectResponse:
+    project = cloud_project_service.update(db, project_id, current_user.id, values)
+    return _project_response(db, project, current_user)
+
+
+@router.post(
+    "/{project_id}/execution-environments",
+    response_model=WorkspaceExecutionEnvironmentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_project_execution_environment(
+    project_id: int,
+    values: WorkspaceExecutionEnvironmentCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> WorkspaceExecutionEnvironmentResponse:
+    return WorkspaceExecutionEnvironmentResponse.model_validate(
+        await cloud_project_service.add_execution_environment(
+            db, project_id, values.device_id, current_user.id
+        )
+    )
+
+
+@router.delete(
+    "/{project_id}/execution-environments/{device_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def remove_project_execution_environment(
+    project_id: int,
+    device_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> None:
+    cloud_project_service.remove_execution_environment(
+        db, project_id, device_id, current_user.id
+    )
+
+
+@router.post(
+    "/{project_id}/execution-environment/initialize",
+    response_model=CloudProjectResponse,
+)
+async def initialize_project_execution_environment(
+    project_id: int,
+    values: ExecutionEnvironmentInitialize,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> CloudProjectResponse:
+    project = await cloud_project_service.initialize_execution_environment(
+        db,
+        project_id,
+        values.device_id,
+        current_user.id,
+        values.version,
+    )
+    return _project_response(db, project, current_user)
+
+
+@router.get("/{project_id}/chat-agents", response_model=list[ProjectChatAgentView])
+def list_project_chat_agents(
+    project_id: int,
+    include_archived: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> list[ProjectChatAgentView]:
+    return project_chat_service.list_agents(
+        db,
+        user_id=current_user.id,
+        project_id=str(project_id),
+        include_archived=include_archived,
+    )
+
+
+@router.get(
+    "/{project_id}/board-snapshot",
+    response_model=ProjectBoardSnapshotResponse,
+)
+def get_project_board_snapshot(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ProjectBoardSnapshotResponse:
+    return project_board_snapshot_service.get(db, project_id, current_user.id)
+
+
+@router.post(
+    "/{project_id}/chat-agents",
+    response_model=ProjectChatAgentView,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_project_chat_agent(
+    project_id: int,
+    values: ProjectChatAgentCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ProjectChatAgentView:
+    return project_chat_service.create_agent(
+        db, user_id=current_user.id, project_id=str(project_id), request=values
+    )
+
+
+@router.patch(
+    "/{project_id}/chat-agents/{agent_id}", response_model=ProjectChatAgentView
+)
+def update_project_chat_agent(
+    project_id: int,
+    agent_id: str,
+    values: ProjectChatAgentUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ProjectChatAgentView:
+    return project_chat_service.update_agent(
+        db,
+        user_id=current_user.id,
+        project_id=str(project_id),
+        agent_id=agent_id,
+        request=values,
+    )
+
+
+@router.post(
+    "/{project_id}/loop-items/{item_id}/assign",
+    response_model=LoopItemResponse,
+)
+async def assign_loop_item(
+    project_id: int,
+    item_id: str,
+    values: LoopItemAssign,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LoopItemResponse:
+    """Assign a task to a member, project robot, or Wegent Team.
+
+    The assignment chain and the derived queue state live on the task itself;
+    there is no separate queue storage.
+    """
+
+    if external_loop_item_provider.is_external_item(db, item_id):
+        response = external_loop_item_provider.assign(
+            db, item_id, current_user.id, values
+        )
+        from app.tasks.robot_queue_tasks import consume_queues_background
+
+        background_tasks.add_task(consume_queues_background)
+        return LoopItemResponse.model_validate(response)
+    item = loop_item_service.assign(
+        db,
+        project_id=project_id,
+        item_id=item_id,
+        user_id=current_user.id,
+        values=values,
+    )
+    from app.tasks.robot_queue_tasks import consume_queues_background
+
+    background_tasks.add_task(consume_queues_background)
+    publish_loop_item_changed(
+        db,
+        item=item,
+        reason="assignment",
+        actor_user_id=current_user.id,
+    )
+    access = cloud_project_service.access(db, project_id, current_user.id)
+    return LoopItemResponse.model_validate(
+        loop_item_service.response_values(db, item, current_user.id, access=access)
+    )
+
+
+@router.post(
+    "/{project_id}/loop-items/{item_id}/approve",
+    response_model=LoopItemResponse,
+)
+def approve_loop_item_run(
+    project_id: int,
+    item_id: str,
+    values: LoopItemApproval,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LoopItemResponse:
+    """Approve a pending robot run. Only the robot creator can approve."""
+
+    if external_loop_item_provider.is_external_item(db, item_id):
+        response = external_loop_item_provider.approve_run(
+            db,
+            project_id=project_id,
+            item_id=item_id,
+            user_id=current_user.id,
+            values=values,
+        )
+        from app.tasks.robot_queue_tasks import consume_queues_background
+
+        background_tasks.add_task(consume_queues_background)
+        return LoopItemResponse.model_validate(response)
+    item = loop_item_service.approve_run(
+        db,
+        project_id=project_id,
+        item_id=item_id,
+        user_id=current_user.id,
+        values=values,
+    )
+    from app.tasks.robot_queue_tasks import consume_queues_background
+
+    background_tasks.add_task(consume_queues_background)
+    publish_loop_item_changed(
+        db,
+        item=item,
+        reason="execution_approved",
+        actor_user_id=current_user.id,
+    )
+    access = cloud_project_service.access(db, project_id, current_user.id)
+    return LoopItemResponse.model_validate(
+        loop_item_service.response_values(db, item, current_user.id, access=access)
+    )
+
+
+@router.post(
+    "/{project_id}/loop-items/{item_id}/reject",
+    response_model=LoopItemResponse,
+)
+def reject_loop_item_run(
+    project_id: int,
+    item_id: str,
+    values: LoopItemApproval,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LoopItemResponse:
+    """Reject a pending robot run. Only the robot creator can reject."""
+
+    if external_loop_item_provider.is_external_item(db, item_id):
+        response = external_loop_item_provider.reject_run(
+            db,
+            project_id=project_id,
+            item_id=item_id,
+            user_id=current_user.id,
+            values=values,
+        )
+        return LoopItemResponse.model_validate(response)
+    item = loop_item_service.reject_run(
+        db,
+        project_id=project_id,
+        item_id=item_id,
+        user_id=current_user.id,
+        values=values,
+    )
+    publish_loop_item_changed(
+        db,
+        item=item,
+        reason="execution_rejected",
+        actor_user_id=current_user.id,
+    )
+    access = cloud_project_service.access(db, project_id, current_user.id)
+    return LoopItemResponse.model_validate(
+        loop_item_service.response_values(db, item, current_user.id, access=access)
+    )
+
+
+@router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+def archive_cloud_project(
+    project_id: int,
+    version: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    cloud_project_service.archive(db, project_id, current_user.id, version)
+
+
+@router.get("/{project_id}/members", response_model=list[CloudProjectMemberResponse])
+def list_cloud_project_members(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> list[CloudProjectMemberResponse]:
+    members = cloud_project_service.list_members(db, project_id, current_user.id)
+    return [CloudProjectMemberResponse.model_validate(member) for member in members]
+
+
+@router.post(
+    "/{project_id}/members",
+    response_model=CloudProjectMemberResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def add_cloud_project_member(
+    project_id: int,
+    values: CloudProjectMemberCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> CloudProjectMemberResponse:
+    member = cloud_project_service.add_member(db, project_id, current_user.id, values)
+    return CloudProjectMemberResponse.model_validate(member)
+
+
+@router.patch(
+    "/{project_id}/members/{member_user_id}",
+    response_model=CloudProjectMemberResponse,
+)
+def update_cloud_project_member(
+    project_id: int,
+    member_user_id: int,
+    values: CloudProjectMemberUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> CloudProjectMemberResponse:
+    member = cloud_project_service.update_member(
+        db, project_id, member_user_id, current_user.id, values
+    )
+    return CloudProjectMemberResponse.model_validate(member)
+
+
+@router.delete(
+    "/{project_id}/members/{member_user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def remove_cloud_project_member(
+    project_id: int,
+    member_user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    cloud_project_service.remove_member(db, project_id, member_user_id, current_user.id)
+
+
+@router.get("/{project_id}/files", response_model=CloudFileListResponse)
+def list_cloud_files(
+    project_id: int,
+    prefix: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> CloudFileListResponse:
+    files = cloud_file_service.list(db, project_id, current_user.id, prefix)
+    return CloudFileListResponse(
+        items=[CloudFileResponse.model_validate(file) for file in files]
+    )
+
+
+@router.get(
+    "/{project_id}/delivery-files", response_model=ProjectDeliveryFileListResponse
+)
+def list_project_delivery_files(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ProjectDeliveryFileListResponse:
+    rows = cloud_file_service.list_delivery_files(db, project_id, current_user.id)
+    return ProjectDeliveryFileListResponse(
+        items=[
+            ProjectDeliveryFileResponse(
+                asset_id=row.asset.id,
+                delivery_id=row.delivery.id,
+                loop_item_id=row.item.id,
+                loop_item_title=row.item.title or row.item.id,
+                relative_path=row.asset.relative_path,
+                display_name=row.asset.display_name,
+                content_type=row.asset.content_type,
+                size_bytes=row.asset.size_bytes,
+                delivered_at=row.delivery.delivered_at,
+                loop_item_path=[
+                    ProjectDeliveryItemPathResponse(
+                        id=item.id, title=item.title or item.id
+                    )
+                    for item in row.item_path
+                ],
+            )
+            for row in rows
+            if row.delivery.delivered_at is not None
+        ]
+    )
+
+
+@router.get(
+    "/{project_id}/task-attachments",
+    response_model=ProjectLoopItemAttachmentListResponse,
+)
+def list_project_task_attachments(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ProjectLoopItemAttachmentListResponse:
+    """List attachments from all active tasks in a project."""
+
+    rows = loop_item_service.list_project_attachments(db, project_id, current_user.id)
+    return ProjectLoopItemAttachmentListResponse(
+        items=[
+            ProjectLoopItemAttachmentResponse.model_validate(
+                {
+                    **attachment.__dict__,
+                    "loop_item_title": item.title or item.name or item.id,
+                }
+            )
+            for attachment, item in rows
+        ]
+    )
+
+
+@router.post(
+    "/{project_id}/folders",
+    response_model=CloudFileResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_cloud_folder(
+    project_id: int,
+    values: CloudFolderCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> CloudFileResponse:
+    folder = cloud_file_service.create_folder(
+        db, project_id, current_user.id, values.path, values.description
+    )
+    return CloudFileResponse.model_validate(folder)
+
+
+@router.post(
+    "/{project_id}/files",
+    response_model=CloudFileResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_cloud_file(
+    project_id: int,
+    file: UploadFile = File(...),
+    path: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> CloudFileResponse:
+    uploaded = cloud_file_service.upload(
+        db,
+        project_id,
+        current_user.id,
+        path,
+        file.content_type or "application/octet-stream",
+        file.file,
+    )
+    return CloudFileResponse.model_validate(uploaded)
+
+
+@router.get("/files/{file_id}/access", response_model=CloudFileAccessResponse)
+def access_cloud_file(
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> CloudFileAccessResponse:
+    return CloudFileAccessResponse(
+        url=cloud_file_service.access_url(db, file_id, current_user.id)
+    )
+
+
+@router.get("/files/{file_id}/content")
+def read_cloud_file(
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Response:
+    content, content_type, filename = cloud_file_service.read_content(
+        db, file_id, current_user.id
+    )
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
+@router.patch("/files/{file_id}", response_model=CloudFileResponse)
+def move_cloud_file(
+    file_id: int,
+    values: CloudFileMove,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> CloudFileResponse:
+    file = cloud_file_service.move(
+        db, file_id, current_user.id, values.path, values.version
+    )
+    return CloudFileResponse.model_validate(file)
+
+
+@router.delete("/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_cloud_file(
+    file_id: int,
+    recursive: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    cloud_file_service.delete(db, file_id, current_user.id, recursive)

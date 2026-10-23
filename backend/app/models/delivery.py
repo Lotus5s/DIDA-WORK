@@ -1,0 +1,623 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Single-table project, task, execution, file, and delivery nodes."""
+
+import secrets
+from datetime import datetime
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    case,
+    cast,
+    event,
+    inspect,
+    or_,
+    select,
+)
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.orm import column_property
+from sqlalchemy.sql import func
+
+from app.core.provider_credentials import mask_provider_config
+from app.db.base import Base
+from app.models.resource_member import ResourceMember
+from shared.models.db.types import big_integer_id_type
+
+
+def _numeric_id() -> str:
+    return str(secrets.randbelow(9_000_000_000_000_000_000) + 1)
+
+
+def project_parent_relationships():
+    """Project containment remains in the relationship table used by v1."""
+    return (
+        select(
+            ResourceMember.resource_id.label("project_id"),
+            cast(func.min(ResourceMember.entity_id), Integer).label("workspace_id"),
+        )
+        .where(
+            ResourceMember.resource_type == "CloudProject",
+            ResourceMember.entity_type == "workspace",
+            ResourceMember.status == "approved",
+        )
+        .group_by(ResourceMember.resource_id)
+        .having(func.count(func.distinct(ResourceMember.entity_id)) == 1)
+    )
+
+
+class LoopNode(Base):
+    __tablename__ = "loop_items"
+
+    id = Column(String(64), primary_key=True, default=_numeric_id)
+    resource_type = Column(String(24), nullable=False, index=True)
+    project_space = Column(
+        String(100),
+        nullable=False,
+        default="default",
+        server_default="default",
+        index=True,
+    )
+    cloud_project_id = Column(
+        String(64),
+        ForeignKey("loop_items.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    parent_id = Column(
+        String(64),
+        ForeignKey("loop_items.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    loop_item_id = Column(
+        String(64),
+        ForeignKey("loop_items.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    delivery_id = Column(
+        String(64),
+        ForeignKey("loop_items.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    public_id = Column(String(36), nullable=True, unique=True)
+    project_key = Column(String(16), nullable=True, unique=True)
+    name = Column(String(255), nullable=True)
+    title = Column(String(255), nullable=True)
+    description = Column(Text, nullable=False, default="")
+    storage_prefix = Column(String(512), nullable=True, unique=True)
+    sequence_number = Column(Integer, nullable=True)
+    next_item_number = Column(Integer, nullable=True, default=1)
+    created_by_user_id = Column(Integer, nullable=True, index=True)
+    updated_by_user_id = Column(Integer, nullable=True)
+    assignee_user_id = Column(Integer, nullable=True, index=True)
+    user_id = Column(Integer, nullable=True, index=True)
+    added_by_user_id = Column(Integer, nullable=True)
+    source = Column(String(20), nullable=True)
+    status = Column(String(32), nullable=True, index=True)
+    priority = Column(String(20), nullable=True)
+    start_at = Column(DateTime, nullable=True)
+    due_at = Column(DateTime, nullable=True)
+    sort_order = Column(Integer, nullable=False, default=0, server_default="0")
+    current_delivery_id = Column(String(64), nullable=True)
+    local_project_id = Column(
+        Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=True
+    )
+    device_id = Column(String(100), nullable=True)
+    is_default = Column(Boolean, nullable=True)
+    task_user_id = Column(Integer, nullable=True)
+    assignee_agent_id = Column(
+        String(64),
+        nullable=False,
+        default="",
+        server_default="",
+        comment="Assigned project chat agent ID; empty when unassigned",
+    )
+    assignee_team_id = Column(
+        Integer,
+        ForeignKey(
+            "kinds.id",
+            name="fk_loop_items_assignee_team_id_kinds",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+        comment="Assigned Wegent Team ID; null when the assignee is not a Team",
+    )
+    task_id = Column(String(255), nullable=True)
+    task_title = Column(String(255), nullable=True)
+    backend_task_id = Column(
+        big_integer_id_type(),
+        ForeignKey("tasks.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    linked_by_user_id = Column(Integer, nullable=True)
+    linked_at = Column(DateTime, nullable=True)
+    unlinked_at = Column(DateTime, nullable=True)
+    path = Column(String(700), nullable=True)
+    kind = Column(String(32), nullable=True)
+    display_name = Column(String(255), nullable=True)
+    relative_path = Column(String(700), nullable=True)
+    object_key = Column(String(1400), nullable=True)
+    content_type = Column(String(255), nullable=True)
+    size_bytes = Column(big_integer_id_type(), nullable=True)
+    sha256 = Column(String(64), nullable=True)
+    source_task_binding_id = Column(String(64), nullable=True)
+    source_task_snapshot = Column(JSON, nullable=True)
+    markdown_object_key = Column(String(1024), nullable=True)
+    chat_object_key = Column(String(1024), nullable=True)
+    manifest_object_key = Column(String(1024), nullable=True)
+    metadata_json = Column("metadata", JSON, nullable=True)
+    version = Column(Integer, nullable=False, default=1, server_default="1")
+    created_at = Column(DateTime, nullable=False, default=func.now())
+    updated_at = Column(
+        DateTime, nullable=False, default=func.now(), onupdate=func.now()
+    )
+    completed_at = Column(DateTime, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    deleted_at = Column(DateTime, nullable=True, index=True)
+
+    __mapper_args__ = {"polymorphic_on": resource_type, "polymorphic_identity": "node"}
+    __table_args__ = (
+        Index("idx_loop_items_project_type", "cloud_project_id", "resource_type"),
+        Index("idx_loop_items_parent_type", "parent_id", "resource_type", "sort_order"),
+        Index("idx_loop_items_project_path", "cloud_project_id", "path"),
+        Index("idx_loop_items_assignee_agent_id", "assignee_agent_id"),
+        {"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4"},
+    )
+
+
+class CloudProject(LoopNode):
+    __mapper_args__ = {"polymorphic_identity": "project"}
+
+    # Old and new backends use the same containment records. Ambiguous parents
+    # provide no authority; neither membership nor creation implies a parent.
+    workspace_id = column_property(
+        select(
+            case(
+                (
+                    func.count(func.distinct(ResourceMember.entity_id)) == 1,
+                    cast(func.min(ResourceMember.entity_id), Integer),
+                ),
+                else_=None,
+            )
+        )
+        .where(
+            ResourceMember.resource_type == "CloudProject",
+            ResourceMember.resource_id == cast(LoopNode.id, Integer),
+            ResourceMember.entity_type == "workspace",
+            ResourceMember.status == "approved",
+        )
+        .correlate_except(ResourceMember)
+        .scalar_subquery()
+    )
+
+    @hybrid_property
+    def membership_mode(self) -> str:
+        return (self.metadata_json or {}).get("membership_mode", "inherit")
+
+    @membership_mode.setter
+    def membership_mode(self, value: str) -> None:
+        self.metadata_json = {**(self.metadata_json or {}), "membership_mode": value}
+
+    @membership_mode.expression
+    def membership_mode(cls):
+        return func.coalesce(
+            cls.metadata_json["membership_mode"].as_string(), "inherit"
+        )
+
+    @property
+    def tags(self) -> list[str]:
+        """Project-level tag registry stored inside the metadata JSON column."""
+        metadata = self.metadata_json
+        if not isinstance(metadata, dict):
+            return []
+        tags = metadata.get("tags")
+        if not isinstance(tags, list):
+            return []
+        return [str(tag) for tag in tags]
+
+    @property
+    def project_store(self) -> str:
+        return "backend"
+
+    @property
+    def task_provider(self) -> str:
+        metadata = self.metadata_json
+        if not isinstance(metadata, dict):
+            return "local"
+        provider = metadata.get("task_provider")
+        known = {"local", "github", "gitlab", "dingtalk_aitable"}
+        return provider if provider in known else "local"
+
+    @property
+    def provider_config(self) -> dict[str, object]:
+        metadata = self.metadata_json
+        if not isinstance(metadata, dict):
+            return {}
+        config = metadata.get("provider_config")
+        return mask_provider_config(config)
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("status", "active")
+        kwargs.setdefault("next_item_number", 1)
+        super().__init__(**kwargs)
+
+
+class LoopItem(LoopNode):
+    __mapper_args__ = {"polymorphic_identity": "task"}
+
+    @property
+    def badges(self) -> list[dict[str, object]]:
+        metadata = self.metadata_json
+        values = metadata.get("badges") if isinstance(metadata, dict) else None
+        return (
+            [dict(value) for value in values if isinstance(value, dict)]
+            if isinstance(values, list)
+            else []
+        )
+
+    @property
+    def tags(self) -> list[str]:
+        """Item tags stored inside the metadata JSON column."""
+        metadata = self.metadata_json
+        if not isinstance(metadata, dict):
+            return []
+        tags = metadata.get("tags")
+        if not isinstance(tags, list):
+            return []
+        return [str(tag) for tag in tags]
+
+
+class ProjectChatAgent(LoopNode):
+    """A Wework-owned AI member in one cloud project's group chat."""
+
+    __mapper_args__ = {"polymorphic_identity": "chat_agent"}
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("status", "active")
+        super().__init__(**kwargs)
+
+
+@event.listens_for(LoopItem, "before_update")
+def _preserve_issue_runner_binding(
+    _mapper: object, connection: Connection, target: LoopItem
+) -> None:
+    """Protect server-owned affinity from concurrent content metadata rewrites."""
+    if not inspect(target).attrs.metadata_json.history.has_changes():
+        return
+    persisted = connection.execute(
+        select(LoopItem.metadata_json).where(LoopItem.id == target.id).with_for_update()
+    ).scalar_one()
+    protected = {
+        key: persisted[key]
+        for key in ("runner_binding", "runner_binding_conflict")
+        if key in (persisted or {})
+    }
+    if protected:
+        target.metadata_json = {**(target.metadata_json or {}), **protected}
+
+
+class RuntimeProfile(LoopNode):
+    """A reusable, user-owned Wework execution configuration."""
+
+    __mapper_args__ = {"polymorphic_identity": "runtime_profile"}
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("status", "active")
+        super().__init__(**kwargs)
+
+
+class RuntimeBinding(LoopNode):
+    """One project member's default Runtime profile."""
+
+    __mapper_args__ = {"polymorphic_identity": "runtime_binding"}
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("status", "active")
+        kwargs.setdefault("is_default", True)
+        super().__init__(**kwargs)
+
+
+class ProjectAutomationRule(LoopNode):
+    """A scheduled automation owned by one Wework project."""
+
+    __mapper_args__ = {"polymorphic_identity": "automation_rule"}
+
+
+class ProjectAutomationRun(LoopNode):
+    """One scheduled or manual occurrence of a project automation."""
+
+    __mapper_args__ = {"polymorphic_identity": "automation_run"}
+
+
+class ProjectWorkflowRun(LoopNode):
+    """Persisted legacy workflow run rows retained for polymorphic loading."""
+
+    __mapper_args__ = {"polymorphic_identity": "workflow_run"}
+
+
+class ProjectWorkflowPlanItem(LoopNode):
+    """Persisted legacy workflow plan rows retained for polymorphic loading."""
+
+    __mapper_args__ = {"polymorphic_identity": "workflow_plan_item"}
+
+
+class ProjectIncomingHook(LoopNode):
+    """One observed-resource event subscription and its collection state."""
+
+    __mapper_args__ = {"polymorphic_identity": "incoming_hook"}
+
+
+class ProjectIncomingEvent(LoopNode):
+    """One deduplicated webhook, polling, or internal event input."""
+
+    __mapper_args__ = {"polymorphic_identity": "incoming_event"}
+
+
+class CloudProjectLocalBinding(LoopNode):
+    __mapper_args__ = {"polymorphic_identity": "local_binding"}
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("is_default", False)
+        super().__init__(**kwargs)
+
+
+class LoopItemTaskBinding(LoopNode):
+    __mapper_args__ = {"polymorphic_identity": "execution"}
+
+    @property
+    def model_selection(self) -> dict[str, object] | None:
+        metadata = self.metadata_json
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("model_selection")
+        return value if isinstance(value, dict) else None
+
+    @property
+    def execution_context(self) -> dict[str, object] | None:
+        metadata = self.metadata_json
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("execution_context")
+        return value if isinstance(value, dict) else None
+
+    @property
+    def workflow_node_id(self) -> str | None:
+        metadata = self.metadata_json
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("workflow_node_id")
+        return value if isinstance(value, str) and value else None
+
+    def _metadata_text(self, key: str) -> str | None:
+        metadata = self.metadata_json
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get(key)
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def human_assignment_id(self) -> str | None:
+        return self._metadata_text("human_assignment_id")
+
+    @property
+    def dispatch_id(self) -> str | None:
+        return self._metadata_text("dispatch_id")
+
+    @property
+    def dispatch_round_id(self) -> str | None:
+        return self._metadata_text("dispatch_round_id")
+
+    @property
+    def assignment_id(self) -> str | None:
+        return self._metadata_text("assignment_id")
+
+    @property
+    def change_requests(self) -> list[dict[str, object]]:
+        metadata = self.metadata_json
+        if not isinstance(metadata, dict):
+            return []
+        values = metadata.get("change_requests")
+        if not isinstance(values, list):
+            return []
+        return [dict(value) for value in values if isinstance(value, dict)]
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("linked_at", func.now())
+        super().__init__(**kwargs)
+
+
+class WorkspaceCleanupIntent(LoopNode):
+    """Durable Issue lifecycle intent addressed to one Executor."""
+
+    __mapper_args__ = {"polymorphic_identity": "workspace_cleanup"}
+
+
+class CloudProjectFile(LoopNode):
+    __mapper_args__ = {"polymorphic_identity": "file"}
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("size_bytes", 0)
+        super().__init__(**kwargs)
+
+
+class LoopItemAttachment(LoopNode):
+    __mapper_args__ = {"polymorphic_identity": "attachment"}
+
+
+class LoopItemCollaborator(LoopNode):
+    __mapper_args__ = {"polymorphic_identity": "collaborator"}
+
+
+class LoopItemComment(LoopNode):
+    __mapper_args__ = {"polymorphic_identity": "comment"}
+
+
+class Delivery(LoopNode):
+    __mapper_args__ = {"polymorphic_identity": "delivery"}
+
+
+class DeliveryAsset(LoopNode):
+    __mapper_args__ = {"polymorphic_identity": "delivery_asset"}
+
+
+_MYSQL_UNSET_DATETIME = datetime(1970, 1, 1, 0, 0, 1)
+_MYSQL_UNSET_DATETIMES = (
+    datetime(1970, 1, 1, 0, 0, 0),
+    _MYSQL_UNSET_DATETIME,
+)
+_MYSQL_NON_NULL_DEFAULTS: dict[str, object] = {
+    "cloud_project_id": "",
+    "parent_id": "",
+    "loop_item_id": "",
+    "delivery_id": "",
+    "public_id": "",
+    "project_key": "",
+    "name": "",
+    "title": "",
+    "storage_prefix": "",
+    "sequence_number": 0,
+    "created_by_user_id": 0,
+    "updated_by_user_id": 0,
+    "assignee_user_id": 0,
+    "assignee_team_id": 0,
+    "user_id": 0,
+    "added_by_user_id": 0,
+    "source": "",
+    "status": "",
+    "priority": "",
+    "start_at": _MYSQL_UNSET_DATETIME,
+    "due_at": _MYSQL_UNSET_DATETIME,
+    "current_delivery_id": "",
+    "local_project_id": 0,
+    "device_id": "",
+    "is_default": False,
+    "task_user_id": 0,
+    "task_id": "",
+    "task_title": "",
+    "backend_task_id": 0,
+    "linked_by_user_id": 0,
+    "linked_at": _MYSQL_UNSET_DATETIME,
+    "unlinked_at": _MYSQL_UNSET_DATETIME,
+    "path": "",
+    "kind": "",
+    "display_name": "",
+    "relative_path": "",
+    "object_key": "",
+    "content_type": "",
+    "size_bytes": 0,
+    "sha256": "",
+    "source_task_binding_id": "",
+    "source_task_snapshot": {},
+    "markdown_object_key": "",
+    "chat_object_key": "",
+    "manifest_object_key": "",
+    "metadata_json": {},
+    "completed_at": _MYSQL_UNSET_DATETIME,
+    "delivered_at": _MYSQL_UNSET_DATETIME,
+    "deleted_at": _MYSQL_UNSET_DATETIME,
+}
+
+
+def adapt_loop_node_values_for_dialect(
+    values: dict[str, object],
+    dialect_name: str,
+    non_nullable_attributes: set[str] | frozenset[str] | None = None,
+) -> dict[str, object]:
+    """Convert explicit nulls to sentinels required by the production schema."""
+    if dialect_name != "mysql":
+        return values
+    adapted = values.copy()
+    attributes = (
+        _MYSQL_NON_NULL_DEFAULTS.keys()
+        if non_nullable_attributes is None
+        else non_nullable_attributes
+    )
+    for attribute in attributes:
+        default = _MYSQL_NON_NULL_DEFAULTS[attribute]
+        if attribute in adapted and adapted[attribute] is None:
+            adapted[attribute] = (
+                default.copy() if isinstance(default, dict) else default
+            )
+    return adapted
+
+
+def loop_node_non_nullable_attributes(connection: Connection) -> frozenset[str]:
+    """Return model attributes backed by NOT NULL columns in this MySQL schema."""
+    if connection.dialect.name != "mysql":
+        return frozenset()
+    cache_key = "loop_node_non_nullable_attributes"
+    cached = connection.info.get(cache_key)
+    if isinstance(cached, frozenset):
+        return cached
+    columns = {
+        column["name"]: column
+        for column in inspect(connection).get_columns("loop_items")
+    }
+    attributes = frozenset(
+        attribute
+        for attribute in _MYSQL_NON_NULL_DEFAULTS
+        if not columns[getattr(LoopNode, attribute).property.columns[0].name][
+            "nullable"
+        ]
+    )
+    connection.info[cache_key] = attributes
+    return attributes
+
+
+def loop_datetime_is_unset(column: object) -> object:
+    """Match unset datetimes in both nullable and sentinel schemas."""
+    return or_(column.is_(None), column.in_(_MYSQL_UNSET_DATETIMES))
+
+
+def loop_datetime_value_is_unset(value: datetime | None) -> bool:
+    """Match an unset datetime value in both nullable and sentinel schemas."""
+    return value is None or value in _MYSQL_UNSET_DATETIMES
+
+
+def loop_unset_datetime_for_connection(
+    connection: Connection, attribute: str
+) -> datetime | None:
+    """Return the correct unset datetime for the connected schema.
+
+    Some deployed MySQL schemas retain historical ``NOT NULL`` datetime
+    columns. Updates, unlike inserts, do not pass through the insert adapter,
+    so services clearing one of those columns must use its sentinel value.
+    """
+
+    if attribute not in _MYSQL_NON_NULL_DEFAULTS:
+        raise ValueError(f"Unsupported LoopNode datetime attribute: {attribute}")
+    if attribute in loop_node_non_nullable_attributes(connection):
+        value = _MYSQL_NON_NULL_DEFAULTS[attribute]
+        return value if isinstance(value, datetime) else None
+    return None
+
+
+@event.listens_for(LoopNode, "before_insert", propagate=True)
+@event.listens_for(LoopNode, "before_update", propagate=True)
+def _adapt_mysql_non_null_defaults(
+    _mapper: object, connection: Connection, target: LoopNode
+) -> None:
+    """Adapt nullable model values to the production MySQL sentinel schema."""
+    values = {
+        attribute: getattr(target, attribute) for attribute in _MYSQL_NON_NULL_DEFAULTS
+    }
+    adapted = adapt_loop_node_values_for_dialect(
+        values,
+        connection.dialect.name,
+        loop_node_non_nullable_attributes(connection),
+    )
+    for attribute, value in adapted.items():
+        setattr(target, attribute, value)

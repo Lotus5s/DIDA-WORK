@@ -1,0 +1,99 @@
+name: Build DIDA Work for macOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+            cargo_target: aarch64-apple-darwin
+          - arch: x64
+            runner: macos-13
+            cargo_target: x86_64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.cargo_target }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            wework/electron/pnpm-lock.yaml
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install DIDA Work Electron dependencies
+        run: pnpm --dir wework/electron install --frozen-lockfile
+
+      - name: Regenerate macOS icon
+        run: |
+          set -euo pipefail
+          iconset="$RUNNER_TEMP/DIDA.iconset"
+          rm -rf "$iconset"
+          mkdir -p "$iconset"
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" wework/resources/icons/icon.png \
+              --out "$iconset/icon_${size}x${size}.png" >/dev/null
+            sips -z "$((size * 2))" "$((size * 2))" wework/resources/icons/icon.png \
+              --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$iconset" -o wework/resources/icons/icon.icns
+
+      - name: Build unsigned DMG and ZIP
+        env:
+          # Unsigned local/test build. Add Apple signing secrets and remove this
+          # line when you are ready to sign and notarize for customers.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+          WEWORK_CODEX_TARGET: ${{ matrix.cargo_target }}
+          WEWORK_DWS_TARGET: ${{ matrix.cargo_target }}
+          WEWORK_ELECTRON_DEPENDENCIES_READY: "true"
+          WEWORK_ONLINE_UPDATE_INCLUDE_COMPONENTS: "true"
+          WEWORK_RELEASE_ARCH: ${{ matrix.arch }}
+          WEWORK_RELEASE_PLATFORM: macos
+          WEWORK_SOURCE_SHA: ${{ github.sha }}
+          VITE_WEWORK_RELEASE_CHANNEL: stable
+          VITE_WEWORK_RUNTIME_MODE: local-first
+          VITE_WEWORK_TELEMETRY_DISTRIBUTION: internal
+        run: pnpm --filter wework build:release
+
+      - name: List build output
+        run: |
+          find wework/electron/release-installer -maxdepth 2 \
+            \( -name '*.dmg' -o -name '*.zip' -o -name '*.app' \) -print || true
+
+      - name: Upload DMG and ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: DIDAWork-macos-${{ matrix.arch }}
+          path: |
+            wework/electron/release-installer/**/*.dmg
+            wework/electron/release-installer/**/*.zip
+          if-no-files-found: error
+          retention-days: 14

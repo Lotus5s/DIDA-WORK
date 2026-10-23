@@ -1,0 +1,517 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Unified block data structures for mixed content rendering.
+
+This module defines the data structures for blocks used in:
+1. WebSocket events (chat:block_created, chat:block_updated)
+2. Database storage (subtask.result.blocks)
+3. Frontend rendering (MixedContentView)
+
+Block Types:
+- ToolBlock: Represents a tool call (e.g., Bash, Read, Write)
+- TextBlock: Represents text content between tool calls
+- GuidanceBlock: Represents user guidance applied to a Chat Shell turn
+
+The blocks maintain the order of tool-text-tool-text for proper
+mixed content rendering.
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Literal, Optional, Union
+
+
+class BlockType(str, Enum):
+    """Block type enumeration."""
+
+    TOOL = "tool"
+    TEXT = "text"
+    SUBAGENT = "subagent"
+    GUIDANCE = "guidance"
+    CARD = "card"
+
+
+class BlockStatus(str, Enum):
+    """Block status enumeration."""
+
+    QUEUED = "queued"  # Subagent is waiting to start
+    PENDING = "pending"  # Tool is executing
+    INVOKING = "invoking"  # Subagent is being started
+    STREAMING = "streaming"  # Text is being streamed
+    DONE = "done"  # Block is complete
+    ERROR = "error"  # Tool execution failed
+
+
+@dataclass
+class ToolBlock:
+    """Tool block representing a tool call.
+
+    Attributes:
+        id: Unique block identifier (usually tool_use_id)
+        type: Always "tool"
+        tool_use_id: Tool use ID from the LLM
+        tool_name: Name of the tool (e.g., "Bash", "Read", "Write")
+        tool_input: Input parameters for the tool
+        tool_protocol: Optional Responses API protocol type
+        server_label: Optional MCP server label
+        status: Current status (pending, done, error)
+        timestamp: Unix timestamp in milliseconds
+        display_name: Optional human-readable display name
+        tool_output: Optional output from tool execution
+        render_payload: Optional UI-only payload for frontend renderers
+    """
+
+    id: str
+    tool_use_id: str
+    tool_name: str
+    tool_input: Dict[str, Any] = field(default_factory=dict)
+    tool_protocol: Optional[str] = None
+    server_label: Optional[str] = None
+    status: str = BlockStatus.PENDING.value
+    timestamp: int = 0
+    display_name: Optional[str] = None
+    tool_output: Optional[str] = None
+    render_payload: Optional[Dict[str, Any]] = None
+    parent_tool_use_id: Optional[str] = None
+    type: Literal["tool"] = "tool"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        result = {
+            "id": self.id,
+            "type": self.type,
+            "tool_use_id": self.tool_use_id,
+            "tool_name": self.tool_name,
+            "tool_input": self.tool_input,
+            "status": self.status,
+            "timestamp": self.timestamp,
+        }
+        if self.tool_protocol:
+            result["tool_protocol"] = self.tool_protocol
+        if self.server_label:
+            result["server_label"] = self.server_label
+        if self.display_name:
+            result["display_name"] = self.display_name
+        if self.tool_output:
+            result["tool_output"] = self.tool_output
+        if self.render_payload:
+            result["render_payload"] = self.render_payload
+        if self.parent_tool_use_id:
+            result["parent_tool_use_id"] = self.parent_tool_use_id
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ToolBlock":
+        """Create from dictionary."""
+        return cls(
+            id=data.get("id", ""),
+            tool_use_id=data.get("tool_use_id", ""),
+            tool_name=data.get("tool_name", ""),
+            tool_input=data.get("tool_input", {}),
+            tool_protocol=data.get("tool_protocol"),
+            server_label=data.get("server_label"),
+            status=data.get("status", BlockStatus.PENDING.value),
+            timestamp=data.get("timestamp", 0),
+            display_name=data.get("display_name"),
+            tool_output=data.get("tool_output"),
+            render_payload=data.get("render_payload"),
+            parent_tool_use_id=data.get("parent_tool_use_id"),
+        )
+
+
+@dataclass
+class SubagentBlock:
+    """Subagent invocation and its nested Claude SDK message blocks."""
+
+    id: str
+    tool_use_id: str
+    tool_name: str = "Agent"
+    tool_input: Dict[str, Any] = field(default_factory=dict)
+    status: str = BlockStatus.QUEUED.value
+    timestamp: int = 0
+    display_name: Optional[str] = None
+    agent_type: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    output: Optional[str] = None
+    summary: Optional[str] = None
+    children: List[Dict[str, Any]] = field(default_factory=list)
+    parent_tool_use_id: Optional[str] = None
+    type: Literal["subagent"] = "subagent"
+
+    def to_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "id": self.id,
+            "type": self.type,
+            "tool_use_id": self.tool_use_id,
+            "tool_name": self.tool_name,
+            "tool_input": self.tool_input,
+            "status": self.status,
+            "timestamp": self.timestamp,
+            "children": self.children,
+        }
+        for key in (
+            "display_name",
+            "agent_type",
+            "title",
+            "description",
+            "output",
+            "summary",
+        ):
+            value = getattr(self, key)
+            if value is not None:
+                result[key] = value
+        if self.parent_tool_use_id:
+            result["parent_tool_use_id"] = self.parent_tool_use_id
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SubagentBlock":
+        return cls(
+            id=data.get("id", ""),
+            tool_use_id=data.get("tool_use_id", data.get("id", "")),
+            tool_name=data.get("tool_name", "Agent"),
+            tool_input=data.get("tool_input", {}),
+            status=data.get("status", BlockStatus.QUEUED.value),
+            timestamp=data.get("timestamp", 0),
+            display_name=data.get("display_name"),
+            agent_type=data.get("agent_type"),
+            title=data.get("title"),
+            description=data.get("description"),
+            output=data.get("output"),
+            summary=data.get("summary"),
+            children=data.get("children", []),
+            parent_tool_use_id=data.get("parent_tool_use_id"),
+        )
+
+
+@dataclass
+class TextBlock:
+    """Text block representing text content.
+
+    Attributes:
+        id: Unique block identifier
+        type: Always "text"
+        content: Text content
+        status: Current status (streaming, done)
+        timestamp: Unix timestamp in milliseconds
+    """
+
+    id: str
+    content: str = ""
+    status: str = BlockStatus.STREAMING.value
+    timestamp: int = 0
+    parent_tool_use_id: Optional[str] = None
+    type: Literal["text"] = "text"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        result = {
+            "id": self.id,
+            "type": self.type,
+            "content": self.content,
+            "status": self.status,
+            "timestamp": self.timestamp,
+        }
+        if self.parent_tool_use_id:
+            result["parent_tool_use_id"] = self.parent_tool_use_id
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TextBlock":
+        """Create from dictionary."""
+        return cls(
+            id=data.get("id", ""),
+            content=data.get("content", ""),
+            status=data.get("status", BlockStatus.STREAMING.value),
+            timestamp=data.get("timestamp", 0),
+            parent_tool_use_id=data.get("parent_tool_use_id"),
+        )
+
+
+@dataclass
+class GuidanceBlock:
+    """Guidance block representing user guidance applied to a Chat Shell turn."""
+
+    id: str
+    guidance_id: str
+    content: str
+    status: str = BlockStatus.DONE.value
+    timestamp: int = 0
+    loop_index: Optional[int] = None
+    applied_at: Optional[str] = None
+    type: Literal["guidance"] = "guidance"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        result = {
+            "id": self.id,
+            "type": self.type,
+            "guidance_id": self.guidance_id,
+            "content": self.content,
+            "status": self.status,
+            "timestamp": self.timestamp,
+        }
+        if self.loop_index is not None:
+            result["loop_index"] = self.loop_index
+        if self.applied_at is not None:
+            result["applied_at"] = self.applied_at
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GuidanceBlock":
+        """Create from dictionary."""
+        return cls(
+            id=data.get("id", ""),
+            guidance_id=data.get("guidance_id", ""),
+            content=data.get("content", ""),
+            status=data.get("status", BlockStatus.DONE.value),
+            timestamp=data.get("timestamp", 0),
+            loop_index=data.get("loop_index"),
+            applied_at=data.get("applied_at"),
+        )
+
+
+@dataclass
+class CardBlock:
+    """Generic card block whose UI is selected by ``card_type``."""
+
+    id: str
+    card_id: str
+    card_type: str
+    card_status: str
+    card_data: Dict[str, Any] = field(default_factory=dict)
+    card_preview_data: Dict[str, Any] = field(default_factory=dict)
+    card_error: Optional[str] = None
+    status: str = BlockStatus.PENDING.value
+    timestamp: int = 0
+    type: Literal["card"] = "card"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "type": self.type,
+            "status": self.status,
+            "timestamp": self.timestamp,
+            "card_id": self.card_id,
+            "card_type": self.card_type,
+            "card_status": self.card_status,
+            "card_data": self.card_data,
+            "card_preview_data": self.card_preview_data,
+            "card_error": self.card_error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CardBlock":
+        return cls(
+            id=data.get("id", ""),
+            card_id=str(data.get("card_id", "")),
+            card_type=str(data.get("card_type", "")),
+            card_status=str(data.get("card_status", "pending")),
+            card_data=data.get("card_data", {}),
+            card_preview_data=data.get("card_preview_data", {}),
+            card_error=data.get("card_error"),
+            status=data.get("status", BlockStatus.PENDING.value),
+            timestamp=data.get("timestamp", 0),
+        )
+
+
+# Type alias for any block type
+MessageBlock = Union[ToolBlock, TextBlock, SubagentBlock, GuidanceBlock, CardBlock]
+
+
+def block_from_dict(data: Dict[str, Any]) -> MessageBlock:
+    """Create a block from dictionary based on type field.
+
+    Args:
+        data: Dictionary with block data
+
+    Returns:
+        ToolBlock or TextBlock instance
+    """
+    block_type = data.get("type", "")
+    if block_type == BlockType.TOOL.value:
+        return ToolBlock.from_dict(data)
+    elif block_type == BlockType.TEXT.value:
+        return TextBlock.from_dict(data)
+    elif block_type == BlockType.SUBAGENT.value:
+        return SubagentBlock.from_dict(data)
+    elif block_type == BlockType.GUIDANCE.value:
+        return GuidanceBlock.from_dict(data)
+    elif block_type == BlockType.CARD.value:
+        return CardBlock.from_dict(data)
+    else:
+        # Default to text block for unknown types
+        return TextBlock.from_dict(data)
+
+
+def blocks_from_list(data: List[Dict[str, Any]]) -> List[MessageBlock]:
+    """Create a list of blocks from list of dictionaries.
+
+    Args:
+        data: List of block dictionaries
+
+    Returns:
+        List of ToolBlock or TextBlock instances
+    """
+    return [block_from_dict(item) for item in data]
+
+
+def blocks_to_list(blocks: List[MessageBlock]) -> List[Dict[str, Any]]:
+    """Convert a list of blocks to list of dictionaries.
+
+    Args:
+        blocks: List of ToolBlock or TextBlock instances
+
+    Returns:
+        List of block dictionaries
+    """
+    return [block.to_dict() for block in blocks]
+
+
+def create_tool_block(
+    tool_use_id: str,
+    tool_name: str,
+    tool_input: Optional[Dict[str, Any]] = None,
+    display_name: Optional[str] = None,
+    tool_protocol: Optional[str] = None,
+    server_label: Optional[str] = None,
+    timestamp: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Create a tool block dictionary.
+
+    This is a convenience function for creating tool blocks without
+    instantiating the dataclass.
+
+    Args:
+        tool_use_id: Tool use ID
+        tool_name: Tool name
+        tool_input: Tool input parameters
+        display_name: Optional display name
+        tool_protocol: Optional protocol type
+        server_label: Optional MCP server label
+        timestamp: Optional timestamp (defaults to current time)
+
+    Returns:
+        Tool block dictionary
+    """
+    import time
+
+    ts = timestamp if timestamp is not None else int(time.time() * 1000)
+    block_id = tool_use_id or f"tool-{ts}"
+
+    result = {
+        "id": block_id,
+        "type": BlockType.TOOL.value,
+        "tool_use_id": tool_use_id,
+        "tool_name": tool_name,
+        "tool_input": tool_input or {},
+        "status": BlockStatus.PENDING.value,
+        "timestamp": ts,
+    }
+    if display_name:
+        result["display_name"] = display_name
+    if tool_protocol:
+        result["tool_protocol"] = tool_protocol
+    if server_label:
+        result["server_label"] = server_label
+    return result
+
+
+def create_text_block(
+    content: str = "",
+    block_id: Optional[str] = None,
+    timestamp: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Create a text block dictionary.
+
+    This is a convenience function for creating text blocks without
+    instantiating the dataclass.
+
+    Args:
+        content: Text content
+        block_id: Optional block ID (defaults to generated ID)
+        timestamp: Optional timestamp (defaults to current time)
+
+    Returns:
+        Text block dictionary
+    """
+    import time
+
+    ts = timestamp if timestamp is not None else int(time.time() * 1000)
+    bid = block_id or f"text-{ts}"
+
+    return {
+        "id": bid,
+        "type": BlockType.TEXT.value,
+        "content": content,
+        "status": BlockStatus.STREAMING.value,
+        "timestamp": ts,
+    }
+
+
+def create_card_block(
+    card_id: str | int,
+    card_type: str,
+    card_data: Optional[Dict[str, Any]] = None,
+    card_status: str = "populated",
+    card_preview_data: Optional[Dict[str, Any]] = None,
+    card_error: Optional[str] = None,
+    block_id: Optional[str] = None,
+    timestamp: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Create a generic card block for persistence and streaming."""
+    import time
+
+    ts = timestamp if timestamp is not None else int(time.time() * 1000)
+    normalized_card_id = str(card_id)
+    normalized_block_id = block_id or (
+        normalized_card_id
+        if normalized_card_id.startswith("card-")
+        else f"card-{normalized_card_id}"
+    )
+    block_status = {
+        "pending": BlockStatus.PENDING.value,
+        "partial_ready": BlockStatus.STREAMING.value,
+        "populated": BlockStatus.DONE.value,
+        "error": BlockStatus.ERROR.value,
+        "expired": BlockStatus.ERROR.value,
+    }.get(card_status, BlockStatus.DONE.value)
+    return CardBlock(
+        id=normalized_block_id,
+        card_id=normalized_card_id,
+        card_type=card_type,
+        card_status=card_status,
+        card_data=card_data or {},
+        card_preview_data=card_preview_data or {},
+        card_error=card_error,
+        status=block_status,
+        timestamp=ts,
+    ).to_dict()
+
+
+def create_guidance_block(
+    guidance_id: str,
+    content: str,
+    block_id: Optional[str] = None,
+    timestamp: Optional[int] = None,
+    loop_index: Optional[int] = None,
+    applied_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a guidance block dictionary."""
+    import time
+
+    ts = timestamp if timestamp is not None else int(time.time() * 1000)
+    bid = block_id or f"guidance-{guidance_id}"
+    block = GuidanceBlock(
+        id=bid,
+        guidance_id=guidance_id,
+        content=content,
+        timestamp=ts,
+        loop_index=loop_index,
+        applied_at=applied_at,
+    )
+    return block.to_dict()

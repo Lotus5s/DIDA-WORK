@@ -1,0 +1,1301 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Model resolver for Chat Shell.
+
+Resolves model configuration from Bot's bound model or task-level override.
+"""
+
+import base64
+import json
+import logging
+import os
+import re
+from typing import Any, Dict, Optional
+
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.models.kind import Kind
+from app.models.user import User
+from app.schemas.kind import Bot, Model
+from app.services.adapters.public_model import is_public_model_allowed_for_user
+from app.services.capability_reference_service import get_referenced_capability
+from app.services.model_capabilities import normalize_model_capabilities
+from app.services.runtime_codex_model import get_enabled_codex_runtime_model_spec
+from shared.codex_model_catalog import codex_catalog_model_id_from_config
+from shared.models.execution import ExecutionRequest
+from shared.utils.crypto import CryptoConfigurationError, decrypt_api_key
+
+logger = logging.getLogger(__name__)
+
+
+class PublicModelAccessDeniedError(ValueError):
+    """Raised when a public model's user whitelist rejects the current user."""
+
+
+def resolve_env_placeholder(value: str) -> str:
+    """
+    Resolve environment variable placeholders in a string.
+
+    Supports format: ${ENV_VAR_NAME}
+
+    Args:
+        value: String that may contain environment variable placeholders
+
+    Returns:
+        String with placeholders replaced by environment variable values
+    """
+    if not value or not isinstance(value, str):
+        return value
+
+    # Pattern to match ${ENV_VAR_NAME}
+    pattern = r"\$\{([^}]+)\}"
+
+    def replace_env(match):
+        env_var = match.group(1)
+        env_value = os.environ.get(env_var)
+        if env_value is not None:
+            logger.info(
+                f"[model_resolver] Resolved env var ${{{env_var}}} to value (length={len(env_value)})"
+            )
+            return env_value
+        else:
+            logger.warning(
+                f"[model_resolver] Env var ${{{env_var}}} not found, keeping placeholder"
+            )
+            return match.group(0)  # Return original placeholder unchanged
+
+    return re.sub(pattern, replace_env, value)
+
+
+def resolve_value_from_source(
+    data_sources: Dict[str, Dict[str, Any]], source_spec: str
+) -> str:
+    """
+    Resolve value from specified data source using flexible notation.
+
+    This is a port of the executor's config_utils.resolve_value_from_source function.
+
+    Args:
+        data_sources: Dictionary containing all available data sources
+        source_spec: Source specification in format "source_name.path" or just "path"
+
+    Returns:
+        The resolved value or empty string if not found
+    """
+    try:
+        # Parse source specification
+        if "." in source_spec:
+            # Format: "source_name.path"
+            parts = source_spec.split(".", 1)
+            source_name = parts[0]
+            path = parts[1]
+        else:
+            # Format: just "path", use default source
+            source_name = "agent_config"
+            path = source_spec
+
+        # Get the specified data source
+        if source_name not in data_sources:
+            return ""
+
+        data = data_sources[source_name]
+
+        # Navigate the path
+        keys = path.split(".")
+        current = data
+
+        for key in keys:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            elif (
+                isinstance(current, list) and key.isdigit() and int(key) < len(current)
+            ):
+                current = current[int(key)]
+            else:
+                return ""
+
+        return str(current) if current is not None else ""
+    except Exception:
+        return ""
+
+
+def replace_placeholders_with_sources(
+    template: str, data_sources: Dict[str, Dict[str, Any]]
+) -> str:
+    """
+    Replace placeholders in template with values from multiple data sources.
+
+    This is a port of the executor's config_utils.replace_placeholders_with_sources function.
+
+    Args:
+        template: The template string with placeholders like ${agent_config.env.user} or ${env.user}
+        data_sources: Dictionary containing all available data sources
+
+    Returns:
+        The template with placeholders replaced with actual values
+    """
+    # Find all placeholders in format ${source_spec}
+    pattern = r"\$\{([^}]+)\}"
+
+    def replace_match(match):
+        source_spec = match.group(1)
+        value = resolve_value_from_source(data_sources, source_spec)
+        return value
+
+    return re.sub(pattern, replace_match, template)
+
+
+def get_default_headers_from_env() -> Dict[str, Any]:
+    """
+    Get DEFAULT_HEADERS from environment variable.
+
+    This mirrors the executor's ConfigManager._parse_default_headers method.
+    Reads from EXECUTOR_ENV or DEFAULT_HEADERS environment variable.
+
+    Returns:
+        Parsed default headers dictionary
+    """
+    default_headers = {}
+
+    try:
+        # First try EXECUTOR_ENV (JSON format)
+        executor_env_str = os.environ.get("EXECUTOR_ENV", "")
+        if executor_env_str:
+            try:
+                executor_env = json.loads(executor_env_str)
+                if isinstance(executor_env, dict):
+                    dh = executor_env.get("DEFAULT_HEADERS")
+                    if dh:
+                        if isinstance(dh, dict):
+                            default_headers = dh
+                        elif isinstance(dh, str):
+                            default_headers = json.loads(dh)
+                        logger.info(
+                            f"[model_resolver] Loaded DEFAULT_HEADERS from EXECUTOR_ENV: keys={list(default_headers.keys())}"
+                        )
+            except json.JSONDecodeError as e:
+                logger.warning(f"[model_resolver] Failed to parse EXECUTOR_ENV: {e}")
+
+        # Fallback to DEFAULT_HEADERS env var
+        if not default_headers:
+            dh_str = os.environ.get("DEFAULT_HEADERS", "")
+            if dh_str:
+                try:
+                    default_headers = json.loads(dh_str)
+                    logger.info(
+                        f"[model_resolver] Loaded DEFAULT_HEADERS from env: keys={list(default_headers.keys())}"
+                    )
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        f"[model_resolver] Failed to parse DEFAULT_HEADERS env: {e}"
+                    )
+    except Exception as e:
+        logger.warning(f"[model_resolver] Failed to load DEFAULT_HEADERS from env: {e}")
+
+    return default_headers
+
+
+def build_default_headers_with_placeholders(
+    default_headers: Dict[str, Any], data_sources: Dict[str, Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Build default headers with placeholder replacement.
+
+    This is a port of the executor's ConfigManager.build_default_headers_with_placeholders method.
+
+    Args:
+        default_headers: Raw default headers dictionary (may contain placeholders)
+        data_sources: Dictionary containing all available data sources
+
+    Returns:
+        Default headers with placeholders replaced
+    """
+    result_headers = {}
+    try:
+        # Apply placeholder replacement on individual string values inside the dict
+        for k, v in default_headers.items():
+            if isinstance(v, str):
+                result_headers[k] = replace_placeholders_with_sources(v, data_sources)
+            else:
+                result_headers[k] = v
+        logger.info(
+            f"Built default_headers with placeholders: keys={list(result_headers.keys())}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"Failed to build default headers; proceeding without. Error: {e}"
+        )
+        result_headers = {}
+
+    return result_headers
+
+
+# Substring marker identifying the agent/team identity header group forwarded to the
+# model backend (e.g. wegent-agent-namespace, wegent-agent-name). Any header whose
+# name *contains* this substring shares the empty-strip and encoding behaviors.
+WEGENT_IDENTITY_HEADER_MARKER = "wegent-agent-"
+
+
+def strip_empty_wegent_headers(headers: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop headers whose name contains 'wegent-agent-' and whose value is empty.
+
+    Placeholder resolution yields "" when a data source is missing (e.g.
+    non-Team execution paths such as wizard/correction that carry no team
+    context). Emitting blank identity headers is undesirable, so any header
+    whose name contains WEGENT_IDENTITY_HEADER_MARKER is removed when its
+    value is empty; all other headers (including the legacy ``user`` header)
+    keep their existing behavior.
+
+    Args:
+        headers: Default headers after placeholder replacement.
+
+    Returns:
+        Headers with empty wegent-agent-* entries removed.
+    """
+    return {
+        key: value
+        for key, value in headers.items()
+        if not (
+            WEGENT_IDENTITY_HEADER_MARKER in key.lower()
+            and (value is None or (isinstance(value, str) and not value.strip()))
+        )
+    }
+
+
+def _encode_wegent_header_value(value: str) -> str:
+    """Encode a header value that may contain non-ASCII characters.
+
+    HTTP headers must be ASCII (RFC 7230). Team names may contain non-ASCII
+    characters (e.g. Chinese). If the value is already ASCII-safe it is
+    returned unchanged; otherwise it is base64-encoded and prefixed with
+    'b64:' so the receiver can detect and decode it.
+
+    Args:
+        value: The resolved header value string.
+
+    Returns:
+        The original string if ASCII-safe, otherwise 'b64:<base64>'.
+    """
+    try:
+        value.encode("ascii")
+        return value
+    except UnicodeEncodeError:
+        return "b64:" + base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def encode_wegent_header_values(headers: Dict[str, Any]) -> Dict[str, Any]:
+    """Base64-encode non-ASCII values in wegent-agent-* headers.
+
+    Applies _encode_wegent_header_value to every header whose name contains
+    WEGENT_IDENTITY_HEADER_MARKER so non-ASCII team names (e.g. Chinese)
+    are transmitted as ASCII-safe 'b64:<base64>' strings.
+
+    Args:
+        headers: Resolved headers after placeholder replacement and empty-strip.
+
+    Returns:
+        Headers with non-ASCII wegent-agent-* values base64-encoded.
+    """
+    return {
+        key: (
+            _encode_wegent_header_value(value)
+            if WEGENT_IDENTITY_HEADER_MARKER in key.lower() and isinstance(value, str)
+            else value
+        )
+        for key, value in headers.items()
+    }
+
+
+def _process_model_config_placeholders(
+    model_config: Dict[str, Any],
+    user_id: int,
+    user_name: str,
+    agent_config: Optional[Dict[str, Any]] = None,
+    task_data: Optional[ExecutionRequest] = None,
+) -> Dict[str, Any]:
+    """
+    Process placeholders in model_config (api_key and default_headers).
+
+    This is an internal function used by extract_and_process_model_config.
+    Handles placeholders like ${user.user_name}, ${agent_config.env.xxx}, etc.
+
+    Args:
+        model_config: Model configuration dict from _extract_model_config
+        user_id: Current user's ID
+        user_name: Current user's username
+        agent_config: Optional agent config from bot (for chat mode)
+        task_data: Optional[ExecutionRequest] containing task-specific data (for chat mode)
+
+    Returns:
+        Model config with placeholders replaced in api_key and default_headers
+    """
+    # Build user info for data sources
+    user_info = {
+        "id": user_id,
+        "name": user_name or "",
+        "user_name": user_name or "",
+    }
+
+    # Build task_data dict for data_sources
+    # This ensures ${task_data.user.name} placeholders work even without full task context
+    if task_data is not None:
+        if isinstance(task_data, dict):
+            effective_task_data = task_data
+        elif hasattr(task_data, "to_dict") and callable(task_data.to_dict):
+            effective_task_data = task_data.to_dict()
+        else:
+            effective_task_data = {}
+    else:
+        effective_task_data = {}
+
+    if "user" not in effective_task_data:
+        effective_task_data = {**effective_task_data, "user": user_info}
+
+    # Expose Team (UI "Agent") identity as a nested object so placeholders can use
+    # the same dotted style as ${task_data.user.name}, e.g. ${task_data.team.name}.
+    # Derived from the flat ExecutionRequest fields; absent context resolves to "".
+    if "team" not in effective_task_data:
+        effective_task_data = {
+            **effective_task_data,
+            "team": {
+                "name": effective_task_data.get("team_name") or "",
+                "namespace": effective_task_data.get("team_namespace") or "",
+            },
+        }
+
+    # Build data_sources for placeholder replacement
+    # This mirrors the chat.py logic for handling ${user.name}, ${task_data.user.name}, etc.
+    data_sources = {
+        "agent_config": agent_config or {},
+        "model_config": model_config,
+        "task_data": effective_task_data,
+        "user": user_info,
+        "env": model_config.get("default_headers", {}),
+    }
+
+    # Process api_key placeholder if it contains ${...} pattern
+    api_key = model_config.get("api_key", "")
+    if api_key and "${" in api_key:
+        processed_api_key = replace_placeholders_with_sources(api_key, data_sources)
+        if processed_api_key:
+            model_config["api_key"] = processed_api_key
+            logger.debug("[model_resolver] Processed api_key placeholder")
+
+    # Process DEFAULT_HEADERS with placeholder replacement
+    raw_default_headers = model_config.get("default_headers", {})
+    if raw_default_headers:
+        processed_headers = build_default_headers_with_placeholders(
+            raw_default_headers, data_sources
+        )
+        # Drop wegent-agent-* identity headers that resolved to empty (e.g. paths
+        # without Team context), so we never emit blank identity headers.
+        processed_headers = strip_empty_wegent_headers(processed_headers)
+        # Encode non-ASCII values (e.g. Chinese team names) to ASCII-safe base64.
+        processed_headers = encode_wegent_header_values(processed_headers)
+        model_config["default_headers"] = processed_headers
+        logger.info(f"[model_resolver] Processed default_headers with placeholders")
+
+    return model_config
+
+
+def extract_and_process_model_config(
+    model_spec: Dict[str, Any],
+    user_id: int,
+    user_name: str,
+    agent_config: Optional[Dict[str, Any]] = None,
+    task_data: Optional[ExecutionRequest] = None,
+) -> Dict[str, Any]:
+    """
+    Extract model configuration from spec and process all placeholders.
+
+    This is the main public function that combines _extract_model_config
+    and _process_model_config_placeholders into a single call.
+
+    Used by both chat and wizard to get a fully processed model config.
+
+    Args:
+        model_spec: Model specification dictionary (from model.json.spec)
+        user_id: Current user's ID
+        user_name: Current user's username
+        agent_config: Optional agent config from bot (for chat mode)
+        task_data: Optional[ExecutionRequest] containing task-specific data
+            used for placeholder substitution (e.g., ${task_data.user.name})
+
+    Returns:
+        Dict with fully processed model configuration:
+        {
+            "api_key": "sk-xxx",  # decrypted and placeholders resolved
+            "base_url": "https://api.openai.com/v1",
+            "model_id": "gpt-4",
+            "model": "openai",
+            "default_headers": {...}  # placeholders resolved
+        }
+    """
+    # Step 1: Extract basic model config (handles env var placeholders and decryption)
+    model_config = _extract_model_config(model_spec)
+    custom_headers = (model_spec.get("modelConfig", {}).get("env") or {}).get(
+        "custom_headers"
+    )
+    if isinstance(custom_headers, dict):
+        model_config["default_headers"] = {
+            **model_config.get("default_headers", {}),
+            **custom_headers,
+        }
+
+    # Step 2: Process data source placeholders (${user.xxx}, ${agent_config.xxx}, etc.)
+    model_config = _process_model_config_placeholders(
+        model_config=model_config,
+        user_id=user_id,
+        user_name=user_name,
+        agent_config=agent_config,
+        task_data=task_data,
+    )
+
+    return model_config
+
+
+def _resolve_model_for_bot(
+    db: Session,
+    bot: Kind,
+    user_id: int,
+    override_model_name: Optional[str] = None,
+    force_override: bool = False,
+) -> tuple[Optional[Kind], Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
+    """
+    Resolve model Kind and spec for a bot.
+
+    Shared logic for build_agent_config_for_bot and get_model_config_for_bot.
+
+    Resolution priority:
+    1. override_model_name with force_override=True (task-level override)
+    2. bot.spec.agent_config.bind_model (bot-level binding)
+    3. bot.spec.modelRef (legacy reference)
+    4. override_model_name without force_override (fallback)
+
+    Args:
+        db: Database session
+        bot: The Bot Kind object
+        user_id: User ID for querying user-specific models
+        override_model_name: Optional model name to override
+        force_override: If True, override_model_name takes highest priority
+
+    Returns:
+        Tuple of (model_kind, model_spec, model_name, raw_agent_config).
+        model_kind/model_spec/model_name may be None if no model is found.
+
+    Raises:
+        ValueError: If override_model_name is not in the bot's allowed_models whitelist.
+    """
+    bot_crd = Bot.model_validate(bot.json)
+    bot_json = bot.json or {}
+    bot_spec = bot_json.get("spec", {})
+    raw_agent_config = bot_spec.get("agent_config", {})
+
+    model_name = None
+
+    # Priority 1: Force override from task
+    # Tracks whether the resolved model was explicitly chosen by the user.
+    # Bot-bound models that later become whitelist-restricted are reported as
+    # "not found" (the user never picked them), while a user-selected model
+    # keeps the informative whitelist error.
+    model_from_user_override = False
+    if force_override and override_model_name:
+        model_name = override_model_name
+        model_from_user_override = True
+        logger.info(f"Using task model (force override): {model_name}")
+    else:
+        # Priority 2: Bot's agent_config.bind_model
+        bind_model = raw_agent_config.get("bind_model")
+        if bind_model and isinstance(bind_model, str) and bind_model.strip():
+            model_name = bind_model.strip()
+            logger.info(f"Using bot bound model: {model_name}")
+
+        # Priority 3: Bot's modelRef (legacy)
+        if not model_name and bot_crd.spec.modelRef:
+            model_name = bot_crd.spec.modelRef.name
+            logger.info(f"Using bot modelRef: {model_name}")
+
+        # Priority 4: Task-level override (fallback)
+        if not model_name and override_model_name:
+            model_name = override_model_name
+            model_from_user_override = True
+            logger.info(f"Using task model (fallback): {model_name}")
+
+    if not model_name:
+        return None, None, None, raw_agent_config
+
+    # Validate against allowed_models whitelist when an override model is used.
+    # This is the single validation point covering all call paths (chat, task creation,
+    # subscription, retry, etc.).
+    if override_model_name:
+        allowed_names = _resolve_allowed_model_names(
+            db, bot_crd=bot_crd, raw_agent_config=raw_agent_config, user_id=user_id
+        )
+        if allowed_names is not None:
+            if model_name not in allowed_names:
+                raise ValueError(
+                    f"Model '{model_name}' is not in the allowed models list for bot '{bot.name}'"
+                )
+            logger.info(
+                f"Model '{model_name}' passed allowed_models whitelist check for bot '{bot.name}'"
+            )
+
+    # Find the model Kind object, following any bind_model pointer chain
+    # (e.g. a Bot's private Model that only carries an allowed_models
+    # whitelist and points onward to the model with the real env config).
+    try:
+        model_kind, model_spec = _find_model_with_namespace(db, model_name, user_id)
+        model_kind, model_spec = _resolve_bind_model_pointer(
+            db, user_id, model_kind, model_spec
+        )
+    except PublicModelAccessDeniedError:
+        if model_from_user_override:
+            raise
+        # The bot's bound model became whitelist-restricted after it was
+        # configured. From this user's perspective the model is unusable, so
+        # treat it exactly like a model that no longer exists.
+        logger.warning(
+            f"Bot bound model '{model_name}' is not available to user_id={user_id} "
+            f"(public model whitelist); treating it as not found"
+        )
+        model_kind, model_spec = None, None
+    return model_kind, model_spec, model_name, raw_agent_config
+
+
+def _resolve_allowed_model_names(
+    db: Session,
+    *,
+    bot_crd: Bot,
+    raw_agent_config: Dict[str, Any],
+    user_id: int,
+) -> Optional[set[str]]:
+    """Resolve the model names a bot allows.
+
+    The whitelist lives either on the bot's agent_config or, for bots that bind
+    a Model carrying only the restriction, on that Model's modelConfig. Bound
+    Models are read in the same priority order as the model selection itself
+    (agent_config.bind_model, then the legacy spec.modelRef).
+
+    Returns None when the bot does not restrict models. An absent or empty
+    allowed_models list means "no restriction" (the settings UI only writes the
+    key once at least one model is allowed), while an empty set means a
+    whitelist is configured but declares no usable entry, which blocks every
+    override.
+    """
+    allowed_models = raw_agent_config.get("allowed_models")
+    if not allowed_models:
+        for bound_model_name in _bound_model_names(bot_crd, raw_agent_config):
+            # Only inspect the bound model's metadata here; the user is not
+            # executing with it, so the public-model user whitelist must not
+            # apply. Otherwise overriding away from a whitelist-restricted
+            # bound model would still fail with that model's whitelist error.
+            _, bound_model_spec = _find_model_with_namespace(
+                db, bound_model_name, user_id, enforce_public_whitelist=False
+            )
+            if not bound_model_spec:
+                continue
+            bound_model_config = bound_model_spec.get("modelConfig", {})
+            if not isinstance(bound_model_config, dict):
+                continue
+            bound_allowed_models = bound_model_config.get("allowed_models")
+            if bound_allowed_models:
+                allowed_models = bound_allowed_models
+                break
+
+    if not isinstance(allowed_models, list) or not allowed_models:
+        return None
+
+    return {
+        m.get("name") for m in allowed_models if isinstance(m, dict) and m.get("name")
+    }
+
+
+def _bound_model_names(bot_crd: Bot, raw_agent_config: Dict[str, Any]) -> list[str]:
+    """Return models a bot binds, ordered like the model selection priority."""
+    bound_model_names: list[str] = []
+
+    bind_model = raw_agent_config.get("bind_model")
+    if isinstance(bind_model, str) and bind_model.strip():
+        bound_model_names.append(bind_model.strip())
+
+    model_ref = bot_crd.spec.modelRef
+    if model_ref and model_ref.name not in bound_model_names:
+        bound_model_names.append(model_ref.name)
+
+    return bound_model_names
+
+
+def allowed_model_names_for_bot(
+    db: Session,
+    bot: Kind,
+    user_id: int,
+) -> Optional[set[str]]:
+    """Return the model names a bot allows, or None when it allows everything."""
+    bot_json = bot.json if isinstance(bot.json, dict) else {}
+    bot_crd = Bot.model_validate(bot_json)
+    bot_spec = bot_json.get("spec") or {}
+    raw_agent_config = bot_spec.get("agent_config") or {}
+    if not isinstance(raw_agent_config, dict):
+        raw_agent_config = {}
+    return _resolve_allowed_model_names(
+        db,
+        bot_crd=bot_crd,
+        raw_agent_config=raw_agent_config,
+        user_id=user_id,
+    )
+
+
+def allowed_model_names_for_team(
+    db: Session,
+    team: Kind,
+    user_id: int,
+) -> Optional[set[str]]:
+    """Return the model names every bot of a team allows.
+
+    A model override is applied to every bot of the team, so it has to satisfy
+    each bot's restriction. Returns None when the team JSON is unavailable or
+    no bot restricts models; an empty set means no model satisfies the team.
+    """
+    from app.schemas.kind import Team
+    from app.services.readers import KindType, kindReader
+
+    team_json = getattr(team, "json", None)
+    if not isinstance(team_json, dict):
+        return None
+
+    team_crd = Team.model_validate(team_json)
+    team_user_id = team.user_id or user_id
+    allowed_names: Optional[set[str]] = None
+
+    for member in team_crd.spec.members or []:
+        bot = kindReader.get_by_name_and_namespace(
+            db,
+            team_user_id,
+            KindType.BOT,
+            member.botRef.namespace,
+            member.botRef.name,
+        )
+        if bot is None:
+            continue
+        bot_allowed_names = allowed_model_names_for_bot(db, bot, user_id)
+        if bot_allowed_names is None:
+            continue
+        allowed_names = (
+            bot_allowed_names
+            if allowed_names is None
+            else allowed_names & bot_allowed_names
+        )
+
+    return allowed_names
+
+
+def resolve_model_name_for_bot(
+    db: Session,
+    bot: Kind,
+    user_id: int,
+) -> Optional[str]:
+    """Return the Bot's configured Model resource name."""
+
+    _, _, model_name, _ = _resolve_model_for_bot(db, bot, user_id)
+    return model_name
+
+
+def build_agent_config_for_bot(
+    db: Session,
+    bot: Kind,
+    user_id: int,
+    override_model_name: Optional[str] = None,
+    force_override: bool = False,
+) -> Dict[str, Any]:
+    """
+    Build agent_config for a bot based on its model binding.
+
+    Resolves the model and returns agent_config in the format that
+    downstream executors expect: {"env": {"model": "...", "api_key": "...", ...}}.
+    """
+    # Short-circuit: if raw agent_config already has inline model config, use it
+    bot_json = bot.json or {}
+    raw_agent_config = bot_json.get("spec", {}).get("agent_config", {})
+    if not (force_override and override_model_name):
+        raw_env = raw_agent_config.get("env", {})
+        if raw_env.get("model") and raw_env.get("api_key"):
+            return raw_agent_config
+
+    model_kind, model_spec, model_name, raw_agent_config = _resolve_model_for_bot(
+        db, bot, user_id, override_model_name, force_override
+    )
+
+    if not model_spec:
+        if model_name:
+            logger.warning(
+                "[build_agent_config_for_bot] Model '%s' not found, "
+                "returning raw agent_config",
+                model_name,
+            )
+        return raw_agent_config
+
+    # Return the model's modelConfig directly - this contains the "env" dict
+    # that executors expect (e.g., {"env": {"model": "claude", "api_key": "...", ...}})
+    model_config_dict = model_spec.get("modelConfig", {})
+    if not model_config_dict:
+        return raw_agent_config
+
+    # Preserve explicit transport settings for downstream executor adapters.
+    for key in ("protocol", "apiFormat"):
+        if model_spec.get(key):
+            model_config_dict = {**model_config_dict, key: model_spec[key]}
+
+    return model_config_dict
+
+
+def get_model_config_for_bot(
+    db: Session,
+    bot: Kind,
+    user_id: int,
+    override_model_name: Optional[str] = None,
+    force_override: bool = False,
+) -> Dict[str, Any]:
+    """
+    Get model configuration for a Bot (flat format for Chat Shell).
+
+    Returns:
+        Dict containing model configuration:
+        {
+            "api_key": "sk-xxx",
+            "base_url": "https://api.openai.com/v1",
+            "model_id": "gpt-4",
+            "model": "openai",  # or "claude"
+            "model_name": "my-model",  # Model CRD name for subscription
+            "model_namespace": "default"  # Model CRD namespace for subscription
+        }
+
+    Raises:
+        ValueError: If no model is configured or model not found
+    """
+    model_kind, model_spec, model_name, _ = _resolve_model_for_bot(
+        db, bot, user_id, override_model_name, force_override
+    )
+
+    if not model_name:
+        raise ValueError(f"Bot {bot.name} has no model configured")
+
+    if not model_spec:
+        raise ValueError(f"Model {model_name} not found")
+
+    # Use the actual namespace from the found model
+    model_namespace = (
+        model_kind.namespace if model_kind and model_kind.namespace else "default"
+    )
+
+    # Extract configuration and add model_name/model_namespace
+    config = _extract_model_config(model_spec)
+    config["model_name"] = model_name
+    config["model_namespace"] = model_namespace
+    return config
+
+
+def _find_model(db: Session, model_name: str, user_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Find model by name.
+
+    Search order:
+    1. User's private models (kinds table)
+    2. Group models (kinds table in user's groups)
+    3. Public models (kinds table with user_id=0)
+    4. Runtime-only models derived from user execution config
+
+    Args:
+        db: Database session
+        model_name: Model name to find
+        user_id: User ID for private model lookup
+
+    Returns:
+        Model spec dictionary or None if not found
+    """
+    model_kind, model_spec = _find_model_with_namespace(db, model_name, user_id)
+    return model_spec
+
+
+def _find_model_with_namespace(
+    db: Session,
+    model_name: str,
+    user_id: int,
+    enforce_public_whitelist: bool = True,
+) -> tuple[Optional[Kind], Optional[Dict[str, Any]]]:
+    """
+    Find model by name and return both the Kind object and spec.
+
+    Search order:
+    1. User's private models (kinds table)
+    2. Group models (kinds table in user's groups)
+    3. Public models (kinds table with user_id=0)
+    4. Runtime-only models derived from user execution config
+
+    Args:
+        db: Database session
+        model_name: Model name to find
+        user_id: User ID for private model lookup
+        enforce_public_whitelist: When False, skip the public model user
+            whitelist check. Only used by callers that read a model's metadata
+            (e.g. an agent's bound model) without executing with it.
+
+    Returns:
+        Tuple of (Kind object, Model spec dictionary) or (None, None) if not found
+    """
+    # Search user's private models first
+    user_model = (
+        db.query(Kind)
+        .filter(
+            Kind.kind == "Model",
+            Kind.user_id == user_id,
+            Kind.name == model_name,
+            Kind.is_active == True,
+        )
+        .first()
+    )
+
+    if user_model and user_model.json:
+        logger.info(
+            f"Found model '{model_name}' in user's private models (namespace: {user_model.namespace})"
+        )
+        return user_model, user_model.json.get("spec", {})
+
+    referenced_model = get_referenced_capability(
+        db,
+        kind="Model",
+        name=model_name,
+        user_id=user_id,
+        namespace="default",
+    )
+    if referenced_model and referenced_model.json:
+        return referenced_model, referenced_model.json.get("spec", {})
+
+    # Search group models
+    from app.services.group_permission import get_user_groups
+
+    user_groups = get_user_groups(db, user_id)
+    if user_groups:
+        group_model = (
+            db.query(Kind)
+            .filter(
+                Kind.kind == "Model",
+                Kind.name == model_name,
+                Kind.namespace.in_(user_groups),
+                Kind.is_active == True,
+            )
+            .first()
+        )
+
+        if group_model and group_model.json:
+            logger.info(
+                f"Found model '{model_name}' in group models (namespace: {group_model.namespace})"
+            )
+            return group_model, group_model.json.get("spec", {})
+        for group_name in user_groups:
+            referenced_model = get_referenced_capability(
+                db,
+                kind="Model",
+                name=model_name,
+                user_id=user_id,
+                namespace=group_name,
+            )
+            if referenced_model and referenced_model.json:
+                return referenced_model, referenced_model.json.get("spec", {})
+
+    # Search public models
+    public_model = (
+        db.query(Kind)
+        .filter(
+            Kind.user_id == 0,
+            Kind.kind == "Model",
+            Kind.name == model_name,
+            Kind.namespace == "default",
+            Kind.is_active == True,
+        )
+        .first()
+    )
+
+    if public_model and public_model.json:
+        # Enforce the public model user whitelist: only listed users may use it.
+        user = db.query(User).filter(User.id == user_id).first()
+        if enforce_public_whitelist and not is_public_model_allowed_for_user(
+            public_model.json, user.user_name if user else None
+        ):
+            raise PublicModelAccessDeniedError(
+                f"Model '{model_name}' is restricted to whitelisted users"
+            )
+        logger.info(
+            f"Found model '{model_name}' in public models (namespace: {public_model.namespace})"
+        )
+        return public_model, public_model.json.get("spec", {})
+
+    runtime_model_spec = get_enabled_codex_runtime_model_spec(db, user_id, model_name)
+    if runtime_model_spec:
+        logger.info("Found model '%s' as runtime-only Codex model", model_name)
+        return None, runtime_model_spec
+
+    logger.warning(f"Model '{model_name}' not found in any source")
+    return None, None
+
+
+# Maximum number of bind_model pointer hops to follow before giving up.
+# Guards against misconfigured or accidentally-cyclic pointer chains.
+_MAX_BIND_MODEL_POINTER_DEPTH = 5
+
+
+def _resolve_bind_model_pointer(
+    db: Session,
+    user_id: int,
+    model_kind: Optional[Kind],
+    model_spec: Optional[Dict[str, Any]],
+) -> tuple[Optional[Kind], Optional[Dict[str, Any]]]:
+    """
+    Follow a Model's modelConfig.bind_model pointer to the Model it references.
+
+    Some Models (e.g. a Bot's private Model created to carry a restricted
+    allowed_models whitelist) only store {"bind_model": ..., "allowed_models": [...]}
+    without their own "env" section - the actual provider config lives on the
+    Model named by bind_model. Without this resolution, callers would silently
+    fall back to placeholder defaults (gpt-4 / empty api_key) instead of the
+    real credentials.
+
+    Args:
+        db: Database session
+        user_id: User ID for querying user-specific models
+        model_kind: The Model Kind object to start from (may be None for
+            runtime-only models)
+        model_spec: The Model spec dict to start from
+
+    Returns:
+        Tuple of (model_kind, model_spec) once a Model with a real "env"
+        section is reached, or the last unresolved (model_kind, model_spec)
+        if there was no bind_model to follow.
+
+    Raises:
+        ValueError: If a bind_model pointer target cannot be found, or the
+            pointer chain is too deep or cyclic.
+    """
+    visited: set[str] = set()
+    while model_spec:
+        model_config = model_spec.get("modelConfig") or {}
+        if model_config.get("env"):
+            return model_kind, model_spec
+
+        bind_model = model_config.get("bind_model")
+        if not isinstance(bind_model, str) or not bind_model.strip():
+            return model_kind, model_spec
+        bind_model = bind_model.strip()
+
+        if bind_model in visited or len(visited) >= _MAX_BIND_MODEL_POINTER_DEPTH:
+            raise ValueError(
+                f"Model bind_model pointer chain is too deep or cyclic "
+                f"while resolving '{bind_model}'"
+            )
+        visited.add(bind_model)
+
+        current_name = model_kind.name if model_kind else bind_model
+        logger.info(
+            "[model_resolver] Model '%s' has no env, following bind_model "
+            "pointer to '%s'",
+            current_name,
+            bind_model,
+        )
+        next_kind, next_spec = _find_model_with_namespace(db, bind_model, user_id)
+        if not next_spec:
+            raise ValueError(
+                f"Model '{current_name}' binds to model '{bind_model}', "
+                f"which was not found"
+            )
+        model_kind, model_spec = next_kind, next_spec
+
+    return model_kind, model_spec
+
+
+def _extract_model_config(model_spec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract API configuration from model spec.
+
+    Args:
+        model_spec: Model specification dictionary
+
+    Returns:
+        Dict with api_key, base_url, model_id, model type, and default_headers
+
+    Raises:
+        ValueError: If modelConfig has no usable "env" section. This can happen
+            when a Model is a bind_model pointer wrapper that was never resolved
+            to its target (see _resolve_bind_model_pointer), or when modelConfig
+            is entirely empty. We raise instead of silently falling back to
+            placeholder defaults (gpt-4 / openai / empty api_key), which look
+            like a valid config but produce authentication failures downstream.
+    """
+    logger.info(
+        f"[model_resolver] _extract_model_config: model_spec keys = {list(model_spec.keys())}"
+    )
+
+    model_config = model_spec.get("modelConfig", {})
+    logger.info(
+        f"[model_resolver] _extract_model_config: modelConfig keys = {list(model_config.keys()) if model_config else 'empty'}"
+    )
+
+    env = model_config.get("env")
+    if not env:
+        bind_model = model_config.get("bind_model")
+        if bind_model:
+            raise ValueError(
+                f"Model config has an unresolved bind_model pointer to "
+                f"'{bind_model}' with no env configuration"
+            )
+        raise ValueError("Model config has no env configuration")
+    logger.info(
+        f"[model_resolver] _extract_model_config: env keys = {list(env.keys()) if env else 'empty'}"
+    )
+
+    # Get raw values with defaults
+    api_key = env.get("api_key", "")
+    base_url = env.get("base_url", "https://api.openai.com/v1")
+    model_id = env.get("model_id", "gpt-4")
+    model_type = env.get("model", "openai")
+
+    # Resolve environment variable placeholders in api_key
+    if api_key and "${" in api_key:
+        logger.info(
+            f"[model_resolver] api_key contains placeholder, resolving from env..."
+        )
+        api_key = resolve_env_placeholder(api_key)
+
+    # Get DEFAULT_HEADERS - first from modelConfig, then from env, then from environment variable
+    default_headers = model_config.get("DEFAULT_HEADERS", {})
+    if not default_headers:
+        # Also check env for backward compatibility
+        default_headers = env.get("DEFAULT_HEADERS", {})
+
+    if not default_headers:
+        # settings.EXECUTOR_ENV is a JSON string, need to parse it first
+        try:
+            executor_env = (
+                json.loads(settings.EXECUTOR_ENV) if settings.EXECUTOR_ENV else {}
+            )
+            default_headers = executor_env.get("DEFAULT_HEADERS", {})
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                f"[model_resolver] Failed to parse settings.EXECUTOR_ENV as JSON"
+            )
+            default_headers = {}
+
+    # If still empty, try to get from environment variable (EXECUTOR_ENV or DEFAULT_HEADERS)
+    if not default_headers:
+        default_headers = get_default_headers_from_env()
+
+    # If default_headers is a string, try to parse it as JSON
+    if isinstance(default_headers, str):
+        try:
+            default_headers = json.loads(default_headers)
+        except Exception:
+            logger.warning("Failed to parse DEFAULT_HEADERS as JSON")
+            default_headers = {}
+
+    logger.info(
+        f"[model_resolver] _extract_model_config: DEFAULT_HEADERS keys = {list(default_headers.keys()) if default_headers else 'empty'}"
+    )
+
+    logger.info(
+        "[model_resolver] _extract_model_config: api_key_configured=%s, "
+        "base_url_configured=%s, model_id=%s, model_type=%s",
+        bool(api_key),
+        bool(base_url),
+        model_id,
+        model_type,
+    )
+
+    # Decrypt API key if encrypted (only if it doesn't look like a placeholder)
+    if api_key == "***":
+        raise CryptoConfigurationError(
+            "Model API key is masked and unavailable for execution"
+        )
+    if api_key and "${" not in api_key:
+        try:
+            decrypted_key = decrypt_api_key(api_key)
+            logger.info("[model_resolver] _extract_model_config: decrypted api key")
+            api_key = decrypted_key
+        except CryptoConfigurationError:
+            raise
+        except Exception:
+            logger.warning("Failed to decrypt API key; using configured value")
+
+    # Extract API format (for OpenAI-compatible models)
+    # Priority: 1. spec field, 2. modelConfig field, 3. protocol/env inference
+    api_format = model_spec.get("apiFormat") or model_config.get("apiFormat")
+    protocol = model_spec.get("protocol") or model_config.get("protocol")
+
+    env_model = (
+        str(env.get("model") or "").strip().lower() if isinstance(env, dict) else ""
+    )
+
+    # Fallback: infer protocol from env.model when the spec/modelConfig does not set it.
+    # This fixes models created by older frontend versions that only stored
+    # env.model (e.g. "openai" or "claude") without spec.protocol/apiFormat.
+    if not protocol and env_model:
+        if env_model == "openai":
+            protocol = "openai"
+        elif env_model == "claude":
+            protocol = "claude"
+        if protocol:
+            logger.info(
+                f"[model_resolver] _extract_model_config: inferred protocol={protocol} from env.model={env_model}"
+            )
+
+    # If protocol is "openai-responses", use responses API format
+    if not api_format and protocol == "openai-responses":
+        api_format = "responses"
+        logger.info(
+            f"[model_resolver] _extract_model_config: using responses API from protocol={protocol}"
+        )
+
+    # Fallback: infer chat/completions API format for plain OpenAI protocol
+    if not api_format and protocol == "openai":
+        api_format = "chat/completions"
+        logger.info(
+            f"[model_resolver] _extract_model_config: using chat/completions API from protocol={protocol}"
+        )
+    # Context window and output token limits from modelConfig
+    context_window = model_config.get("context_window")
+    max_output_tokens = model_config.get("max_output_tokens")
+
+    # Model category type (llm, video, tts, etc.) - used for routing
+    model_category_type = model_spec.get("modelType")
+    if model_category_type:
+        logger.info(
+            f"[model_resolver] _extract_model_config: modelType={model_category_type}"
+        )
+
+    # Generation configs for image/video models
+    image_config = model_spec.get("imageConfig")
+    video_config = model_spec.get("videoConfig")
+    raw_model_capabilities = model_spec.get("modelCapabilities")
+    if raw_model_capabilities is None:
+        raw_model_capabilities = model_config.get("modelCapabilities")
+    model_capabilities = normalize_model_capabilities(raw_model_capabilities)
+    if model_capabilities:
+        logger.info(
+            f"[model_resolver] _extract_model_config: modelCapabilities={model_capabilities}"
+        )
+
+    # Thinking/reasoning config (provider-native passthrough)
+    # Only read from env - this is the single source of truth
+    thinking_config = env.get("thinking_config") or env.get("thinkingConfig")
+    if thinking_config:
+        logger.info(
+            f"[model_resolver] _extract_model_config: thinking_config={list(thinking_config.keys())}"
+        )
+
+    # Temperature override from env (user-configured, overrides default)
+    temperature = env.get("temperature")
+    if temperature is not None:
+        logger.info(
+            f"[model_resolver] _extract_model_config: temperature={temperature}"
+        )
+
+    # Catalog model id override for Codex-compatible models
+    codex_catalog_model_id = codex_catalog_model_id_from_config(env)
+    if codex_catalog_model_id:
+        logger.info(
+            f"[model_resolver] _extract_model_config: codex_catalog_model_id={codex_catalog_model_id}"
+        )
+
+    supports_developer_role = env.get("supports_developer_role")
+    if supports_developer_role is not None:
+        logger.info(
+            "[model_resolver] _extract_model_config: "
+            "supports_developer_role configured"
+        )
+
+    result = {
+        "api_key": api_key,
+        "base_url": base_url,
+        "model_id": model_id,
+        "model": model_type,
+        "default_headers": default_headers,
+        "api_format": api_format,
+        # Protocol for special API routing (e.g., gemini-deep-research)
+        "protocol": protocol,
+        # Context window and output token limits from ModelSpec or modelConfig
+        "context_window": context_window,
+        "max_output_tokens": max_output_tokens,
+        # Model category type for routing (llm, video, tts, etc.)
+        "modelType": model_category_type,
+        # Video generation config (resolution, ratio, duration, etc.)
+        "videoConfig": video_config,
+        # Thinking/reasoning config (provider-native passthrough)
+        "think_config": thinking_config,
+        # User-configured temperature override
+        "temperature": temperature,
+    }
+    if supports_developer_role is not None:
+        # Preserve the existing response shape unless the capability is explicit.
+        result["supports_developer_role"] = supports_developer_role
+    if image_config is not None:
+        result["imageConfig"] = image_config
+    if model_capabilities:
+        result["modelCapabilities"] = model_capabilities
+    if codex_catalog_model_id:
+        result["codex_catalog_model_id"] = codex_catalog_model_id
+    return result
+
+
+def get_bot_system_prompt(
+    db: Session, bot: Kind, user_id: int, team_member_prompt: Optional[str] = None
+) -> str:
+    """
+    Get the system prompt for a Bot.
+
+    Combines Ghost's system prompt with team member's additional prompt.
+    The combined prompt is wrapped in <base_prompt> XML tags.
+
+    Args:
+        db: Database session
+        bot: The Bot Kind object
+        user_id: User ID (for Ghost lookup)
+        team_member_prompt: Optional additional prompt from team member config
+
+    Returns:
+        Combined system prompt string wrapped in <base_prompt> tags
+    """
+    from app.schemas.kind import Ghost
+
+    bot_crd = Bot.model_validate(bot.json)
+    system_prompt = ""
+
+    # Get Ghost for system prompt
+    ghost = (
+        db.query(Kind)
+        .filter(
+            Kind.user_id == user_id,
+            Kind.kind == "Ghost",
+            Kind.name == bot_crd.spec.ghostRef.name,
+            Kind.namespace == bot_crd.spec.ghostRef.namespace,
+            Kind.is_active == True,
+        )
+        .first()
+    )
+
+    if ghost and ghost.json:
+        ghost_crd = Ghost.model_validate(ghost.json)
+        system_prompt = ghost_crd.spec.systemPrompt or ""
+
+    # Append team member prompt if provided
+    if team_member_prompt:
+        if system_prompt:
+            system_prompt = f"{system_prompt}\n\n{team_member_prompt}"
+        else:
+            system_prompt = team_member_prompt
+
+    # Wrap in <base_prompt> tags for structured prompt identification
+    if system_prompt:
+        system_prompt = f"<base_prompt>\n{system_prompt}\n</base_prompt>"
+
+    return system_prompt

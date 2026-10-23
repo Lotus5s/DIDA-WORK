@@ -1,0 +1,380 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import React, { useState } from 'react'
+import {
+  BookPlus,
+  Check,
+  Copy,
+  History,
+  Pencil,
+  RefreshCw,
+  Send,
+  ThumbsDown,
+  ThumbsUp,
+} from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { useTranslation } from '@/hooks/useTranslation'
+import type { FeedbackState } from '@/hooks/useMessageFeedback'
+
+// CopyButton component for copying markdown content
+export const CopyButton = ({
+  content,
+  className,
+  tooltip,
+  onCopySuccess,
+}: {
+  content: string
+  className?: string
+  tooltip?: string
+  /** Optional callback when copy succeeds - used for telemetry */
+  onCopySuccess?: () => void
+}) => {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = async () => {
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(content)
+        setCopied(true)
+        setTimeout(() => setCopied(false), 2000)
+        onCopySuccess?.()
+        return
+      } catch (err) {
+        console.error('Failed to copy text: ', err)
+      }
+    }
+
+    try {
+      const textarea = document.createElement('textarea')
+      textarea.value = content
+      textarea.style.cssText = 'position:fixed;opacity:0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+      onCopySuccess?.()
+    } catch (err) {
+      console.error('Fallback copy failed: ', err)
+    }
+  }
+
+  const button = (
+    <Button
+      variant="ghost"
+      size="icon"
+      onClick={handleCopy}
+      className={className ?? 'h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec'}
+    >
+      {copied ? (
+        <Check className="h-3.5 w-3.5 text-green-500" />
+      ) : (
+        <Copy className="h-3.5 w-3.5 text-text-muted" />
+      )}
+    </Button>
+  )
+
+  if (tooltip) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>{button}</TooltipTrigger>
+        <TooltipContent>{copied ? 'Copied!' : tooltip}</TooltipContent>
+      </Tooltip>
+    )
+  }
+
+  return button
+}
+
+// EditButton component for editing user messages
+export const EditButton = ({
+  onEdit,
+  className,
+  tooltip,
+  disabled,
+}: {
+  onEdit: () => void
+  className?: string
+  tooltip?: string
+  disabled?: boolean
+}) => {
+  const button = (
+    <Button
+      variant="ghost"
+      size="icon"
+      onClick={onEdit}
+      disabled={disabled}
+      className={
+        className ??
+        'h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec disabled:opacity-50'
+      }
+    >
+      <Pencil className="h-3.5 w-3.5 text-text-muted" />
+    </Button>
+  )
+
+  if (tooltip) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>{button}</TooltipTrigger>
+        <TooltipContent>{tooltip}</TooltipContent>
+      </Tooltip>
+    )
+  }
+
+  return button
+}
+
+// ForwardButton sends a chat message into a collaboration project.
+export const ForwardButton = ({
+  onForward,
+  className,
+  tooltip,
+  disabled,
+}: {
+  onForward: () => void
+  className?: string
+  tooltip?: string
+  disabled?: boolean
+}) => {
+  const button = (
+    <Button
+      variant="ghost"
+      size="icon"
+      onClick={onForward}
+      disabled={disabled}
+      className={
+        className ??
+        'h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec disabled:opacity-50'
+      }
+      data-testid="forward-message-button"
+    >
+      <Send className="h-3.5 w-3.5 text-text-muted" />
+    </Button>
+  )
+
+  if (tooltip) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>{button}</TooltipTrigger>
+        <TooltipContent>{tooltip}</TooltipContent>
+      </Tooltip>
+    )
+  }
+
+  return button
+}
+
+export interface BubbleToolsProps {
+  contentToCopy: string
+  tools?: Array<{
+    key: string
+    title: string
+    icon: React.ReactNode
+    onClick: () => void
+  }>
+  /** Optional callback when copy succeeds - used for telemetry */
+  onCopySuccess?: () => void
+  /** Save the displayed Markdown content to a knowledge base. */
+  onSaveToKnowledge?: (content: string) => void
+  /** Whether the save-to-knowledge action should be shown. */
+  showSaveToKnowledge?: boolean
+  /** Current feedback state (from useMessageFeedback hook) */
+  feedback: FeedbackState
+  /** Handler for like button click (from useMessageFeedback hook) */
+  onLike: () => void
+  /** Handler for dislike button click (from useMessageFeedback hook) */
+  onDislike: () => void
+  /** Labels for feedback buttons */
+  feedbackLabels?: {
+    like: string
+    dislike: string
+  }
+  /** Handler for regenerate button click (opens model selection popover) */
+  onRegenerateClick?: () => void
+  /** Whether regenerate button should be shown */
+  showRegenerate?: boolean
+  /** Whether regenerate is in progress */
+  isRegenerating?: boolean
+  /** Optional render prop for custom regenerate button with popover */
+  renderRegenerateButton?: (defaultButton: React.ReactNode, tooltipText: string) => React.ReactNode
+  /** Handler for re-edit button click - restores original user input to chat box */
+  onReEditClick?: () => void
+  /** Whether re-edit button should be shown */
+  showReEdit?: boolean
+  /** Handler for forward button click - opens forward message dialog */
+  onForwardClick?: () => void
+  /** Whether forward button should be shown */
+  showForward?: boolean
+}
+
+// Bubble toolbar: supports copy button, feedback buttons, and extensible tool buttons
+const BubbleTools = ({
+  contentToCopy,
+  tools = [],
+  onCopySuccess,
+  onSaveToKnowledge,
+  showSaveToKnowledge = false,
+  feedback,
+  onLike,
+  onDislike,
+  feedbackLabels,
+  onRegenerateClick,
+  showRegenerate,
+  isRegenerating,
+  renderRegenerateButton,
+  onReEditClick,
+  showReEdit,
+  onForwardClick,
+  showForward,
+}: BubbleToolsProps) => {
+  const { t } = useTranslation()
+
+  return (
+    <div className="absolute bottom-2 left-2 flex items-center gap-1 z-10">
+      {/* Copy button */}
+      <CopyButton
+        content={contentToCopy}
+        onCopySuccess={onCopySuccess}
+        tooltip={t('chat:actions.copy') || 'Copy'}
+        className="h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec"
+      />
+      {showSaveToKnowledge && onSaveToKnowledge && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => onSaveToKnowledge(contentToCopy)}
+              className="h-11 w-11 !rounded-full bg-fill-tert hover:!bg-fill-sec sm:h-[30px] sm:w-[30px]"
+              data-testid="message-save-to-knowledge-button"
+            >
+              <BookPlus className="h-3.5 w-3.5 text-text-muted" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{t('chat:saveToKnowledge.action')}</TooltipContent>
+        </Tooltip>
+      )}
+      {/* Re-edit button - restores original user message to input box */}
+      {showReEdit && onReEditClick && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={onReEditClick}
+              className="h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec"
+              data-testid="message-re-edit-button"
+            >
+              <History className="h-3.5 w-3.5 text-text-muted" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>
+            {t('chat:actions.re_edit_tooltip') || 'Restore original input to chat box'}
+          </TooltipContent>
+        </Tooltip>
+      )}
+      {/* Regenerate button - only shown when showRegenerate is true */}
+      {showRegenerate &&
+        (() => {
+          // When renderRegenerateButton is provided, the button is wrapped in a PopoverTrigger
+          // In that case, we should NOT include onClick since PopoverTrigger handles the open state
+          const hasPopoverWrapper = !!renderRegenerateButton
+
+          // The raw button - onClick is only set when there's no popover wrapper
+          const rawButton = (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={hasPopoverWrapper ? undefined : onRegenerateClick}
+              disabled={isRegenerating}
+              className="h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec disabled:opacity-50"
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 text-text-muted ${isRegenerating ? 'animate-spin' : ''}`}
+              />
+            </Button>
+          )
+
+          const tooltipText =
+            t('chat:regenerate.tooltip') || t('chat:actions.regenerate') || 'Regenerate'
+
+          // When using renderRegenerateButton (with Popover), tooltip is handled inside the Popover component
+          // When not using renderRegenerateButton, wrap button with Tooltip here
+          if (renderRegenerateButton) {
+            return renderRegenerateButton(rawButton, tooltipText)
+          }
+
+          return (
+            <Tooltip>
+              <TooltipTrigger asChild>{rawButton}</TooltipTrigger>
+              <TooltipContent>{tooltipText}</TooltipContent>
+            </Tooltip>
+          )
+        })()}
+      {/* Feedback buttons: like and dislike */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onLike}
+            className={`h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec ${feedback === 'like' ? 'text-green-500' : ''}`}
+          >
+            <ThumbsUp
+              className={`h-3.5 w-3.5 ${feedback === 'like' ? 'fill-current' : 'text-text-muted'}`}
+            />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{feedbackLabels?.like || 'Like'}</TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onDislike}
+            className={`h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec ${feedback === 'dislike' ? 'text-red-500' : ''}`}
+          >
+            <ThumbsDown
+              className={`h-3.5 w-3.5 ${feedback === 'dislike' ? 'fill-current' : 'text-text-muted'}`}
+            />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{feedbackLabels?.dislike || 'Dislike'}</TooltipContent>
+      </Tooltip>
+      {/* Send the message to a collaboration project. */}
+      {showForward && onForwardClick && (
+        <ForwardButton
+          onForward={onForwardClick}
+          tooltip={t('chat:actions.forward') || 'Forward'}
+          className="h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec"
+        />
+      )}
+      {/* Additional tool buttons (e.g., download) */}
+      {tools.map(tool => (
+        <Tooltip key={tool.key}>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={tool.onClick}
+              className="h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec"
+            >
+              {tool.icon}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{tool.title}</TooltipContent>
+        </Tooltip>
+      ))}
+    </div>
+  )
+}
+
+export default BubbleTools

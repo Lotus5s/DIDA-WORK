@@ -1,0 +1,308 @@
+const stages = [
+  {
+    en: 'Opening your projects',
+    zh: '正在整理项目',
+    paths: [
+      [2, 7, 9, 7, 11, 9, 22, 9, 22, 20, 2, 20, 2, 7],
+      [4, 12, 20, 12, 20, 12],
+      [12, 16, 12, 16],
+    ],
+  },
+  {
+    en: 'Connecting your tools',
+    zh: '正在连接工具',
+    paths: [
+      [2, 4, 22, 4, 22, 20, 2, 20, 2, 4, 2, 4, 2, 4],
+      [7, 9, 10, 12, 7, 15],
+      [13, 15, 18, 15],
+    ],
+  },
+  {
+    en: 'Waking your agents',
+    zh: '正在唤醒智能体',
+    paths: [
+      [13, 2, 5, 13, 11, 13, 9, 22, 20, 9, 14, 9, 13, 2],
+      [12, 12, 12, 12, 12, 12],
+      [12, 12, 12, 12],
+    ],
+  },
+]
+
+const pathElements = [
+  document.querySelector('#morph-primary'),
+  document.querySelector('#morph-secondary'),
+  document.querySelector('#morph-tertiary'),
+]
+const splashRoot = document.querySelector('#splash-root')
+const stageIndicator = document.querySelector('#stage-indicator')
+const statusElement = document.querySelector('#splash-status')
+const titleElement = document.querySelector('#splash-title')
+const stageDots = [...document.querySelectorAll('.stage-dot')]
+const recoveryElement = document.querySelector('#startup-recovery')
+const disablePluginButton = document.querySelector('#startup-disable-plugin')
+const retryButton = document.querySelector('#startup-retry')
+const recoverButton = document.querySelector('#startup-recover')
+const resetOpenButton = document.querySelector('#startup-reset-open')
+const actionErrorElement = document.querySelector('#startup-action-error')
+const confirmationElement = document.querySelector('#startup-confirmation')
+const confirmationTitle = document.querySelector('#startup-confirmation-title')
+const confirmationDescription = document.querySelector('#startup-confirmation-description')
+const confirmationCancel = document.querySelector('#startup-confirmation-cancel')
+const confirmationSubmit = document.querySelector('#startup-confirmation-submit')
+const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+const isChinese = navigator.language.toLowerCase().startsWith('zh')
+const coldStart = new URLSearchParams(window.location.search).get('coldStart') === '1'
+const currentPaths = stages[0].paths.map(path => [...path])
+const velocities = stages[0].paths.map(path => path.map(() => 0))
+let stageIndex = prefersReducedMotion ? stages.length - 1 : 0
+let previousTime = performance.now()
+let slowStartup = false
+let startupFailed = false
+let failedPluginName = null
+let pendingResetMode = null
+let actionPending = false
+let confirmationTrigger = null
+
+function pathData(points) {
+  let data = `M${points[0]} ${points[1]}`
+  for (let index = 2; index < points.length; index += 2) {
+    data += `L${points[index]} ${points[index + 1]}`
+  }
+  return data
+}
+
+function paintPaths(paths) {
+  paths.forEach((path, index) => {
+    pathElements[index]?.setAttribute('d', pathData(path))
+  })
+}
+
+function updateCopy(index, animate) {
+  const stage = stages[index]
+  document.documentElement.lang = isChinese ? 'zh-CN' : 'en'
+  document.body.dataset.stage = String(index)
+  titleElement.textContent = startupFailed
+    ? isChinese
+      ? 'DIDA Work 启动失败'
+      : 'DIDA Work could not start'
+    : coldStart
+      ? isChinese
+        ? '第一次启动时间较长，请稍后'
+        : 'Preparing the runtime'
+      : slowStartup
+        ? isChinese
+          ? '第一次启动时间较长，请稍后'
+          : 'Startup is taking longer than expected'
+        : isChinese
+          ? '我们正在准备工作台'
+          : "We're preparing your workbench"
+  splashRoot.setAttribute('aria-label', isChinese ? 'DIDA Work 正在启动' : 'DIDA Work is starting')
+  stageIndicator.setAttribute(
+    'aria-label',
+    isChinese ? '正在准备工作台' : 'Preparing your workbench'
+  )
+  stageIndicator.setAttribute('aria-valuenow', String(index + 1))
+
+  const replaceStatus = () => {
+    statusElement.textContent = startupFailed
+      ? isChinese
+        ? failedPluginName
+          ? `检测到插件 ${failedPluginName} 加载失败`
+          : '你可以重试，或重置启动状态后重新打开'
+        : failedPluginName
+          ? `The plugin ${failedPluginName} failed to load`
+          : 'Retry, or reset startup state and reopen DIDA Work'
+      : coldStart
+        ? isChinese
+          ? '首次启动需要解压运行环境，通常需要 3–5 分钟，请勿关闭窗口；之后启动会很快。'
+          : 'First launch extracts the runtime; this usually takes 3–5 minutes. Please keep this window open. Later launches are fast.'
+        : slowStartup
+          ? isChinese
+            ? '正在初始化运行环境，通常需要 30–60 秒；完成后会自动进入工作台。'
+            : 'Initializing the runtime; this usually takes 30–60 seconds.'
+          : isChinese
+            ? stage.zh
+            : stage.en
+    statusElement.classList.remove('is-changing')
+  }
+
+  if (animate) {
+    statusElement.classList.add('is-changing')
+    window.setTimeout(replaceStatus, 140)
+  } else {
+    replaceStatus()
+  }
+
+  stageDots.forEach((dot, dotIndex) => {
+    dot.classList.toggle('is-active', dotIndex === index)
+  })
+}
+
+function setLocalizedActionCopy() {
+  if (failedPluginName) {
+    disablePluginButton.textContent = isChinese
+      ? `屏蔽 ${failedPluginName} 并重启`
+      : `Disable ${failedPluginName} and restart`
+  }
+  retryButton.textContent = isChinese ? '重新启动' : 'Restart'
+  recoverButton.textContent = isChinese ? '修复启动' : 'Repair startup'
+  resetOpenButton.textContent = isChinese ? '重置个人状态' : 'Reset personal state'
+  confirmationCancel.textContent = isChinese ? '取消' : 'Cancel'
+}
+
+function showRecovery() {
+  recoveryElement.hidden = false
+  document.documentElement.dataset.recoveryVisible = 'true'
+}
+
+function showConfirmation(mode) {
+  pendingResetMode = mode
+  confirmationTrigger = document.activeElement
+  confirmationElement.hidden = false
+  document.documentElement.dataset.confirmationVisible = 'true'
+  if (mode === 'recover') {
+    confirmationTitle.textContent = isChinese ? '修复启动？' : 'Repair startup?'
+    confirmationDescription.textContent = isChinese
+      ? '将清理运行环境和缓存，重启后自动重建。登录、设置、布局、插件、任务和会话都会保留。'
+      : 'This rebuilds the runtime and clears caches. Your sign-in, settings, layout, plugins, tasks, and conversations are preserved.'
+    confirmationSubmit.textContent = isChinese ? '修复并重启' : 'Repair and restart'
+    confirmationSubmit.classList.remove('startup-button-danger')
+    confirmationSubmit.classList.add('startup-button-primary')
+    confirmationSubmit.focus()
+    return
+  }
+  confirmationTitle.textContent = isChinese ? '重置个人状态？' : 'Reset personal state?'
+  confirmationDescription.textContent = isChinese
+    ? '将修复启动，并退出登录、恢复默认设置和布局、移除已安装插件。任务、会话、智能应用和项目文件都会保留。'
+    : 'This repairs startup, signs you out, restores default settings and layouts, and removes installed plugins. Tasks, conversations, Smart apps, and project files are preserved.'
+  confirmationSubmit.textContent = isChinese ? '重置并重启' : 'Reset and restart'
+  confirmationSubmit.classList.remove('startup-button-primary')
+  confirmationSubmit.classList.add('startup-button-danger')
+  confirmationSubmit.focus()
+}
+
+function hideConfirmation() {
+  if (actionPending) return
+  pendingResetMode = null
+  confirmationElement.hidden = true
+  delete document.documentElement.dataset.confirmationVisible
+  if (confirmationTrigger instanceof HTMLElement) confirmationTrigger.focus()
+  confirmationTrigger = null
+}
+
+function setActionPending(pending) {
+  actionPending = pending
+  disablePluginButton.disabled = pending
+  retryButton.disabled = pending
+  recoverButton.disabled = pending
+  resetOpenButton.disabled = pending
+  confirmationCancel.disabled = pending
+  confirmationSubmit.disabled = pending
+}
+
+async function runRecoveryAction(action, ...args) {
+  actionErrorElement.hidden = true
+  setActionPending(true)
+  try {
+    const recovery = window.weworkStartupRecovery
+    if (!recovery || typeof recovery[action] !== 'function') {
+      throw new Error('Startup recovery is unavailable')
+    }
+    await recovery[action](...args)
+  } catch {
+    setActionPending(false)
+    actionErrorElement.textContent = isChinese
+      ? '操作失败，请重新尝试。'
+      : 'The operation failed. Please try again.'
+    actionErrorElement.hidden = false
+  }
+}
+
+setLocalizedActionCopy()
+disablePluginButton.addEventListener('click', () => {
+  if (failedPluginName) void runRecoveryAction('disablePlugin', failedPluginName)
+})
+retryButton.addEventListener('click', () => {
+  if (pendingResetMode) {
+    const action = pendingResetMode === 'recover' ? 'recoverWorkbench' : pendingResetMode
+    void runRecoveryAction(action)
+    return
+  }
+  void runRecoveryAction('retry')
+})
+recoverButton.addEventListener('click', () => showConfirmation('recover'))
+resetOpenButton.addEventListener('click', () => showConfirmation('resetAppState'))
+confirmationCancel.addEventListener('click', hideConfirmation)
+confirmationSubmit.addEventListener('click', () => {
+  if (!pendingResetMode) return
+  const action = pendingResetMode === 'recover' ? 'recoverWorkbench' : pendingResetMode
+  void runRecoveryAction(action)
+})
+window.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && !confirmationElement.hidden) {
+    event.preventDefault()
+    hideConfirmation()
+  }
+})
+
+window.addEventListener('wework-startup-error', event => {
+  const pluginName = event.detail?.pluginName
+  failedPluginName = typeof pluginName === 'string' && pluginName ? pluginName : null
+  disablePluginButton.hidden = failedPluginName === null
+  setLocalizedActionCopy()
+  startupFailed = true
+  slowStartup = true
+  document.body.dataset.startupError = 'true'
+  document.body.dataset.slowStartup = 'true'
+  updateCopy(stageIndex, true)
+  showRecovery()
+})
+
+function animateMorph(time) {
+  const delta = Math.min((time - previousTime) / 1000, 0.032)
+  const targetPaths = stages[stageIndex].paths
+  previousTime = time
+
+  currentPaths.forEach((path, pathIndex) => {
+    path.forEach((value, coordinateIndex) => {
+      const displacement = targetPaths[pathIndex][coordinateIndex] - value
+      const acceleration = displacement * 190
+      const damping = Math.exp(-24 * delta)
+      velocities[pathIndex][coordinateIndex] =
+        (velocities[pathIndex][coordinateIndex] + acceleration * delta) * damping
+      path[coordinateIndex] += velocities[pathIndex][coordinateIndex] * delta
+    })
+  })
+
+  paintPaths(currentPaths)
+  requestAnimationFrame(animateMorph)
+}
+
+if (prefersReducedMotion) {
+  currentPaths.forEach((path, pathIndex) => {
+    path.splice(0, path.length, ...stages[stageIndex].paths[pathIndex])
+  })
+  paintPaths(currentPaths)
+  updateCopy(stageIndex, false)
+} else {
+  paintPaths(currentPaths)
+  updateCopy(stageIndex, false)
+  requestAnimationFrame(animateMorph)
+  window.setInterval(() => {
+    stageIndex = (stageIndex + 1) % stages.length
+    if (!slowStartup && !startupFailed) updateCopy(stageIndex, true)
+  }, 1150)
+}
+
+window.setTimeout(() => {
+  slowStartup = true
+  document.body.dataset.slowStartup = 'true'
+  updateCopy(stageIndex, true)
+}, 30_000)
+
+
+requestAnimationFrame(() => {
+  requestAnimationFrame(() => {
+    document.documentElement.dataset.animationReady = 'true'
+  })
+})

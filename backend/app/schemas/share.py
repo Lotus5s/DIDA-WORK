@@ -1,0 +1,522 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Pydantic schemas for unified resource sharing.
+
+Provides request/response schemas for share links and resource members.
+"""
+
+from datetime import datetime
+from enum import Enum
+from typing import List, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.models.share_link import ResourceType
+
+# Import BaseRole and create MemberRole alias for backward compatibility
+from app.schemas.base_role import BaseRole
+
+# MemberRole is an alias to BaseRole for backward compatibility
+# All role-related code should use BaseRole as the single source of truth
+MemberRole = BaseRole
+
+
+class MemberStatus(str, Enum):
+    """Status of a resource member."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+# =============================================================================
+# Share Link Schemas
+# =============================================================================
+
+
+class ShareLinkConfig(BaseModel):
+    """Configuration for creating a share link."""
+
+    require_approval: bool = Field(
+        default=True, description="Whether joining requires approval"
+    )
+    default_role: MemberRole = Field(
+        default=MemberRole.Reporter, description="Default role for joiners"
+    )
+    expires_in_hours: Optional[int] = Field(
+        default=None,
+        description="Hours until link expires (None = never expires)",
+        ge=1,
+    )
+
+    @field_validator("default_role")
+    @classmethod
+    def validate_default_role(cls, v: MemberRole) -> MemberRole:
+        """Validate that Owner role cannot be assigned via API."""
+        if v == MemberRole.Owner:
+            raise ValueError("Owner role cannot be assigned via API")
+        return v
+
+
+class ShareLinkCreate(BaseModel):
+    """Request body for creating a share link."""
+
+    config: ShareLinkConfig = Field(
+        default_factory=ShareLinkConfig, description="Share link configuration"
+    )
+
+
+class ShareLinkUpdate(BaseModel):
+    """Request body for updating a share link."""
+
+    require_approval: Optional[bool] = Field(
+        default=None, description="Whether joining requires approval"
+    )
+    default_role: Optional[MemberRole] = Field(
+        default=None, description="Default role for joiners"
+    )
+    expires_in_hours: Optional[int] = Field(
+        default=None, description="Hours until link expires (None = never expires)"
+    )
+    is_active: Optional[bool] = Field(
+        default=None, description="Whether the link is active"
+    )
+
+    @field_validator("default_role")
+    @classmethod
+    def validate_default_role(cls, v: Optional[MemberRole]) -> Optional[MemberRole]:
+        """Validate that Owner role cannot be assigned via API."""
+        if v == MemberRole.Owner:
+            raise ValueError("Owner role cannot be assigned via API")
+        return v
+
+
+class ShareLinkResponse(BaseModel):
+    """Response containing share link information."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    resource_type: str
+    resource_id: int
+    share_url: str = Field(description="Full share URL")
+    share_token: str = Field(description="Share token for joining")
+    require_approval: bool
+    default_role: str = Field(description="Default role for joiners")
+    expires_at: Optional[datetime] = None
+    is_active: bool
+    created_by_user_id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class ShareLinkInDB(BaseModel):
+    """Share link model from database."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    resource_type: str
+    resource_id: int
+    share_token: str
+    require_approval: bool
+    default_role: str
+    expires_at: Optional[datetime] = None
+    created_by_user_id: int
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+# =============================================================================
+# Resource Member Schemas
+# =============================================================================
+
+
+class ResourceMemberCreate(BaseModel):
+    """Request body for adding a member directly.
+
+    Supports both user and entity-type members:
+    - For user members: provide user_id, entity_type defaults to 'user'
+    - For entity members: provide entity_type, entity_id (user_id=0)
+    """
+
+    user_id: int = Field(
+        default=0, description="User ID to add as member (0 for entity members)"
+    )
+    role: MemberRole = Field(
+        default=MemberRole.Reporter,
+        description="Member role (Owner not allowed)",
+    )
+    entity_type: Optional[str] = Field(
+        default=None,
+        description="Entity type: 'user' (default), 'namespace'. "
+        "When set to non-user type, user_id can be 0.",
+    )
+    entity_id: Optional[str] = Field(
+        default=None,
+        description="Entity identifier (required when entity_type is set and not 'user')",
+    )
+    entity_display_name: Optional[str] = Field(
+        default=None,
+        description="Display name for entity-type members (e.g., group name, department name). "
+        "Optional; used as a snapshot when creating the member record.",
+    )
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: MemberRole) -> MemberRole:
+        """Validate that Owner role cannot be assigned via API."""
+        if v == MemberRole.Owner:
+            raise ValueError("Owner role cannot be assigned via API")
+        return v
+
+    @field_validator("entity_type")
+    @classmethod
+    def validate_entity_type(cls, v: Optional[str]) -> Optional[str]:
+        """Normalize entity_type to lowercase."""
+        if v is not None:
+            return v.lower()
+        return v
+
+    @model_validator(mode="after")
+    def validate_member_identity(self) -> "ResourceMemberCreate":
+        """Ensure valid member identity combinations."""
+        entity_type = self.entity_type or "user"
+        if entity_type != "user" and not self.entity_id:
+            raise ValueError("entity_id is required for non-user entity members")
+        if entity_type != "user" and self.user_id != 0:
+            raise ValueError("user_id must be 0 for non-user entity members")
+        return self
+
+
+class BatchResourceMemberCreate(BaseModel):
+    """Request body for batch adding members directly."""
+
+    members: List[ResourceMemberCreate] = Field(
+        description="List of members to add", min_length=1, max_length=10
+    )
+
+
+class ResourceMemberUpdate(BaseModel):
+    """Request body for updating member permissions."""
+
+    role: Optional[MemberRole] = Field(
+        default=None, description="New member role (Owner not allowed)"
+    )
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: Optional[MemberRole]) -> Optional[MemberRole]:
+        """Validate that Owner role cannot be assigned via API."""
+        if v == MemberRole.Owner:
+            raise ValueError("Owner role cannot be assigned via API")
+        return v
+
+
+class ResourceMemberResponse(BaseModel):
+    """Response containing resource member information."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    resource_type: str
+    resource_id: int
+    user_id: Optional[int] = (
+        None  # Null for entity-type members (namespace, department, etc.)
+    )
+    display_name: Optional[str] = None  # Unified display name for all member types
+    user_email: Optional[str] = None  # Populated from user lookup
+    role: str = Field(description="Member role: Owner, Maintainer, Developer, Reporter")
+    status: str
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+    source_type: str = Field(
+        default="direct",
+        description="Permission source: 'direct', 'entity_permission', 'share_link', 'group_membership'",
+    )
+    invited_by_user_id: int
+    invited_by_user_name: Optional[str] = None  # Populated from user lookup
+    reviewed_by_user_id: Optional[int] = None
+    reviewed_by_user_name: Optional[str] = None  # Populated from user lookup
+    reviewed_at: Optional[datetime] = None
+    copied_resource_id: Optional[int] = None  # For Task type
+    requested_at: datetime
+    created_at: datetime
+    updated_at: datetime
+
+
+class FailedMemberResponse(BaseModel):
+    """Response entry for a failed member addition."""
+
+    user_id: int
+    error: str
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+
+
+class BatchResourceMemberResponse(BaseModel):
+    """Response containing batch member addition results."""
+
+    succeeded: List[ResourceMemberResponse] = Field(
+        default_factory=list, description="Successfully added members"
+    )
+    failed: List[FailedMemberResponse] = Field(
+        default_factory=list,
+        description="Failed additions with user_id and error message",
+    )
+
+
+class ResourceMemberInDB(BaseModel):
+    """Resource member model from database."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    resource_type: str
+    resource_id: int
+    user_id: Optional[int] = (
+        None  # Null for entity-type members (namespace, department, etc.)
+    )
+    role: str = Field(description="Member role: Owner, Maintainer, Developer, Reporter")
+    status: str
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+    entity_display_name: Optional[str] = None
+    invited_by_user_id: int
+    share_link_id: Optional[int] = None
+    reviewed_by_user_id: Optional[int] = None
+    reviewed_at: Optional[datetime] = None
+    copied_resource_id: Optional[int] = None
+    requested_at: datetime
+    created_at: datetime
+    updated_at: datetime
+
+
+class MemberListResponse(BaseModel):
+    """Response containing list of resource members."""
+
+    members: List[ResourceMemberResponse]
+    total: int
+
+
+# =============================================================================
+# Join Request Schemas
+# =============================================================================
+
+
+class JoinByLinkRequest(BaseModel):
+    """Request body for joining via share link."""
+
+    share_token: str = Field(description="Share token from URL")
+    requested_role: Optional[MemberRole] = Field(
+        default=None, description="Requested role (optional, Owner not allowed)"
+    )
+
+    @field_validator("requested_role")
+    @classmethod
+    def validate_requested_role(cls, v: Optional[MemberRole]) -> Optional[MemberRole]:
+        """Validate that Owner role cannot be assigned via API."""
+        if v == MemberRole.Owner:
+            raise ValueError("Owner role cannot be assigned via API")
+        return v
+
+
+class JoinByLinkResponse(BaseModel):
+    """Response for join request."""
+
+    message: str
+    status: MemberStatus = Field(description="Current status (pending/approved)")
+    member_id: int = Field(description="Created member record ID")
+    resource_type: str
+    resource_id: int
+    copied_resource_id: Optional[int] = None  # For Task type when auto-approved
+
+
+# =============================================================================
+# Approval Request Schemas
+# =============================================================================
+
+
+class PendingRequestResponse(BaseModel):
+    """Response containing pending approval request."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    user_name: Optional[str] = None
+    user_email: Optional[str] = None
+    requested_role: str = Field(description="Requested role")
+    requested_at: datetime
+
+
+class PendingRequestListResponse(BaseModel):
+    """Response containing list of pending requests."""
+
+    requests: List[PendingRequestResponse]
+    total: int
+
+
+class ReviewRequestBody(BaseModel):
+    """Request body for reviewing a join request."""
+
+    approved: bool = Field(description="Whether to approve the request")
+    role: Optional[MemberRole] = Field(
+        default=None,
+        description="Role to grant (only for approval, defaults to requested role, Owner not allowed)",
+    )
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: Optional[MemberRole]) -> Optional[MemberRole]:
+        """Validate that Owner role cannot be assigned via API."""
+        if v == MemberRole.Owner:
+            raise ValueError("Owner role cannot be assigned via API")
+        return v
+
+
+class ReviewRequestResponse(BaseModel):
+    """Response for review action."""
+
+    message: str
+    member_id: int
+    new_status: MemberStatus
+    role: Optional[str] = Field(None, description="Granted role")
+
+
+# =============================================================================
+# Public Info Schemas (for share link preview)
+# =============================================================================
+
+
+class ShareInfoResponse(BaseModel):
+    """Public response for share link preview (no auth required)."""
+
+    resource_type: str
+    resource_id: int
+    resource_name: str = Field(description="Name of the shared resource")
+    owner_user_id: int
+    owner_user_name: str = Field(description="Name of resource owner")
+    require_approval: bool
+    default_role: str = Field(description="Default role for joiners")
+    is_expired: bool = False
+
+
+# =============================================================================
+# Permission Check Schemas
+# =============================================================================
+
+
+class PermissionCheckRequest(BaseModel):
+    """Request for checking user permission."""
+
+    resource_type: ResourceType
+    resource_id: int
+    user_id: int
+    required_role: MemberRole
+
+
+class PermissionCheckResponse(BaseModel):
+    """Response for permission check."""
+
+    has_permission: bool
+    actual_role: Optional[str] = None
+
+
+# =============================================================================
+# Knowledge Base Permission Schemas
+# =============================================================================
+
+
+class PendingRequestInfo(BaseModel):
+    """Schema for current user's pending request info."""
+
+    id: int = Field(..., description="Member record ID")
+    role: MemberRole = Field(..., description="Requested role")
+    requested_at: datetime = Field(..., description="Request timestamp")
+
+
+class MyKBPermissionResponse(BaseModel):
+    """Schema for current user's permission on a knowledge base."""
+
+    has_access: bool = Field(
+        ...,
+        description="Whether the user may directly access the KB after ACL and direct-access requirement checks",
+    )
+    role: Optional[MemberRole] = Field(
+        None,
+        description="Highest underlying ACL role; may be set even when direct access is denied",
+    )
+    is_creator: bool = Field(..., description="Whether user is the KB creator")
+    pending_request: Optional[PendingRequestInfo] = Field(
+        None,
+        description="Pending permission request info if exists",
+    )
+
+
+class PermissionSourceInfo(BaseModel):
+    """Schema describing a single permission source."""
+
+    source_type: str = Field(
+        ...,
+        description="Source type: 'direct', 'entity_permission', 'group_membership', 'share_link', 'creator'",
+    )
+    display_name: Optional[str] = Field(
+        None, description="Display name of the source (e.g., group name)"
+    )
+    role: str = Field(..., description="Role granted by this source")
+    entity_type: Optional[str] = Field(
+        None, description="Entity type if source is entity_permission"
+    )
+    entity_id: Optional[str] = Field(
+        None, description="Entity ID if source is entity_permission"
+    )
+
+
+class MyPermissionSourcesResponse(BaseModel):
+    """Schema for current user's permission sources on a resource."""
+
+    has_access: bool = Field(..., description="Whether user may access the resource")
+    effective_role: Optional[str] = Field(
+        None,
+        description="Highest underlying ACL role across all permission sources",
+    )
+    is_creator: bool = Field(..., description="Whether user is the resource creator")
+    sources: List[PermissionSourceInfo] = Field(
+        default_factory=list, description="All permission sources"
+    )
+
+
+class KBShareInfoResponse(BaseModel):
+    """Schema for knowledge base share info response."""
+
+    id: int = Field(..., description="Knowledge base ID")
+    name: str = Field(..., description="Knowledge base name")
+    description: Optional[str] = Field(None, description="Knowledge base description")
+    namespace: str = Field(..., description="Knowledge base namespace")
+    creator_id: int = Field(..., description="Creator user ID")
+    creator_name: str = Field(..., description="Creator username")
+    created_at: Optional[str] = Field(
+        None, description="Creation timestamp (ISO format)"
+    )
+    my_permission: MyKBPermissionResponse = Field(
+        ..., description="Current user's permission info"
+    )
+
+
+class PublicKnowledgeBaseResponse(BaseModel):
+    """Public knowledge base info for anonymous access via share token."""
+
+    id: int = Field(..., description="Knowledge base ID")
+    name: str = Field(..., description="Knowledge base name")
+    namespace: str = Field(..., description="Knowledge base namespace")
+    description: Optional[str] = Field(None, description="Knowledge base description")
+    creator_id: int = Field(..., description="Creator user ID")
+    creator_name: str = Field(..., description="Creator username")
+    require_approval: bool = Field(..., description="Whether joining requires approval")
+    default_role: str = Field(..., description="Default role for joiners")
+    is_expired: bool = Field(False, description="Whether the share link has expired")

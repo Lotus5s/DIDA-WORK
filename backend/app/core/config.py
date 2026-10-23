@@ -1,0 +1,953 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+import os
+from pathlib import Path
+from typing import Any, Mapping, Optional, Tuple, Type
+
+from dotenv import dotenv_values
+from pydantic import Field, SecretStr, field_validator
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
+from pydantic_settings.sources import DotEnvSettingsSource
+from pydantic_settings.sources.utils import parse_env_vars
+
+
+class NoInterpolationDotEnvSettingsSource(DotEnvSettingsSource):
+    """
+    Custom DotEnvSettingsSource that disables variable interpolation.
+
+    This fixes an issue where dotenv's default interpolation behavior
+    incorrectly parses template variables like ${{user.name}} in JSON strings,
+    turning them into "}".
+    """
+
+    @staticmethod
+    def _static_read_env_file(
+        file_path: Path,
+        *,
+        encoding: str | None = None,
+        case_sensitive: bool = False,
+        ignore_empty: bool = False,
+        parse_none_str: str | None = None,
+    ) -> Mapping[str, str | None]:
+        # Disable interpolation to preserve template variables like ${{user.name}}
+        file_vars: dict[str, str | None] = dotenv_values(
+            file_path, encoding=encoding or "utf8", interpolate=False
+        )
+        return parse_env_vars(file_vars, case_sensitive, ignore_empty, parse_none_str)
+
+
+GIT_TOKEN_CRYPTO_ENV_NAMES = ("GIT_TOKEN_AES_KEY", "GIT_TOKEN_AES_IV")
+
+
+def load_git_token_crypto_environment(env_file: Path) -> None:
+    """Make git-token crypto settings available to the shared crypto module."""
+    values = dotenv_values(env_file, interpolate=False)
+    for name in GIT_TOKEN_CRYPTO_ENV_NAMES:
+        if name not in os.environ and (value := values.get(name)) is not None:
+            os.environ[name] = value
+
+
+def _parse_json_object_setting(value: Any, setting_name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return {
+            str(key).strip(): item for key, item in value.items() if str(key).strip()
+        }
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{setting_name} must be a JSON object") from exc
+        if not isinstance(parsed, Mapping):
+            raise ValueError(f"{setting_name} must be a JSON object")
+        return _parse_json_object_setting(parsed, setting_name)
+    raise ValueError(f"{setting_name} must be a mapping")
+
+
+class Settings(BaseSettings):
+    # Project configuration
+    PROJECT_NAME: str = "Task Manager Backend"
+    VERSION: str = "1.0.0"
+    API_PREFIX: str = "/api"
+    # API docs toggle (from env ENABLE_API_DOCS, default True)
+    ENABLE_API_DOCS: bool = True
+    # Whether the auth handshake should surface first-run system initialization.
+    CHECK_SYSTEM_INITIALIZATION_STATUS: bool = True
+
+    # Environment configuration
+    ENVIRONMENT: str = "development"  # development or production
+
+    # MCP transport security (DNS rebinding protection)
+    MCP_ENABLE_DNS_REBINDING_PROTECTION: bool = False
+    MCP_ALLOWED_HOSTS: list[str] = []
+    MCP_ALLOWED_ORIGINS: list[str] = []
+
+    # Standalone mode configuration
+    # When enabled, Backend runs in a simplified single-process mode suitable for local development
+    STANDALONE_MODE: bool = False
+    # Enable the bundled Rust executor process when in standalone mode
+    STANDALONE_EXECUTOR_ENABLED: bool = True
+    STANDALONE_EXECUTOR_DEVICE_ID: str = "standalone-admin-device"
+
+    # Database configuration
+    # Supports both MySQL and SQLite:
+    # - MySQL: "mysql+pymysql://user:pass@localhost/db"
+    # - SQLite: "sqlite:///./data/wegent.db"
+    DATABASE_URL: str = "mysql+pymysql://user:password@localhost/task_manager"
+    DATABASE_TIMEZONE: str = Field(
+        default="+08:00",
+        pattern=r"^(?:[+-](?:0[0-9]|1[0-3]):[0-5][0-9]|\+14:00)$",
+    )
+
+    # Database auto-migration configuration (only in development)
+    DB_AUTO_MIGRATE: bool = True
+
+    # Database connection pool configuration. Each Backend or Celery process owns
+    # its own pool, so deployment capacity must account for every process.
+    DB_POOL_SIZE: int = Field(default=20, ge=1)
+    DB_MAX_OVERFLOW: int = Field(default=40, ge=0)
+    DB_ASYNC_POOL_SIZE: int = Field(default=10, ge=1)
+    DB_ASYNC_MAX_OVERFLOW: int = Field(default=20, ge=0)
+    DB_POOL_TIMEOUT: int = Field(default=30, ge=1)
+    DB_POOL_RECYCLE: int = Field(default=3600, ge=1)
+
+    # Executor configuration
+    EXECUTOR_DELETE_TASK_URL: str = (
+        "http://localhost:8001/executor-manager/executor/delete"
+    )
+    EXECUTOR_CANCEL_TASK_URL: str = (
+        "http://localhost:8001/executor-manager/tasks/cancel"
+    )
+    # Latest Executor version (manually updated when releasing new versions)
+    # This is used to show upgrade warnings in the UI
+    EXECUTOR_LATEST_VERSION: str = "1.0.0"
+    # Optional local device command overrides/additions. API callers pass the key;
+    # Backend resolves the shell command and optional post processor from registry.
+    LOCAL_DEVICE_COMMANDS: dict[str, Any] = {}
+
+    # Executor version checking configuration
+    # If EXECUTOR_REGISTRY_URL is set, version is fetched from registry
+    # Otherwise, version is fetched from GitHub (public repo, no auth needed)
+    # Registry URL for internal deployments (e.g., "https://registry.example.com/update.json")
+    EXECUTOR_REGISTRY_URL: str = ""
+    # Auth token for private registry (e.g., GitLab private token)
+    EXECUTOR_REGISTRY_TOKEN: str = ""
+    # Cache TTL for executor version in seconds (default: 60 seconds = 1 minute)
+    EXECUTOR_VERSION_CACHE_TTL: int = 60
+
+    # JWT configuration
+    SECRET_KEY: str = "secret-key"
+    ALGORITHM: str = "HS256"
+    WEWORK_TRANSCRIPT_ENCRYPTION_SECRET: str = ""
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 7 * 24 * 60  # 7 days in minutes
+    WEWORK_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    WEWORK_REFRESH_TOKEN_EXPIRE_MINUTES: int = 365 * 24 * 60
+    SKILL_IDENTITY_TOKEN_EXPIRE_MINUTES: int = 10 * 24 * 60  # 10 days in minutes
+
+    # OIDC state configuration
+    OIDC_STATE_SECRET_KEY: str = "test"
+    OIDC_STATE_EXPIRE_SECONDS: int = 10 * 60  # 10 minutes, unit: seconds
+
+    # Cache configuration
+    REPO_CACHE_EXPIRED_TIME: int = 7200  # 2 hour in seconds
+    REPO_UPDATE_INTERVAL_SECONDS: int = 3600  # 1 hour in seconds
+    # External issue page cache TTL in seconds; 0 disables cache reuse.
+    ISSUE_PAGE_CACHE_SECONDS: int = Field(default=30, ge=0)
+
+    # Task limits
+    MAX_RUNNING_TASKS_PER_USER: int = 10
+    WORKTREE_CLEANUP_RETENTION_DAYS: int = Field(default=7, ge=0)
+
+    # Names assigned only when a default source group is first created.
+    TASK_SOURCE_GROUP_NAMES: dict[str, str] = Field(
+        default_factory=lambda: {"api": "API Tasks", "dingtalk": "DingTalk"}
+    )
+
+    @field_validator("TASK_SOURCE_GROUP_NAMES")
+    @classmethod
+    def validate_task_source_group_names(cls, names: dict[str, str]) -> dict[str, str]:
+        if not {"api", "dingtalk"}.issubset(names):
+            raise ValueError("TASK_SOURCE_GROUP_NAMES must define api and dingtalk")
+        normalized = {source: name.strip() for source, name in names.items()}
+        if any(not name or len(name) > 100 for name in normalized.values()):
+            raise ValueError("Task source group names must contain 1 to 100 characters")
+        return normalized
+
+    # Group entity member configuration
+    # Maximum number of entity members (departments, etc.) per group
+    MAX_ENTITY_MEMBERS_PER_GROUP: int = 30
+
+    # Direct chat configuration
+    MAX_CONCURRENT_CHATS: int = 50  # Maximum concurrent direct chat sessions
+    CHAT_HISTORY_EXPIRE_SECONDS: int = 7200  # Chat history expiration (2 hours)
+    CHAT_HISTORY_MAX_MESSAGES: int = 50  # Maximum messages to keep in history
+    CHAT_API_TIMEOUT_SECONDS: int = 300  # LLM API call timeout (5 minutes)
+
+    # Async video polling configuration
+    VIDEO_POLL_INTERVAL_SECONDS: int = 3
+    VIDEO_MAX_POLL_COUNT: int = 600
+    VIDEO_POLL_SCHEDULE_LEASE_SECONDS: int = 10
+    VIDEO_SHUTDOWN_HANDOFF_DELAY_SECONDS: int = 15
+    VIDEO_RECOVERY_STALE_SECONDS: int = 10
+    VIDEO_RECOVERY_LOOKBACK_HOURS: int = 1
+    SEEDANCE_ASSET_BASE_URL: str = ""
+    SEEDANCE_ASSET_GROUP_ID: str = ""
+    SEEDANCE_ASSET_STATUS_POLL_INTERVAL_SECONDS: int = 5
+    SEEDANCE_ASSET_STATUS_TIMEOUT_SECONDS: int = 60
+
+    # Default models used by image/video generation MCP tools when the current
+    # task model is not a matching generation model.
+    DEFAULT_IMAGE_GENERATION_MODEL: str = ""
+    DEFAULT_VIDEO_GENERATION_MODEL: str = ""
+
+    # Tool calling flow limits
+    CHAT_TOOL_MAX_REQUESTS: int = 10  # Maximum LLM requests in tool calling flow
+    CHAT_TOOL_MAX_TIME_SECONDS: float = (
+        60.0  # Maximum time for tool calling flow (5 minutes)
+    )
+    # Group chat history configuration
+    # In group chat mode, AI-bot sees: first N messages + last M messages (no duplicates)
+    # If total messages < N + M, all messages are kept
+    GROUP_CHAT_HISTORY_FIRST_MESSAGES: int = 10  # Number of first messages to keep
+    GROUP_CHAT_HISTORY_LAST_MESSAGES: int = 20  # Number of last messages to keep
+
+    # Streaming incremental save configuration
+    STREAMING_REDIS_SAVE_INTERVAL: float = 1.0  # Redis save interval (seconds)
+    STREAMING_DB_SAVE_INTERVAL: float = 5.0  # Database save interval (seconds)
+    STREAMING_REDIS_TTL: int = 300  # Redis streaming cache TTL (seconds)
+    STREAMING_MIN_CHARS_TO_SAVE: int = 50  # Minimum characters to save on disconnect
+
+    # Task append expiration (hours)
+    APPEND_CHAT_TASK_EXPIRE_HOURS: int = 2
+    APPEND_CODE_TASK_EXPIRE_HOURS: int = 24
+
+    # Cancellation recovery configuration
+    # A task stuck in CANCELLING (or a streaming subtask whose runtime is gone) is
+    # finalized locally once no streaming activity has been observed for this long.
+    # Healthy streams touch Redis activity every ~1s, so 30min is conservative.
+    CANCELLING_STUCK_TIMEOUT_SECONDS: int = 1800
+
+    # Subtask executor cleanup configuration
+    # After a subtask is COMPLETED or FAILED, if executor_name/executor_namespace are set
+    # and updated_at exceeds this threshold, the executor task will be deleted automatically.
+    CHAT_TASK_EXECUTOR_DELETE_AFTER_HOURS: int = 2
+    CODE_TASK_EXECUTOR_DELETE_AFTER_HOURS: int = 24
+    STALE_NON_TERMINAL_TASK_EXECUTOR_DELETE_AFTER_HOURS: int = 24
+    TASK_EXECUTOR_CLEANUP_PRIMARY_SCAN_BATCH_SIZE: int = 2000
+    TASK_EXECUTOR_CLEANUP_LOOKBACK_HOURS: int = 96
+    TASK_EXECUTOR_CLEANUP_LOOKBACK_SCAN_LIMIT: int = 500
+    # Cleanup scanning interval seconds
+    TASK_EXECUTOR_CLEANUP_INTERVAL_SECONDS: int = 600
+
+    # Workspace archive configuration
+    WORKSPACE_ARCHIVE_MAX_SIZE_MB: int = 2048
+    WORKSPACE_ARCHIVE_RETENTION_DAYS: int = 30
+    WORKSPACE_ARCHIVE_BUCKET: str = "wegent-archives"
+    WORKSPACE_ARCHIVE_ENABLED: bool = True
+    WORKSPACE_ARCHIVE_TIMEZONE: str = "Asia/Shanghai"
+    WEWORK_TRANSCRIPT_S3_BUCKET: str = "wework-transcripts"
+
+    # Publish storage configuration
+    PUBLISH_PRESIGNED_UPLOAD_EXPIRE_SECONDS: int = 3600
+
+    # Frontend URL configuration
+    FRONTEND_URL: str = "http://localhost:3000"
+    # Public base URL used for short-lived model-provider attachment downloads.
+    # Required when remote generation providers use locally uploaded references.
+    ATTACHMENT_PUBLIC_BASE_URL: str = ""
+    # Public Socket.IO origin returned to Wework desktop clients.
+    WEGENT_SOCKET_URL: str = ""
+    # Optional Web URL used to build Wework desktop cloud authorization pages.
+    # Defaults to FRONTEND_URL when empty.
+    WEWORK_AUTHORIZE_BASE_URL: str = ""
+    # GitHub OAuth App used by Wework connector authorization.
+    GITHUB_OAUTH_CLIENT_ID: str = ""
+    GITHUB_OAUTH_CLIENT_SECRET: str = ""
+    GITHUB_OAUTH_REDIRECT_URI: str = (
+        "http://localhost:8000/api/connector-apps/oauth/callback"
+    )
+    GITHUB_OAUTH_SCOPES: str = "repo read:org workflow"
+    CONNECTOR_OAUTH_STATE_SECRET: str = ""
+    CONNECTOR_OAUTH_SESSION_TTL_SECONDS: int = 600
+    # User-level MCP OAuth for provider servers such as DingTalk. These servers
+    # expose RFC 9728 protected-resource metadata and an RFC 8414 authorization
+    # server, so the platform authorizes and refreshes tokens on the user's behalf.
+    MCP_OAUTH_REDIRECT_URI: str = "http://localhost:8000/api/mcp-oauth/callback"
+    MCP_OAUTH_STATE_SECRET: str = ""
+    MCP_OAUTH_SESSION_TTL_SECONDS: int = 600
+    # Dedicated versioned plugin credential keyring; validated only when used.
+    WEWORK_PLUGIN_CREDENTIAL_KEYS: SecretStr = Field(default=SecretStr(""), repr=False)
+    WEWORK_PLUGIN_CREDENTIAL_ACTIVE_KEY_ID: str = ""
+    # Upstream Sites Platform base URL. Wework accesses it through Backend.
+    SITES_API_BASE_URL: str = ""
+    # Optional bearer token for the upstream Sites Platform project API.
+    SITES_API_TOKEN: str = ""
+
+    # OIDC configuration
+    OIDC_CLIENT_ID: str = "wegent"
+    OIDC_CLIENT_SECRET: str = "test"
+    OIDC_DISCOVERY_URL: str = "http://localhost:5556/.well-known/openid-configuration"
+    OIDC_REDIRECT_URI: str = "http://localhost:8000/api/auth/oidc/callback"
+    OIDC_CLI_REDIRECT_URI: str = "http://localhost:8000/api/auth/oidc/cli-callback"
+
+    # Redis configuration
+    REDIS_URL: str = "redis://127.0.0.1:6379/0"
+    SOCKETIO_REDIS_SOCKET_TIMEOUT: float = Field(
+        default=30.0, gt=0, allow_inf_nan=False
+    )
+    SOCKETIO_REDIS_CONNECT_TIMEOUT: float = Field(
+        default=5.0, gt=0, allow_inf_nan=False
+    )
+    SOCKETIO_REDIS_HEALTH_CHECK_INTERVAL: float = Field(
+        default=15.0, gt=0, allow_inf_nan=False
+    )
+    TERMINAL_SESSION_CACHE_MAX_ENTRIES: int = 8192
+    TERMINAL_SESSION_CACHE_TTL_SECONDS: float = 5.0
+    # Keep false during mixed-version Backend rollout; enable after all replicas upgrade.
+    TERMINAL_PROTOCOL_V2_ENABLED: bool = True
+    TASK_RUN_METRICS_RETENTION_DAYS: int = 32
+
+    # Public base URL of this backend, reachable from executor devices. The
+    # cloud-model LLM proxy URL is derived from it
+    # (`{WEGENT_BACKEND_PUBLIC_URL}/api/runtime-work/llm-responses-proxy`).
+    WEGENT_BACKEND_PUBLIC_URL: str = "http://localhost:8000"
+
+    # Rate limiting configuration for OpenAPI endpoints
+    # Format: "requests/period" where period can be second, minute, hour, day
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_CREATE_RESPONSE: str = "60/minute"  # POST /api/v1/responses
+    RATE_LIMIT_GET_RESPONSE: str = "120/minute"  # GET /api/v1/responses/{id}
+    RATE_LIMIT_CANCEL_RESPONSE: str = "30/minute"  # POST /api/v1/responses/{id}/cancel
+    RATE_LIMIT_DELETE_RESPONSE: str = "30/minute"  # DELETE /api/v1/responses/{id}
+    RATE_LIMIT_MCP_IDENTITY: str = (
+        "60/minute"  # GET /api/external/mcp-identity/userinfo
+    )
+
+    # External knowledge MCP configuration
+    # Disabled by default because this endpoint is intended for trusted integrations.
+    EXTERNAL_KNOWLEDGE_MCP_ENABLED: bool = False
+    EXTERNAL_KNOWLEDGE_MCP_RATE_LIMIT_ENABLED: bool = True
+    EXTERNAL_KNOWLEDGE_MCP_RATE_LIMIT_REQUESTS: int = 120
+    EXTERNAL_KNOWLEDGE_MCP_RATE_LIMIT_WINDOW_SECONDS: int = 60
+    EXTERNAL_KNOWLEDGE_MCP_SEARCH_RATE_LIMIT_ENABLED: bool = True
+    EXTERNAL_KNOWLEDGE_MCP_SEARCH_RATE_LIMIT_REQUESTS: int = 30
+    EXTERNAL_KNOWLEDGE_MCP_SEARCH_RATE_LIMIT_WINDOW_SECONDS: int = 60
+    EXTERNAL_KNOWLEDGE_MCP_DOWNLOAD_RATE_LIMIT_ENABLED: bool = True
+    EXTERNAL_KNOWLEDGE_MCP_DOWNLOAD_PREAUTH_IP_RATE_LIMIT_REQUESTS: int = 300
+    EXTERNAL_KNOWLEDGE_MCP_DOWNLOAD_PREAUTH_IP_RATE_LIMIT_WINDOW_SECONDS: int = 60
+    EXTERNAL_KNOWLEDGE_MCP_DOWNLOAD_PREAUTH_DOCUMENT_RATE_LIMIT_REQUESTS: int = 60
+    EXTERNAL_KNOWLEDGE_MCP_DOWNLOAD_PREAUTH_DOCUMENT_RATE_LIMIT_WINDOW_SECONDS: int = 60
+    EXTERNAL_KNOWLEDGE_MCP_DOWNLOAD_RATE_LIMIT_REQUESTS: int = 20
+    EXTERNAL_KNOWLEDGE_MCP_DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS: int = 60
+
+    # External Wiki import, page-picker, and scheduled refresh configuration.
+    WIKIJS_GRAPHQL_TIMEOUT_SECONDS: int = 30  # Wiki.js connector per-request timeout
+    WIKI_TREE_MAX_PAGES: int = Field(
+        default=5000, ge=1
+    )  # Tree browse page-list upper bound
+    # Controls scheduled refresh only; manual import and refresh remain available.
+    EXTERNAL_DOC_SYNC_ENABLED: bool = False
+    EXTERNAL_DOC_SYNC_CRON: str = "0 21 * * *"
+    EXTERNAL_DOC_SYNC_SCAN_BATCH_SIZE: int = 500
+    EXTERNAL_DOC_SYNC_RUN_MAX_DOCUMENTS: int = 10000
+    EXTERNAL_DOC_SYNC_TIME_BUDGET_SECONDS: int = 2700
+    EXTERNAL_DOC_SYNC_TASK_SOFT_TIME_LIMIT_SECONDS: int = 3000
+    EXTERNAL_DOC_SYNC_TASK_TIME_LIMIT_SECONDS: int = 3300
+    WIKI_SYNC_REMOTE_BATCH_SIZE: int = 500
+    WIKI_SYNC_DOWNLOAD_CONCURRENCY: int = Field(default=8, ge=1, le=8)
+    EXTERNAL_DOC_SYNC_LOCK_TTL_SECONDS: int = 3600
+    KNOWLEDGE_ATTACHMENT_ORPHAN_RETENTION_HOURS: int = 24
+    KNOWLEDGE_ATTACHMENT_ORPHAN_SCAN_BATCH_SIZE: int = 200
+    KNOWLEDGE_ATTACHMENT_ORPHAN_SCAN_INTERVAL_SECONDS: int = 3600
+
+    # Celery configuration
+    CELERY_BROKER_URL: Optional[str] = None  # If None/empty, uses REDIS_URL
+    CELERY_RESULT_BACKEND: Optional[str] = None  # If None/empty, uses REDIS_URL
+    # Recover unacknowledged countdown tasks promptly after a worker restart.
+    CELERY_BROKER_VISIBILITY_TIMEOUT: int = 300
+
+    # Celery default queue name (useful for separating preview and prod environments)
+    CELERY_TASK_DEFAULT_QUEUE: str = "wegent_online"
+
+    # Celery Beat scheduler configuration
+    # "default" = SQLite file (single instance only)
+    # "sqlalchemy" = MySQL database (multi-instance deployment)
+    CELERY_BEAT_SCHEDULER: str = "default"
+    # Database URL for Beat scheduler (only used when CELERY_BEAT_SCHEDULER="sqlalchemy")
+    # If None/empty, uses DATABASE_URL
+    CELERY_BEAT_DATABASE_URL: Optional[str] = None
+
+    # Embedded Celery configuration
+    # When True, Backend starts Celery worker/beat as daemon threads (for local dev)
+    # When False, Celery must be started separately (for production)
+    EMBEDDED_CELERY_ENABLED: bool = True
+
+    @field_validator(
+        "CELERY_BROKER_URL",
+        "CELERY_RESULT_BACKEND",
+        "CELERY_BEAT_DATABASE_URL",
+        mode="before",
+    )
+    @classmethod
+    def empty_str_to_none(cls, v: Any) -> Optional[str]:
+        """Convert empty strings to None for proper fallback to REDIS_URL."""
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
+
+    @field_validator(
+        "MCP_ALLOWED_HOSTS",
+        "MCP_ALLOWED_ORIGINS",
+        mode="before",
+    )
+    @classmethod
+    def parse_mcp_list(cls, v: Any) -> list[str]:
+        """Parse MCP allowlist values from JSON or comma-separated strings."""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(item).strip() for item in v if str(item).strip()]
+        if isinstance(v, str):
+            raw = v.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        return [
+                            str(item).strip() for item in parsed if str(item).strip()
+                        ]
+                except json.JSONDecodeError:
+                    pass
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        return v
+
+    @field_validator("WEWORK_PLUGIN_PUBLICATION_MAX_ACTIVE_REQUESTS")
+    @classmethod
+    def validate_plugin_publication_max_active_requests(cls, v: int) -> int:
+        """Keep request capacity from becoming an implicit publication kill switch."""
+        if v < 1:
+            raise ValueError(
+                "WEWORK_PLUGIN_PUBLICATION_MAX_ACTIVE_REQUESTS must be at least 1"
+            )
+        return v
+
+    @field_validator("LOCAL_DEVICE_COMMANDS", mode="before")
+    @classmethod
+    def parse_local_device_commands(cls, v: Any) -> dict[str, Any]:
+        """Parse local device command map from JSON settings."""
+        return _parse_json_object_setting(v, "LOCAL_DEVICE_COMMANDS")
+
+    # Master switch for scheduled work started by this Backend process.
+    # Disable it for traffic-verification environments that share production
+    # resources but must not run maintenance, scheduling, or queue-consuming
+    # workers. Scheduled work can run on a dedicated deployment instead.
+    SCHEDULED_TASKS_ENABLED: bool = True
+
+    # Registers the daily DingTalk copy refresh on Celery Beat. Off by default:
+    # the schedule needs Beat plus a Worker on the default queue, and every
+    # knowledge base that opted in turns into provider and indexing work. The
+    # manual trigger endpoint does not depend on this switch.
+    DINGTALK_SYNC_SCHEDULE_ENABLED: bool = False
+
+    # Scheduler backend configuration
+    # Supported backends: "celery" (default), "apscheduler", "xxljob"
+    SCHEDULER_BACKEND: str = "celery"
+
+    # APScheduler configuration (only used when SCHEDULER_BACKEND="apscheduler")
+    APSCHEDULER_JOB_STORE: str = "memory"  # "memory" or "sqlite"
+    APSCHEDULER_SQLITE_PATH: str = "scheduler_jobs.db"
+
+    # XXL-JOB configuration (only used when SCHEDULER_BACKEND="xxljob")
+    XXLJOB_ADMIN_ADDRESSES: str = ""  # Comma-separated admin URLs
+    XXLJOB_APP_NAME: str = "wegent-executor"
+    XXLJOB_ACCESS_TOKEN: str = ""
+    XXLJOB_EXECUTOR_PORT: int = 9999
+
+    # Flow scheduler configuration
+    FLOW_SCHEDULER_INTERVAL_SECONDS: int = 60
+    FLOW_DEFAULT_TIMEOUT_SECONDS: int = 600  # 10 minutes
+    FLOW_DEFAULT_RETRY_COUNT: int = 1
+    FLOW_EXECUTION_PAGE_LIMIT: int = 50
+    SUBSCRIPTION_SCHEDULER_ENABLED: bool = True
+    # Subscription minimum interval configuration (minutes)
+    SUBSCRIPTION_MIN_INTERVAL_MINUTES: int = 15
+    # Stale execution cleanup thresholds (hours)
+    FLOW_STALE_PENDING_HOURS: int = (
+        2  # PENDING executions older than this will be recovered
+    )
+    FLOW_STALE_RUNNING_HOURS: int = (
+        3  # RUNNING executions older than this will be marked FAILED
+    )
+
+    # Project robot queue scheduler
+    ROBOT_QUEUE_SCHEDULER_ENABLED: bool = True
+    ROBOT_QUEUE_SCAN_INTERVAL_SECONDS: int = 5
+
+    # Knowledge indexing protection configuration
+    KNOWLEDGE_INDEX_LOCK_TIMEOUT_SECONDS: int = 120
+    KNOWLEDGE_INDEX_LOCK_EXTEND_INTERVAL_SECONDS: int = 30
+    KNOWLEDGE_INDEX_LOCK_RETRY_DELAY_SECONDS: int = 15
+    KNOWLEDGE_INDEX_LOCK_MAX_RETRIES: int = 1
+    KNOWLEDGE_INDEX_STALE_QUEUED_SECONDS: int = 600  # 10 min
+    KNOWLEDGE_INDEX_STALE_PENDING_CONVERSION_SECONDS: int = 7200  # 120 min
+    KNOWLEDGE_INDEX_STALE_INDEXING_SECONDS: int = 2700  # 45 min
+    KNOWLEDGE_ARTIFACT_STALL_SECONDS: int = 600  # 10 min
+
+    # --- Document Conversion Configuration ---
+
+    # [Retained] Master switch: when False, all files indexed directly
+    KNOWLEDGE_CONVERSION_ENABLED: bool = False
+    # [Retained] Comma-separated file extensions requiring conversion
+    KNOWLEDGE_CONVERSION_FILE_TYPES: str = ""
+    # [Retained] Celery queue name for conversion tasks
+    KNOWLEDGE_CONVERSION_QUEUE: str = "knowledge_conversion"
+    # [Retained, value adjusted] Stale detection for CONVERTING status
+    # MUST be > converter CONVERSION_TASK_TIME_LIMIT to avoid false kills
+    # See cross-service config constraints in design doc section 4.4
+    KNOWLEDGE_INDEX_STALE_CONVERTING_SECONDS: int = (
+        14400  # was 12000, 20% margin over lock_timeout
+    )
+
+    # [Migrated to knowledge_doc_converter] The following configs have been moved:
+    # KNOWLEDGE_CONVERSION_LOCK_TIMEOUT_SECONDS  -> converter config (value: 12000)
+    # KNOWLEDGE_CONVERSION_LOCK_EXTEND_INTERVAL_SECONDS -> converter config
+    # KNOWLEDGE_CONVERSION_LOCK_MAX_RETRIES -> converter config
+    # KNOWLEDGE_CONVERSION_LOCK_RETRY_DELAY_SECONDS -> converter config
+    # MINERU_API_BASE_URL -> converter config
+    # MINERU_BACKEND -> converter config
+    # MINERU_PARSE_METHOD -> converter config
+    # MINERU_LANG_LIST -> converter config
+    # MINERU_FORMULA_ENABLE -> converter config
+    # MINERU_TABLE_ENABLE -> converter config
+    # MINERU_POLL_INTERVAL_SECONDS -> converter config
+    # MINERU_MAX_WAIT_SECONDS -> converter config
+    # WORKER_CONVERSION_S3_ENABLED -> converter config
+    # WORKER_CONVERSION_S3_ENDPOINT -> converter config
+    # WORKER_CONVERSION_S3_ACCESS_KEY -> converter config
+    # WORKER_CONVERSION_S3_SECRET_KEY -> converter config
+    # WORKER_CONVERSION_S3_BUCKET_NAME -> converter config
+    # WORKER_CONVERSION_S3_REGION_NAME -> converter config
+    # --- End Document Conversion Configuration ---
+
+    # --- Knowledge Multimodal Analysis Configuration ---
+    # Master switch for multimodal (video/image) Gemini analysis in knowledge
+    # bases. When False the orchestrator never classifies a file as multimodal,
+    # so no dispatch/Gemini runs anywhere; already-converted documents keep
+    # re-indexing normally. The open-source build ships image analysis fully
+    # wired; video analysis requires a configured media staging provider.
+    KNOWLEDGE_MULTIMODAL_ENABLED: bool = False
+    # Dedicated Celery queue for multimodal conversion tasks. The converter
+    # worker consumes both this and the MinerU queue by default.
+    KNOWLEDGE_MULTIMODAL_CONVERSION_QUEUE: str = "knowledge_multimodal_conversion"
+    # Internal endpoint the converter calls at execution time to resolve the
+    # KB's multimodalAnalysisModelRef into a decrypted runtime config (api_key
+    # + resolved default_headers). Keeps the Celery broker free of secrets.
+    MULTIMODAL_MODEL_CONFIG_RESOLVE_PATH: str = "/api/internal/model-config/resolve"
+    # When False, video multimodal analysis is rejected up-front (the
+    # open-source default ships no media staging provider). Enable after
+    # configuring a concrete MediaStagingProvider implementation.
+    KNOWLEDGE_MULTIMODAL_VIDEO_STAGING_ENABLED: bool = False
+    # --- End Knowledge Multimodal Analysis Configuration ---
+
+    # Circuit breaker configuration
+    CIRCUIT_BREAKER_FAIL_MAX: int = 5  # Open circuit after 5 consecutive failures
+    CIRCUIT_BREAKER_RESET_TIMEOUT: int = 60  # Try to recover after 60 seconds
+
+    # Service extension module (empty = disabled)
+    SERVICE_EXTENSION: str = ""
+
+    # Team sharing configuration
+    TEAM_SHARE_BASE_URL: str = "http://localhost:3000/chat"
+    TASK_SHARE_BASE_URL: str = "http://localhost:3000"
+    TEAM_SHARE_QUERY_PARAM: str = "teamShare"
+
+    # AES encryption configuration for share tokens
+    SHARE_TOKEN_AES_KEY: str = (
+        "12345678901234567890123456789012"  # 32 bytes for AES-256
+    )
+    SHARE_TOKEN_AES_IV: str = "1234567890123456"  # 16 bytes for AES IV
+
+    # Webhook notification configuration
+    WEBHOOK_ENABLED: bool = False
+    WEBHOOK_ENDPOINT_URL: str = ""
+    WEBHOOK_HTTP_METHOD: str = "POST"
+    WEBHOOK_AUTH_TYPE: str = ""
+    WEBHOOK_AUTH_TOKEN: str = ""
+    WEBHOOK_HEADERS: str = ""
+    WEBHOOK_TIMEOUT: int = 30
+    # Allow PII (Personally Identifiable Information) in webhook notifications
+    # When False, email addresses are masked in notification descriptions
+    ALLOW_PII_IN_WEBHOOKS: bool = False
+
+    # YAML initialization configuration
+    INIT_DATA_DIR: str = "/app/init_data"
+    INIT_DATA_ENABLED: bool = True
+    INIT_DATA_FORCE: bool = (
+        False  # Force re-initialize YAML resources (delete and recreate)
+    )
+    BUILTIN_PLUGINS_DIR: str = "/app/init_data/plugins"
+
+    # Default headers forwarded to the model backend on every LLM call.
+    # Keys are sent verbatim as HTTP headers (resolved by model_resolver against
+    # task_data). The wegent-agent-* group carries agent (Team) identity; when a
+    # placeholder resolves empty (non-Team paths), the group is dropped downstream.
+    EXECUTOR_ENV: str = (
+        '{"DEFAULT_HEADERS":{'
+        '"user":"${task_data.user.name}",'
+        '"wegent-agent-namespace":"${task_data.team.namespace}",'
+        '"wegent-agent-name":"${task_data.team.name}"'
+        "}}"
+    )
+
+    # File upload configuration
+    MAX_UPLOAD_FILE_SIZE_MB: int = 100  # Maximum file size in MB
+    MAX_EXTRACTED_TEXT_LENGTH: int = 500000  # Maximum extracted (stored) text length
+    # Max chars of extracted text injected inline into the prompt. Far smaller
+    # than the stored length: the inline copy is only a preview — chat_shell can
+    # page the full text via read_attachment, and executor/device modes read the
+    # downloaded file directly. Keeps the prompt bounded for modes without the
+    # chat_shell token-level preview (executor/device, which have no L3 guard).
+    ATTACHMENT_INJECT_MAX_CHARS: int = 32000
+
+    # Attachment storage backend configuration
+    # Supported backends: "mysql" (default), "s3", "minio"
+    # If not configured or set to "mysql", binary data is stored in MySQL database
+    ATTACHMENT_STORAGE_BACKEND: str = "mysql"
+    # S3/MinIO configuration (only used when ATTACHMENT_STORAGE_BACKEND is "s3" or "minio")
+    ATTACHMENT_S3_ENDPOINT: str = (
+        ""  # e.g., "https://s3.amazonaws.com" or "http://minio:9000"
+    )
+    ATTACHMENT_S3_ACCESS_KEY: str = ""
+    ATTACHMENT_S3_SECRET_KEY: str = ""
+    ATTACHMENT_S3_BUCKET: str = "attachments"
+    DELIVERY_S3_BUCKET: str = "wegent-deliveries"
+    DELIVERY_MAX_ASSET_SIZE_MB: int = 2048
+    ATTACHMENT_S3_REGION: str = "us-east-1"
+    ATTACHMENT_S3_USE_SSL: bool = True
+
+    # How long a repository read may take before it is given up on. These run inside
+    # a user-facing request -- resolving a repository, checking access, reading HEAD
+    # -- and `requests` has no default timeout, so without one an unresponsive
+    # provider holds the worker until the OS gives up on the socket. Configurable
+    # because the right number depends on how far away the git host is.
+    REPOSITORY_READ_TIMEOUT_SECONDS: int = 15
+    # Large GitLab file and Wiki page bodies need a separate request budget.
+    EXTERNAL_WIKI_DOWNLOAD_TIMEOUT_SECONDS: int = Field(default=300, ge=1)
+
+    # Plugin marketplace package storage and controlled publishing.
+    PLUGIN_STORAGE_BUCKET: str = "plugins"
+    PLUGIN_PACKAGE_URL_EXPIRES_SECONDS: int = 600
+    PLUGIN_SUBMISSION_SCAN_TIMEOUT_SECONDS: int = 1200
+    PLUGIN_LEGACY_UPLOAD_ENABLED: bool = False
+    WEWORK_PLUGIN_PUBLICATION_MAX_ACTIVE_REQUESTS: int = 5
+    WEWORK_PLUGIN_PUBLICATION_GITLAB_API_URL: str = ""
+    WEWORK_PLUGIN_PUBLICATION_GITLAB_PROJECT_ID: str = ""
+    WEWORK_PLUGIN_PUBLICATION_GITLAB_PROJECT_URL: str = ""
+    WEWORK_PLUGIN_PUBLICATION_GITLAB_TOKEN: str = ""
+    WEWORK_PLUGIN_PUBLICATION_GITLAB_MATERIALIZER_USER_ID: int = 0
+    WEWORK_PLUGIN_PUBLICATION_GITLAB_TARGET_BRANCH: str = "master"
+    WEWORK_PLUGIN_PUBLICATION_GITLAB_MAX_FILES: int = 500
+    WEWORK_PLUGIN_PUBLICATION_GITLAB_WEBHOOK_SECRET: str = ""
+    WEWORK_PLUGIN_RELEASE_KEY_MAX_DAYS: int = 180
+
+    # Attachment encryption configuration
+    # Enable/disable AES-256-CBC encryption for attachment binary data
+    # When enabled, all newly uploaded attachments will be encrypted
+    # Existing unencrypted attachments remain accessible (backward compatible)
+    ATTACHMENT_ENCRYPTION_ENABLED: bool = False
+    # AES encryption key for attachments (32 bytes for AES-256)
+    # SECURITY WARNING: Change this default value in production!
+    # Generate using: openssl rand -hex 32
+    ATTACHMENT_AES_KEY: str = "12345678901234567890123456789012"
+    # AES initialization vector for attachments (16 bytes)
+    # SECURITY WARNING: Change this default value in production!
+    # Generate using: openssl rand -hex 16
+    ATTACHMENT_AES_IV: str = "1234567890123456"
+
+    OTEL_ENABLED: bool = False
+
+    # Logging configuration
+    # Enable/disable file logging (default: disabled, logs only to console)
+    LOG_FILE_ENABLED: bool = False
+    # Log file directory (default: ./logs in project root)
+    LOG_DIR: str = "./logs"
+
+    # Web scraper proxy configuration
+    # Supports HTTP, HTTPS, SOCKS5 proxy formats:
+    # - Simple: "http://proxy.example.com:8080"
+    # - With auth: "http://user:pass@proxy.example.com:8080"
+    # - SOCKS5: "socks5://proxy.example.com:1080"
+    # If empty, no proxy will be used (direct connection)
+    WEBSCRAPER_PROXY: str = ""
+    # Proxy mode: "none", "fallback", "proxy", or legacy "direct"
+    # - "none": Never use proxy
+    # - "fallback": Try direct connection first, use proxy only if direct fails
+    # - "proxy": Always use proxy for all requests (proxy must be configured)
+    # - "direct": Legacy alias for "proxy"
+    # Default is "fallback" for better reliability
+    WEBSCRAPER_PROXY_MODE: str = "fallback"
+    # Web scraper site-specific configuration
+    # Configuration for specific sites that require special handling
+    # due to anti-bot detection, dynamic content loading, or navigation patterns
+    # Format: JSON object with site URL patterns as keys
+    # WEB_SCRAPER_SITE_CONFIG={"example.com":{"wait_until":"networkidle","page_timeout_ms":30000,"delay_before_return_html":3.0}}
+    WEB_SCRAPER_SITE_CONFIG: str = "{}"
+
+    # Web search configuration
+    WEB_SEARCH_ENABLED: bool = False  # Enable/disable web search feature
+    WEB_SEARCH_ENGINES: str = "{}"  # JSON configuration for search API adapter
+    WEB_SEARCH_DEFAULT_MAX_RESULTS: int = (
+        50  # Default max results when not specified by LLM or engine config
+    )
+
+    # Message compression configuration
+    # Enable/disable automatic message compression when context limit is exceeded
+    MESSAGE_COMPRESSION_ENABLED: bool = True
+    # Number of first messages to keep during history truncation (system prompt + initial context)
+    MESSAGE_COMPRESSION_FIRST_MESSAGES: int = 2
+    # Number of last messages to keep during history truncation (recent context)
+    MESSAGE_COMPRESSION_LAST_MESSAGES: int = 10
+    # Maximum length for attachment content after truncation (characters)
+    MESSAGE_COMPRESSION_ATTACHMENT_LENGTH: int = 50000
+
+    # Wizard configuration
+    # The name of the public model to use for wizard AI features (follow-up questions, prompt generation)
+    # If not set or empty, wizard will try to find any available model (user's first, then public)
+    WIZARD_MODEL_NAME: str = ""
+
+    # MCP (Model Context Protocol) configuration for Chat Shell
+    # Enable/disable MCP tools in Chat Shell mode
+    CHAT_MCP_ENABLED: bool = False
+
+    # Chat Shell mode configuration
+    # "package" - use local app/chat_shell module directly (default, single process)
+    # "http" - call external Chat Shell service via HTTP/SSE
+    CHAT_SHELL_MODE: str = "http"
+    # Chat Shell service URL (only used when CHAT_SHELL_MODE="http")
+    CHAT_SHELL_URL: str = "http://localhost:8100"
+    # Executor Manager service URL (for ClaudeCode, Agno, Dify shell types)
+    EXECUTOR_MANAGER_URL: str = "http://localhost:8001"
+    # Chat Shell service authentication token (only used when CHAT_SHELL_MODE="http")
+    CHAT_SHELL_TOKEN: str = ""
+    # Backend internal URL (for service-to-service communication)
+    # Used by chat_shell to download skill binaries
+    BACKEND_INTERNAL_URL: str = "http://localhost:8000"
+    # Internal service token for service-to-service authentication
+    # Used by: Backend -> knowledge_runtime, Backend -> chat_shell,
+    #          chat_shell/knowledge_runtime -> Backend internal API
+    # Generate using: openssl rand -hex 32
+    INTERNAL_SERVICE_TOKEN: str = ""
+    # Knowledge runtime service URL. RAG execution always happens there.
+    KNOWLEDGE_RUNTIME_URL: str = "http://localhost:8200"
+    # Kill switch for auto route selection of direct injection.
+    # When enabled, route_mode="auto" will always choose rag_retrieval.
+    # Explicit route_mode="direct_injection" remains supported for manual testing.
+    RAG_AUTO_DISABLE_DIRECT_INJECTION: bool = False
+
+    # Streaming architecture mode configuration
+    # "legacy" - WebSocketStreamingHandler directly emits to WebSocket (current behavior)
+    # "bridge" - StreamingCore publishes to Redis channel, WebSocketBridge forwards to WebSocket
+    STREAMING_MODE: str = "legacy"
+
+    # IM Channel configuration
+    # Default Claude model name for device mode (auto-switch when user's model is not Claude)
+    # Format: model name as shown in /models list (e.g., "claude-3-5-sonnet")
+    # If empty, user must manually select a Claude model
+    IM_CHANNEL_DEVICE_DEFAULT_MODEL: str = ""
+    # Conversation timeout in minutes for IM channels
+    # If the last message was sent more than this many minutes ago, start a new conversation
+    # Set to 0 to disable auto-new conversation (default: 720 minutes = 12 hours)
+    IM_CHANNEL_CONVERSATION_TIMEOUT_MINUTES: int = 720
+
+    # Default team configuration for each mode
+    # Format: "name#namespace" (namespace is optional, defaults to "default")
+    DEFAULT_TEAM_CHAT: str = "wegent-chat#default"  # Default team for chat mode
+    DEFAULT_TEAM_CODE: str = ""  # Default team for code mode
+    DEFAULT_TEAM_KNOWLEDGE: str = (
+        "wegent-notebook#default"  # Default team for knowledge mode
+    )
+    DEFAULT_TEAM_TASK: str = (
+        "wegent-wework#default"  # Default team for task mode (devices/chat page)
+    )
+    DEFAULT_TEAM_WEWORK: str = (
+        "wegent-wework#default"  # Default team for WeWork workbench
+    )
+    # Cloud project that receives authenticated Wework feedback submissions.
+    # An empty value disables the feedback channel.
+    WEWORK_FEEDBACK_PROJECT_ID: str = ""
+    WEWORK_FEEDBACK_MAX_BUNDLE_SIZE_MB: int = 250
+    WEWORK_FEEDBACK_RATE_LIMIT: str = "5/hour"
+
+    # JSON configuration for MCP servers (similar to Claude Desktop format)
+    # Example:
+    # {
+    #     "mcpServers": {
+    #         "image-gen": {
+    #             "type": "sse",
+    #             "url": "http://localhost:8080/sse",
+    #             "headers": {"Authorization": "Bearer xxx"}
+    #         },
+    #         "ppt-gen": {
+    #             "type": "stdio",
+    #             "command": "npx",
+    #             "args": ["-y", "@anthropic/ppt-mcp-server"],
+    #             "env": {"API_KEY": "xxx"}
+    #         }
+    #     }
+    # }
+    # Supports ${{path}} variable substitution, e.g.:
+    # "headers": {"X-User": "${{user.name}}"} will be replaced with actual username
+    CHAT_MCP_SERVERS: str = "{}"
+
+    # Error model recommendations configuration (platform-level, public models only)
+    # JSON string mapping error types to recommended public model names.
+    # Example: {
+    #   "context_length_exceeded": {
+    #     "description": "Large context models",
+    #     "models": ["model-a", "model-b"]
+    #   },
+    #   "default_errors": {
+    #     "description": "Fallback models for unmapped errors",
+    #     "models": ["model-c"]
+    #   }
+    # }
+    ERROR_MODEL_RECOMMENDATIONS: str = ""
+
+    # Maximum time to wait for active streaming requests to complete (seconds)
+    # Default: 600 seconds (10 minutes) to allow long-running streaming requests to complete
+    GRACEFUL_SHUTDOWN_TIMEOUT: int = 600
+    # Whether to reject new requests during shutdown (503 Service Unavailable)
+    SHUTDOWN_REJECT_NEW_REQUESTS: bool = True
+
+    # Knowledge base and document summary configuration
+    # Enable/disable automatic summary generation after document indexing
+    SUMMARY_ENABLED: bool = True
+
+    # Knowledge base chunk storage configuration
+    # Enable/disable storing chunk content in database for frontend viewing
+    # When disabled (default), chunk bodies are only stored in the retrieval index;
+    # QA metadata is still saved to knowledge_documents.chunks for query planning.
+    # When enabled, chunk content is also saved to knowledge_documents.chunks column
+    CHUNK_STORAGE_ENABLED: bool = False
+
+    # Long-term memory configuration (mem0)
+    # Enable/disable long-term memory feature
+    MEMORY_ENABLED: bool = False
+    # mem0 service base URL
+    MEMORY_BASE_URL: str = "http://localhost:8080"
+    # Optional API key for mem0 service authentication
+    MEMORY_API_KEY: str = ""
+    # Search timeout in seconds (to avoid blocking chat flow)
+    MEMORY_TIMEOUT_SECONDS: float = 2.0
+    # Write timeout in seconds (for async background operations like add_memory)
+    # Can be longer since write operations don't block the main chat flow
+    MEMORY_WRITE_TIMEOUT_SECONDS: float = 10.0
+    # Maximum number of memories to inject into system prompt
+    MEMORY_MAX_RESULTS: int = 5
+    # Number of recent messages to include as context when saving memory (default: 3 total)
+    # This includes 2 history messages + 1 current message for better memory quality
+    MEMORY_CONTEXT_MESSAGES: int = 3
+    # User ID prefix for resource isolation in shared mem0 service
+    # Since mem0 may be shared across multiple systems, this prefix ensures
+    # wegent resources are isolated from other systems' resources
+    MEMORY_USER_ID_PREFIX: str = "wegent_user:"
+
+    # OpenTelemetry configuration is centralized in shared/telemetry/config.py
+    # Use: from shared.telemetry.config import get_otel_config
+    # All OTEL_* environment variables are read from there
+
+    def needs_conversion(self, file_extension: str) -> bool:
+        """Check if a file extension requires conversion before indexing."""
+        if not self.KNOWLEDGE_CONVERSION_ENABLED:
+            return False
+        if not self.KNOWLEDGE_CONVERSION_FILE_TYPES:
+            return False
+        ext = file_extension.lstrip(".").lower()
+        types = [
+            t.strip().lower()
+            for t in self.KNOWLEDGE_CONVERSION_FILE_TYPES.split(",")
+            if t.strip()
+        ]
+        return ext in types
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: Type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+        """
+        Customize settings sources to use NoInterpolationDotEnvSettingsSource.
+
+        This ensures that template variables like ${{user.name}} in .env files
+        are preserved and not incorrectly parsed by dotenv's interpolation.
+        """
+        return (
+            init_settings,
+            env_settings,
+            NoInterpolationDotEnvSettingsSource(
+                settings_cls,
+                env_file=getattr(dotenv_settings, "env_file", None),
+                env_file_encoding=getattr(
+                    dotenv_settings,
+                    "env_file_encoding",
+                    None,
+                ),
+                case_sensitive=getattr(dotenv_settings, "case_sensitive", None),
+                env_prefix=getattr(dotenv_settings, "env_prefix", None),
+                env_nested_delimiter=getattr(
+                    dotenv_settings,
+                    "env_nested_delimiter",
+                    None,
+                ),
+                env_nested_max_split=getattr(
+                    dotenv_settings,
+                    "env_nested_max_split",
+                    None,
+                ),
+                env_ignore_empty=getattr(
+                    dotenv_settings,
+                    "env_ignore_empty",
+                    None,
+                ),
+                env_parse_none_str=getattr(
+                    dotenv_settings,
+                    "env_parse_none_str",
+                    None,
+                ),
+                env_parse_enums=getattr(dotenv_settings, "env_parse_enums", None),
+            ),
+            file_secret_settings,
+        )
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+# The shared crypto module reads these values directly from ``os.environ`` rather
+# than from ``Settings``. Keep local ``backend/.env`` startup behavior aligned
+# with Docker's explicit environment injection, without overriding deployment
+# environment variables.
+load_git_token_crypto_environment(Path(__file__).resolve().parents[2] / ".env")
+
+# Global configuration instance
+settings = Settings()

@@ -1,0 +1,1054 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for fail-fast tool ID validation in Responses API event parsing."""
+
+from unittest.mock import AsyncMock
+
+import pytest
+
+from app.services.execution.response_bridge import EmitterBridgeTransport
+from app.services.execution.response_parser import (
+    InvalidToolCallEventError,
+    ResponsesAPIEventParser,
+)
+from shared.models import EventType
+from shared.models.responses_api import ResponsesAPIStreamEvents
+
+
+class TestResponsesAPIEventParserToolIds:
+    def test_response_created_event_emits_start_event_with_shell_type(self):
+        parser = ResponsesAPIEventParser()
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.RESPONSE_CREATED.value,
+            data={"shell_type": "ClaudeCode"},
+        )
+
+        assert result is not None
+        assert result.type == EventType.START
+        assert result.task_id == 1
+        assert result.subtask_id == 2
+        assert result.message_id == 3
+        assert result.data == {"shell_type": "ClaudeCode"}
+
+    def test_reasoning_summary_text_delta_emits_thinking_event(self):
+        parser = ResponsesAPIEventParser()
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA.value,
+            data={"delta": "Reasoning chunk."},
+        )
+
+        assert result is not None
+        assert result.type == EventType.THINKING
+        assert result.content == "Reasoning chunk."
+        assert result.data == {"thinking_kind": "reasoning_summary"}
+
+    def test_response_completed_preserves_streamed_reasoning_content(self):
+        parser = ResponsesAPIEventParser()
+
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA.value,
+            data={"delta": "First thought. "},
+        )
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA.value,
+            data={"delta": "Second thought."},
+        )
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED.value,
+            data={
+                "response": {
+                    "output": [
+                        {
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Visible answer.",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+        )
+
+        assert result is not None
+        assert result.type == EventType.DONE
+        assert result.result["value"] == "Visible answer."
+        assert result.result["reasoning_content"] == "First thought. Second thought."
+
+    def test_status_updated_event_emits_status_update(self):
+        parser = ResponsesAPIEventParser()
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.STATUS_UPDATED.value,
+            data={
+                "phase": "after_tool_end",
+                "context_metrics": {
+                    "remaining_percent": 42,
+                    "is_over_trigger": False,
+                },
+                "context_compaction": {
+                    "type": "summary_compact",
+                    "status": "started",
+                },
+            },
+        )
+
+        assert result is not None
+        assert result.type == EventType.STATUS_UPDATED
+        assert result.data == {
+            "phase": "after_tool_end",
+            "context_metrics": {
+                "remaining_percent": 42,
+                "is_over_trigger": False,
+            },
+            "context_compaction": {
+                "type": "summary_compact",
+                "status": "started",
+            },
+        }
+
+    def test_block_updated_event_parses_direct_block_update(self):
+        parser = ResponsesAPIEventParser()
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.BLOCK_UPDATED.value,
+            data={
+                "block_id": "codex-commentary-1",
+                "updates": {"content": "Working", "status": "streaming"},
+            },
+        )
+
+        assert result is not None
+        assert result.type == EventType.BLOCK_UPDATED
+        assert result.data == {
+            "block_id": "codex-commentary-1",
+            "updates": {"content": "Working", "status": "streaming"},
+        }
+
+    def test_tool_start_requires_non_empty_id(self):
+        parser = ResponsesAPIEventParser()
+
+        with pytest.raises(
+            InvalidToolCallEventError,
+            match=r"response\.output_item\.added\(function_call\)",
+        ):
+            parser.parse(
+                task_id=1,
+                subtask_id=2,
+                message_id=3,
+                event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+                data={
+                    "item": {
+                        "type": "function_call",
+                        "id": "",
+                        "name": "search",
+                        "arguments": "{}",
+                    }
+                },
+            )
+
+    def test_tool_result_requires_non_empty_id(self):
+        parser = ResponsesAPIEventParser()
+
+        with pytest.raises(
+            InvalidToolCallEventError,
+            match="function_call_arguments.done",
+        ):
+            parser.parse(
+                task_id=1,
+                subtask_id=2,
+                message_id=3,
+                event_type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE.value,
+                data={"call_id": "", "output": "done"},
+            )
+
+    def test_tool_result_parses_arguments_as_tool_input(self):
+        """Test that function_call_arguments.done emits argument completion, not tool result."""
+        parser = ResponsesAPIEventParser()
+
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "function_call",
+                    "id": "tool_123",
+                    "name": "write_file",
+                    "arguments": '{"path": "/test/file.py", "content": "hello"}',
+                }
+            },
+        )
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE.value,
+            data={
+                "call_id": "tool_123",
+                "arguments": '{"path": "/test/file.py", "content": "hello"}',
+                "output": "File created successfully",
+            },
+        )
+
+        assert result is not None
+        assert result.type == "tool_argument_done"
+        assert result.tool_use_id == "tool_123"
+        assert result.tool_output is None
+        assert result.tool_input == {"path": "/test/file.py", "content": "hello"}
+        assert result.tool_name == "write_file"
+        assert result.data["argument_status"] == "done"
+
+    def test_tool_argument_delta_updates_sanitized_summary(self):
+        parser = ResponsesAPIEventParser()
+
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "function_call",
+                    "id": "tool_delta",
+                    "name": "write_file",
+                    "arguments": "",
+                },
+                "arguments_summary": {"file_path": "/tmp/out.txt"},
+            },
+        )
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA.value,
+            data={
+                "item_id": "tool_delta",
+                "delta": '{"content":"hello',
+                "arguments_summary": {
+                    "file_path": "/tmp/out.txt",
+                    "content": {"omitted": True, "length": 5},
+                },
+            },
+        )
+
+        assert result is not None
+        assert result.type == "tool_argument_delta"
+        assert result.tool_use_id == "tool_delta"
+        assert result.tool_name == "write_file"
+        assert result.tool_input == {
+            "file_path": "/tmp/out.txt",
+            "content": {"omitted": True, "length": 5},
+        }
+        assert result.data["argument_status"] == "streaming"
+
+    def test_tool_result_with_empty_arguments(self):
+        """Test that function_call_arguments.done event handles empty arguments."""
+        parser = ResponsesAPIEventParser()
+
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "function_call",
+                    "id": "tool_456",
+                    "name": "search",
+                    "arguments": "",
+                }
+            },
+        )
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE.value,
+            data={
+                "call_id": "tool_456",
+                "arguments": "",
+                "output": "Success",
+            },
+        )
+
+        assert result is not None
+        assert result.type == "tool_argument_done"
+        assert result.tool_use_id == "tool_456"
+        assert result.tool_output is None
+        assert result.tool_input == {}
+
+    def test_tool_result_without_arguments(self):
+        """Test that function_call_arguments.done event handles missing arguments."""
+        parser = ResponsesAPIEventParser()
+
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "function_call",
+                    "id": "tool_789",
+                    "name": "search",
+                    "arguments": "",
+                }
+            },
+        )
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE.value,
+            data={
+                "call_id": "tool_789",
+                "output": "Done",
+            },
+        )
+
+        assert result is not None
+        assert result.type == "tool_argument_done"
+        assert result.tool_use_id == "tool_789"
+        assert result.tool_output is None
+        assert result.tool_input == {}
+
+    def test_mcp_tool_start_and_completion(self):
+        parser = ResponsesAPIEventParser()
+
+        start = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "mcp_call",
+                    "id": "mcp_123",
+                    "name": "search_docs",
+                    "server_label": "wegent-knowledge",
+                }
+            },
+        )
+        assert start is not None
+        assert start.type == "tool_start"
+        assert start.tool_use_id == "mcp_123"
+        assert start.tool_name == "search_docs"
+        assert start.data["tool_protocol"] == "mcp_call"
+        assert start.data["server_label"] == "wegent-knowledge"
+
+        args_done = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.MCP_CALL_ARGUMENTS_DONE.value,
+            data={
+                "item_id": "mcp_123",
+                "arguments": '{"query": "SSE timeout"}',
+            },
+        )
+        assert args_done is not None
+        assert args_done.type == "tool"
+        assert args_done.tool_use_id == "mcp_123"
+        assert args_done.tool_input == {"query": "SSE timeout"}
+
+        done = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.MCP_CALL_COMPLETED.value,
+            data={"item_id": "mcp_123"},
+        )
+        assert done is not None
+        assert done.type == "tool_result"
+        assert done.tool_use_id == "mcp_123"
+        assert done.tool_name == "search_docs"
+        assert done.tool_input == {"query": "SSE timeout"}
+        assert done.data["tool_protocol"] == "mcp_call"
+        assert done.data["status"] == "completed"
+
+    def test_mcp_tool_completion_carries_output(self):
+        parser = ResponsesAPIEventParser()
+
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "mcp_call",
+                    "id": "mcp_789",
+                    "name": "search_docs",
+                    "server_label": "wegent-knowledge",
+                }
+            },
+        )
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.MCP_CALL_ARGUMENTS_DONE.value,
+            data={
+                "item_id": "mcp_789",
+                "arguments": '{"query": "tool blocks"}',
+            },
+        )
+
+        done = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.MCP_CALL_COMPLETED.value,
+            data={
+                "item_id": "mcp_789",
+                "output": '{"results":["block output"]}',
+            },
+        )
+
+        assert done is not None
+        assert done.type == "tool_result"
+        assert done.tool_use_id == "mcp_789"
+        assert done.tool_output == '{"results":["block output"]}'
+        assert done.tool_input == {"query": "tool blocks"}
+
+    def test_mcp_tool_failed_carries_error(self):
+        parser = ResponsesAPIEventParser()
+
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "mcp_call",
+                    "id": "mcp_456",
+                    "name": "search_docs",
+                    "server_label": "wegent-knowledge",
+                }
+            },
+        )
+
+        failed = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.MCP_CALL_FAILED.value,
+            data={"item_id": "mcp_456", "failure_reason": "timeout"},
+        )
+
+        assert failed is not None
+        assert failed.type == "tool_result"
+        assert failed.data["tool_protocol"] == "mcp_call"
+        assert failed.data["status"] == "failed"
+        assert failed.data["error"] == "timeout"
+
+    def test_shell_tool_start_and_completion(self):
+        parser = ResponsesAPIEventParser()
+
+        start = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "shell_call",
+                    "id": "shell_123",
+                    "call_id": "shell_123",
+                    "name": "exec",
+                    "status": "in_progress",
+                    "input": {"working_directory": "/tmp"},
+                    "action": {"commands": ["ls -la"], "timeout_ms": 5000},
+                }
+            },
+        )
+        assert start is not None
+        assert start.type == "tool_start"
+        assert start.tool_use_id == "shell_123"
+        assert start.tool_name == "exec"
+        assert start.tool_input == {
+            "working_directory": "/tmp",
+            "command": "ls -la",
+            "timeout_seconds": 5,
+        }
+        assert start.data["tool_protocol"] == "shell_call"
+
+        done = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE.value,
+            data={
+                "item": {
+                    "type": "shell_call",
+                    "id": "shell_123",
+                    "call_id": "shell_123",
+                    "name": "exec",
+                    "status": "completed",
+                    "input": {"working_directory": "/tmp"},
+                    "action": {"commands": ["ls -la"], "timeout_ms": 5000},
+                }
+            },
+        )
+        assert done is not None
+        assert done.type == "tool_result"
+        assert done.tool_use_id == "shell_123"
+        assert done.tool_name == "exec"
+        assert done.tool_input == {
+            "working_directory": "/tmp",
+            "command": "ls -la",
+            "timeout_seconds": 5,
+        }
+        assert done.data["tool_protocol"] == "shell_call"
+        assert done.data["status"] == "completed"
+
+    def test_tool_result_without_context_still_updates_block(self):
+        parser = ResponsesAPIEventParser()
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE.value,
+            data={
+                "call_id": "missing_tool",
+                "arguments": '{"path": "/tmp/test.py"}',
+                "output": "done",
+            },
+        )
+
+        assert result is not None
+        assert result.type == "tool_argument_done"
+        assert result.tool_use_id == "missing_tool"
+        assert result.tool_name is None
+        assert result.tool_input == {"path": "/tmp/test.py"}
+        assert result.tool_output is None
+        assert result.data["tool_protocol"] == "function_call"
+
+    def test_mcp_tool_completion_without_context_still_updates_block(self):
+        parser = ResponsesAPIEventParser()
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.MCP_CALL_COMPLETED.value,
+            data={
+                "item_id": "missing_mcp_tool",
+                "output": '{"results":["ok"]}',
+            },
+        )
+
+        assert result is not None
+        assert result.type == "tool_result"
+        assert result.tool_use_id == "missing_mcp_tool"
+        assert result.tool_name is None
+        assert result.tool_input is None
+        assert result.tool_output == '{"results":["ok"]}'
+        assert result.data["tool_protocol"] == "mcp_call"
+        assert result.data["status"] == "completed"
+
+    def test_shell_tool_completion_without_context_still_updates_block(self):
+        parser = ResponsesAPIEventParser()
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE.value,
+            data={
+                "item": {
+                    "type": "shell_call",
+                    "id": "shell_123",
+                    "call_id": "shell_123",
+                    "name": "exec",
+                    "status": "completed",
+                    "input": {"working_directory": "/tmp"},
+                    "action": {"commands": ["ls -la"], "timeout_ms": 5000},
+                }
+            },
+        )
+
+        assert result is not None
+        assert result.type == "tool_result"
+        assert result.tool_use_id == "shell_123"
+        assert result.tool_name == "exec"
+        assert result.tool_input == {
+            "working_directory": "/tmp",
+            "command": "ls -la",
+            "timeout_seconds": 5,
+        }
+        assert result.data["tool_protocol"] == "shell_call"
+        assert result.data["status"] == "completed"
+
+    def test_tool_context_is_scoped_by_task_and_subtask(self):
+        parser = ResponsesAPIEventParser()
+
+        parser.parse(
+            task_id=1,
+            subtask_id=10,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "function_call",
+                    "id": "shared_tool",
+                    "name": "tool_for_task_1",
+                    "arguments": "{}",
+                }
+            },
+        )
+        parser.parse(
+            task_id=2,
+            subtask_id=20,
+            message_id=4,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "function_call",
+                    "id": "shared_tool",
+                    "name": "tool_for_task_2",
+                    "arguments": "{}",
+                }
+            },
+        )
+
+        first = parser.parse(
+            task_id=1,
+            subtask_id=10,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE.value,
+            data={"call_id": "shared_tool", "output": "done-1"},
+        )
+        second = parser.parse(
+            task_id=2,
+            subtask_id=20,
+            message_id=4,
+            event_type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE.value,
+            data={"call_id": "shared_tool", "output": "done-2"},
+        )
+
+        assert first is not None
+        assert first.tool_name == "tool_for_task_1"
+        assert second is not None
+        assert second.tool_name == "tool_for_task_2"
+
+    def test_inprocess_bridge_reuses_same_fail_fast_validation(self):
+        transport = EmitterBridgeTransport(
+            emitter=AsyncMock(),
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+        )
+
+        with pytest.raises(
+            InvalidToolCallEventError,
+            match=r"response\.output_item\.added\(function_call\)",
+        ):
+            transport._convert_event(
+                ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+                {
+                    "item": {
+                        "type": "function_call",
+                        "id": "",
+                        "name": "search",
+                        "arguments": "{}",
+                    }
+                },
+                message_id=3,
+            )
+
+    def test_inprocess_bridge_reasoning_summary_text_delta_emits_thinking_event(self):
+        transport = EmitterBridgeTransport(
+            emitter=AsyncMock(),
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+        )
+
+        result = transport._convert_event(
+            ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA.value,
+            {"delta": "Reasoning chunk."},
+            message_id=3,
+        )
+
+        assert result is not None
+        assert result.type == EventType.THINKING.value
+        assert result.content == "Reasoning chunk."
+        assert result.data == {"thinking_kind": "reasoning_summary"}
+
+    def test_inprocess_bridge_completed_result_preserves_streamed_reasoning(self):
+        transport = EmitterBridgeTransport(
+            emitter=AsyncMock(),
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+        )
+
+        transport._convert_event(
+            ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA.value,
+            {"delta": "First thought. "},
+            message_id=3,
+        )
+        transport._convert_event(
+            ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA.value,
+            {"delta": "Second thought."},
+            message_id=3,
+        )
+
+        result = transport._convert_event(
+            ResponsesAPIStreamEvents.RESPONSE_COMPLETED.value,
+            {
+                "response": {
+                    "output": [
+                        {
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Visible answer.",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            message_id=3,
+        )
+
+        assert result is not None
+        assert result.type == EventType.DONE.value
+        assert result.result["value"] == "Visible answer."
+        assert result.result["reasoning_content"] == "First thought. Second thought."
+
+    def test_inprocess_bridge_raises_for_unknown_tool_completion(self):
+        transport = EmitterBridgeTransport(
+            emitter=AsyncMock(),
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+        )
+
+        with pytest.raises(
+            ValueError, match="Received tool completion event for unknown tool"
+        ):
+            transport._convert_event(
+                ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE.value,
+                {
+                    "call_id": "missing_tool",
+                    "arguments": '{"path": "/tmp/test.py"}',
+                    "output": "done",
+                },
+                message_id=3,
+            )
+
+    def test_inprocess_bridge_function_call_done_uses_final_arguments_payload(self):
+        transport = EmitterBridgeTransport(
+            emitter=AsyncMock(),
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+        )
+
+        transport._convert_event(
+            ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            {
+                "item": {
+                    "type": "function_call",
+                    "id": "tool_123",
+                    "name": "write_file",
+                    "arguments": "",
+                }
+            },
+            message_id=3,
+        )
+
+        result = transport._convert_event(
+            ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE.value,
+            {
+                "call_id": "tool_123",
+                "arguments": '{"path": "/tmp/test.py", "content": "hello"}',
+                "output": "done",
+            },
+            message_id=3,
+        )
+
+        assert result is not None
+        assert result.tool_input == {"path": "/tmp/test.py", "content": "hello"}
+
+    def test_inprocess_bridge_raises_for_unknown_mcp_arguments_event(self):
+        transport = EmitterBridgeTransport(
+            emitter=AsyncMock(),
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+        )
+
+        with pytest.raises(
+            ValueError, match="Received tool arguments event for unknown tool"
+        ):
+            transport._convert_event(
+                ResponsesAPIStreamEvents.MCP_CALL_ARGUMENTS_DONE.value,
+                {
+                    "item_id": "missing_mcp_tool",
+                    "arguments": '{"query": "SSE timeout"}',
+                },
+                message_id=3,
+            )
+
+    def test_inprocess_bridge_mcp_completion_carries_output(self):
+        transport = EmitterBridgeTransport(
+            emitter=AsyncMock(),
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+        )
+
+        transport._convert_event(
+            ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            {
+                "item": {
+                    "type": "mcp_call",
+                    "id": "mcp_789",
+                    "name": "search_docs",
+                    "server_label": "wegent-knowledge",
+                }
+            },
+            message_id=3,
+        )
+        transport._convert_event(
+            ResponsesAPIStreamEvents.MCP_CALL_ARGUMENTS_DONE.value,
+            {
+                "item_id": "mcp_789",
+                "arguments": '{"query": "tool blocks"}',
+            },
+            message_id=3,
+        )
+
+        result = transport._convert_event(
+            ResponsesAPIStreamEvents.MCP_CALL_COMPLETED.value,
+            {
+                "item_id": "mcp_789",
+                "output": '{"results":["block output"]}',
+            },
+            message_id=3,
+        )
+
+        assert result is not None
+        assert result.tool_output == '{"results":["block output"]}'
+        assert result.tool_input == {"query": "tool blocks"}
+
+    def test_inprocess_bridge_shell_call_lifecycle(self):
+        transport = EmitterBridgeTransport(
+            emitter=AsyncMock(),
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+        )
+
+        start = transport._convert_event(
+            ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            {
+                "item": {
+                    "type": "shell_call",
+                    "id": "shell_123",
+                    "call_id": "shell_123",
+                    "name": "exec",
+                    "status": "in_progress",
+                    "input": {"working_directory": "/tmp"},
+                    "action": {"commands": ["ls -la"], "timeout_ms": 5000},
+                }
+            },
+            message_id=3,
+        )
+        assert start is not None
+        assert start.type == "tool_start"
+        assert start.tool_input == {
+            "working_directory": "/tmp",
+            "command": "ls -la",
+            "timeout_seconds": 5,
+        }
+
+        done = transport._convert_event(
+            ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE.value,
+            {
+                "item": {
+                    "type": "shell_call",
+                    "id": "shell_123",
+                    "call_id": "shell_123",
+                    "name": "exec",
+                    "status": "completed",
+                    "input": {"working_directory": "/tmp"},
+                    "action": {"commands": ["ls -la"], "timeout_ms": 5000},
+                }
+            },
+            message_id=3,
+        )
+        assert done is not None
+        assert done.type == "tool_result"
+        assert done.tool_input == {
+            "working_directory": "/tmp",
+            "command": "ls -la",
+            "timeout_seconds": 5,
+        }
+        assert done.data["tool_protocol"] == "shell_call"
+
+    def test_terminal_events_clear_scoped_tool_contexts(self):
+        parser = ResponsesAPIEventParser()
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "function_call",
+                    "id": "call_123",
+                    "call_id": "call_123",
+                    "name": "load_skill",
+                    "arguments": "{}",
+                }
+            },
+        )
+        assert parser._tool_contexts
+
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE.value,
+            data={},
+        )
+
+        assert parser._tool_contexts == {}
+
+
+class TestMcpCallFailedEventParsing:
+    """Regression tests for MCP tool failure event parsing.
+
+    Root cause: response.mcp_call.failed used "error" as top-level key, which
+    triggered OpenAI SDK's error detection in _streaming.py, causing the entire
+    SSE stream to terminate with "An error occurred during streaming" instead of
+    letting the LLM handle the failure gracefully.
+
+    Fix: renamed "error" to "failure_reason" in mcp_call_failed() so the SDK
+    no longer misidentifies it as a fatal streaming error.
+    """
+
+    def _setup_mcp_in_progress(
+        self, parser: ResponsesAPIEventParser, item_id: str
+    ) -> None:
+        """Register MCP call context via OUTPUT_ITEM_ADDED."""
+        parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED.value,
+            data={
+                "item": {
+                    "type": "mcp_call",
+                    "id": item_id,
+                    "name": "get_namespaces",
+                    "server_label": "kubernetes",
+                    "arguments": "{}",
+                }
+            },
+        )
+
+    def test_mcp_call_failed_produces_tool_result_with_failed_status(self):
+        """response.mcp_call.failed → TOOL_RESULT event with status=failed."""
+        from shared.models import EventType
+
+        parser = ResponsesAPIEventParser()
+        self._setup_mcp_in_progress(parser, "call_abc")
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.MCP_CALL_FAILED.value,
+            data={
+                "item_id": "call_abc",
+                "failure_reason": "MCP tool 'get_namespaces' failed: Output validation error: 'context' is a required property",
+            },
+        )
+
+        assert result is not None
+        assert result.type == EventType.TOOL_RESULT
+        assert result.data["status"] == "failed"
+        assert result.data["tool_protocol"] == "mcp_call"
+        assert "get_namespaces" in result.data.get("error", "")
+
+    def test_mcp_call_failed_without_failure_reason(self):
+        """response.mcp_call.failed with no failure_reason still produces TOOL_RESULT."""
+        from shared.models import EventType
+
+        parser = ResponsesAPIEventParser()
+        self._setup_mcp_in_progress(parser, "call_xyz")
+
+        result = parser.parse(
+            task_id=1,
+            subtask_id=2,
+            message_id=3,
+            event_type=ResponsesAPIStreamEvents.MCP_CALL_FAILED.value,
+            data={"item_id": "call_xyz"},
+        )
+
+        assert result is not None
+        assert result.type == EventType.TOOL_RESULT
+        assert result.data["status"] == "failed"
+        assert result.data.get("error") is None
+
+    def test_mcp_call_failed_does_not_have_error_key_in_raw_event(self):
+        """mcp_call_failed builder must NOT use 'error' as top-level key.
+
+        The OpenAI SDK _streaming.py checks data.get('error') to detect fatal
+        streaming errors. A plain string value triggers the fallback message
+        'An error occurred during streaming' and raises APIError, killing the stream.
+        """
+        from shared.models.responses_api import ResponsesAPIEventBuilder
+
+        builder = ResponsesAPIEventBuilder(subtask_id=1, response_id="resp_1")
+        event = builder.mcp_call_failed(
+            item_id="call_1",
+            error="MCP tool 'get_namespaces' failed: Output validation error: 'context' is a required property",
+        )
+
+        assert "error" not in event, (
+            "mcp_call_failed must not use 'error' as top-level key — "
+            "it triggers OpenAI SDK fatal error detection in _streaming.py"
+        )
+        assert event.get("failure_reason") is not None

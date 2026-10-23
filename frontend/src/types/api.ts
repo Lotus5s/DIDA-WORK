@@ -1,0 +1,935 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import type { ExternalKnowledgeRef } from '@/types/context'
+
+// Authentication Types
+
+// User Preferences
+export interface QuickAccessConfig {
+  version?: number // User's synced system version
+  teams: number[] // User's selected team IDs (excluding system recommended)
+}
+
+export interface UserPreferences {
+  composer_quick_phrases?: import('@wegent/chat-core/composer-quick-phrases').QuickPhrase[] | null
+  send_key: 'enter' | 'cmd_enter'
+  follow_up_behavior?: 'queue' | 'guide'
+  search_key?: 'cmd_k' | 'cmd_f' | 'disabled'
+  quick_access?: QuickAccessConfig
+  memory_enabled?: boolean
+  chat_status_items?: string[]
+  /** Default execution target: 'cloud' for cloud mode, or device_id for a specific device */
+  default_execution_target?: string | null
+}
+
+// User Types
+export type UserRole = 'admin' | 'user'
+export type AuthSource = 'password' | 'oidc' | 'unknown'
+
+/** User type for search results (used in member search dropdowns) */
+export interface SearchUser {
+  id: number
+  user_name: string
+  email?: string
+}
+
+export interface User {
+  id: number
+  user_name: string
+  email: string
+  is_active: boolean
+  role?: UserRole
+  auth_source?: AuthSource
+  created_at: string
+  updated_at: string
+  git_info: GitInfo[]
+  preferences?: UserPreferences
+  /** Whether admin setup wizard has been completed (only returned for 'admin' user) */
+  admin_setup_completed?: boolean | null
+}
+
+/** Git account information */
+export interface GitInfo {
+  /** Unique identifier for this git info entry (UUID) */
+  id?: string
+  git_domain: string
+  git_token: string
+  /** Type: "github" | "gitlab" | "gitee" | "gitea" | "gerrit" */
+  type: 'github' | 'gitlab' | 'gitee' | 'gitea' | 'gerrit'
+  /** Username (required for Gerrit) */
+  user_name?: string
+  /** Git user ID (from provider) */
+  git_id?: string
+  /** Git login name */
+  git_login?: string
+  /** Git email */
+  git_email?: string
+  /** Authentication type for Gerrit: 'digest' or 'basic' */
+  auth_type?: 'digest' | 'basic'
+}
+
+// Bot Types
+export interface SkillRefMeta {
+  skill_id: number
+  namespace: string
+  is_public: boolean
+}
+
+/** Skill reference with full identification info for backend */
+export interface SkillRef {
+  skill_id?: number
+  name: string
+  namespace: string
+  is_public: boolean
+}
+
+export interface KnowledgeBaseDefaultRef {
+  id: number
+  name: string
+}
+
+export interface Bot {
+  id: number
+  name: string
+  namespace?: string // Namespace for group bots (default: 'default')
+  shell_name: string // Shell name user selected (e.g., 'ClaudeCode', 'my-custom-shell')
+  shell_type: string // Actual agent type (e.g., 'Chat', 'ClaudeCode', 'Agno', 'Dify')
+  agent_config: Record<string, unknown>
+  system_prompt: string
+  mcp_servers: Record<string, unknown>
+  plugins?: import('@wegent/collaboration').UnifiedAgentPluginRef[]
+  capability_mode?: 'follow_device' | 'manual'
+  inherit_base_capabilities?: boolean
+  default_knowledge_base_refs?: KnowledgeBaseDefaultRef[]
+  skills?: string[] // Skills associated with this bot
+  skill_refs?: Record<string, SkillRefMeta>
+  preload_skills?: string[] // Skills to preload into system prompt
+  preload_skill_refs?: Record<string, SkillRefMeta>
+  secondary_model_name?: string | null
+  secondary_model_namespace?: string | null
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+// Skill Types (CRD format)
+export interface SkillMetadata {
+  name: string
+  namespace: string
+  labels?: Record<string, string>
+}
+
+export interface SkillSpec {
+  description: string
+  displayName?: string
+  prompt?: string
+  version?: string
+  author?: string
+  tags?: string[]
+  /** List of shell types this skill is compatible with (e.g., 'ClaudeCode', 'Agno', 'Dify', 'Chat') */
+  bindShells?: string[]
+  /** Whether this skill is visible in user-facing skill lists */
+  visible?: boolean
+}
+
+export interface SkillStatus {
+  state: 'Available' | 'Unavailable'
+  fileSize?: number
+  fileHash?: string
+}
+
+export interface Skill {
+  apiVersion: string
+  kind: 'Skill'
+  metadata: SkillMetadata
+  spec: SkillSpec
+  status?: SkillStatus
+}
+
+export interface SkillList {
+  items: Skill[]
+}
+
+export type TeamAccessSource = 'native' | 'user_share' | 'namespace_authorization'
+
+export interface LocalizedInputPlaceholder {
+  en?: string | null
+  zh?: string | null
+}
+
+export interface TeamInputPlaceholder extends LocalizedInputPlaceholder {
+  mobile?: LocalizedInputPlaceholder | null
+  desktop?: LocalizedInputPlaceholder | null
+}
+
+// Shell Types
+export interface Shell {
+  id: number
+  name: string
+  runtime: string
+  shell_type?: 'local_engine' | 'external_api'
+  support_model?: string[]
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface Team {
+  id: number
+  name: string
+  displayName?: string | null
+  namespace?: string // Namespace for group teams (default: 'default')
+  description: string
+  bots: TeamBot[]
+  workflow: Record<string, string>
+  is_active: boolean
+  user_id: number
+  created_at: string
+  updated_at: string
+  share_status?: number // 0: 个人团队, 1: 分享中, 2: 共享团队
+  access_source?: TeamAccessSource
+  agent_type?: string // agno, claude, dify, etc.
+  is_mix_team?: boolean // true if team has multiple different agent types (e.g., ClaudeCode + Agno)
+  recommended_mode?: 'chat' | 'code' | 'both' // Recommended usage mode (for QuickAccess)
+  bind_mode?: TaskType[] // Allowed modes for this team
+  mode_spec?: {
+    allowedModelCategories: string[]
+    hiddenVideoParams?: string[]
+  } | null
+  icon?: string // Icon ID from preset icon library
+  quick_phrases?: string[] // Launcher phrases that prefill the chat input
+  inputPlaceholder?: TeamInputPlaceholder | null
+  requires_workspace?: boolean // Whether this team requires a workspace/repository (null = auto-infer from shell)
+  publication_status?: 'published' | 'archived'
+  /** Modes this team is the default for (e.g., ['chat', 'code']) - computed from env config */
+  default_for_modes?: string[]
+  user?: {
+    user_name: string
+  }
+}
+
+/** Bot summary with only necessary fields for team list */
+export interface BotSummary {
+  agent_config?: Record<string, unknown>
+  shell_type?: string
+}
+
+/** Bot information (used for Team.bots) */
+export type PipelineContextPassing =
+  | 'none'
+  | 'original_user'
+  | 'previous_bot'
+  | 'original_and_previous'
+
+export interface TeamBot {
+  bot_id: number
+  bot_prompt: string
+  role?: string
+  requireConfirmation?: boolean // Pipeline mode: pause after this stage for user confirmation
+  contextPassing?: PipelineContextPassing // Pipeline mode: message passed from this stage to the next stage
+  bot?: BotSummary
+}
+
+/** TaskDetail structure (adapted to latest backend response) */
+// Task Types
+export type TaskStatus =
+  | 'PENDING'
+  | 'RUNNING'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'CANCELLED'
+  | 'CANCELLING'
+  | 'DELETE'
+  | 'PENDING_CONFIRMATION' // Pipeline stage completed, waiting for user confirmation
+export type TaskType = 'chat' | 'code' | 'knowledge' | 'task' | 'video' | 'image'
+
+// Video result type (corresponds to VideoAgent's result.video from backend)
+export interface VideoResult {
+  attachment_id: number
+  video_url: string
+  thumbnail?: string // Base64 thumbnail
+  duration?: number // Video duration in seconds
+}
+
+// Git commit statistics
+interface CommitStats {
+  files_changed: number
+  insertions: number
+  deletions: number
+}
+
+// Git commit information
+interface GitCommit {
+  commit_id: string
+  short_id: string
+  message: string
+  author: string
+  author_email: string
+  committed_date: string
+  stats: CommitStats
+}
+
+// Git information
+interface GitInfoWorkbench {
+  initial_commit_id: string
+  initial_commit_message: string
+  task_commits: GitCommit[]
+  source_branch: string
+  target_branch: string
+}
+
+// File change information
+interface FileChange {
+  old_path: string
+  new_path: string
+  new_file: boolean
+  renamed_file: boolean
+  deleted_file: boolean
+  added_lines: number
+  removed_lines: number
+  diff_title: string
+}
+
+export interface WorkbenchData {
+  taskTitle: string
+  taskNumber: string
+  status: 'completed' | 'running' | 'failed'
+  completedTime: string
+  repository: string
+  branch: string
+  sessions: number
+  premiumRequests: number
+  lastUpdated: string
+  summary: string
+  changes: string[]
+  originalPrompt: string
+  file_changes: FileChange[]
+  git_info: GitInfoWorkbench
+}
+
+export interface OpenLinks {
+  session_id: string | null
+  vscode_link: string | null
+  git_link: string | null
+  git_url: string
+  target_branch: string | null
+}
+
+/** App preview information (set by expose_service tool when service starts) */
+export interface TaskApp {
+  address: string
+  name: string
+  previewUrl: string
+}
+
+export interface TaskDetail {
+  project_id?: number | null
+  id: number
+  title: string
+  git_url: string
+  git_repo: string
+  git_repo_id: number
+  git_domain: string
+  branch_name: string
+  prompt: string
+  status: TaskStatus
+  task_type?: TaskType
+  progress: number
+  batch: number
+  result: Record<string, unknown>
+  error_message: string
+  created_at: string
+  updated_at: string
+  completed_at?: string
+  user: User
+  team: Team
+  workbench?: WorkbenchData | null
+  model_id?: string | null // Model name used for this task
+  is_group_chat?: boolean // Whether this task is a group chat
+  is_group_owner?: boolean // Whether current user is the group owner
+  member_count?: number // Number of active members in the group
+  app?: TaskApp | null // App preview information (set by expose_service tool)
+  device_id?: string | null // Device ID used for execution (for task history)
+  preserve_executor?: boolean // Whether to preserve executor pod after task completion
+  requested_skills?: SkillRef[] | null // User-selected skills for this task
+  external_knowledge_refs?: ExternalKnowledgeRef[] | null // Task-level external knowledge bindings
+}
+
+export interface TaskRuntimeActiveStream {
+  subtask_id: number
+  cursor: number
+  last_activity_at?: string | null
+}
+
+export interface TaskRuntimeCheck {
+  task_id: number
+  task_status: TaskStatus
+  status_updated_at?: string | null
+  active_stream: TaskRuntimeActiveStream | null
+}
+
+/** Correction data stored in subtask.result.correction */
+export interface CorrectionData {
+  model_id: string
+  model_name?: string
+  scores: {
+    accuracy: number
+    logic: number
+    completeness: number
+  }
+  corrections: Array<{
+    issue: string
+    suggestion: string
+  }>
+  summary: string
+  improved_answer: string
+  is_correct: boolean
+  corrected_at?: string
+}
+
+/** Subtask result structure */
+export interface SubtaskResult {
+  thinking?: unknown[]
+  value?: string | { workbench?: WorkbenchData }
+  workbench?: WorkbenchData
+  termination_reason?: string
+  /** Persisted correction data from AI correction mode */
+  correction?: CorrectionData
+  /** Video generation result */
+  video?: VideoResult
+  /** Reference image for multi-turn video generation */
+  image?: string
+  /** Video generation progress (0-100) */
+  progress?: number
+  /** Video generation config (stored in user message subtask for display) */
+  video_config?: {
+    model?: string
+    resolution?: string
+    ratio?: string
+    duration?: number
+  }
+  [key: string]: unknown
+}
+
+/** Subtask structure (adapted to latest backend response) */
+export interface TaskDetailSubtask {
+  task_id: number
+  team_id: number
+  title: string
+  /** Multi-bot support */
+  bot_ids: number[]
+  /** Role */
+  role: string
+  /** Message ID */
+  message_id: number
+  /** Parent Task ID */
+  parent_id: number
+  prompt: string
+  executor_namespace: string
+  executor_name: string
+  status: TaskStatus
+  progress: number
+  batch: number
+  result: SubtaskResult
+  error_message: string
+  id: number
+  user_id: number
+  created_at: string
+  updated_at: string
+  completed_at: string
+  bots: Bot[]
+  /** @deprecated Use contexts instead */
+  attachments?: Attachment[]
+  /** Unified contexts (attachments, knowledge bases, etc.) */
+  contexts?: SubtaskContextBrief[]
+  // Group chat fields
+  sender_type?: 'USER' | 'TEAM' | 'SYSTEM'
+  sender_user_id?: number
+  sender_user_name?: string
+  reply_to_subtask_id?: number
+}
+
+export interface Task {
+  id: number
+  project_id?: number | null
+  title: string
+  team_id: number
+  team_name?: string | null
+  team_namespace?: string | null
+  team_display_name?: string | null
+  team_icon?: string | null
+  device_id?: string | null
+  device_name?: string | null
+  git_url: string
+  git_repo: string
+  git_repo_id: number
+  git_domain: string
+  branch_name: string
+  prompt: string
+  status: TaskStatus
+  task_type?: TaskType
+  progress: number
+  batch: number
+  result: Record<string, unknown>
+  error_message: string
+  user_id: number
+  user_name: string
+  created_at: string
+  updated_at: string
+  completed_at: string
+  is_group_chat?: boolean // Whether this task is a group chat
+  knowledge_base_id?: number // Knowledge base ID for knowledge type tasks
+}
+
+/** GitHub repository new structure */
+export interface GitRepoInfo {
+  git_repo_id: number
+  name: string
+  git_repo: string
+  git_url: string
+  git_domain: string
+  private: boolean
+  /** Type: "github" | "gitlab" | "gitee" */
+  type: 'github' | 'gitlab' | 'gitee'
+}
+
+export interface GitBranch {
+  name: string
+  protected: boolean
+  default: boolean
+}
+
+// Common API Response Types
+export interface APIError {
+  message: string
+  detail?: string
+}
+
+export interface SuccessMessage {
+  message: string
+}
+
+// Pagination Types
+export interface PaginationParams {
+  page?: number
+  limit?: number
+}
+
+// Task View Status Types
+export interface TaskViewStatus {
+  viewedAt: string
+  status: TaskStatus
+}
+
+export interface TaskViewStatusMap {
+  [taskId: string]: TaskViewStatus
+}
+
+// Clarification answer summary types
+export interface ClarificationAnswer {
+  question_id: string
+  question_text: string
+  answer_type: 'choice' | 'custom'
+  value: string | string[]
+  selected_labels?: string | string[]
+}
+
+export interface ClarificationAnswerPayload {
+  type: 'clarification_answer'
+  answers: ClarificationAnswer[]
+}
+
+// Ask User Types (MCP tool-based interactive form)
+export interface AskUserOption {
+  label: string
+  value: string
+  recommended?: boolean
+}
+
+/** A single question in multi-question mode */
+export interface AskUserQuestion {
+  /** Unique identifier for this question within the form (e.g. 'q1', 'destination') */
+  id: string
+  question: string
+  input_type: 'choice' | 'text'
+  options?: AskUserOption[] | null
+  multi_select: boolean
+  required: boolean
+  default?: string[] | null
+  placeholder?: string | null
+}
+
+export interface AskUserFormData {
+  type: 'interactive_form_question'
+  /** Tool call ID used to submit the deferred form answer. */
+  tool_use_id: string
+  task_id: number
+  subtask_id: number
+  /** All questions to render. A single-question form uses a one-item array. */
+  questions: AskUserQuestion[]
+  /**
+   * Tool output from the backend after the tool completes.
+   * Used to detect timeout: {"error": "Timeout waiting for user response", "answer": null}
+   */
+  tool_output?: Record<string, unknown> | null
+}
+
+export interface InteractiveFormAnswerPayload {
+  type: 'interactive_form_question'
+  tool_use_id: string
+  task_id?: number | null
+  subtask_id?: number | null
+  success?: boolean
+  status?: 'answered' | 'cancelled'
+  answers: Record<string, string | string[]>
+  message?: string
+}
+
+export interface AskUserAnswer {
+  tool_use_id: string
+  /** Single-question answer */
+  answer?: string | string[]
+  /** Multi-question answers: {question_id: value_or_list} */
+  answers?: Record<string, string | string[]>
+}
+
+export interface FinalPromptData {
+  type: 'final_prompt'
+  final_prompt: string
+}
+
+// Dify Types
+export interface DifyApp {
+  id: string
+  name: string
+  mode: 'chat' | 'workflow' | 'agent' | 'chatflow'
+  icon: string
+  icon_background: string
+}
+
+export interface DifyBotPrompt {
+  difyAppId?: string
+  params?: Record<string, unknown>
+}
+
+export interface DifyParameterField {
+  variable: string
+  label: string
+  type: 'text-input' | 'select' | 'paragraph'
+  required?: boolean
+  default?: string
+  options?: Array<{ label: string; value: string }>
+}
+
+export interface DifyParametersSchema {
+  user_input_form: DifyParameterField[]
+}
+
+// Attachment Types
+export type AttachmentStatus = 'uploading' | 'parsing' | 'ready' | 'failed'
+
+export interface TruncationInfo {
+  is_truncated: boolean
+  original_length?: number | null
+  truncated_length?: number | null
+  truncation_message_key?: string | null
+}
+
+export interface Attachment {
+  id: number
+  filename: string
+  file_size: number
+  mime_type: string
+  status: AttachmentStatus
+  text_length?: number | null
+  error_message?: string | null
+  error_code?: string | null
+  subtask_id?: number | null
+  file_extension: string
+  created_at: string
+  truncation_info?: TruncationInfo | null
+  cover_url?: string | null
+  local_preview_url?: string
+}
+
+export interface AttachmentUploadState {
+  file: File | null
+  attachment: Attachment | null
+  isUploading: boolean
+  uploadProgress: number
+  error: string | null
+}
+
+export interface MultiAttachmentUploadState {
+  attachments: Attachment[]
+  uploadingFiles: Map<string, { file: File; progress: number }>
+  errors: Map<string, string>
+}
+
+// Subtask Context Types (unified context system)
+export type ContextType = 'attachment' | 'knowledge_base' | 'external_knowledge'
+export type ContextStatus = 'pending' | 'uploading' | 'parsing' | 'ready' | 'failed' | 'empty'
+
+export interface SubtaskContextBrief {
+  id: number
+  context_type: ContextType
+  name: string
+  status: ContextStatus
+  // Attachment fields (from type_data)
+  file_extension?: string | null
+  file_size?: number | null
+  mime_type?: string | null
+  // Knowledge base fields (from type_data)
+  knowledge_id?: number | null
+  document_count?: number | null
+  document_ids?: number[] | null
+  folder_ids?: number[] | null
+  folder_names?: string[] | null
+  include_subfolders?: boolean | null
+  scope_restricted?: boolean | null
+  // External knowledge fields
+  external_provider?: string | null
+  external_mode?: string | null
+  external_id?: string | null
+  external_scope?: string | null
+  external_target_type?: 'knowledge_base' | 'folder' | 'document' | null
+  external_node_id?: string | null
+  external_document_id?: string | null
+  external_parent_id?: string | null
+  video_count?: number | null
+  site?: string | null
+  source_url?: string | null
+  cover_url?: string | null
+}
+
+// Quick Access Types
+export interface QuickAccessTeam {
+  id: number
+  name: string
+  display_name?: string | null
+  is_system: boolean // True if from system recommendations
+  recommended_mode?: 'chat' | 'code' | 'both'
+  agent_type?: string
+  icon?: string // Icon ID from preset icon library
+}
+
+export interface QuickAccessResponse {
+  system_version: number
+  system_team_ids: number[]
+  user_version: number | null
+  show_system_recommended: boolean // True if user_version < system_version
+  teams: QuickAccessTeam[]
+}
+
+export interface QuickLaunchFunction {
+  type: 'system_function'
+  id: string
+  title: string
+  description?: string | null
+  icon?: string | null
+  cover?: string | null
+  team_id: number
+  name: string
+  bind_mode?: TaskType[]
+  recommended_mode?: 'chat' | 'code' | 'both'
+  enabled: boolean
+  order: number
+  input_presets: QuickLaunchInputPreset[]
+}
+
+export interface QuickLaunchFavoriteAgent {
+  type: 'favorite_agent'
+  id: number
+  team_id: number
+  name: string
+  title: string
+  description?: string | null
+  icon?: string | null
+  bind_mode?: TaskType[]
+  recommended_mode?: 'chat' | 'code' | 'both'
+  agent_type?: string | null
+  quick_phrases: string[]
+  input_presets: QuickLaunchInputPreset[]
+}
+
+export interface QuickLaunchResponse {
+  system_functions: QuickLaunchFunction[]
+  favorite_agents: QuickLaunchFavoriteAgent[]
+}
+
+export interface QuickLaunchInputOptions {
+  enable_deep_thinking?: boolean | null
+  enable_clarification?: boolean | null
+  force_override?: boolean | null
+  selected_skill_names?: string[]
+}
+
+export interface QuickLaunchInputPreset {
+  id: string
+  title: string
+  prompt?: string | null
+  options?: QuickLaunchInputOptions | null
+  source_attachment_ids?: number[]
+}
+
+export interface QuickLaunchPreparePresetRequest {
+  function_id: string
+  preset_id: string
+}
+
+export interface QuickLaunchPreparePresetResponse {
+  function_id: string
+  preset_id: string
+  attachments: Attachment[]
+}
+
+// Welcome Config Types (Slogan & Tips)
+export interface ChatSloganItem {
+  id: number
+  zh: string
+  en: string
+  mode?: 'chat' | 'code' | 'both'
+}
+
+export interface ChatTipItem {
+  id: number
+  zh: string
+  en: string
+  mode?: 'chat' | 'code' | 'both'
+}
+
+export interface WelcomeConfigResponse {
+  slogans: ChatSloganItem[]
+  tips: ChatTipItem[]
+  /** Whether admin setup wizard has been completed (only returned for admin users) */
+  admin_setup_completed?: boolean | null
+}
+
+// Default Teams Configuration Types
+export interface DefaultTeamConfig {
+  name: string
+  namespace: string
+}
+
+export interface DefaultTeamsResponse {
+  chat: DefaultTeamConfig | null
+  code: DefaultTeamConfig | null
+  knowledge: DefaultTeamConfig | null
+  task: DefaultTeamConfig | null
+}
+
+export interface SystemConfigResponse {
+  version: number
+  teams: number[]
+}
+
+export interface SystemConfigUpdate {
+  teams: number[]
+}
+
+// Knowledge Base / RAG Types
+export interface KnowledgeBaseRef {
+  knowledge_id: number // Knowledge base ID (database ID)
+  retriever_name: string
+  retriever_namespace: string
+}
+
+// Import KnowledgeBase types from knowledge.ts to avoid duplication
+export type {
+  KnowledgeBase,
+  KnowledgeBaseListResponse as KnowledgeBasesResponse,
+  PersonalKnowledgeBaseGroup,
+} from './knowledge'
+
+// Project Types
+export type ProjectExecutionTargetType = 'local' | 'cloud' | 'remote'
+export type ProjectWorkspaceSource = 'git' | 'local_path' | 'device_path'
+
+export interface ProjectWorkspaceRef {
+  name: string
+  namespace: string
+}
+
+export interface ProjectExecutionConfig {
+  targetType: ProjectExecutionTargetType
+  deviceId?: string | null
+}
+
+export interface ProjectTeamConfig {
+  id?: number | null
+  name?: string | null
+  namespace: string
+}
+
+export interface ProjectWorkspaceConfig {
+  source: ProjectWorkspaceSource
+  localPath?: string | null
+  checkoutPath?: string | null
+  devicePath?: string | null
+  workspaceRef?: ProjectWorkspaceRef | null
+}
+
+export interface ProjectGitConfig {
+  url: string
+  repo?: string | null
+  repoId?: number | null
+  domain?: string | null
+  branch?: string | null
+}
+
+export interface ProjectConfig {
+  mode?: 'workspace' | null
+  execution?: ProjectExecutionConfig | null
+  team?: ProjectTeamConfig | null
+  workspace?: ProjectWorkspaceConfig | null
+  git?: ProjectGitConfig | null
+}
+
+/** Task within a project */
+export interface ProjectTask {
+  task_id: number
+  task_title: string
+  task_status: TaskStatus
+  device_id?: string | null
+  execution_workspace_source?: string | null
+  execution_workspace_path?: string | null
+  is_group_chat: boolean
+  project_id: number
+  updated_at?: string | null
+}
+
+/** Project for organizing tasks */
+export interface Project {
+  id: number
+  user_id: number
+  name: string
+  description: string
+  color: string | null
+  sort_order: number
+  is_expanded: boolean
+  task_count: number
+  config?: ProjectConfig | null
+  created_at: string
+  updated_at: string
+}
+
+/** Project with its tasks */
+export interface ProjectWithTasks extends Project {
+  tasks: ProjectTask[]
+}
+
+/** Project list response */
+export interface ProjectListResponse {
+  total: number
+  items: ProjectWithTasks[]
+}
+
+/** Paginated tasks in a project */
+export interface ProjectTaskListResponse {
+  total: number
+  items: ProjectTask[]
+  has_more: boolean
+  next_cursor: string | null
+}

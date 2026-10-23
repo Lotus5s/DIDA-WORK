@@ -1,0 +1,109 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+mod api_context;
+pub(crate) mod automations;
+mod codex_global_state;
+mod codex_notifications;
+mod codex_rollout;
+mod codex_transcript_page;
+mod codex_user_input;
+mod collaboration_projects;
+mod connectors;
+mod events;
+pub mod fork_transfer;
+mod handler;
+pub(crate) mod local_connector_auth;
+mod local_execution;
+pub(crate) mod native_transcript;
+mod notification_mapping;
+mod remote_projects;
+mod response;
+mod runtime_handle_messages;
+mod store;
+mod task_create_contract;
+mod transcript;
+pub(crate) use transcript::codex_file_change_content;
+mod transcript_page;
+mod transcript_transport;
+mod util;
+mod worktrees;
+
+pub use codex_global_state::run_project_state_query;
+pub(crate) use collaboration_projects::sync_local_collaboration_projects;
+pub(crate) use events::CodexNotificationEventMapper;
+pub use handler::RuntimeWorkRpcHandler;
+pub(crate) use handler::CONTEXT_COMPACTION_ACTION_BUDGET_SECONDS;
+pub(crate) use notification_mapping::codex_stream_debug_enabled;
+pub(crate) use util::runtime_task_title;
+
+pub(crate) fn runtime_features() -> serde_json::Value {
+    let gateway_enabled = env_enabled("DEVICE_SESSION_GATEWAY_ENABLED", true);
+    serde_json::json!({
+        "schemaVersion": 4,
+        "runtimeTaskCreate": {
+            "schemaVersions": [1, 2],
+            "features": {
+                "attachments": true,
+                "goal": true,
+                "supervisor": true,
+                "permissionMode": true,
+                "projectPlugins": true,
+                "skills": true,
+                "standaloneWorkspace": true,
+                "workspaceInheritance": true,
+                "worktree": true
+            }
+        },
+        "interactiveSessions": {
+            "codeServer": gateway_enabled && env_enabled("DEVICE_CODE_SERVER_ENABLED", true),
+            "terminal": env_enabled("DEVICE_TERMINAL_ENABLED", true),
+        },
+        "projectEditing": {
+            "multiRoots": true,
+            "aiSettings": true,
+            "defaultProjectSpace": true,
+            "plugins": true,
+        },
+        "worktrees": worktrees::WorktreeManager::capabilities_from_env(),
+    })
+}
+
+fn env_enabled(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(default)
+}
+
+pub(crate) fn codex_workspace_roots() -> Vec<std::path::PathBuf> {
+    codex_global_state::CodexGlobalProjectIndex::load()
+        .projects()
+        .iter()
+        .flat_map(|project| project.roots.iter())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+#[cfg(test)]
+mod project_editing_feature_tests {
+    #[test]
+    fn advertises_independent_project_editing_capabilities() {
+        let features = super::runtime_features();
+        assert_eq!(
+            features["projectEditing"],
+            serde_json::json!({
+                "multiRoots": true,
+                "aiSettings": true,
+                "defaultProjectSpace": true,
+                "plugins": true,
+            })
+        );
+    }
+}

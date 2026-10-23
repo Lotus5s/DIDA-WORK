@@ -1,0 +1,1206 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::{
+    path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde_json::{json, Value};
+
+use crate::protocol::ExecutionRequest;
+
+pub(crate) fn execution_request(payload: &Value) -> Option<ExecutionRequest> {
+    payload
+        .get("executionRequest")
+        .or_else(|| payload.get("execution_request"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ExecutionRequest>(value).ok())
+}
+
+pub(crate) fn apply_runtime_payload_metadata(request: &mut ExecutionRequest, payload: &Value) {
+    if let Some(title) = string_field(payload, "title") {
+        set_runtime_task_title(request, &title);
+    }
+    if !request.extra.contains_key("cloudProjectId")
+        && !request.extra.contains_key("cloud_project_id")
+    {
+        if let Some(project_id) = payload
+            .get("cloudProjectId")
+            .or_else(|| payload.get("cloud_project_id"))
+            .filter(|value| value.is_string() || value.is_number())
+            .cloned()
+        {
+            request
+                .extra
+                .insert("cloudProjectId".to_owned(), project_id);
+        }
+    }
+    if request.runtime_project_key.is_none() {
+        request.runtime_project_key = string_field(payload, "runtimeProjectKey")
+            .or_else(|| string_field(payload, "runtime_project_key"));
+    }
+    if request.runtime_project_name.is_none() {
+        request.runtime_project_name = string_field(payload, "runtimeProjectName")
+            .or_else(|| string_field(payload, "runtime_project_name"));
+    }
+    if request.runtime_workspace_roots.is_empty() {
+        request.runtime_workspace_roots = payload
+            .get("runtimeWorkspaceRoots")
+            .or_else(|| payload.get("runtime_workspace_roots"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    if prompt_is_blank(&request.prompt) {
+        if let Some(content) = string_field(payload, "message")
+            .or_else(|| string_field(payload, "content"))
+            .or_else(|| string_field(payload, "prompt"))
+        {
+            request.prompt = Value::String(content);
+        }
+    }
+    if let Some(source) = payload
+        .get("source")
+        .filter(|value| value.is_object())
+        .cloned()
+    {
+        request.extra.insert("source".to_owned(), source);
+    }
+    if let Some(origin) = payload
+        .get("origin")
+        .filter(|value| value.is_object())
+        .cloned()
+    {
+        request.extra.insert("origin".to_owned(), origin);
+    }
+    if let Some(model_selection) = payload
+        .get("modelSelection")
+        .or_else(|| payload.get("model_selection"))
+        .filter(|value| value.is_object())
+        .cloned()
+    {
+        request
+            .extra
+            .insert("modelSelection".to_owned(), model_selection);
+    }
+    if let Some(attachments) = payload
+        .get("attachments")
+        .filter(|value| value.is_array())
+        .cloned()
+    {
+        request.extra.insert("attachments".to_owned(), attachments);
+    }
+    if let Some(additional_skills) = payload
+        .get("additionalSkills")
+        .or_else(|| payload.get("additional_skills"))
+        .filter(|value| value.is_array())
+        .cloned()
+    {
+        let skill_names = additional_skills
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|skill| {
+                skill
+                    .as_str()
+                    .or_else(|| skill.get("name").and_then(Value::as_str))
+            })
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .fold(Vec::new(), |mut names, name| {
+                if !names.iter().any(|existing| existing == name) {
+                    names.push(name.to_owned());
+                }
+                names
+            });
+        request
+            .extra
+            .insert("additional_skills".to_owned(), additional_skills);
+        request
+            .extra
+            .insert("preload_skills".to_owned(), json!(skill_names));
+        request
+            .extra
+            .insert("user_selected_skills".to_owned(), json!(skill_names));
+    }
+    if let Some(additional_context) = payload
+        .get("additionalContext")
+        .or_else(|| payload.get("additional_context"))
+        .filter(|value| value.is_object())
+        .cloned()
+    {
+        request
+            .extra
+            .insert("additionalContext".to_owned(), additional_context);
+    }
+    if let Some(client_user_message_id) = payload
+        .get("clientUserMessageId")
+        .or_else(|| payload.get("client_user_message_id"))
+        .filter(|value| value.is_string())
+        .cloned()
+    {
+        request
+            .extra
+            .insert("client_user_message_id".to_owned(), client_user_message_id);
+    }
+    if let Some(generated_user_message) = runtime_generated_user_message(payload) {
+        request.extra.insert(
+            "runtime_generated_user_message".to_owned(),
+            generated_user_message,
+        );
+    }
+    if let Some(collaboration_mode) = payload
+        .get("collaborationMode")
+        .or_else(|| payload.get("collaboration_mode"))
+        .or_else(|| payload.get("collaboration_model"))
+        .or_else(|| {
+            payload
+                .get("modelOptions")
+                .or_else(|| payload.get("model_options"))
+                .and_then(|options| {
+                    options
+                        .get("collaborationMode")
+                        .or_else(|| options.get("collaboration_mode"))
+                        .or_else(|| options.get("collaboration_model"))
+                })
+        })
+        .filter(|value| value.is_string())
+        .cloned()
+    {
+        request
+            .extra
+            .insert("collaborationMode".to_owned(), collaboration_mode);
+    }
+    if let Some(turn_id) = id_field(payload, "turn_id") {
+        request.subtask_id = turn_id;
+    }
+}
+
+pub(crate) fn set_runtime_task_title(request: &mut ExecutionRequest, title: &str) {
+    let title = title.trim();
+    if title.is_empty() {
+        return;
+    }
+    request.extra.insert(
+        "runtimeTaskTitle".to_owned(),
+        Value::String(title.to_owned()),
+    );
+}
+
+pub(crate) fn runtime_task_title(request: &ExecutionRequest) -> Option<String> {
+    request
+        .extra
+        .get("runtimeTaskTitle")
+        .or_else(|| request.extra.get("runtime_task_title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned)
+}
+
+fn runtime_generated_user_message(payload: &Value) -> Option<Value> {
+    let source = payload.get("source").filter(|value| value.is_object())?;
+    if string_field(source, "source").as_deref() != Some("im") {
+        return None;
+    }
+    let id = string_field(payload, "clientUserMessageId")
+        .or_else(|| string_field(payload, "client_user_message_id"))?;
+    let message = string_field(payload, "message").or_else(|| string_field(payload, "content"))?;
+    let created_at = payload
+        .get("createdAt")
+        .or_else(|| payload.get("created_at"))
+        .cloned()
+        .unwrap_or_else(|| json!(now_ms()));
+    Some(json!({
+        "id": id,
+        "message": message,
+        "createdAt": created_at,
+        "source": source,
+    }))
+}
+
+pub(crate) fn cloud_project_id(request: &ExecutionRequest) -> Option<Value> {
+    request
+        .extra
+        .get("cloudProjectId")
+        .or_else(|| request.extra.get("cloud_project_id"))
+        .filter(|value| value.is_string() || value.is_number())
+        .cloned()
+}
+
+pub(crate) fn restore_cloud_project_id(request: &mut ExecutionRequest, runtime_handle: &Value) {
+    if cloud_project_id(request).is_some() {
+        return;
+    }
+    if let Some(project_id) = runtime_handle
+        .get("cloudProjectId")
+        .or_else(|| runtime_handle.get("cloud_project_id"))
+        .filter(|value| value.is_string() || value.is_number())
+        .cloned()
+    {
+        request
+            .extra
+            .insert("cloudProjectId".to_owned(), project_id);
+    }
+}
+
+pub(crate) fn restore_origin(request: &mut ExecutionRequest, runtime_handle: &Value) {
+    if request.extra.contains_key("origin") {
+        return;
+    }
+    if let Some(origin) = runtime_handle
+        .get("origin")
+        .filter(|value| value.is_object())
+        .cloned()
+    {
+        request.extra.insert("origin".to_owned(), origin);
+    }
+}
+
+pub(crate) fn runtime_task_id(payload: &Value) -> Option<String> {
+    id_field(payload, "taskId")
+        .or_else(|| id_field(payload, "task_id"))
+        .or_else(|| {
+            payload.get("address").and_then(|address| {
+                id_field(address, "taskId").or_else(|| id_field(address, "task_id"))
+            })
+        })
+}
+
+pub(crate) fn workspace_path(payload: &Value) -> Option<String> {
+    string_field(payload, "workspacePath")
+        .or_else(|| string_field(payload, "workspace_path"))
+        .or_else(|| {
+            payload.get("address").and_then(|address| {
+                string_field(address, "workspacePath")
+                    .or_else(|| string_field(address, "workspace_path"))
+            })
+        })
+}
+
+pub(crate) fn prompt_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .or_else(|| item.get("content"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+pub(crate) fn id_field(value: &Value, key: &str) -> Option<String> {
+    match value.get(key)? {
+        Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn raw_string_field(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+pub(crate) fn raw_string_field_ref<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+pub(crate) fn integer_field(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+    })
+}
+
+pub(crate) fn timestamp_ms_field(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(timestamp_ms_value)
+}
+
+fn timestamp_ms_value(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+        .map(timestamp_ms)
+        .or_else(|| value.as_str().and_then(parse_utc_timestamp_ms))
+}
+
+pub(crate) fn timestamp_ms(value: i64) -> i64 {
+    if value > 0 && value < 10_000_000_000 {
+        value.saturating_mul(1000)
+    } else {
+        value
+    }
+}
+
+pub(crate) fn normalize_runtime_goal_timestamps(mut goal: Value) -> Value {
+    if let Some(object) = goal.as_object_mut() {
+        for key in ["createdAt", "updatedAt", "created_at", "updated_at"] {
+            let timestamp = object.get(key).and_then(timestamp_ms_value);
+            if let Some(timestamp) = timestamp {
+                object.insert(key.to_owned(), Value::Number(timestamp.into()));
+            }
+        }
+    }
+    goal
+}
+
+fn parse_utc_timestamp_ms(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if let Ok(number) = value.parse::<i64>() {
+        return Some(timestamp_ms(number));
+    }
+    if !value.ends_with('Z') {
+        return None;
+    }
+
+    let (date, time) = value[..value.len().saturating_sub(1)].split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i64>().ok()?;
+    let month = date_parts.next()?.parse::<i64>().ok()?;
+    let day = date_parts.next()?.parse::<i64>().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+
+    let (time, millis) = match time.split_once('.') {
+        Some((time, fraction)) => (time, parse_millis_fraction(fraction)?),
+        None => (time, 0),
+    };
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<i64>().ok()?;
+    let minute = time_parts.next()?.parse::<i64>().ok()?;
+    let second = time_parts.next()?.parse::<i64>().ok()?;
+    if time_parts.next().is_some()
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day)?;
+    Some((((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis)
+}
+
+fn parse_millis_fraction(fraction: &str) -> Option<i64> {
+    if fraction.is_empty() || !fraction.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let mut millis = 0_i64;
+    for (index, ch) in fraction.chars().take(3).enumerate() {
+        let digit = ch.to_digit(10)? as i64;
+        millis += digit * 10_i64.pow(2 - index as u32);
+    }
+    Some(millis)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    let month_days = days_in_month(year, month)?;
+    if day > month_days {
+        return None;
+    }
+
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
+}
+
+fn days_in_month(year: i64, month: i64) -> Option<i64> {
+    Some(match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return None,
+    })
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+pub(crate) fn bool_field(value: &Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(|value| {
+        value.as_bool().or_else(|| {
+            value
+                .as_str()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .and_then(|value| match value.as_str() {
+                    "true" | "1" | "yes" => Some(true),
+                    "false" | "0" | "no" => Some(false),
+                    _ => None,
+                })
+        })
+    })
+}
+
+pub(crate) fn item_type(item: &Value) -> String {
+    item.get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .replace('_', "")
+        .to_ascii_lowercase()
+}
+
+pub(crate) fn codex_wrapped_item_payload(item: &Value) -> Option<&Value> {
+    if matches!(item_type(item).as_str(), "responseitem" | "eventmsg") {
+        return item.get("payload").filter(|payload| payload.is_object());
+    }
+    None
+}
+
+pub(crate) fn is_codex_tool_item_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "commandexecution"
+            | "shellcall"
+            | "localshellcall"
+            | "functioncall"
+            | "customtoolcall"
+            | "dynamictoolcall"
+            | "mcptoolcall"
+            | "mcpcall"
+            | "toolsearchcall"
+            | "websearchcall"
+            | "websearch"
+            | "imagegeneration"
+            | "imageview"
+            | "sleep"
+    )
+}
+
+pub(crate) fn is_codex_tool_output_item_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "functioncalloutput" | "customtoolcalloutput" | "toolsearchoutput" | "execcommandend"
+    )
+}
+
+pub(crate) fn is_likely_codex_tool_item_type(item_type: &str) -> bool {
+    is_codex_tool_item_type(item_type)
+        || is_codex_tool_output_item_type(item_type)
+        || item_type.contains("tool")
+        || item_type.contains("command")
+        || item_type.contains("exec")
+        || item_type.contains("mcp")
+        || item_type.contains("function")
+}
+
+pub(crate) fn is_likely_codex_tool_output_item_type(item_type: &str) -> bool {
+    is_codex_tool_output_item_type(item_type)
+        || (is_likely_codex_tool_item_type(item_type)
+            && (item_type.ends_with("end")
+                || item_type.ends_with("output")
+                || item_type.ends_with("result")
+                || item_type.contains("complete")))
+}
+
+pub(crate) fn is_codex_context_compaction_item_type(item_type: &str) -> bool {
+    matches!(item_type, "contextcompaction" | "contextcompacted")
+}
+
+pub(crate) fn item_id(item: &Value, prefix: &str) -> String {
+    string_field(item, "id").unwrap_or_else(|| format!("{prefix}-{}", now_ms()))
+}
+
+pub(crate) fn extract_text(item: &Value) -> Option<String> {
+    for key in ["text", "content", "message"] {
+        if let Some(text) = raw_string_field(item, key).filter(|text| !text.is_empty()) {
+            return Some(text);
+        }
+    }
+    let text = item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| {
+            part.as_str().map(str::to_owned).or_else(|| {
+                part.get("text")
+                    .or_else(|| part.get("content"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+pub(crate) fn is_completed_plan_item(params: &Value) -> bool {
+    let item = params.get("item").unwrap_or(params);
+    item_type(item).as_str() == "plan"
+}
+
+pub(crate) fn reasoning_content(item: &Value) -> Option<String> {
+    if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+        let text = summary
+            .iter()
+            .filter_map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| extract_text(value))
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    extract_text(item)
+}
+
+pub(crate) fn workspace_label(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| path.to_owned())
+}
+
+pub(crate) fn workspace_group_path(path: &str) -> String {
+    let normalized = normalize_workspace_path(path);
+    git_common_workspace_root(&normalized)
+        .or_else(|| codex_worktree_fallback_root(&normalized))
+        .unwrap_or(normalized)
+}
+
+pub(crate) fn workspace_task_path(path: &str, group_path: &str) -> String {
+    let normalized = normalize_workspace_path(path);
+    if infer_workspace_kind(&normalized) == "chat" {
+        return normalized;
+    }
+    if let Some((worktree_root, _)) = resolved_worktree_root_and_id(&normalized) {
+        return worktree_root;
+    }
+    if group_path.is_empty() {
+        normalized
+    } else {
+        group_path.to_owned()
+    }
+}
+
+pub(crate) fn infer_workspace_kind(path: &str) -> &'static str {
+    if path.contains("/Codex/") || path.contains("\\Codex\\") {
+        "chat"
+    } else if infer_worktree_id(path).is_some() {
+        "worktree"
+    } else {
+        "workspace"
+    }
+}
+
+pub(crate) fn infer_worktree_id(path: &str) -> Option<String> {
+    let normalized = normalize_workspace_path(path);
+    resolved_worktree_root_and_id(&normalized).map(|(_, worktree_id)| worktree_id)
+}
+
+pub(crate) fn normalize_device_id(device_id: String) -> String {
+    if device_id.trim().is_empty() {
+        "local-device".to_owned()
+    } else {
+        device_id
+    }
+}
+
+pub(crate) fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+fn prompt_is_blank(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Null => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn normalize_workspace_path(path: &str) -> String {
+    let trimmed = path.trim().trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized.to_string_lossy().into_owned()
+}
+
+pub(crate) fn path_is_within(root: &str, path: &str) -> bool {
+    let root = root.trim_end_matches(['/', '\\']);
+    let path = path.trim_end_matches(['/', '\\']);
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+}
+
+fn git_common_workspace_root(path: &str) -> Option<String> {
+    let (workspace, _, common_dir) = git_metadata_directories(Path::new(path))?;
+    let root = if common_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        common_dir.parent()?
+    } else {
+        &workspace
+    };
+    Some(root.to_string_lossy().into_owned())
+}
+
+pub(crate) fn git_metadata_directories(path: &Path) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let mut current = path.to_path_buf();
+    loop {
+        let git_marker = current.join(".git");
+        if git_marker.is_dir() {
+            return Some((current, git_marker.clone(), git_marker));
+        }
+        if git_marker.is_file() {
+            let git_dir = parse_gitdir_file(&git_marker, &current)?;
+            let common_dir = read_common_git_dir(&git_dir).unwrap_or_else(|| git_dir.clone());
+            return Some((current, git_dir, common_dir));
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn git_worktree_root_and_id(path: &str) -> Option<(String, String)> {
+    let (workspace, git_dir, _) = git_metadata_directories(Path::new(path))?;
+    if workspace.join(".git").is_dir() {
+        return None;
+    }
+    let worktree_id = worktree_id_from_git_dir(&git_dir)?;
+    Some((workspace.to_string_lossy().into_owned(), worktree_id))
+}
+
+fn resolved_worktree_root_and_id(path: &str) -> Option<(String, String)> {
+    if !Path::new(path).exists() {
+        return path_worktree_root_and_id(path);
+    }
+    if let Some(worktree) = git_worktree_root_and_id(path) {
+        return Some(worktree);
+    }
+    if let Some((worktree_root, worktree_id)) = path_worktree_root_and_id(path) {
+        if let Some(repository_root) = git_common_workspace_root(path) {
+            if path_is_within(&worktree_root, &repository_root) {
+                return None;
+            }
+        }
+        return Some((worktree_root, worktree_id));
+    }
+    if git_common_workspace_root(path).is_some() {
+        return None;
+    }
+    path_worktree_root_and_id(path)
+}
+
+fn worktree_id_from_git_dir(git_dir: &Path) -> Option<String> {
+    let mut components = git_dir.components().peekable();
+    while let Some(component) = components.next() {
+        if component.as_os_str().to_str()? != "worktrees" {
+            continue;
+        }
+        return components
+            .next()
+            .and_then(|value| value.as_os_str().to_str())
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty());
+    }
+    None
+}
+
+fn parse_gitdir_file(git_file: &Path, worktree_root: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(git_file).ok()?;
+    let raw_path = content.trim().strip_prefix("gitdir:")?.trim();
+    let path = Path::new(raw_path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        worktree_root.join(path)
+    };
+    Some(PathBuf::from(normalize_workspace_path(
+        &resolved.to_string_lossy(),
+    )))
+}
+
+fn path_worktree_root_and_id(path: &str) -> Option<(String, String)> {
+    let parts = Path::new(path).components().collect::<Vec<_>>();
+    for index in (0..parts.len()).rev() {
+        let component_text = parts[index].as_os_str().to_str()?;
+        if component_text != "worktrees" && component_text != ".worktrees" {
+            continue;
+        }
+        if index + 2 >= parts.len() {
+            continue;
+        }
+        let worktree_id = parts[index + 1]
+            .as_os_str()
+            .to_str()
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty())?;
+        let mut root = PathBuf::new();
+        for component in parts.iter().take(index + 3) {
+            match component {
+                Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+                Component::RootDir => root.push(component.as_os_str()),
+                other => root.push(other.as_os_str()),
+            }
+        }
+        return Some((root.to_string_lossy().into_owned(), worktree_id));
+    }
+    None
+}
+
+fn read_common_git_dir(git_dir: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let raw_path = content.trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+    let path = Path::new(raw_path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        git_dir.join(path)
+    };
+    Some(PathBuf::from(normalize_workspace_path(
+        &resolved.to_string_lossy(),
+    )))
+}
+
+fn codex_worktree_fallback_root(path: &str) -> Option<String> {
+    let mut components = Path::new(path).components().peekable();
+    let mut prefix = PathBuf::new();
+    while let Some(component) = components.next() {
+        let component_text = component.as_os_str().to_str()?;
+        prefix.push(component.as_os_str());
+        if component_text != ".codex" {
+            continue;
+        }
+        if components.next()?.as_os_str().to_str()? != "worktrees" {
+            continue;
+        }
+        let _worktree_id = components.next()?;
+        let project = components.next()?;
+        prefix.push("worktrees");
+        prefix.push(project.as_os_str());
+        return Some(prefix.to_string_lossy().into_owned());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn copies_cloud_project_id_from_runtime_payload() {
+        let mut request = ExecutionRequest::default();
+
+        apply_runtime_payload_metadata(&mut request, &json!({"cloudProjectId": 9001}));
+
+        assert_eq!(cloud_project_id(&request), Some(json!(9001)));
+    }
+
+    #[test]
+    fn copies_runtime_task_title_from_runtime_payload() {
+        let mut request = ExecutionRequest::default();
+
+        apply_runtime_payload_metadata(&mut request, &json!({"title": " Analyze issue "}));
+
+        assert_eq!(
+            runtime_task_title(&request).as_deref(),
+            Some("Analyze issue")
+        );
+    }
+
+    #[test]
+    fn copies_runtime_origin_from_runtime_payload() {
+        let mut request = ExecutionRequest::default();
+
+        apply_runtime_payload_metadata(
+            &mut request,
+            &json!({"origin": {"type": "project_automation", "run_id": "run-1"}}),
+        );
+
+        assert_eq!(
+            request.extra.get("origin"),
+            Some(&json!({"type": "project_automation", "run_id": "run-1"}))
+        );
+    }
+
+    #[test]
+    fn copies_runtime_model_selection_from_runtime_payload() {
+        let mut request = ExecutionRequest::default();
+
+        apply_runtime_payload_metadata(
+            &mut request,
+            &json!({
+                "modelSelection": {
+                    "modelName": "deepseek-v4-pro-responses(public)",
+                    "modelType": "public",
+                    "options": {"reasoning": "medium"}
+                }
+            }),
+        );
+
+        assert_eq!(
+            request.extra.get("modelSelection"),
+            Some(&json!({
+                "modelName": "deepseek-v4-pro-responses(public)",
+                "modelType": "public",
+                "options": {"reasoning": "medium"}
+            }))
+        );
+    }
+
+    #[test]
+    fn copies_nested_collaboration_mode_into_execution_request_extra() {
+        let mut request = ExecutionRequest::default();
+
+        apply_runtime_payload_metadata(
+            &mut request,
+            &json!({"modelOptions": {"collaborationMode": "coordinate"}}),
+        );
+
+        assert_eq!(
+            request.extra.get("collaborationMode"),
+            Some(&json!("coordinate"))
+        );
+    }
+
+    #[test]
+    fn copies_backend_collaboration_model_into_execution_request_extra() {
+        let mut request = ExecutionRequest::default();
+
+        apply_runtime_payload_metadata(&mut request, &json!({"collaboration_model": "single"}));
+
+        assert_eq!(
+            request.extra.get("collaborationMode"),
+            Some(&json!("single"))
+        );
+    }
+
+    #[test]
+    fn normalizes_runtime_additional_skills_for_agent_consumers() {
+        let mut request = ExecutionRequest::default();
+
+        apply_runtime_payload_metadata(
+            &mut request,
+            &json!({
+                "additionalSkills": [
+                    {
+                        "name": "wework-plugin-creator",
+                        "namespace": "codex",
+                        "is_public": false
+                    },
+                    "review",
+                    {"name": "wework-plugin-creator", "namespace": "codex"}
+                ]
+            }),
+        );
+
+        assert_eq!(
+            request.extra.get("additional_skills"),
+            Some(&json!([
+                {
+                    "name": "wework-plugin-creator",
+                    "namespace": "codex",
+                    "is_public": false
+                },
+                "review",
+                {"name": "wework-plugin-creator", "namespace": "codex"}
+            ]))
+        );
+        assert_eq!(
+            request.extra.get("preload_skills"),
+            Some(&json!(["wework-plugin-creator", "review"]))
+        );
+        assert_eq!(
+            request.extra.get("user_selected_skills"),
+            Some(&json!(["wework-plugin-creator", "review"]))
+        );
+    }
+
+    #[test]
+    fn generates_visible_user_message_for_external_im_runtime_send() {
+        let mut request = ExecutionRequest::default();
+
+        apply_runtime_payload_metadata(
+            &mut request,
+            &json!({
+                "message": "continue from dingtalk",
+                "clientUserMessageId": "im:dingtalk:77:dingtalk-message-1",
+                "createdAt": 1_780_000_000_000_i64,
+                "source": {
+                    "source": "im",
+                    "channel_type": "dingtalk",
+                    "channel_id": 77,
+                    "message_id": "dingtalk-message-1"
+                }
+            }),
+        );
+
+        assert_eq!(
+            request.extra.get("runtime_generated_user_message"),
+            Some(&json!({
+                "id": "im:dingtalk:77:dingtalk-message-1",
+                "message": "continue from dingtalk",
+                "createdAt": 1_780_000_000_000_i64,
+                "source": {
+                    "source": "im",
+                    "channel_type": "dingtalk",
+                    "channel_id": 77,
+                    "message_id": "dingtalk-message-1"
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn does_not_generate_external_user_message_without_im_source() {
+        let mut request = ExecutionRequest::default();
+
+        apply_runtime_payload_metadata(
+            &mut request,
+            &json!({
+                "message": "continue from wework",
+                "clientUserMessageId": "runtime-local-pane-1"
+            }),
+        );
+
+        assert!(!request.extra.contains_key("runtime_generated_user_message"));
+    }
+
+    #[test]
+    fn restores_cloud_project_id_for_a_follow_up_turn() {
+        let mut request = ExecutionRequest::default();
+
+        restore_cloud_project_id(&mut request, &json!({"cloudProjectId": "local-42"}));
+
+        assert_eq!(cloud_project_id(&request), Some(json!("local-42")));
+    }
+
+    #[test]
+    fn restores_origin_for_a_follow_up_turn() {
+        let mut request = ExecutionRequest::default();
+
+        restore_origin(
+            &mut request,
+            &json!({"origin": {"type": "project_automation", "run_id": "run-1"}}),
+        );
+
+        assert_eq!(
+            request.extra.get("origin"),
+            Some(&json!({"type": "project_automation", "run_id": "run-1"}))
+        );
+    }
+
+    #[test]
+    fn normal_repository_under_worktrees_parent_is_not_a_worktree() {
+        let directory = tempdir().expect("temporary directory");
+        let repository = directory
+            .path()
+            .join("worktrees")
+            .join("runtime-1")
+            .join("project");
+        std::fs::create_dir_all(repository.join(".git")).expect("repository metadata");
+        let source = repository.join("src");
+        std::fs::create_dir_all(&source).expect("repository source directory");
+        let repository_path = repository.display().to_string();
+        let source_path = source.display().to_string();
+
+        assert_eq!(infer_workspace_kind(&source_path), "workspace");
+        assert_eq!(infer_worktree_id(&source_path), None);
+        assert_eq!(
+            workspace_task_path(&source_path, &repository_path),
+            repository_path
+        );
+    }
+
+    #[test]
+    fn nested_repository_inside_a_worktree_is_not_the_outer_worktree() {
+        let directory = tempdir().expect("temporary directory");
+        let common_dir = directory.path().join("repo").join(".git");
+        let outer_worktree = directory.path().join("worktrees").join("runtime-1");
+        let outer_git_dir = common_dir.join("worktrees").join("runtime-1");
+        std::fs::create_dir_all(&outer_git_dir).expect("outer worktree metadata");
+        std::fs::create_dir_all(&outer_worktree).expect("outer worktree");
+        std::fs::write(
+            outer_worktree.join(".git"),
+            format!("gitdir: {}\n", outer_git_dir.display()),
+        )
+        .expect("outer worktree git file");
+        let nested_repository = outer_worktree.join("artifacts").join("workspace");
+        std::fs::create_dir_all(nested_repository.join(".git")).expect("nested repository");
+        let nested_path = nested_repository.display().to_string();
+
+        assert_eq!(infer_workspace_kind(&nested_path), "workspace");
+        assert_eq!(infer_worktree_id(&nested_path), None);
+    }
+
+    #[test]
+    fn standalone_chat_inside_a_worktree_keeps_its_own_workspace() {
+        let directory = tempdir().expect("temporary directory");
+        let common_dir = directory.path().join("repo").join(".git");
+        let outer_worktree = directory.path().join("outer");
+        let outer_git_dir = common_dir.join("worktrees").join("outer");
+        std::fs::create_dir_all(&outer_git_dir).expect("outer worktree metadata");
+        std::fs::create_dir_all(&outer_worktree).expect("outer worktree");
+        std::fs::write(
+            outer_worktree.join(".git"),
+            format!("gitdir: {}\n", outer_git_dir.display()),
+        )
+        .expect("outer worktree git file");
+        let chat = outer_worktree
+            .join("executor-home")
+            .join("Documents")
+            .join("Codex")
+            .join("chat");
+        std::fs::create_dir_all(&chat).expect("standalone chat workspace");
+        let chat_path = chat.display().to_string();
+
+        assert_eq!(infer_workspace_kind(&chat_path), "chat");
+        assert_eq!(
+            workspace_task_path(&chat_path, &outer_worktree.display().to_string()),
+            chat_path
+        );
+    }
+
+    #[test]
+    fn nonexistent_planned_worktree_does_not_inherit_an_ancestor_worktree() {
+        let directory = tempdir().expect("temporary directory");
+        let common_dir = directory.path().join("repo").join(".git");
+        let outer_worktree = directory.path().join("outer");
+        let outer_git_dir = common_dir.join("worktrees").join("outer");
+        std::fs::create_dir_all(&outer_git_dir).expect("outer worktree metadata");
+        std::fs::create_dir_all(&outer_worktree).expect("outer worktree");
+        std::fs::write(
+            outer_worktree.join(".git"),
+            format!("gitdir: {}\n", outer_git_dir.display()),
+        )
+        .expect("outer worktree git file");
+
+        let planned = outer_worktree
+            .join("executor-home")
+            .join("workspace")
+            .join("worktrees")
+            .join("runtime-1")
+            .join("workspace");
+        let planned_path = planned.display().to_string();
+
+        assert_eq!(
+            workspace_task_path(&planned_path, &outer_worktree.display().to_string()),
+            planned_path
+        );
+        assert_eq!(
+            infer_worktree_id(&planned_path).as_deref(),
+            Some("runtime-1")
+        );
+    }
+
+    #[test]
+    fn planned_worktree_path_under_repository_checkout_is_a_worktree() {
+        let checkout = tempdir().expect("temporary directory");
+        std::fs::create_dir_all(checkout.path().join(".git")).expect("checkout git metadata");
+        let planned = checkout
+            .path()
+            .join("executor-home")
+            .join("workspace")
+            .join("worktrees")
+            .join("runtime-132780333")
+            .join("workspace");
+        std::fs::create_dir_all(&planned).expect("planned worktree directory");
+        let planned_path = planned.display().to_string();
+
+        assert_eq!(infer_workspace_kind(&planned_path), "worktree");
+        assert_eq!(
+            infer_worktree_id(&planned_path),
+            Some("runtime-132780333".to_owned())
+        );
+        assert_eq!(
+            workspace_task_path(&planned_path, &checkout.path().display().to_string()),
+            planned_path
+        );
+    }
+
+    #[test]
+    fn normalizes_runtime_goal_seconds_to_milliseconds() {
+        assert_eq!(
+            normalize_runtime_goal_timestamps(json!({
+                "threadId": "thread-1",
+                "createdAt": 1_787_636_000,
+                "updatedAt": 1_787_636_001,
+            })),
+            json!({
+                "threadId": "thread-1",
+                "createdAt": 1_787_636_000_000_i64,
+                "updatedAt": 1_787_636_001_000_i64,
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_runtime_goal_millisecond_timestamps() {
+        assert_eq!(
+            normalize_runtime_goal_timestamps(json!({
+                "createdAt": 1_787_636_000_123_i64,
+                "updatedAt": 1_787_636_001_456_i64,
+            })),
+            json!({
+                "createdAt": 1_787_636_000_123_i64,
+                "updatedAt": 1_787_636_001_456_i64,
+            })
+        );
+    }
+}

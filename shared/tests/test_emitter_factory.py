@@ -1,0 +1,730 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for ResponsesAPIEmitter Factory and Builder."""
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from shared.models import (
+    CallbackTransport,
+    EmitterBuilder,
+    EventTransport,
+    GeneratorTransport,
+    RedisTransport,
+    ResponsesAPIEmitter,
+    ThrottleConfig,
+    ThrottledTransport,
+    TransportFactory,
+    TransportType,
+    WebSocketTransport,
+)
+
+
+class TestTransportType:
+    """Tests for TransportType enum."""
+
+    def test_transport_type_values(self):
+        """Test that TransportType has expected values."""
+        assert TransportType.CALLBACK.value == "callback"
+        assert TransportType.WEBSOCKET.value == "websocket"
+        assert TransportType.GENERATOR.value == "generator"
+        assert TransportType.REDIS.value == "redis"
+
+
+class TestTransportFactory:
+    """Tests for TransportFactory."""
+
+    def test_create_callback_with_client(self):
+        """Test creating CallbackTransport with provided client."""
+        mock_client = MagicMock()
+        transport = TransportFactory.create_callback(client=mock_client)
+        assert isinstance(transport, CallbackTransport)
+        assert transport.client == mock_client
+
+    def test_create_websocket(self):
+        """Test creating WebSocketTransport."""
+        mock_client = MagicMock()
+        event_mapping = {"response.created": "chat:start"}
+        transport = TransportFactory.create_websocket(mock_client, event_mapping)
+        assert isinstance(transport, WebSocketTransport)
+        assert transport.client == mock_client
+        assert transport.event_mapping == event_mapping
+
+    def test_create_generator(self):
+        """Test creating GeneratorTransport."""
+        callback = MagicMock()
+        transport = TransportFactory.create_generator(callback)
+        assert isinstance(transport, GeneratorTransport)
+        assert transport.callback == callback
+
+    def test_create_generator_without_callback(self):
+        """Test creating GeneratorTransport without callback."""
+        transport = TransportFactory.create_generator()
+        assert isinstance(transport, GeneratorTransport)
+        assert transport.callback is None
+
+    def test_create_redis(self):
+        """Test creating RedisTransport."""
+        mock_storage = MagicMock()
+        transport = TransportFactory.create_redis(mock_storage)
+        assert isinstance(transport, RedisTransport)
+        assert transport._storage == mock_storage
+
+    def test_create_callback_throttled(self):
+        """Test creating throttled CallbackTransport."""
+        mock_client = MagicMock()
+        config = ThrottleConfig(default_interval=0.5)
+        transport = TransportFactory.create_callback_throttled(
+            client=mock_client, config=config
+        )
+        assert isinstance(transport, ThrottledTransport)
+        assert isinstance(transport._transport, CallbackTransport)
+        assert transport._config.default_interval == 0.5
+
+    def test_create_websocket_throttled(self):
+        """Test creating throttled WebSocketTransport."""
+        mock_client = MagicMock()
+        config = ThrottleConfig(default_interval=0.3)
+        transport = TransportFactory.create_websocket_throttled(
+            mock_client, config=config
+        )
+        assert isinstance(transport, ThrottledTransport)
+        assert isinstance(transport._transport, WebSocketTransport)
+
+    def test_with_throttle(self):
+        """Test wrapping any transport with throttling."""
+        mock_transport = MagicMock(spec=EventTransport)
+        config = ThrottleConfig(max_buffer_size=2048)
+        throttled = TransportFactory.with_throttle(mock_transport, config)
+        assert isinstance(throttled, ThrottledTransport)
+        assert throttled._transport == mock_transport
+        assert throttled._config.max_buffer_size == 2048
+
+
+class TestEmitterBuilder:
+    """Tests for EmitterBuilder."""
+
+    def test_build_with_required_params(self):
+        """Test building emitter with required parameters."""
+        mock_transport = MagicMock(spec=EventTransport)
+        emitter = (
+            EmitterBuilder().with_task(123, 456).with_transport(mock_transport).build()
+        )
+        assert isinstance(emitter, ResponsesAPIEmitter)
+        assert emitter.task_id == 123
+        assert emitter.subtask_id == 456
+        assert emitter.transport == mock_transport
+
+    def test_build_with_all_params(self):
+        """Test building emitter with all parameters."""
+        mock_transport = MagicMock(spec=EventTransport)
+        emitter = (
+            EmitterBuilder()
+            .with_task(123, 456)
+            .with_transport(mock_transport)
+            .with_model("claude-3")
+            .with_message_id(789)
+            .with_executor_info("executor-1", "default")
+            .build()
+        )
+        assert emitter.task_id == 123
+        assert emitter.subtask_id == 456
+        assert emitter.builder.model == "claude-3"
+        assert emitter.message_id == 789
+        assert emitter.executor_name == "executor-1"
+        assert emitter.executor_namespace == "default"
+
+    def test_build_without_task_raises_error(self):
+        """Test that building without task raises ValueError."""
+        mock_transport = MagicMock(spec=EventTransport)
+        with pytest.raises(ValueError, match="task_id and subtask_id are required"):
+            EmitterBuilder().with_transport(mock_transport).build()
+
+    def test_build_without_transport_raises_error(self):
+        """Test that building without transport raises ValueError."""
+        with pytest.raises(ValueError, match="transport is required"):
+            EmitterBuilder().with_task(123, 456).build()
+
+    def test_builder_chaining(self):
+        """Test that builder methods return self for chaining."""
+        builder = EmitterBuilder()
+        mock_transport = MagicMock(spec=EventTransport)
+
+        result = builder.with_task(1, 2)
+        assert result is builder
+
+        result = builder.with_transport(mock_transport)
+        assert result is builder
+
+        result = builder.with_model("test")
+        assert result is builder
+
+        result = builder.with_message_id(3)
+        assert result is builder
+
+        result = builder.with_executor_info("name", "ns")
+        assert result is builder
+
+
+class TestThrottleConfig:
+    """Tests for ThrottleConfig."""
+
+    def test_default_config(self):
+        """Test default configuration values."""
+        config = ThrottleConfig()
+        assert config.default_interval == 2
+        assert config.max_buffer_size == 4096
+        assert config.throttled_events is None
+        assert "response.created" in config.bypass_events
+        assert "response.completed" in config.bypass_events
+        assert "error" in config.bypass_events
+
+    def test_custom_config(self):
+        """Test custom configuration values."""
+        config = ThrottleConfig(
+            default_interval=0.5,
+            event_intervals={"response.output_text.delta": 0.2},
+            max_buffer_size=2048,
+        )
+        assert config.default_interval == 0.5
+        assert config.get_interval("response.output_text.delta") == 0.2
+        assert config.get_interval("unknown_event") == 0.5
+        assert config.max_buffer_size == 2048
+
+    def test_should_throttle_bypass_events(self):
+        """Test that bypass events are not throttled."""
+        config = ThrottleConfig()
+        assert not config.should_throttle("response.created")
+        assert not config.should_throttle("response.completed")
+        assert not config.should_throttle("error")
+
+    def test_should_throttle_regular_events(self):
+        """Test that regular events are throttled."""
+        config = ThrottleConfig()
+        assert config.should_throttle("response.output_text.delta")
+        assert config.should_throttle("response.part.added")
+
+    def test_should_throttle_with_throttled_events_set(self):
+        """Test throttling with explicit throttled_events set."""
+        config = ThrottleConfig(
+            throttled_events={"response.output_text.delta"},
+            bypass_events=set(),
+        )
+        assert config.should_throttle("response.output_text.delta")
+        assert not config.should_throttle("response.created")
+
+
+class TestThrottledTransport:
+    """Tests for ThrottledTransport."""
+
+    @pytest.mark.asyncio
+    async def test_bypass_events_sent_immediately(self):
+        """Test that bypass events are sent immediately without buffering."""
+        mock_transport = AsyncMock(spec=EventTransport)
+        throttled = ThrottledTransport(mock_transport)
+
+        await throttled.send("response.created", 1, 2, {"test": "data"})
+
+        mock_transport.send.assert_called_once_with(
+            "response.created", 1, 2, {"test": "data"}, None, None, None
+        )
+
+    @pytest.mark.asyncio
+    async def test_throttled_events_sent_on_interval(self):
+        """Test that throttled events are sent when interval is exceeded."""
+        mock_transport = AsyncMock(spec=EventTransport)
+        # Use default config - first event will be sent immediately since
+        # time_since_last (from 0) will exceed interval
+        throttled = ThrottledTransport(mock_transport)
+
+        await throttled.send("response.output_text.delta", 1, 2, {"delta": "hello"})
+
+        # First event should be sent immediately (time_since_last > interval)
+        mock_transport.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_events_aggregated_within_interval(self):
+        """Test that multiple events within interval are aggregated."""
+        mock_transport = AsyncMock(spec=EventTransport)
+        config = ThrottleConfig(default_interval=10.0)  # Long interval
+        throttled = ThrottledTransport(mock_transport, config)
+
+        # First event triggers immediate send (time_since_last from 0 > interval)
+        await throttled.send("response.output_text.delta", 1, 2, {"delta": "hello"})
+        mock_transport.send.assert_called_once()
+        mock_transport.reset_mock()
+
+        # Subsequent events within interval should be buffered
+        await throttled.send("response.output_text.delta", 1, 2, {"delta": " world"})
+        await throttled.send("response.output_text.delta", 1, 2, {"delta": "!"})
+
+        # Should not have sent yet (within interval)
+        mock_transport.send.assert_not_called()
+
+        # Flush to send aggregated
+        await throttled.flush_all()
+        mock_transport.send.assert_called_once()
+        call_args = mock_transport.send.call_args
+        assert call_args[0][3]["delta"] == " world!"
+
+    @pytest.mark.asyncio
+    async def test_cross_type_events_flush_pending_buffer_in_order(self):
+        """Test that reasoning buffered before text is sent before that text."""
+        mock_transport = AsyncMock(spec=EventTransport)
+        config = ThrottleConfig(default_interval=10.0)
+        throttled = ThrottledTransport(mock_transport, config)
+
+        await throttled.send(
+            "response.reasoning_summary_text.delta", 1, 2, {"delta": "Good"}
+        )
+        mock_transport.reset_mock()
+
+        await throttled.send(
+            "response.reasoning_summary_text.delta", 1, 2, {"delta": "思考"}
+        )
+        mock_transport.send.assert_not_called()
+
+        await throttled.send("response.output_text.delta", 1, 2, {"delta": "数据"})
+
+        calls = mock_transport.send.call_args_list
+        assert [call.args[0] for call in calls] == [
+            "response.reasoning_summary_text.delta",
+            "response.output_text.delta",
+        ]
+        assert [call.args[3]["delta"] for call in calls] == ["思考", "数据"]
+
+    @pytest.mark.asyncio
+    async def test_flush_all(self):
+        """Test flushing all buffers."""
+        mock_transport = AsyncMock(spec=EventTransport)
+        config = ThrottleConfig(default_interval=10.0)
+        throttled = ThrottledTransport(mock_transport, config)
+
+        # First event triggers immediate send
+        await throttled.send("response.output_text.delta", 1, 2, {"delta": "hello"})
+        mock_transport.reset_mock()
+
+        # Buffer more events
+        await throttled.send("response.output_text.delta", 1, 2, {"delta": " world"})
+
+        # Flush all
+        await throttled.flush_all()
+
+        # Should have sent aggregated event
+        mock_transport.send.assert_called_once()
+        call_args = mock_transport.send.call_args
+        assert call_args[0][0] == "response.output_text.delta"
+        assert call_args[0][3]["delta"] == " world"
+
+    @pytest.mark.asyncio
+    async def test_buffer_size_triggers_immediate_send(self):
+        """Test that exceeding buffer size triggers immediate send."""
+        mock_transport = AsyncMock(spec=EventTransport)
+        config = ThrottleConfig(default_interval=10.0, max_buffer_size=10)
+        throttled = ThrottledTransport(mock_transport, config)
+
+        # First event triggers immediate send
+        await throttled.send("response.output_text.delta", 1, 2, {"delta": "hi"})
+        mock_transport.reset_mock()
+
+        # Send event that exceeds buffer size
+        await throttled.send(
+            "response.output_text.delta", 1, 2, {"delta": "this is a long text"}
+        )
+
+        # Should have sent immediately due to buffer size
+        mock_transport.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_tool_argument_coalescing_preserves_every_character_once(self):
+        """Large tool arguments should be compacted without loss or duplication."""
+        mock_transport = AsyncMock(spec=EventTransport)
+        event_type = "response.function_call_arguments.delta"
+        throttled = ThrottledTransport(
+            mock_transport,
+            ThrottleConfig(
+                default_interval=60.0,
+                max_buffer_size=4096,
+                throttled_events={event_type},
+            ),
+        )
+        content = "".join(str(index % 10) for index in range(100_000))
+        chunks = [content[index : index + 97] for index in range(0, len(content), 97)]
+
+        emitted_length = 0
+        for chunk in chunks:
+            emitted_length += len(chunk)
+            await throttled.send(
+                event_type,
+                1,
+                2,
+                {
+                    "item_id": "call_write",
+                    "delta": chunk,
+                    "arguments_summary": {
+                        "file_path": "/tmp/report.md",
+                        "content": {"omitted": True, "length": emitted_length},
+                    },
+                },
+            )
+
+        await throttled.send(
+            "response.function_call_arguments.done",
+            1,
+            2,
+            {
+                "item_id": "call_write",
+                "arguments": "",
+                "arguments_summary": {
+                    "file_path": "/tmp/report.md",
+                    "content": {"omitted": True, "length": len(content)},
+                },
+            },
+        )
+
+        delta_calls = [
+            call
+            for call in mock_transport.send.call_args_list
+            if call.args[0] == event_type
+        ]
+        streamed_content = "".join(call.args[3]["delta"] for call in delta_calls)
+
+        assert streamed_content == content
+        assert len(delta_calls) < len(chunks) // 10
+        assert delta_calls[-1].args[3]["arguments_summary"]["content"]["length"] == len(
+            content
+        )
+        assert mock_transport.send.call_args_list[-1].args[0] == (
+            "response.function_call_arguments.done"
+        )
+
+    @pytest.mark.asyncio
+    async def test_parallel_tool_argument_streams_are_not_merged(self):
+        """Parallel calls must retain independent ordered argument streams."""
+        mock_transport = AsyncMock(spec=EventTransport)
+        event_type = "response.function_call_arguments.delta"
+        throttled = ThrottledTransport(
+            mock_transport,
+            ThrottleConfig(
+                default_interval=60.0,
+                max_buffer_size=100_000,
+                throttled_events={event_type},
+            ),
+        )
+
+        for call_id, delta in [
+            ("call_a", "A1"),
+            ("call_b", "B1"),
+            ("call_a", "A2"),
+            ("call_b", "B2"),
+        ]:
+            await throttled.send(
+                event_type,
+                1,
+                2,
+                {
+                    "item_id": call_id,
+                    "delta": delta,
+                    "arguments_summary": {"call_id": call_id, "latest": delta},
+                },
+            )
+        await throttled.flush_all()
+
+        streamed_by_call = {"call_a": "", "call_b": ""}
+        for transport_call in mock_transport.send.call_args_list:
+            data = transport_call.args[3]
+            streamed_by_call[data["item_id"]] += data["delta"]
+            assert data["arguments_summary"]["call_id"] == data["item_id"]
+
+        assert streamed_by_call == {
+            "call_a": "A1A2",
+            "call_b": "B1B2",
+        }
+
+    @pytest.mark.asyncio
+    async def test_failed_flush_keeps_buffer_for_retry(self):
+        """A failed underlying send must not discard buffered events."""
+        mock_transport = AsyncMock(spec=EventTransport)
+        mock_transport.send.side_effect = RuntimeError("transport failed")
+        event_type = "response.function_call_arguments.delta"
+        throttled = ThrottledTransport(
+            mock_transport,
+            ThrottleConfig(
+                default_interval=60.0,
+                throttled_events={event_type},
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="transport failed"):
+            await throttled.send(
+                event_type,
+                1,
+                2,
+                {"item_id": "call_write", "delta": "payload"},
+            )
+
+        mock_transport.send.side_effect = None
+        mock_transport.reset_mock()
+        await throttled.flush_all()
+
+        mock_transport.send.assert_awaited_once()
+        assert mock_transport.send.await_args.args[3]["delta"] == "payload"
+
+
+class TestRedisTransport:
+    """Tests for RedisTransport."""
+
+    @pytest.mark.asyncio
+    async def test_send_publishes_to_redis(self):
+        """Test that send publishes event to Redis channel."""
+        mock_storage = AsyncMock()
+        transport = RedisTransport(mock_storage)
+
+        await transport.send(
+            "response.created",
+            task_id=1,
+            subtask_id=2,
+            data={"test": "data"},
+            message_id=3,
+        )
+
+        mock_storage.publish_streaming_chunk.assert_called_once()
+        call_args = mock_storage.publish_streaming_chunk.call_args
+        assert call_args[0][0] == 2  # subtask_id
+        # Verify JSON contains expected fields
+        import json
+
+        published_data = json.loads(call_args[0][1])
+        assert published_data["event_type"] == "response.created"
+        assert published_data["task_id"] == 1
+        assert published_data["subtask_id"] == 2
+        assert published_data["data"] == {"test": "data"}
+        assert published_data["message_id"] == 3
+
+
+class TestResponsesAPIEmitter:
+    @pytest.mark.asyncio
+    async def test_done_merges_completion_provider_fields(self):
+        transport = GeneratorTransport()
+        emitter = EmitterBuilder().with_task(1, 2).with_transport(transport).build()
+
+        async def completion_fields():
+            return {"file_changes": {"version": 1, "file_count": 2}}
+
+        emitter.set_completion_fields_provider(completion_fields)
+
+        await emitter.done(content="done")
+
+        completed = transport.get_events()[-1][1]["response"]
+        assert completed["file_changes"] == {
+            "version": 1,
+            "file_count": 2,
+        }
+
+    @pytest.mark.asyncio
+    async def test_done_ignores_empty_completion_provider_fields(self):
+        transport = GeneratorTransport()
+        emitter = EmitterBuilder().with_task(1, 2).with_transport(transport).build()
+        emitter.set_completion_fields_provider(lambda: {})
+
+        await emitter.done(content="done")
+
+        completed = transport.get_events()[-1][1]["response"]
+        assert "file_changes" not in completed
+
+    @pytest.mark.asyncio
+    async def test_done_logs_provider_failure_and_still_emits_completion(self, caplog):
+        transport = GeneratorTransport()
+        emitter = EmitterBuilder().with_task(1, 2).with_transport(transport).build()
+
+        async def fail():
+            raise RuntimeError("snapshot failed")
+
+        emitter.set_completion_fields_provider(fail)
+
+        await emitter.done(content="done")
+
+        completed = transport.get_events()[-1][1]["response"]
+        assert completed["output"][0]["content"][0]["text"] == "done"
+        assert "Failed to collect response completion fields" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_done_consumes_completion_provider_once(self):
+        transport = GeneratorTransport()
+        emitter = EmitterBuilder().with_task(1, 2).with_transport(transport).build()
+        calls = 0
+
+        async def completion_fields():
+            nonlocal calls
+            calls += 1
+            return {"file_changes": {"version": 1}}
+
+        emitter.set_completion_fields_provider(completion_fields)
+
+        await emitter.done(content="first")
+        await emitter.done(content="second")
+
+        assert calls == 1
+
+    @pytest.mark.asyncio
+    async def test_reasoning_emits_summary_text_delta(self):
+        transport = GeneratorTransport()
+        emitter = EmitterBuilder().with_task(1, 2).with_transport(transport).build()
+
+        await emitter.reasoning("目标")
+
+        events = transport.get_events()
+        assert [event_type for event_type, _ in events] == [
+            "response.reasoning_summary_text.delta"
+        ]
+        assert events[0][1]["delta"] == "目标"
+
+    @pytest.mark.asyncio
+    async def test_mcp_tool_done_failed_emits_failed_terminal_events(self):
+        transport = GeneratorTransport()
+        emitter = EmitterBuilder().with_task(1, 2).with_transport(transport).build()
+
+        await emitter.tool_done(
+            call_id="mcp_123",
+            name="search_docs",
+            arguments={"query": "timeout"},
+            output="MCP tool 'search_docs' timed out after 180.0s",
+            tool_protocol="mcp",
+            server_label="wegent-knowledge",
+            status="failed",
+            error="MCP tool 'search_docs' timed out after 180.0s",
+        )
+
+        events = transport.get_events()
+        event_types = [event_type for event_type, _ in events]
+
+        assert event_types == [
+            "response.mcp_call_arguments.done",
+            "response.mcp_call.failed",
+            "response.output_item.done",
+        ]
+        assert (
+            events[1][1]["failure_reason"]
+            == "MCP tool 'search_docs' timed out after 180.0s"
+        )
+        assert events[2][1]["item"]["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_shell_tool_emits_output_item_lifecycle_only(self):
+        transport = GeneratorTransport()
+        emitter = EmitterBuilder().with_task(1, 2).with_transport(transport).build()
+
+        await emitter.tool_start(
+            call_id="shell_123",
+            name="exec",
+            arguments={"command": "ls -la", "timeout_seconds": 5},
+            tool_protocol="shell_call",
+        )
+        await emitter.tool_done(
+            call_id="shell_123",
+            name="exec",
+            arguments={"command": "ls -la", "timeout_seconds": 5},
+            tool_protocol="shell_call",
+        )
+
+        events = transport.get_events()
+        event_types = [event_type for event_type, _ in events]
+
+        assert event_types == [
+            "response.output_item.added",
+            "response.output_item.done",
+        ]
+        assert events[0][1]["item"]["type"] == "shell_call"
+        assert events[0][1]["item"]["action"]["commands"] == ["ls -la"]
+        assert events[1][1]["item"]["type"] == "shell_call"
+        assert events[1][1]["item"]["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_exec_tool_infers_shell_call_and_reuses_context(self):
+        transport = GeneratorTransport()
+        emitter = EmitterBuilder().with_task(1, 2).with_transport(transport).build()
+
+        await emitter.tool_start(
+            call_id="shell_456",
+            name="exec",
+            arguments={"command": "python hello.py", "timeout_seconds": 30},
+        )
+        await emitter.tool_done(
+            call_id="shell_456",
+            name="",
+            arguments=None,
+        )
+
+        events = transport.get_events()
+        assert [event_type for event_type, _ in events] == [
+            "response.output_item.added",
+            "response.output_item.done",
+        ]
+        assert events[0][1]["item"]["type"] == "shell_call"
+        assert events[1][1]["item"]["type"] == "shell_call"
+        assert events[1][1]["item"]["name"] == "exec"
+        assert events[1][1]["item"]["input"] == {
+            "command": "python hello.py",
+            "timeout_seconds": 30,
+        }
+
+    @pytest.mark.asyncio
+    async def test_mcp_tool_done_uses_cached_protocol_without_duplicate_arguments(self):
+        transport = GeneratorTransport()
+        emitter = EmitterBuilder().with_task(1, 2).with_transport(transport).build()
+
+        await emitter.tool_start(
+            call_id="mcp_456",
+            name="search_docs",
+            arguments={"query": "timeout"},
+            tool_protocol="mcp_call",
+            server_label="wegent-knowledge",
+        )
+        await emitter.tool_done(
+            call_id="mcp_456",
+            name="",
+            arguments=None,
+        )
+
+        events = transport.get_events()
+        assert [event_type for event_type, _ in events] == [
+            "response.output_item.added",
+            "response.mcp_call_arguments.done",
+            "response.mcp_call.in_progress",
+            "response.mcp_call.completed",
+            "response.output_item.done",
+        ]
+        assert events[-1][1]["item"]["type"] == "mcp_call"
+
+    @pytest.mark.asyncio
+    async def test_mcp_tool_done_completed_carries_output(self):
+        transport = GeneratorTransport()
+        emitter = EmitterBuilder().with_task(1, 2).with_transport(transport).build()
+
+        await emitter.tool_start(
+            call_id="mcp_789",
+            name="search_docs",
+            arguments={"query": "tool blocks"},
+            tool_protocol="mcp_call",
+            server_label="wegent-knowledge",
+        )
+        await emitter.tool_done(
+            call_id="mcp_789",
+            name="search_docs",
+            output='{"results":["block output"]}',
+            tool_protocol="mcp_call",
+            server_label="wegent-knowledge",
+        )
+
+        events = transport.get_events()
+        completed_event = next(
+            data
+            for event_type, data in events
+            if event_type == "response.mcp_call.completed"
+        )
+
+        assert completed_event["output"] == '{"results":["block output"]}'

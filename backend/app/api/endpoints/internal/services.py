@@ -1,0 +1,170 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Internal Service API endpoints for AI Agent tools.
+
+Provides internal API for chat_shell's expose_service tool to update task services.
+These endpoints are intended for service-to-service communication, not user access.
+"""
+
+import asyncio
+import logging
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from app.api.dependencies import get_db
+from app.models.task import TaskResource
+from app.services.chat.webpage_ws_chat_emitter import (
+    get_extended_emitter,
+    get_main_event_loop,
+)
+from app.stores.tasks import task_store
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/services", tags=["internal-services"])
+
+
+# ==================== Request/Response Schemas ====================
+
+
+class ServiceUpdateRequest(BaseModel):
+    """Request model for updating service/app fields via internal API."""
+
+    task_id: int = Field(..., description="Task ID to update")
+    name: Optional[str] = Field(None, description="Application name")
+    address: Optional[str] = Field(
+        None, description="Service address in IP:port format (e.g., '192.168.1.1:3456')"
+    )
+    previewUrl: Optional[str] = Field(None, description="Application preview URL")
+    mysql: Optional[str] = Field(
+        None, description="MySQL connection string (mysql://user:pass@host:port/db)"
+    )
+
+
+class ServiceResponse(BaseModel):
+    """Response model for service/app data."""
+
+    success: bool = True
+    app: dict[str, Any] = Field(default_factory=dict, description="App configuration")
+
+
+class HealthResponse(BaseModel):
+    """Health check response."""
+
+    status: str
+    service: str = "internal-services"
+
+
+# ==================== API Endpoints ====================
+
+
+@router.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint for internal services API."""
+    return HealthResponse(status="ok")
+
+
+@router.post("/update", response_model=ServiceResponse)
+def update_task_services(
+    request: ServiceUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Update task services/app configuration (partial merge).
+
+    This is an internal API for chat_shell's expose_service tool.
+    It merges the provided fields with existing app data.
+
+    Args:
+        request: Service update request with task_id and optional fields
+        db: Database session
+
+    Returns:
+        ServiceResponse with updated app data
+    """
+    task = task_store.get_task_by_states(
+        db,
+        task_id=request.task_id,
+        states=[TaskResource.STATE_ACTIVE],
+    )
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Get existing app data or initialize empty dict
+    # App data is stored under status.app
+    task_json = task.json or {}
+    status_data = task_json.get("status", {}) or {}
+    app_data = status_data.get("app", {}) or {}
+
+    # Merge only non-None fields from the request (exclude task_id)
+    update_data = request.model_dump(exclude_none=True, exclude={"task_id"})
+
+    if not update_data:
+        # No fields to update, just return current app data
+        return ServiceResponse(success=True, app=app_data)
+
+    app_data.update(update_data)
+
+    # Update task JSON with new app data under status.app
+    status_data["app"] = app_data
+    task_json["status"] = status_data
+    task_store.update_json(db, task=task, payload=task_json)
+
+    db.commit()
+    db.refresh(task)
+
+    logger.info(f"Updated task {request.task_id} services: {list(update_data.keys())}")
+
+    # Emit WebSocket event to notify frontend about app update
+    extended_emitter = get_extended_emitter()
+    loop = get_main_event_loop()
+    if loop and loop.is_running():
+        asyncio.run_coroutine_threadsafe(
+            extended_emitter.emit_task_app_update(request.task_id, app_data),
+            loop,
+        )
+    else:
+        logger.warning(
+            f"Cannot emit task:app_update for task {request.task_id}: event loop not running"
+        )
+
+    return ServiceResponse(success=True, app=app_data)
+
+
+@router.get("/{task_id}", response_model=ServiceResponse)
+def get_task_services(
+    task_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Get task services/app configuration.
+
+    This is an internal API for reading task app data.
+
+    Args:
+        task_id: Task ID to query
+        db: Database session
+
+    Returns:
+        ServiceResponse with app data
+    """
+    task = task_store.get_task_by_states(
+        db,
+        task_id=task_id,
+        states=[TaskResource.STATE_ACTIVE],
+    )
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # App data is stored under status.app
+    status_data = task.json.get("status", {}) if task.json else {}
+    app_data = status_data.get("app", {}) if status_data else {}
+    return ServiceResponse(success=True, app=app_data)

@@ -1,0 +1,323 @@
+import type {
+  DeviceInfo,
+  RuntimeTaskSummary,
+  ProjectWithTasks,
+  RuntimeDeviceWorkspace,
+  RuntimeTaskAddress,
+  RuntimeWorkListResponse,
+} from '@/types/api'
+import {
+  executionDeviceId,
+  resolveProjectWorkspacePath,
+  type ProjectWorkspaceRootApi,
+} from '@/lib/project-workspace'
+import { runtimeProjectToProject, runtimeProjectUiId } from '@/lib/runtime-project'
+import { isAbsoluteWorkspacePath } from '@/lib/workspace-paths'
+import {
+  normalizeAbsoluteWorkspacePath,
+  splitAbsoluteWorkspaceFilePath,
+} from '@/lib/workspace-file-contract'
+import { LOCAL_WORKBENCH_DEVICE_ALIAS, resolveLocalWorkbenchDeviceId } from '@/lib/workbench-device'
+import type { WorkspaceTarget } from '@/types/workspace-files'
+
+interface ResolveWorkspaceTargetOptions {
+  currentProject: ProjectWithTasks | null
+  api: ProjectWorkspaceRootApi
+}
+
+interface ResolveRuntimeWorkspaceContextOptions {
+  currentRuntimeTask: RuntimeTaskAddress | null
+  projects: ProjectWithTasks[]
+  runtimeWork: RuntimeWorkListResponse | null
+}
+
+interface ResolveProjectRuntimeWorkspaceTargetOptions {
+  currentProject: ProjectWithTasks | null
+  runtimeWork: RuntimeWorkListResponse | null
+  selectedDeviceWorkspaceId?: number | null
+}
+
+interface ResolveProjectRuntimeWorkspaceTargetsOptions {
+  currentProject: ProjectWithTasks | null
+  runtimeWork: RuntimeWorkListResponse | null
+}
+
+export interface RuntimeWorkspaceContext {
+  project: ProjectWithTasks | null
+  workspaceTarget: WorkspaceTarget | null
+}
+
+export interface RuntimeTaskSource {
+  workspace: RuntimeDeviceWorkspace
+  task: RuntimeTaskSummary
+}
+
+export function createLocalFileWorkspaceTarget(
+  filePath: string,
+  devices: DeviceInfo[],
+  options: { workspaceTargets?: WorkspaceTarget[]; isDirectory?: boolean } = {}
+): WorkspaceTarget | null {
+  if (!isAbsoluteWorkspacePath(filePath.trim().replace(/\\/g, '/'))) return null
+  const normalizedPath = normalizeAbsoluteWorkspacePath(
+    filePath,
+    'Workspace file path must be absolute'
+  )
+
+  const deviceId = resolveLocalWorkbenchDeviceId(devices, LOCAL_WORKBENCH_DEVICE_ALIAS)
+  if (!deviceId) return null
+
+  const matchingRoot = (options.workspaceTargets ?? [])
+    .filter(
+      target =>
+        target.deviceId === deviceId &&
+        target.workspaceSource !== 'remote' &&
+        isAbsoluteWorkspacePath(target.path.trim().replace(/\\/g, '/'))
+    )
+    .map(target => ({
+      target,
+      root: normalizeAbsoluteWorkspacePath(target.path, 'Workspace root must be absolute'),
+    }))
+    .filter(({ root }) => {
+      const windows = /^[a-z]:\//i.test(root) || root.startsWith('//')
+      const path = windows ? normalizedPath.toLowerCase() : normalizedPath
+      const comparableRoot = windows ? root.toLowerCase() : root
+      return path === comparableRoot || path.startsWith(`${comparableRoot.replace(/\/+$/, '')}/`)
+    })
+    .sort((left, right) => right.root.length - left.root.length)[0]
+  if (matchingRoot) return { ...matchingRoot.target, workspaceSource: 'local' }
+
+  return {
+    deviceId,
+    path: options.isDirectory
+      ? normalizedPath
+      : splitAbsoluteWorkspaceFilePath(normalizedPath).parentPath,
+    source: 'runtime',
+    workspaceSource: 'local',
+  }
+}
+
+export function createLocalAttachmentWorkspaceTarget(
+  filePath: string,
+  devices: DeviceInfo[]
+): WorkspaceTarget | null {
+  const normalizedPath = filePath.trim().replace(/\\/g, '/')
+  const isLocalAttachment =
+    normalizedPath.includes('/.wework/workspace/attachments/') ||
+    normalizedPath.includes('/.wegent/attachments/')
+  return isLocalAttachment ? createLocalFileWorkspaceTarget(normalizedPath, devices) : null
+}
+
+async function projectWorkspaceTarget(
+  project: ProjectWithTasks,
+  api: ProjectWorkspaceRootApi
+): Promise<WorkspaceTarget | null> {
+  const deviceId = executionDeviceId(project)
+  const workspacePath = deviceId
+    ? await resolveProjectWorkspacePath(project, deviceId, api)
+    : undefined
+  if (!deviceId || !workspacePath) return null
+  return { deviceId, path: workspacePath, source: 'project' }
+}
+
+export async function resolveWorkspaceTarget({
+  currentProject,
+  api,
+}: ResolveWorkspaceTargetOptions): Promise<WorkspaceTarget | null> {
+  if (currentProject) {
+    return projectWorkspaceTarget(currentProject, api)
+  }
+
+  return null
+}
+
+function projectDeviceWorkspaces(
+  runtimeWork: RuntimeWorkListResponse | null | undefined,
+  projectId: number | null | undefined
+): RuntimeDeviceWorkspace[] {
+  if (!projectId) return []
+  const projectWork = runtimeWork?.projects.find(
+    item => runtimeProjectUiId(item.project) === projectId
+  )
+  return projectWork?.deviceWorkspaces.filter(workspace => workspace.available) ?? []
+}
+
+function selectProjectDeviceWorkspace(
+  workspaces: RuntimeDeviceWorkspace[],
+  selectedDeviceWorkspaceId?: number | null
+): RuntimeDeviceWorkspace | null {
+  if (selectedDeviceWorkspaceId != null) {
+    return workspaces.find(workspace => workspace.id === selectedDeviceWorkspaceId) ?? null
+  }
+  return workspaces.length === 1 ? workspaces[0] : null
+}
+
+function workspaceTargetDeviceId(workspace: RuntimeDeviceWorkspace): string {
+  const remoteHostId = workspace.remoteHostId?.trim()
+  return workspace.workspaceSource === 'remote' && remoteHostId ? remoteHostId : workspace.deviceId
+}
+
+export function resolveProjectRuntimeWorkspaceTarget({
+  currentProject,
+  runtimeWork,
+  selectedDeviceWorkspaceId,
+}: ResolveProjectRuntimeWorkspaceTargetOptions): WorkspaceTarget | null {
+  const workspace = selectProjectDeviceWorkspace(
+    projectDeviceWorkspaces(runtimeWork, currentProject?.id),
+    selectedDeviceWorkspaceId
+  )
+  const workspacePath = workspace?.workspacePath.trim()
+  if (!workspace || !workspacePath) return null
+
+  return {
+    deviceId: workspaceTargetDeviceId(workspace),
+    path: workspacePath,
+    source: 'project',
+    ...(workspace.workspaceSource !== undefined
+      ? { workspaceSource: workspace.workspaceSource }
+      : {}),
+  }
+}
+
+export function resolveProjectRuntimeWorkspaceTargets({
+  currentProject,
+  runtimeWork,
+}: ResolveProjectRuntimeWorkspaceTargetsOptions): WorkspaceTarget[] {
+  return projectDeviceWorkspaces(runtimeWork, currentProject?.id).map(workspace => ({
+    deviceId: workspaceTargetDeviceId(workspace),
+    path: workspace.workspacePath,
+    source: 'project',
+    ...(workspace.workspaceSource !== undefined
+      ? { workspaceSource: workspace.workspaceSource }
+      : {}),
+  }))
+}
+
+function workspaceTargetFromRuntimeTask(
+  workspace: RuntimeDeviceWorkspace,
+  task: RuntimeTaskSummary
+): WorkspaceTarget | null {
+  const taskWorkspacePath = task.workspacePath.trim()
+  const groupWorkspacePath = workspace.workspacePath.trim()
+  const queuedIndependentWorkspace =
+    task.status === 'queued' &&
+    (task.workspaceKind === 'worktree' ||
+      workspace.workspaceKind === 'worktree' ||
+      Boolean(task.worktreeId) ||
+      Boolean(workspace.worktreeId) ||
+      (Boolean(taskWorkspacePath) &&
+        Boolean(groupWorkspacePath) &&
+        taskWorkspacePath !== groupWorkspacePath))
+  if (queuedIndependentWorkspace) return null
+
+  const resolvedWorkspacePath =
+    workspace.workspaceKind === 'worktree' || workspace.worktreeId
+      ? workspace.workspacePath
+      : task.workspacePath || workspace.workspacePath
+
+  return {
+    deviceId: workspaceTargetDeviceId(workspace),
+    path: resolvedWorkspacePath,
+    source: 'runtime',
+    taskId: task.taskId,
+    ...(workspace.workspaceSource !== undefined
+      ? { workspaceSource: workspace.workspaceSource }
+      : {}),
+  }
+}
+
+function runtimeTaskMatches(
+  address: RuntimeTaskAddress,
+  workspace: RuntimeDeviceWorkspace,
+  task: RuntimeTaskSummary
+) {
+  if (workspace.deviceId !== address.deviceId || task.taskId !== address.taskId) {
+    return false
+  }
+
+  const addressPath = address.workspacePath?.trim()
+  if (!addressPath) return true
+
+  const taskPath = task.workspacePath || workspace.workspacePath
+  return addressPath === taskPath || addressPath === workspace.workspacePath
+}
+
+export function resolveRuntimeTaskSource({
+  currentRuntimeTask,
+  runtimeWork,
+}: Pick<
+  ResolveRuntimeWorkspaceContextOptions,
+  'currentRuntimeTask' | 'runtimeWork'
+>): RuntimeTaskSource | null {
+  if (!currentRuntimeTask) return null
+  for (const workspace of [
+    ...(runtimeWork?.projects.flatMap(project => project.deviceWorkspaces) ?? []),
+    ...(runtimeWork?.chats ?? []),
+  ]) {
+    const task = workspace.tasks.find(item =>
+      runtimeTaskMatches(currentRuntimeTask, workspace, item)
+    )
+    if (task) return { workspace, task }
+  }
+  return null
+}
+
+export function resolveRuntimeWorkspaceContext({
+  currentRuntimeTask,
+  projects,
+  runtimeWork,
+}: ResolveRuntimeWorkspaceContextOptions): RuntimeWorkspaceContext | null {
+  if (!currentRuntimeTask) return null
+
+  for (const projectWork of runtimeWork?.projects ?? []) {
+    for (const workspace of projectWork.deviceWorkspaces) {
+      const task = workspace.tasks.find(item =>
+        runtimeTaskMatches(currentRuntimeTask, workspace, item)
+      )
+      if (!task) continue
+
+      return {
+        project:
+          projects.find(project => project.id === runtimeProjectUiId(projectWork.project)) ??
+          runtimeProjectToProject(projectWork),
+        workspaceTarget: workspaceTargetFromRuntimeTask(workspace, task),
+      }
+    }
+  }
+
+  for (const workspace of runtimeWork?.chats ?? []) {
+    const task = workspace.tasks.find(item =>
+      runtimeTaskMatches(currentRuntimeTask, workspace, item)
+    )
+    if (!task) continue
+
+    return {
+      project: null,
+      workspaceTarget: workspaceTargetFromRuntimeTask(workspace, task),
+    }
+  }
+
+  const workspacePath = currentRuntimeTask.workspacePath?.trim()
+  if (!workspacePath) return null
+  if (
+    (currentRuntimeTask.workspaceKind === 'worktree' || currentRuntimeTask.worktreeId) &&
+    !currentRuntimeTask.issueExecution
+  ) {
+    return null
+  }
+
+  return {
+    project: null,
+    workspaceTarget: {
+      deviceId: currentRuntimeTask.deviceId,
+      path: workspacePath,
+      source: 'runtime',
+      taskId: currentRuntimeTask.taskId,
+    },
+  }
+}
+
+export function workspaceTargetKey(target: WorkspaceTarget | null): string {
+  return target
+    ? `${target.deviceId}:${target.path}:${target.source}:${target.taskId ?? ''}:${target.workspaceSource ?? ''}`
+    : ''
+}

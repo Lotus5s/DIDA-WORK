@@ -1,0 +1,694 @@
+import { spawn } from 'node:child_process'
+import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path'
+import semver from 'semver'
+import { runtimeNodeArgs } from './electron-node-runtime.js'
+import * as tar from 'tar'
+import { materializeBundledRuntimes } from './bundled-runtime-materializer.js'
+import {
+  selectBundledDshRuntimeMatching,
+  type BundledDshRuntime,
+  type CommandRunner,
+} from './core-dsh-runtime.js'
+
+export const WORKBENCH_DSH_VERSION = '0.2.0-rc.2'
+
+export function workbenchClientRendererPackage(versionRequirement: string): string {
+  return semver.satisfies(WORKBENCH_DSH_VERSION, versionRequirement, { includePrerelease: true })
+    ? '@deepseek-ai/dsh-client-ui-renderer'
+    : '@deepseek-ai/dsh-client-runtime'
+}
+
+export interface WorkbenchAppManifest {
+  name: string
+  displayName: string
+  version: string
+  type: 'deepseek-harness-plugin-bundle'
+  description: string
+  packages?: Array<{ name: string; role: string; path: string }>
+  entry: {
+    installPackage: string
+    profile: string
+  }
+  requirements: {
+    dsh: string
+    node: string
+  }
+  plugins?: Array<{
+    spec: string
+    path?: string
+  }>
+  /**
+   * Capability requests. Declaring one here grants it: DIDA Work does not gate
+   * these on install provenance, and the Smart App decides when to use them.
+   */
+  capabilities?: {
+    decisionModel?: boolean
+  }
+}
+
+export interface PrepareWorkbenchDshOptions {
+  runtimeRoot: string
+  dataDirectory: string
+  installationId: string
+  packagePath: string
+  manifest: WorkbenchAppManifest
+  environment: NodeJS.ProcessEnv
+  port: number
+  modelBaseUrl?: string | null
+  contextBaseUrl?: string | null
+  contextToken?: string | null
+  decisionBaseUrl?: string | null
+  decisionProtocolVersion?: 1 | null
+  includeElectronHostBridge?: boolean
+  run?: CommandRunner
+}
+
+export interface WorkbenchDshLaunch {
+  command: string
+  entry: string
+  args: string[]
+  cwd: string
+  dshHome: string
+  environment: NodeJS.ProcessEnv
+  profile: string
+  url: string
+  version: string
+  sourceFingerprint: string
+}
+
+export interface WorkbenchProjectPnpmCommand {
+  command: string
+  argsPrefix: string[]
+  environment: NodeJS.ProcessEnv
+}
+
+export interface ResolveWorkbenchProjectPnpmOptions {
+  runtimeRoot: string
+  environment: NodeJS.ProcessEnv
+  versionRequirement?: string
+}
+
+export async function resolveWorkbenchProjectPnpmCommand(
+  options: ResolveWorkbenchProjectPnpmOptions
+): Promise<WorkbenchProjectPnpmCommand> {
+  const runtime = await resolveWorkbenchRuntime(
+    options,
+    options.versionRequirement ?? WORKBENCH_DSH_VERSION
+  )
+  const nodeCommand = options.environment.WEWORK_NODE_PATH?.trim() || 'node'
+  const pnpmEntry = join(runtime.root, 'node_modules', 'pnpm', 'bin', 'pnpm.cjs')
+  await readFile(pnpmEntry)
+  const environment = withRuntimePath(options.environment, runtime.root, nodeCommand)
+  return {
+    command: nodeCommand,
+    argsPrefix: runtimeNodeArgs(environment, [pnpmEntry]),
+    environment,
+  }
+}
+
+export async function prepareWorkbenchDshLaunch(
+  options: PrepareWorkbenchDshOptions
+): Promise<WorkbenchDshLaunch> {
+  const runtime = await resolveWorkbenchRuntime(options, options.manifest.requirements.dsh)
+  validateRequirements(options.manifest, runtime)
+  const nodeCommand = options.environment.WEWORK_NODE_PATH?.trim() || 'node'
+  const dshHome = resolve(
+    options.dataDirectory,
+    'harness-apps',
+    'instances',
+    safeName(options.installationId)
+  )
+  const packages = await prepareInstanceBundle(options, runtime, dshHome)
+  await prepareProfile(dshHome, options.manifest.entry.profile)
+  const environment = runtimeEnvironment(
+    options.environment,
+    runtime.root,
+    dshHome,
+    nodeCommand,
+    options
+  )
+  const run = options.run ?? runCommand
+  await installPlugins(
+    runtime,
+    dshHome,
+    options.manifest.entry.profile,
+    packages,
+    nodeCommand,
+    environment,
+    run
+  )
+  if (runtime.version === WORKBENCH_DSH_VERSION) {
+    environment.WEWORK_DSH_BROWSER_AUTH = '1'
+    await installPlugins(
+      runtime,
+      dshHome,
+      options.manifest.entry.profile,
+      [join(runtime.pluginsRoot, 'wework-browser-auth')],
+      nodeCommand,
+      environment,
+      run
+    )
+  }
+  if (options.includeElectronHostBridge !== false) {
+    // The workbench is an isolated harness profile. Without the electron-host
+    // plugin its DSH client has no route to the scoped host pipe, so calling
+    // /wework/electron-host/v1/invoke hits a plain page and every capability
+    // (including dshCapture.*) silently degrades. Install the trusted host bridge
+    // into the profile so the workbench can reach the owner-scoped capabilities.
+    const hostPluginPath = join(runtime.pluginsRoot, 'wework-electron-host')
+    const corePluginsRoot = options.environment.WEWORK_CORE_PLUGIN_ROOT?.trim()
+    const resolvedHostPluginPath = (await isDirectory(hostPluginPath))
+      ? hostPluginPath
+      : corePluginsRoot && (await isDirectory(join(corePluginsRoot, 'wework-electron-host')))
+        ? join(corePluginsRoot, 'wework-electron-host')
+        : null
+    if (!resolvedHostPluginPath) {
+      throw new Error(
+        'Workbench Smart App runtime requires the trusted wework-electron-host plugin'
+      )
+    }
+    await installPlugins(
+      runtime,
+      dshHome,
+      options.manifest.entry.profile,
+      [resolvedHostPluginPath],
+      nodeCommand,
+      environment,
+      run
+    )
+  }
+  await installPluginSpecs(
+    runtime,
+    dshHome,
+    options.manifest.entry.profile,
+    options.manifest.plugins ?? [],
+    nodeCommand,
+    environment,
+    run
+  )
+  if (options.contextBaseUrl && options.contextToken) {
+    await installPlugins(
+      runtime,
+      dshHome,
+      options.manifest.entry.profile,
+      [
+        join(runtime.pluginsRoot, 'wework-user-context'),
+        join(runtime.pluginsRoot, 'wework-model-context'),
+      ],
+      nodeCommand,
+      environment,
+      run
+    )
+  }
+  return {
+    command: nodeCommand,
+    entry: runtime.entry,
+    args: runtimeNodeArgs(environment, [
+      runtime.entry,
+      '--profile',
+      options.manifest.entry.profile,
+      '--no-open',
+      '--port',
+      String(options.port),
+    ]),
+    cwd: runtime.root,
+    dshHome,
+    environment,
+    profile: options.manifest.entry.profile,
+    url: `http://127.0.0.1:${options.port}/`,
+    version: runtime.version,
+    sourceFingerprint: runtime.sourceFingerprint,
+  }
+}
+
+async function resolveWorkbenchRuntime(
+  options: ResolveWorkbenchProjectPnpmOptions,
+  versionRequirement: string
+): Promise<BundledDshRuntime> {
+  const resources = options.environment.WEWORK_HARNESS_RESOURCE_ROOT?.trim()
+  if (resources) {
+    await materializeBundledRuntimes(resources, options.runtimeRoot, ['workbench'], {
+      versionRequirement,
+    })
+  }
+  return selectBundledDshRuntimeMatching(options.runtimeRoot, 'workbench', versionRequirement)
+}
+
+function validateRequirements(manifest: WorkbenchAppManifest, runtime: BundledDshRuntime): void {
+  if (
+    !semver.satisfies(runtime.version, manifest.requirements.dsh, {
+      includePrerelease: true,
+    })
+  ) {
+    throw new Error(
+      `Smart app requires DeepSeek Harness ${manifest.requirements.dsh}, but DIDA Work provides ${runtime.version}`
+    )
+  }
+  const nodeVersion = process.versions.node
+  if (
+    !semver.satisfies(nodeVersion, manifest.requirements.node, {
+      includePrerelease: true,
+    })
+  ) {
+    throw new Error(
+      `Smart app requires Node ${manifest.requirements.node}, but DIDA Work provides ${nodeVersion}`
+    )
+  }
+}
+
+async function prepareInstanceBundle(
+  options: PrepareWorkbenchDshOptions,
+  runtime: BundledDshRuntime,
+  dshHome: string
+): Promise<string[]> {
+  const destination = join(dshHome, 'wework-package')
+  await rm(destination, { recursive: true, force: true })
+  await mkdir(destination, { recursive: true, mode: 0o700 })
+  await copyDirectoryContents(resolve(options.packagePath), destination)
+  const packages = await materializeManifestPackages(options.manifest, destination)
+  if (options.modelBaseUrl?.trim()) {
+    await writeModelSettings(dshHome, options.modelBaseUrl)
+    await patchModelProvider(
+      join(destination, options.manifest.entry.installPackage, 'cordis.patch.yml')
+    )
+  }
+  await assertPluginDirectories(packages)
+  await assertPluginDirectories(
+    options.contextBaseUrl && options.contextToken
+      ? [
+          join(runtime.pluginsRoot, 'wework-user-context'),
+          join(runtime.pluginsRoot, 'wework-model-context'),
+        ]
+      : []
+  )
+  return packages
+}
+
+export async function materializeManifestPackages(
+  manifest: WorkbenchAppManifest,
+  root: string
+): Promise<string[]> {
+  const installPackage = join(root, manifest.entry.installPackage)
+  if (await isDirectory(installPackage)) return [installPackage]
+  const descriptors = manifest.packages ?? []
+  if (!descriptors.length) {
+    throw new Error(`Smart app install package is missing: ${manifest.entry.installPackage}`)
+  }
+  const archives = await packageArchives(root)
+  const paths: string[] = []
+  for (const descriptor of [...descriptors].sort(
+    (left, right) =>
+      Number(left.role === 'profile-bundle') - Number(right.role === 'profile-bundle')
+  )) {
+    const archive = archives.get(descriptor.name)
+    if (!archive) throw new Error(`Smart app npm package is missing: ${descriptor.name}`)
+    const destination = join(root, descriptor.path)
+    await rm(destination, { recursive: true, force: true })
+    await mkdir(destination, { recursive: true, mode: 0o700 })
+    await tar.x({ file: archive, cwd: destination, strip: 1 })
+    paths.push(destination)
+  }
+  if (!(await isDirectory(installPackage))) {
+    throw new Error('Smart app profile bundle was not materialized')
+  }
+  return paths
+}
+
+async function packageArchives(root: string): Promise<Map<string, string>> {
+  const archives = new Map<string, string>()
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith('.tgz')) continue
+    const path = join(root, entry.name)
+    const name = await npmArchiveName(path)
+    if (archives.has(name)) throw new Error(`Smart app npm package is duplicated: ${name}`)
+    archives.set(name, path)
+  }
+  return archives
+}
+
+async function npmArchiveName(path: string): Promise<string> {
+  let packageName: string | null = null
+  await tar.t({
+    file: path,
+    onReadEntry: entry => {
+      if (entry.path !== 'package/package.json') return
+      const chunks: Buffer[] = []
+      entry.on('data', chunk => chunks.push(Buffer.from(chunk)))
+      entry.on('end', () => {
+        const value = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          name?: unknown
+        }
+        if (typeof value.name === 'string') packageName = value.name
+      })
+    },
+  })
+  if (!packageName) throw new Error(`Smart app npm package has no package name: ${basename(path)}`)
+  return packageName
+}
+
+async function prepareProfile(dshHome: string, profile: string): Promise<void> {
+  const profileRoot = profileDirectory(dshHome, profile)
+  await rm(profileRoot, { recursive: true, force: true })
+  await mkdir(profileRoot, { recursive: true, mode: 0o700 })
+  await writeFile(
+    join(profileRoot, 'package.json'),
+    `${JSON.stringify(
+      {
+        name: `dsh-profile-${profile}`,
+        private: true,
+        dependencies: {},
+        dsh: {
+          profile: {
+            bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],
+          },
+        },
+      },
+      null,
+      2
+    )}\n`,
+    { mode: 0o600 }
+  )
+  await writeFile(join(profileRoot, 'cordis.yml'), '[]\n', { mode: 0o600 })
+  await writeFile(join(profileRoot, 'cordis.patch.yml'), '[]\n', {
+    mode: 0o600,
+  })
+  await writeFile(
+    join(profileRoot, 'pnpm-workspace.yaml'),
+    'packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n',
+    { mode: 0o600 }
+  )
+}
+
+function profileDirectory(dshHome: string, profile: string): string {
+  return join(dshHome, 'profiles', profile)
+}
+
+export interface WorkbenchProfileManifest {
+  name?: string
+  private?: boolean
+  dependencies?: Record<string, string>
+  dsh?: {
+    profile?: {
+      bundles?: string[]
+    }
+  }
+  [key: string]: unknown
+}
+
+async function installPlugins(
+  runtime: BundledDshRuntime,
+  dshHome: string,
+  profile: string,
+  packages: string[],
+  nodeCommand: string,
+  environment: NodeJS.ProcessEnv,
+  run: CommandRunner
+): Promise<void> {
+  if (!packages.length) return
+  await addProfilePackages(
+    runtime,
+    dshHome,
+    profile,
+    packages.map(path => `file:${path}`),
+    nodeCommand,
+    environment,
+    run
+  )
+}
+
+async function installPluginSpecs(
+  runtime: BundledDshRuntime,
+  dshHome: string,
+  profile: string,
+  plugins: NonNullable<WorkbenchAppManifest['plugins']>,
+  nodeCommand: string,
+  environment: NodeJS.ProcessEnv,
+  run: CommandRunner
+): Promise<void> {
+  if (!plugins.length) return
+  const packageRoot = join(dshHome, 'wework-package')
+  const specs = plugins.map(plugin => {
+    if (!plugin.path) return plugin.spec
+    const path = resolve(packageRoot, plugin.path)
+    if (!path.startsWith(`${packageRoot}${sep}`)) {
+      throw new Error('Smart app plugin path escapes the package directory')
+    }
+    return `file:${path}`
+  })
+  await assertPluginDirectories(
+    plugins.flatMap(plugin => (plugin.path ? [resolve(packageRoot, plugin.path)] : []))
+  )
+  await addProfilePackages(runtime, dshHome, profile, specs, nodeCommand, environment, run)
+}
+
+async function addProfilePackages(
+  runtime: BundledDshRuntime,
+  dshHome: string,
+  profile: string,
+  specs: string[],
+  nodeCommand: string,
+  environment: NodeJS.ProcessEnv,
+  run: CommandRunner
+): Promise<void> {
+  if (!specs.length) return
+  const profileDir = profileDirectory(dshHome, profile)
+  const pnpmEntry = join(runtime.root, 'node_modules', 'pnpm', 'bin', 'pnpm.cjs')
+  await readFile(pnpmEntry)
+  const before = await readWorkbenchProfileManifest(profileDir)
+  await run(
+    nodeCommand,
+    runtimeNodeArgs(environment, [
+      pnpmEntry,
+      '--store-dir',
+      join(dshHome, 'pnpm-store'),
+      'add',
+      '--ignore-scripts',
+      ...specs,
+    ]),
+    { cwd: profileDir, env: environment }
+  )
+  await reconcileProfileBundles(profileDir, before)
+}
+
+export async function reconcileProfileBundles(
+  profileDir: string,
+  before: WorkbenchProfileManifest
+): Promise<void> {
+  const after = await readWorkbenchProfileManifest(profileDir)
+  const beforeDeps = new Set(Object.keys(before.dependencies ?? {}))
+  const dependencyNames = Object.keys(after.dependencies ?? {})
+  const dependencySet = new Set(dependencyNames)
+  const bundleDependencies = new Set<string>()
+  for (const packageName of dependencyNames) {
+    if (await declaresProfilePatch(profileDir, packageName)) bundleDependencies.add(packageName)
+  }
+  const bundles = [...(after.dsh?.profile?.bundles ?? [])]
+  let changed = false
+  for (const packageName of dependencyNames) {
+    if (bundleDependencies.has(packageName) && !bundles.includes(packageName)) {
+      bundles.push(packageName)
+      changed = true
+    }
+  }
+  for (const packageName of [...bundles]) {
+    const wasDependency = beforeDeps.has(packageName) || dependencySet.has(packageName)
+    if (wasDependency && !bundleDependencies.has(packageName)) {
+      bundles.splice(bundles.indexOf(packageName), 1)
+      changed = true
+    }
+  }
+  if (!changed) return
+  const dsh = after.dsh ?? {}
+  dsh.profile = dsh.profile ?? {}
+  dsh.profile.bundles = bundles
+  after.dsh = dsh
+  await writeFile(join(profileDir, 'package.json'), `${JSON.stringify(after, null, 2)}\n`, {
+    mode: 0o600,
+  })
+}
+
+async function readWorkbenchProfileManifest(profileDir: string): Promise<WorkbenchProfileManifest> {
+  return JSON.parse(
+    await readFile(join(profileDir, 'package.json'), 'utf8')
+  ) as WorkbenchProfileManifest
+}
+
+async function declaresProfilePatch(profileDir: string, packageName: string): Promise<boolean> {
+  try {
+    const manifest = JSON.parse(
+      await readFile(
+        join(profileDir, 'node_modules', ...packageName.split('/'), 'package.json'),
+        'utf8'
+      )
+    ) as { dsh?: { bundle?: { patch?: unknown } } }
+    return manifest.dsh?.bundle?.patch !== undefined
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    return false
+  }
+}
+
+async function patchModelProvider(path: string): Promise<void> {
+  const source = await readFile(path, 'utf8')
+  await writeFile(path, injectModelProviderPatch(source), {
+    mode: 0o600,
+  })
+}
+
+export function injectModelProviderPatch(source: string): string {
+  let provider = false
+  let model = false
+  const patched = source.split('\n').map(line => {
+    const trimmed = line.trimStart()
+    const indentation = line.slice(0, line.length - trimmed.length)
+    if (!provider && trimmed.startsWith('provider:')) {
+      provider = true
+      return `${indentation}provider: wework-local`
+    }
+    if (!model && trimmed.startsWith('model:')) {
+      model = true
+      return `${indentation}model: wework-selected`
+    }
+    return line
+  })
+  if (provider !== model) {
+    throw new Error('Smart app exposes an incomplete provider/model pair')
+  }
+  if (!provider) {
+    const existing = patched.join('\n').trim()
+    const prefix = existing && existing !== '[]' ? `${existing}\n` : ''
+    return `${prefix}${[
+      '- id: agent-default-model',
+      '  config:',
+      '    provider: wework-local',
+      '    model: wework-selected',
+    ].join('\n')}\n`
+  }
+  return `${patched.join('\n').replace(/\n+$/, '')}\n`
+}
+
+async function writeModelSettings(dshHome: string, baseUrl: string): Promise<void> {
+  await writeFile(
+    join(dshHome, 'settings.yaml'),
+    `llm-pi-ai:
+  providers:
+    wework-local:
+      displayName: DIDA Work
+      apiKeyEnv: WEWORK_HARNESS_API_KEY
+      api: anthropic-messages
+      baseURL: ${baseUrl.replace(/\/+$/, '')}
+      models:
+        - id: wework-selected
+          name: DIDA Work selected model
+`,
+    { mode: 0o600 }
+  )
+}
+
+function runtimeEnvironment(
+  environment: NodeJS.ProcessEnv,
+  runtimeRoot: string,
+  dshHome: string,
+  nodeCommand: string,
+  options: PrepareWorkbenchDshOptions
+): NodeJS.ProcessEnv {
+  return {
+    ...withRuntimePath(environment, runtimeRoot, nodeCommand),
+    DSH_HOME: dshHome,
+    ...(options.modelBaseUrl ? { WEWORK_HARNESS_API_KEY: 'wework-local-router' } : {}),
+    ...(options.contextBaseUrl ? { WEWORK_HARNESS_CONTEXT_BASE_URL: options.contextBaseUrl } : {}),
+    ...(options.contextToken ? { WEWORK_HARNESS_CONTEXT_TOKEN: options.contextToken } : {}),
+    // The decision route is injected as its own capability. Host-controlled
+    // values win over anything already present in the inherited environment,
+    // so a Smart app package cannot pre-seed a hostile router address.
+    ...(options.decisionBaseUrl
+      ? {
+          WEWORK_DECISION_ROUTER_BASE_URL: options.decisionBaseUrl,
+          WEWORK_DECISION_ROUTER_KEY: 'wework-local-router',
+          WEWORK_DECISION_ROUTER_PROTOCOL_VERSION: String(options.decisionProtocolVersion ?? 1),
+        }
+      : {}),
+  }
+}
+
+function withRuntimePath(
+  environment: NodeJS.ProcessEnv,
+  runtimeRoot: string,
+  nodeCommand: string
+): NodeJS.ProcessEnv {
+  const pathEntries = [join(runtimeRoot, 'node_modules', '.bin')]
+  if (isAbsolute(nodeCommand)) pathEntries.push(dirname(nodeCommand))
+  if (environment.PATH) pathEntries.push(environment.PATH)
+  return { ...environment, PATH: pathEntries.join(delimiter) }
+}
+
+function runCommand(
+  command: string,
+  args: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv }
+): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(command, args, {
+      ...options,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', chunk => {
+      stdout += String(chunk)
+    })
+    child.stderr.on('data', chunk => {
+      stderr += String(chunk)
+    })
+    child.once('error', reject)
+    child.once('exit', code => {
+      if (code === 0) {
+        resolvePromise()
+        return
+      }
+      reject(
+        new Error(
+          `DeepSeek Harness rejected Smart app packages (${code ?? 'unknown'}): ${stdout.trim()}${stdout.trim() && stderr.trim() ? '\n' : ''}${stderr.trim()}`
+        )
+      )
+    })
+  })
+}
+
+async function assertPluginDirectories(paths: string[]): Promise<void> {
+  for (const path of paths) {
+    await readFile(join(path, 'package.json'))
+  }
+}
+
+async function copyDirectoryContents(source: string, destination: string): Promise<void> {
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) {
+      throw new Error('Smart app package contains a symbolic link')
+    }
+    await cp(join(source, entry.name), join(destination, entry.name), {
+      recursive: true,
+    })
+  }
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function safeName(value: string): string {
+  const safe = value
+    .trim()
+    .replace(/[^0-9A-Za-z.-]/g, '-')
+    .slice(0, 80)
+  if (!safe) throw new Error('Smart app installation ID is invalid')
+  return safe
+}

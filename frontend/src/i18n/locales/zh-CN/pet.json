@@ -1,0 +1,94 @@
+{
+  "title": "我的宠物",
+  "stages": {
+    "baby": "幼年期",
+    "growing": "成长期",
+    "mature": "成熟期"
+  },
+  "stats": {
+    "experience": "经验值",
+    "chats": "对话次数",
+    "streak": "连续使用",
+    "days": "天",
+    "stage": "阶段"
+  },
+  "settings": {
+    "enable": "显示宠物",
+    "name": "宠物名称",
+    "name_placeholder": "输入宠物名称",
+    "reset": "重置宠物",
+    "reset_confirm": "确定要重置宠物吗？所有成长数据将被清除。",
+    "save": "保存更改",
+    "no_pet": "暂无宠物数据"
+  },
+  "notifications": {
+    "evolved": "恭喜！你的宠物进化到了{{stage}}！",
+    "streak_milestone": "连续使用{{days}}天！继续保持！"
+  },
+  "panel": {
+    "greeting": {
+      "morning": "早上好！",
+      "afternoon": "下午好！",
+      "evening": "晚上好！"
+    },
+    "exp": {
+      "total": "总经验：{{exp}}"
+    },
+    "tasks": {
+      "running": "{{count}} 个任务进行中",
+      "unread": "{{count}} 条未读消息"
+    },
+    "allClear": "所有任务已完成！",
+    "promptDraft": {
+      "cta": "帮我记住这种协作方式",
+      "subtext": "将当前对话提炼成提示词草案"
+    }
+  },
+  "promptDraft": {
+    "hint": "要帮你总结一下吗？",
+    "dialogTitle": "提炼当前对话为提示词",
+    "dialogDescription": "从当前会话中提炼可复用规则，生成可继续微调的提示词草案。",
+    "modelLabel": "模型",
+    "modelPlaceholder": "使用默认模型",
+    "modelSearch": "搜索模型...",
+    "noModelFound": "未找到模型",
+    "useDefaultModel": "使用默认模型",
+    "loading": "正在整理这段对话里的协作习惯和方法...",
+    "resultTitle": "标题",
+    "resultPrompt": "Prompt",
+    "versions": "版本记录",
+    "currentVersion": "当前版本",
+    "currentVersionLabel": "当前版本会作为后续重新生成和微调的基准。",
+    "keepOld": "保留旧版",
+    "useNew": "采用新版",
+    "rollback": "回滚到此版本",
+    "compareToCurrent": "与当前版本对比",
+    "generate": "开始生成",
+    "regenerate": "重新生成",
+    "copyPrompt": "复制提示词",
+    "copied": "已复制",
+    "clear": "清空草案",
+    "close": "关闭",
+    "generateFailed": "提示词生成失败",
+    "copySuccess": "提示词已复制",
+    "copyFailed": "复制提示词失败",
+    "source": {
+      "initial": "首次生成",
+      "regenerate": "重新生成",
+      "rollback": "回滚"
+    },
+    "compare": {
+      "title": "重新生成结果对比",
+      "historyTitle": "历史版本对比",
+      "summary": "变更统计",
+      "previous": "上一版",
+      "next": "新版",
+      "current": "当前版本",
+      "selected": "所选历史版本",
+      "diff": "差异视图",
+      "empty": "暂无可对比内容",
+      "cancel": "取消对比",
+      "rollbackToSelected": "回滚到所选版本"
+    }
+  }
+}

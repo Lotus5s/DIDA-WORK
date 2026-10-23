@@ -1,0 +1,476 @@
+---
+sidebar_position: 1
+---
+
+# Agent Settings Guide
+
+This guide covers everything you need to configure AI agents in Wegent through the Web interface. An Agent combines Bots, collaboration modes, and AI models to accomplish tasks.
+
+---
+
+## 📋 Table of Contents
+
+- [Overview](#-overview)
+- [Agents in collaboration projects](#-agents-in-collaboration-projects)
+- [Accessing Agent Settings](#-accessing-agent-settings)
+- [Creating an Agent](#-creating-an-agent)
+- [Shared Base Capabilities](#-shared-base-capabilities)
+- [Configuring Bots](#-configuring-bots)
+- [Collaboration Modes](#-collaboration-modes)
+- [Model Configuration](#-model-configuration)
+- [MCP Tools & Skills](#-mcp-tools--skills)
+- [Best Practices](#-best-practices)
+- [FAQ](#-faq)
+
+---
+
+## 🎯 Overview
+
+### What is an Agent?
+
+An **Agent** is your AI assistant in Wegent. It can:
+
+- Execute development tasks
+- Answer questions
+- Review code
+- Generate documentation
+- And much more...
+
+### Architecture
+
+```
+Agent = Bot(s) + Collaboration Mode
+
+Bot = Executor + Model + Prompt + Tools
+```
+
+| Component    | Description                | Example                  |
+| ------------ | -------------------------- | ------------------------ |
+| **Agent**    | User-facing AI assistant   | "Code Assistant"         |
+| **Bot**      | Building block of an Agent | "Frontend Developer Bot" |
+| **Executor** | Runtime environment        | ClaudeCode, Dify, Chat   |
+| **Model**    | AI brain                   | Claude Sonnet 4, GPT-4o  |
+| **Prompt**   | Personality & expertise    | System instructions      |
+| **Tools**    | External capabilities      | GitHub MCP, Skills       |
+
+---
+
+## 🧩 Agents in collaboration projects
+
+Wegent Web and Wework use the same agent creation form in collaboration projects. The form keeps four independent dimensions:
+
+| Dimension             | Meaning                                    | Examples                                                  |
+| --------------------- | ------------------------------------------ | --------------------------------------------------------- |
+| **Agent source**      | Where the agent definition is stored       | Current project, shared agent                             |
+| **Hosting mode**      | Which class of environment hosts the agent | Device execution, Wegent-managed                          |
+| **Executor type**     | Which runtime the agent uses               | Codex, Claude Code                                        |
+| **Capability source** | How Skills, Plugins, and MCP are obtained  | Follow the runtime device, manually selected capabilities |
+
+These four dimensions are independent. **Wegent-managed is a hosting mode, not an Agent source or executor type.** A shared agent retains its hosting mode, executor, and capability configuration in its own definition, while the project stores a reference to it. A shared agent may be dispatched to an eligible device or hosted by Wegent. An agent created in the current project stores its executor, model, system prompt, and capability requirements directly from the form.
+
+### Capability sources
+
+- **Follow the runtime device**: the task uses the Plugins, Skills, MCP servers, and local capabilities available to the current user on whichever device runs it. The agent is not permanently bound to the device used during creation.
+- **Manually select capabilities**: the selected Plugins, Skills, and MCP configuration are saved with the agent. Before a task starts, the system selects or prepares an eligible execution device and synchronizes those capabilities into its runtime.
+
+The system prompt editor uses the same reference interaction as the task composer. Supported capability references can be inserted with `@` or `/`. A reference expresses a capability requirement; it does not implicitly bind the agent to the current computer.
+
+---
+
+## ⚙️ Accessing Agent Settings
+
+### Via Web Interface
+
+1. Log in to Wegent
+2. Click **Settings** in the sidebar
+3. You'll see these tabs:
+
+| Tab              | Description                 |
+| ---------------- | --------------------------- |
+| **Team**         | Manage your agents          |
+| **Bot**          | Manage individual bots      |
+| **Models**       | Configure AI models         |
+| **Shells**       | Custom executors            |
+| **Skills**       | Chat and Claude Code skills |
+| **Integrations** | Git tokens                  |
+
+### Quick Access
+
+- From the chat interface, click the **gear icon** next to the agent selector
+- Or click **Manage** in the agent dropdown
+
+---
+
+## 🚀 Creating an Agent
+
+### Step 1: Open Creation Dialog
+
+1. Go to **Settings** → **Team** tab
+2. Click **New Team** button
+
+### Step 2: Basic Information
+
+| Field                   | Required | Description                         |
+| ----------------------- | -------- | ----------------------------------- |
+| **Name**                | Yes      | Agent name (e.g., "Code Assistant") |
+| **Description**         | No       | What this agent does                |
+| **Icon**                | No       | Visual identifier                   |
+| **Bind Mode**           | Yes      | Where agent appears (Chat/Code)     |
+| **Requires Repository** | No       | Need code repo to work?             |
+
+#### Bind Mode Options
+
+| Mode     | Description                            |
+| -------- | -------------------------------------- |
+| **Chat** | Appears in Chat mode for conversations |
+| **Code** | Appears in Code mode for development   |
+| **Both** | Available in both modes                |
+
+### Step 3: Select Collaboration Mode
+
+Choose how your agent works:
+
+| Mode           | Bots | Best For                |
+| -------------- | ---- | ----------------------- |
+| **Solo**       | 1    | Simple tasks, beginners |
+| **Pipeline**   | 2+   | Sequential workflows    |
+| **Coordinate** | 2+   | Parallel analysis       |
+
+The web UI currently offers Solo, Pipeline, and Coordinate when creating or editing agents.
+
+**Recommendation**: Start with **Solo** mode for simplicity.
+
+### Step 4: Configure Bot
+
+For **Solo** mode, configure the bot directly:
+
+1. **Name**: Bot identifier
+2. **Executor**: Select runtime (ClaudeCode, Chat, Dify)
+3. **Bind Model**: Select AI model
+4. **Prompt**: Define personality and expertise
+5. **MCP Config**: Add external tools (optional)
+6. **Skills**: Add capabilities (optional)
+
+For **other modes**, select existing bots or create new ones.
+
+### Step 5: Save
+
+Click **Save** to create your agent. It will appear in your agent list.
+
+---
+
+## 🧰 Shared Base Capabilities
+
+When an agent is created with the simple form, **Use shared base capabilities** is enabled by default. The custom agent reuses the general Skills, MCP tools, and plugins configured on the system default agent while keeping its own name, system prompt, model, and executor.
+
+- This works with Chat, Claude Code, Codex, and other supported executors; it does not require switching to Chat Shell.
+- Wegent merges the base capabilities into the custom agent configuration and performs one model execution. It does not invoke the default agent first and the custom agent second.
+- Same-name MCP and plugin entries from the custom agent take precedence, while Skills are deduplicated.
+- Only one inheritance level is supported to keep capability resolution predictable.
+- Enabling the option provides more capabilities but can increase context size, tool discovery, and tool-call usage. Disable it for pure chat or minimal executions that do not need these capabilities.
+- In **Follow runtime device** mode, Wegent uses the current user's capabilities on the execution device and does not load fixed Ghost capabilities.
+
+After saving, the UI continues to show the Skills available to the agent. During execution, the merged capability configuration is cached within the request so prompt, Skill, MCP, and plugin assembly do not repeat the same reads.
+
+---
+
+## 🤖 Configuring Bots
+
+### Bot Components
+
+| Component      | Required | Description                 |
+| -------------- | -------- | --------------------------- |
+| **Name**       | Yes      | Unique identifier           |
+| **Executor**   | Yes      | Runtime environment         |
+| **Model**      | No       | AI model (can inherit)      |
+| **Prompt**     | No       | System instructions         |
+| **MCP Config** | No       | External tools              |
+| **Skills**     | No       | Chat and Claude Code skills |
+
+### Executor Types
+
+| Executor       | Description               | Use Case             |
+| -------------- | ------------------------- | -------------------- |
+| **ClaudeCode** | Claude Code SDK in Docker | Code development     |
+| **Chat**       | Direct LLM API            | Simple conversations |
+| **Dify**       | External Dify API         | Dify workflows       |
+
+### Writing Effective Prompts
+
+**Structure**:
+
+```
+You are a [role], skilled in [expertise].
+
+Your responsibilities:
+- [Task 1]
+- [Task 2]
+
+Working principles:
+- [Guideline 1]
+- [Guideline 2]
+```
+
+**Example**:
+
+```
+You are a senior frontend engineer, skilled in:
+- React 18+ and TypeScript
+- Tailwind CSS
+- Performance optimization
+
+Your responsibilities:
+- Develop high-quality UI components
+- Write clean, maintainable code
+- Follow React best practices
+
+Working principles:
+- Use functional components and Hooks
+- Write TypeScript types for all components
+- Focus on user experience
+```
+
+### Managing Bots
+
+1. Go to **Settings** → **Bot** tab
+2. View all your bots
+3. Click **Edit** to modify, **Delete** to remove
+4. Click **New Bot** to create standalone bots
+
+---
+
+## 🤝 Collaboration Modes
+
+### Solo Mode
+
+Single bot handles everything.
+
+```
+User → Bot → Result
+```
+
+**Best for**: Simple tasks, getting started
+
+### Pipeline Mode
+
+Bots execute sequentially.
+
+```
+Bot A → Bot B → Bot C → Result
+```
+
+**Best for**: Development → Review → Testing workflows
+
+**Configuration**:
+
+1. Select **Leader** bot (first in pipeline)
+2. Add **Member** bots in order
+3. Optionally enable **Require Confirmation** between stages
+
+### Coordinate Mode
+
+Leader coordinates parallel work.
+
+```
+        → Bot A (parallel)
+Leader → Bot B (parallel) → Aggregate
+        → Bot C (parallel)
+```
+
+**Best for**: Multi-perspective analysis
+
+---
+
+## 🧠 Model Configuration
+
+### Binding Models to Bots
+
+**Method 1: Dropdown Selection** (Recommended)
+
+1. In Bot configuration, find **Bind Model**
+2. Keep "Advanced Mode" OFF
+3. Select from available models
+
+**Method 2: Advanced Mode**
+
+1. Toggle **Advanced Mode** ON
+2. Select **Model Protocol** (OpenAI/Claude/Gemini)
+3. Enter JSON configuration
+
+### Creating Custom Models
+
+1. Go to **Settings** → **Models** tab
+2. Click **Create Model**
+3. Configure:
+   - Model Type (LLM/Embedding/Rerank)
+   - Protocol (OpenAI/Anthropic/Gemini)
+   - API Key
+   - Model ID
+
+See [Model Configuration Guide](./configuring-models.md) for details.
+
+### Per-Task Model Override
+
+When sending a task:
+
+1. Click the **Model** selector in chat input
+2. Choose a different model
+3. Enable **Force Override** if needed
+
+---
+
+## 🔧 MCP Tools & Skills
+
+### MCP (Model Context Protocol) Tools
+
+MCP tools extend bot capabilities with external services.
+
+**Adding MCP Tools**:
+
+1. In Bot configuration, find **MCP Config**
+2. Click **Import MCP**
+3. Paste configuration JSON
+4. Choose **Replace** or **Append**
+
+**Example - GitHub MCP**:
+
+```json
+{
+  "github": {
+    "command": "docker",
+    "args": [
+      "run",
+      "-i",
+      "--rm",
+      "-e",
+      "GITHUB_PERSONAL_ACCESS_TOKEN",
+      "ghcr.io/github/github-mcp-server"
+    ],
+    "env": {
+      "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_xxx..."
+    }
+  }
+}
+```
+
+### Skills
+
+Skills add reusable capabilities to Chat and Claude Code bots.
+
+**Adding Skills**:
+
+1. In Bot configuration, find **Skills** section
+2. Select skills from dropdown
+3. Check the preload option next to a selected skill when it should be available from task start
+4. Click **Manage Skills** to upload new ones
+
+**Preloading Skills**:
+
+- Both the simple configuration UI and the full configuration UI support preload skills
+- **Chat** and **ClaudeCode** executors support preload skills
+- For ClaudeCode, preloaded skills are deployed into the Claude Code skills directory when the task starts
+- Preload only core skills that the bot should prioritize; leave other skills on-demand
+
+**Managing Skills**:
+
+1. Go to **Settings** → **Skills** tab
+2. Upload ZIP packages containing `SKILL.md`
+3. Or import from Git repositories
+
+---
+
+## ✨ Best Practices
+
+### 1. Start Simple
+
+- Begin with **Solo** mode
+- Use one bot with clear responsibilities
+- Add complexity as needed
+
+### 2. Choose Right Executor
+
+| Task             | Executor   |
+| ---------------- | ---------- |
+| Code development | ClaudeCode |
+| Simple Q&A       | Chat       |
+| Dify workflows   | Dify       |
+
+### 3. Write Clear Prompts
+
+- Be specific about the role
+- List concrete responsibilities
+- Include working guidelines
+
+### 4. Optimize Costs
+
+| Complexity | Model                  |
+| ---------- | ---------------------- |
+| Simple     | Claude Haiku / GPT-3.5 |
+| Medium     | Claude Sonnet / GPT-4o |
+| Complex    | Claude Opus / GPT-4    |
+
+### 5. Use Descriptive Names
+
+```
+✅ "Frontend React Developer"
+✅ "Code Review Expert"
+❌ "Bot 1"
+❌ "Test"
+```
+
+---
+
+## ❓ FAQ
+
+### Q: What's the difference between Agent and Bot?
+
+- **Agent**: User-facing AI assistant (what you interact with)
+- **Bot**: Building block of an Agent
+
+An Agent can have one Bot (Solo) or multiple Bots (other modes).
+
+### Q: Which collaboration mode should I use?
+
+| Scenario            | Mode       |
+| ------------------- | ---------- |
+| Simple tasks        | Solo       |
+| Sequential workflow | Pipeline   |
+| Parallel analysis   | Coordinate |
+
+### Q: Can I edit an Agent after creation?
+
+Yes! Click **Edit** on any agent to modify it.
+
+### Q: Why doesn't my Agent appear in Chat/Code?
+
+Check **Bind Mode** setting - enable Chat and/or Code as needed.
+
+### Q: How do I share an Agent?
+
+1. Click **Share** on the agent
+2. Copy the share link
+3. Others can add it to their list
+
+### Q: What's "Requires Repository"?
+
+- **Enabled**: Must select a code repo before starting
+- **Disabled**: Can work without a repo
+
+Enable for development agents, disable for chat agents.
+
+### Q: Does enabling shared base capabilities make two model calls?
+
+No. Wegent reads the custom Ghost and its base Ghost, merges their Skills, MCP tools, and plugins, and sends one final model request. The base Ghost's system prompt does not override the custom agent's identity.
+
+---
+
+## 🔗 Related Resources
+
+- [Model Configuration](./configuring-models.md) - Set up AI models
+- [Managing Tasks](../chat/managing-tasks.md) - Use agents to execute tasks
+- [Shell Configuration](./configuring-shells.md) - Custom executors
+- [Skill Management](./managing-skills.md) - Chat and Claude Code skills
+
+---
+
+<p align="center">Configure your AI agents and start automating! 🚀</p>

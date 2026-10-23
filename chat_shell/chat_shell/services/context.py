@@ -1,0 +1,1036 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Chat Context - Manages chat context preparation and cleanup.
+
+This module provides the ChatContext class that handles:
+- Parallel loading of chat history, tools, and MCP connections
+- Resource lifecycle management (preparation and cleanup)
+- Tool aggregation from various sources (builtin, KB, skills, MCP, etc.)
+
+Note: Agent creation is NOT handled here - it belongs to the service layer.
+"""
+
+import asyncio
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from chat_shell.core.config import settings
+from chat_shell.core.database import get_db_context
+from shared.models.execution import ExecutionRequest
+from shared.telemetry.decorators import add_span_event, trace_async
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ChatContextResult:
+    """Result of chat context preparation.
+
+    Attributes:
+        history: Chat history messages
+        extra_tools: All tools including builtin tools (LoadSkillTool, WebSearchTool, etc.)
+        system_prompt: System prompt (may be updated by KB tools)
+        kb_meta_prompt: Knowledge base meta prompt (dynamic, injected via dynamic_context)
+        backtrack_hint: History-backtracking nudge (dynamic, injected via dynamic_context)
+        mcp_clients: MCP clients for cleanup
+    """
+
+    history: list = field(default_factory=list)
+    extra_tools: list = field(default_factory=list)
+    system_prompt: str = ""
+    kb_meta_prompt: str = ""
+    backtrack_hint: str = ""
+    mcp_clients: list = field(default_factory=list)
+
+
+# A document attachment header is ``[Attachment: …]``; images use
+# ``[Image Attachment: …]`` and videos ``[Video Attachment: …]``. The
+# ``\[Attachment:`` anchor (a bracket immediately before the colon-terminated
+# label) matches only documents — not image/video headers, and not the
+# ``[Attachment N]`` index label (no colon).
+_DOCUMENT_ATTACHMENT = re.compile(r"\[Attachment:")
+
+
+_HISTORY_BACKTRACK_HINT = (
+    "Earlier turns were summarized out of your context — use `list_history` and "
+    "`read_subtask` to recover their original detail when you need it."
+)
+
+
+def _history_backtrack_signals(history: list) -> tuple[frozenset[int], bool]:
+    """Derive (in-context subtask ids, compaction-seen) from loaded history.
+
+    History dicts carry ``id`` (``"<subtask_id>"`` or ``"<subtask_id>-<idx>"``);
+    a ``metadata.summary_compacted`` flag marks a compaction summary present in
+    the live window, i.e. this session has been compacted.
+    """
+    ids: set[int] = set()
+    had_compaction = False
+    for message in history:
+        if not isinstance(message, dict):
+            continue
+        raw_id = message.get("id")
+        if raw_id is not None:
+            head = str(raw_id).split("-", 1)[0]
+            if head.isdigit():
+                ids.add(int(head))
+        metadata = message.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("summary_compacted") is True:
+            had_compaction = True
+    return frozenset(ids), had_compaction
+
+
+def _attachments_have_document(attachments: Any) -> bool:
+    """Return True if the structured request payload includes a document attachment.
+
+    Preferred, format-independent signal for the current turn: the backend sets
+    ``request.attachments`` with each attachment's ``mime_type``. A document is
+    anything that is not an image or a video — only those carry extracted text
+    for read_attachment to serve.
+    """
+    if not isinstance(attachments, list):
+        return False
+    for att in attachments:
+        # ExecutionRequest.attachments is untyped: entries may be plain dicts or
+        # attachment objects that expose mime_type as an attribute.
+        if isinstance(att, dict):
+            mime = str(att.get("mime_type") or "").lower()
+        else:
+            mime = str(getattr(att, "mime_type", "") or "").lower()
+        if mime and not mime.startswith("image/") and not mime.startswith("video/"):
+            return True
+    return False
+
+
+def _content_has_readable_attachment(content: Any) -> bool:
+    """Return True if rendered content carries a document attachment block.
+
+    Header-text fallback used for history (prior turns are not in
+    ``request.attachments``) and as a safety net for the current turn. Only
+    document attachments have extracted text; image/video blocks do not, so a
+    conversation with only those must NOT get the read_attachment tool.
+    """
+    if isinstance(content, str):
+        return bool(_DOCUMENT_ATTACHMENT.search(content))
+    if isinstance(content, list):
+        return any(
+            isinstance(block, dict)
+            and isinstance(block.get("text"), str)
+            and _DOCUMENT_ATTACHMENT.search(block["text"])
+            for block in content
+        )
+    return False
+
+
+class ChatContext:
+    """Manages chat context preparation and cleanup.
+
+    This class handles the lifecycle of chat resources:
+    - Parallel initialization of history and tools
+    - MCP server connections
+    - Resource cleanup after chat completion
+
+    Note: Agent creation is NOT handled here - it belongs to the service layer.
+
+    Performance optimizations:
+    - All independent async operations run in parallel using asyncio.gather
+    - History loading, KB tools, skill tools, and MCP connections
+      all execute concurrently
+    """
+
+    def __init__(self, request: ExecutionRequest):
+        """Initialize chat context.
+
+        Args:
+            request: The execution request containing all configuration
+        """
+        self._request = request
+        self._mcp_clients: list = []
+        self._db_session: AsyncSession | None = None
+        self._load_skill_tool: Any = None
+
+    @trace_async(
+        span_name="chat_context.prepare",
+        tracer_name="chat_shell.services",
+        extract_attributes=lambda self, *args, **kwargs: {
+            "context.task_id": self._request.task_id,
+            "context.subtask_id": self._request.subtask_id,
+            "context.user_id": self._request.user_id,
+            "context.has_skill_names": bool(self._request.skill_names),
+            "context.has_kb_ids": bool(self._request.knowledge_base_ids),
+            "context.has_mcp_servers": bool(self._request.mcp_servers),
+        },
+    )
+    async def prepare(self) -> ChatContextResult:
+        """Prepare all chat context resources in parallel.
+
+        Returns:
+            ChatContextResult containing all prepared resources
+        """
+        from chat_shell.tools.skill_factory import prepare_load_skill_tool
+
+        add_span_event("context_prepare_started", {"task_id": self._request.task_id})
+
+        logger.debug(
+            "[CHAT_CONTEXT] Preparing context: task_id=%d, subtask_id=%d",
+            self._request.task_id,
+            self._request.subtask_id,
+        )
+
+        # Prepare load_skill_tool synchronously (fast, needed by skill_tools task)
+        # This is a builtin tool that will be added to extra_tools
+        if self._request.skill_names:
+            add_span_event(
+                "preparing_load_skill_tool",
+                {"skill_count": len(self._request.skill_names)},
+            )
+            self._load_skill_tool = prepare_load_skill_tool(
+                skill_names=self._request.skill_names,
+                user_id=self._request.user_id,
+                skill_configs=self._request.skill_configs,
+            )
+
+        # Use context manager for database session
+        async with get_db_context() as db:
+            self._db_session = db
+            add_span_event("db_session_acquired")
+            logger.debug(
+                "[CHAT_CONTEXT] >>> Starting parallel initialization tasks",
+            )
+
+            # Execute all independent tasks in parallel
+            # Note: Agent creation is NOT done here - it belongs to the service layer
+            add_span_event("parallel_tasks_started")
+            (
+                history,
+                kb_result,
+                skill_result,
+                mcp_result,
+            ) = await asyncio.gather(
+                self._load_chat_history(),
+                self._prepare_kb_tools(db),
+                self._prepare_skill_tools(self._load_skill_tool),
+                self._connect_mcp_servers(),
+            )
+
+            # Unpack skill result (tools and MCP clients from skills)
+            skill_tools, skill_mcp_clients = skill_result
+
+            add_span_event(
+                "parallel_tasks_completed",
+                {
+                    "history_count": len(history),
+                    "kb_tools_count": len(kb_result.extra_tools),
+                    "skill_tools_count": len(skill_tools),
+                    "skill_mcp_clients_count": len(skill_mcp_clients),
+                    "mcp_tools_count": len(mcp_result[0]) if mcp_result else 0,
+                },
+            )
+            logger.debug(
+                "[CHAT_CONTEXT] <<< Parallel tasks complete: history=%d messages",
+                len(history),
+            )
+
+            # Restore skill loading state from history (for skill retention across turns)
+            if self._load_skill_tool and history:
+                add_span_event("restoring_skill_state_from_history")
+                self._load_skill_tool.restore_from_history(history)
+                restored_skills = self._load_skill_tool.get_loaded_skills()
+                if restored_skills:
+                    restored_skill_tools = (
+                        await self._load_skill_tool.ensure_loaded_skill_tools_loaded()
+                    )
+                    restored_tool_count = sum(
+                        len(tools) for tools in restored_skill_tools.values()
+                    )
+                    add_span_event(
+                        "skill_state_restored",
+                        {
+                            "restored_skills": list(restored_skills),
+                            "restored_tool_count": restored_tool_count,
+                        },
+                    )
+                    logger.info(
+                        "[CHAT_CONTEXT] Restored %d skills from history: %s "
+                        "(materialized_tool_count=%d)",
+                        len(restored_skills),
+                        list(restored_skills),
+                        restored_tool_count,
+                    )
+
+            # Only offer read_attachment when the conversation carries a document
+            # attachment whose text the tool can serve. Prefer the structured
+            # request payload (mime_type) for the current turn — robust to header
+            # format changes — then fall back to a header scan of the prompt and
+            # history (prior turns aren't in request.attachments). Image/video-only
+            # conversations and plain chats don't get it (it would return "empty").
+            has_attachments = (
+                _attachments_have_document(self._request.attachments)
+                or _content_has_readable_attachment(self._request.prompt)
+                or any(
+                    _content_has_readable_attachment(message.get("content"))
+                    for message in history
+                    if isinstance(message, dict)
+                )
+            )
+
+            # History-backtracking signals: which subtasks are still in the live
+            # window, and whether compaction has summarized any away.
+            in_context_ids, had_compaction = _history_backtrack_signals(history)
+
+            # Build extra_tools from all sources (including builtin tools)
+            add_span_event("building_extra_tools")
+            extra_tools = self._build_extra_tools(
+                kb_result,
+                skill_tools,
+                mcp_result,
+                has_attachments=has_attachments,
+                in_context_ids=in_context_ids,
+                had_compaction=had_compaction,
+            )
+
+            # Process KB tools result for system prompt
+            system_prompt = self._request.system_prompt or ""
+            if kb_result.extra_tools:
+                system_prompt = kb_result.enhanced_system_prompt
+            kb_meta_prompt = kb_result.kb_meta_prompt
+
+            # Nudge the model toward the backtracking tools only when compaction
+            # has actually dropped detail AND the tools were registered. Delivered
+            # via dynamic_context (message channel), never the system prompt, so
+            # the cacheable prefix stays stable across turns.
+            backtrack_hint = (
+                _HISTORY_BACKTRACK_HINT
+                if (
+                    had_compaction
+                    and self._request.enable_tools
+                    and self._backtrack_tools_enabled()
+                )
+                else ""
+            )
+
+            # Track MCP clients for cleanup (both from MCP servers and skills)
+            _, mcp_clients = mcp_result
+            # Merge skill MCP clients with MCP server clients
+            all_mcp_clients = mcp_clients + skill_mcp_clients
+            self._mcp_clients = all_mcp_clients
+
+            add_span_event(
+                "context_prepare_completed",
+                {
+                    "total_extra_tools": len(extra_tools),
+                    "mcp_clients_count": len(all_mcp_clients),
+                },
+            )
+
+            return ChatContextResult(
+                history=history,
+                extra_tools=extra_tools,
+                system_prompt=system_prompt,
+                kb_meta_prompt=kb_meta_prompt,
+                backtrack_hint=backtrack_hint,
+                mcp_clients=all_mcp_clients,
+            )
+
+    @trace_async(
+        span_name="chat_context.cleanup",
+        tracer_name="chat_shell.services",
+        extract_attributes=lambda self, *args, **kwargs: {
+            "context.mcp_clients_count": len(self._mcp_clients),
+        },
+    )
+    async def cleanup(self) -> None:
+        """Clean up all chat context resources.
+
+        This method should be called after chat completion to release resources.
+        """
+        add_span_event("cleanup_started", {"mcp_clients_count": len(self._mcp_clients)})
+        dynamic_mcp_clients = []
+        if self._load_skill_tool and hasattr(
+            self._load_skill_tool, "drain_deferred_mcp_clients"
+        ):
+            dynamic_mcp_clients = self._load_skill_tool.drain_deferred_mcp_clients()
+
+        clients = self._mcp_clients + dynamic_mcp_clients
+        if clients:
+            logger.debug("[CHAT_CONTEXT] Cleaning up %d MCP clients", len(clients))
+            await asyncio.gather(
+                *[self._close_mcp_client(c) for c in clients if c],
+                return_exceptions=True,
+            )
+            self._mcp_clients = []
+        add_span_event("cleanup_completed")
+
+    @trace_async(
+        span_name="chat_context.load_chat_history",
+        tracer_name="chat_shell.services",
+        extract_attributes=lambda self, *args, **kwargs: {
+            "context.task_id": self._request.task_id,
+            "context.is_group_chat": self._request.is_group_chat,
+        },
+    )
+    async def _load_chat_history(self) -> list:
+        """Load chat history asynchronously."""
+        from chat_shell.history import get_chat_history
+
+        request_history = (
+            list(self._request.history)
+            if isinstance(self._request.history, list) and self._request.history
+            else []
+        )
+        if self._request.stateless:
+            logger.info(
+                "[CHAT_CONTEXT] Using request-provided history for stateless request: "
+                "task_id=%d, subtask_id=%d, count=%d",
+                self._request.task_id,
+                self._request.subtask_id,
+                len(request_history),
+            )
+            return request_history
+
+        # Use user_message_id to exclude current user message (and all messages after it)
+        # If user_message_id is not provided, infer it from message_id:
+        # message_id is assistant_subtask.message_id, user message is message_id - 1
+        if self._request.user_message_id:
+            exclude_message_id = self._request.user_message_id
+        elif self._request.message_id and self._request.message_id > 1:
+            exclude_message_id = self._request.message_id - 1
+        else:
+            exclude_message_id = None
+
+        # Get history_limit from request (used by subscription tasks)
+        history_limit = getattr(self._request, "history_limit", None)
+
+        add_span_event("loading_chat_history")
+        logger.debug(
+            "[CHAT_CONTEXT] >>> Loading history: task_id=%d, exclude_message_id=%s "
+            "(user_message_id=%s, message_id=%s), history_limit=%s",
+            self._request.task_id,
+            exclude_message_id,
+            self._request.user_message_id,
+            self._request.message_id,
+            history_limit,
+        )
+        history = await get_chat_history(
+            task_id=self._request.task_id,
+            is_group_chat=self._request.is_group_chat,
+            exclude_after_message_id=exclude_message_id,
+            limit=history_limit,
+        )
+        add_span_event("chat_history_loaded", {"message_count": len(history)})
+
+        # Log detailed history content for debugging preserve_history feature
+        logger.info(
+            "[CHAT_CONTEXT] <<< History loaded: task_id=%d, count=%d, history_limit=%s",
+            self._request.task_id,
+            len(history),
+            history_limit,
+        )
+        if (
+            not history
+            and request_history
+            and (history_limit is None or history_limit > 0)
+        ):
+            logger.info(
+                "[CHAT_CONTEXT] Falling back to request-provided history: task_id=%d, "
+                "subtask_id=%d, count=%d",
+                self._request.task_id,
+                self._request.subtask_id,
+                len(request_history),
+            )
+            return request_history
+        return history
+
+    @trace_async(
+        span_name="chat_context.prepare_kb_tools",
+        tracer_name="chat_shell.services",
+        extract_attributes=lambda self, db, *args, **kwargs: {
+            "context.kb_ids_count": len(self._request.knowledge_base_ids or []),
+            "context.external_refs_count": len(
+                self._request.external_knowledge_refs or []
+            ),
+        },
+    )
+    async def _prepare_kb_tools(self, db: AsyncSession):
+        """Prepare knowledge base tools asynchronously.
+
+        In HTTP mode (when Backend calls chat_shell via HTTP), the system prompt
+        may already contain KB instructions added by Backend. We detect this by
+        checking for KB prompt markers to avoid duplicate KB prompts.
+        """
+        from chat_shell.tools.knowledge_factory import prepare_knowledge_base_tools
+        from shared.models.knowledge import KnowledgeBaseToolsResult
+
+        base_system_prompt = self._request.system_prompt or ""
+        if getattr(self._request, "provider_native_knowledge", False) is True:
+            add_span_event("provider_native_knowledge_skipped_unified_tools")
+            return KnowledgeBaseToolsResult(
+                extra_tools=[],
+                enhanced_system_prompt=base_system_prompt,
+                kb_meta_prompt="",
+            )
+        external_refs = self._request.external_knowledge_refs or []
+        if not self._request.knowledge_base_ids and not external_refs:
+            add_span_event("no_kb_targets_skipped")
+            return KnowledgeBaseToolsResult(
+                extra_tools=[],
+                enhanced_system_prompt=base_system_prompt,
+                kb_meta_prompt="",
+            )
+
+        add_span_event(
+            "preparing_kb_tools",
+            {
+                "kb_ids_count": len(self._request.knowledge_base_ids or []),
+                "external_refs_count": len(external_refs),
+            },
+        )
+        model_id = (
+            self._request.model_config.get("model_id")
+            if self._request.model_config
+            else None
+        )
+        context_window = (
+            self._request.model_config.get("context_window")
+            if self._request.model_config
+            else None
+        )
+
+        # In HTTP mode, check if system_prompt already contains KB instructions
+        # to avoid duplicate KB prompts (Backend adds them before calling chat_shell)
+        skip_prompt_enhancement = self._should_skip_kb_prompt_enhancement(
+            base_system_prompt
+        )
+        if skip_prompt_enhancement:
+            logger.debug(
+                "[CHAT_CONTEXT] Detected KB prompt in system_prompt, "
+                "skipping KB prompt enhancement"
+            )
+
+        # KB configs (max_calls, exempt_calls, name) are now fetched by KnowledgeBaseTool from Backend API
+        result = await prepare_knowledge_base_tools(
+            knowledge_base_ids=self._request.knowledge_base_ids,
+            external_knowledge_refs=external_refs,
+            user_id=self._request.user_id,
+            db=db,
+            base_system_prompt=base_system_prompt,
+            task_id=self._request.task_id,
+            user_subtask_id=self._request.user_subtask_id,  # Use user_subtask_id for RAG persistence
+            is_user_selected=self._request.is_user_selected_kb,
+            document_ids=self._request.document_ids,
+            knowledge_base_scopes=self._request.knowledge_base_scopes,
+            model_id=model_id,
+            context_window=context_window,
+            model_config=self._request.model_config,
+            skip_prompt_enhancement=skip_prompt_enhancement,
+            user_name=self._request.user_name,
+            auth_token=self._request.auth_token,
+            kb_tool_access_mode=self._request.kb_tool_access_mode,
+        )
+        add_span_event("kb_tools_prepared", {"tools_count": len(result.extra_tools)})
+        return result
+
+    def _should_skip_kb_prompt_enhancement(self, system_prompt: str) -> bool:
+        """Check if KB prompt enhancement should be skipped.
+
+        In HTTP mode with remote storage, Backend adds KB prompts to system_prompt
+        before calling chat_shell. We detect this by:
+        1. Checking if we're in HTTP mode with remote storage
+        2. Checking if system_prompt already contains KB prompt markers
+
+        Returns:
+            True if KB prompt enhancement should be skipped, False otherwise.
+        """
+        # Check if in HTTP mode with remote storage
+        mode = settings.CHAT_SHELL_MODE.lower()
+        storage = settings.STORAGE_TYPE.lower()
+        is_http_mode = mode == "http" and storage == "remote"
+
+        if not is_http_mode:
+            return False
+
+        # Check for KB prompt markers in system_prompt
+        # Using both XML tag and legacy markers for compatibility
+        kb_prompt_markers = [
+            "<knowledge_base>",
+            "## Knowledge Base Requirement",
+            "## Knowledge Base Available",
+            "# IMPORTANT: Knowledge Base Requirement",
+            "# Knowledge Base Available",
+        ]
+
+        for marker in kb_prompt_markers:
+            if marker in system_prompt:
+                return True
+
+        return False
+
+    @trace_async(
+        span_name="chat_context.prepare_skill_tools",
+        tracer_name="chat_shell.services",
+        extract_attributes=lambda self, load_skill_tool, *args, **kwargs: {
+            "context.skill_configs_count": len(self._request.skill_configs or []),
+            "context.has_load_skill_tool": load_skill_tool is not None,
+        },
+    )
+    async def _prepare_skill_tools(self, load_skill_tool) -> tuple[list, list]:
+        """Prepare skill tools asynchronously.
+
+        This method also handles preloading skill prompts for skills
+        specified in request.preload_skills.
+
+        Returns:
+            Tuple of (skill_tools, skill_mcp_clients)
+        """
+        from chat_shell.tools.skill_factory import prepare_skill_tools
+
+        if not self._request.skill_configs:
+            add_span_event("no_skill_configs_skipped")
+            return [], []
+
+        add_span_event(
+            "preparing_skill_tools",
+            {"skill_configs_count": len(self._request.skill_configs)},
+        )
+        tools, skill_mcp_clients = await prepare_skill_tools(
+            task_id=self._request.task_id,
+            subtask_id=self._request.subtask_id,
+            user_id=self._request.user_id,
+            skill_configs=self._request.skill_configs,
+            load_skill_tool=load_skill_tool,
+            preload_skills=self._request.preload_skills,
+            user_selected_skills=self._request.user_selected_skills,
+            user_name=self._request.user_name,
+            auth_token=self._request.auth_token,
+            skill_identity_token=self._request.skill_identity_token,
+            task_data=self._request,
+        )
+        add_span_event(
+            "skill_tools_prepared",
+            {
+                "tools_count": len(tools),
+                "skill_mcp_clients_count": len(skill_mcp_clients),
+            },
+        )
+        return tools, skill_mcp_clients
+
+    @trace_async(
+        span_name="chat_context.connect_single_mcp_server",
+        tracer_name="chat_shell.services",
+        extract_attributes=lambda self, server, *args, **kwargs: {
+            "mcp.server_name": server.get("name", "server"),
+            "mcp.transport_type": server.get("type", "streamable-http"),
+        },
+    )
+    async def _connect_single_mcp_server(self, server: dict) -> dict:
+        """Connect to a single MCP server."""
+        from chat_shell.tools.mcp import MCPClient
+
+        server_name = server.get("name", "server")
+        add_span_event("connecting_mcp_server", {"server_name": server_name})
+        try:
+            transport_type = server.get("type", "streamable-http")
+            server_url = server.get("url", "")
+            server_config = {
+                server_name: {
+                    "type": transport_type,
+                    "url": server_url,
+                }
+            }
+            auth = server.get("auth")
+            if auth:
+                server_config[server_name]["headers"] = auth
+
+            client = MCPClient(server_config, task_data=self._request)
+            await client.connect()
+            if client.is_connected:
+                tools = client.get_tools()
+                add_span_event(
+                    "mcp_server_connected",
+                    {"server_name": server_name, "tools_count": len(tools)},
+                )
+                return {
+                    "success": True,
+                    "tools": tools,
+                    "client": client,
+                    "summary": f"{server_name}({len(tools)})",
+                }
+            else:
+                add_span_event("mcp_server_not_ready", {"server_name": server_name})
+                logger.warning(
+                    "[CHAT_CONTEXT] MCP server %s connected but not ready",
+                    server_name,
+                )
+                return {"success": False, "client": client}
+        except Exception as e:
+            error_msg = str(e)
+            if hasattr(e, "exceptions"):
+                for exc in e.exceptions:
+                    if hasattr(exc, "exceptions"):
+                        for sub_exc in exc.exceptions:
+                            error_msg = str(sub_exc)
+                            break
+                    else:
+                        error_msg = str(exc)
+                    break
+            add_span_event(
+                "mcp_server_connection_failed",
+                {"server_name": server_name, "error": error_msg},
+            )
+            logger.warning(
+                "[CHAT_CONTEXT] Failed to load MCP server %s: %s",
+                server_name,
+                error_msg,
+            )
+            return {"success": False, "client": None}
+
+    async def _connect_single_mcp_server_with_config(
+        self, server_name: str, server_config: dict
+    ) -> dict:
+        """Connect to a single MCP server with pre-built config.
+
+        This is a lighter version that accepts pre-built config for use in
+        parallel connection scenarios where fault isolation is needed.
+
+        Args:
+            server_name: Name of the MCP server
+            server_config: Config dict for the server (single-entry dict)
+
+        Returns:
+            Dict with success status, tools, client, and summary
+        """
+        from chat_shell.tools.mcp import MCPClient
+
+        try:
+            client = MCPClient(server_config, task_data=self._request)
+            await client.connect()
+            if client.is_connected:
+                tools = client.get_tools()
+                return {
+                    "success": True,
+                    "tools": tools,
+                    "client": client,
+                    "summary": f"{server_name}({len(tools)})",
+                }
+            else:
+                logger.warning(
+                    "[CHAT_CONTEXT] MCP server %s connected but not ready",
+                    server_name,
+                )
+                return {"success": False, "client": client}
+        except Exception as e:
+            error_msg = str(e)
+            if hasattr(e, "exceptions"):
+                for exc in e.exceptions:
+                    if hasattr(exc, "exceptions"):
+                        for sub_exc in exc.exceptions:
+                            error_msg = str(sub_exc)
+                            break
+                    else:
+                        error_msg = str(exc)
+                    break
+            logger.warning(
+                "[CHAT_CONTEXT] Failed to load MCP server %s: %s",
+                server_name,
+                error_msg,
+            )
+            return {"success": False, "client": None}
+
+    @trace_async(
+        span_name="chat_context.connect_mcp_servers",
+        tracer_name="chat_shell.services",
+        extract_attributes=lambda self, *args, **kwargs: {
+            "context.mcp_servers_count": len(self._request.mcp_servers or []),
+        },
+    )
+    async def _connect_mcp_servers(self) -> tuple[list, list]:
+        """Connect to all MCP servers with individual fault isolation.
+
+        Each server is connected independently to prevent one failing server
+        from affecting others. This provides better resilience compared to
+        a single MultiServerMCPClient where shared connection issues can
+        cause total failure.
+
+        Memory impact: Minimal - only MCPClient instances for successfully
+        connected servers are retained (for cleanup purposes).
+        """
+
+        logger.info(
+            "[CHAT_CONTEXT] _connect_mcp_servers called: task_id=%d, mcp_server_names=%s",
+            self._request.task_id,
+            [
+                server.get("name", "server")
+                for server in (self._request.mcp_servers or [])
+                if isinstance(server, dict)
+            ],
+        )
+
+        if not self._request.mcp_servers:
+            add_span_event("no_mcp_servers_skipped")
+            logger.info("[CHAT_CONTEXT] No MCP servers to connect, returning empty")
+            return [], []
+
+        add_span_event(
+            "connecting_mcp_servers",
+            {"servers_count": len(self._request.mcp_servers)},
+        )
+        logger.debug(
+            "[CHAT_CONTEXT] Loading %d MCP servers from request for task %d",
+            len(self._request.mcp_servers),
+            self._request.task_id,
+        )
+
+        # Connect to each MCP server individually for fault isolation
+        # This prevents one failing server from affecting others
+        mcp_tools = []
+        mcp_clients = []
+        mcp_summary = []
+
+        add_span_event("connecting_mcp_servers_individually")
+
+        # Build individual server configs
+        server_configs = []
+        for server in self._request.mcp_servers:
+            server_name = server.get("name", "server")
+            transport_type = server.get("type", "streamable-http")
+            server_url = server.get("url", "")
+            config = {
+                server_name: {
+                    "type": transport_type,
+                    "url": server_url,
+                }
+            }
+            auth = server.get("auth")
+            if auth:
+                config[server_name]["headers"] = auth
+            server_configs.append((server_name, config))
+
+        # Connect to each server in parallel with individual error handling
+        results = await asyncio.gather(
+            *[
+                self._connect_single_mcp_server_with_config(name, config)
+                for name, config in server_configs
+            ],
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning("[CHAT_CONTEXT] MCP server connection error: %s", result)
+                continue
+            if result.get("success"):
+                mcp_tools.extend(result["tools"])
+                if result.get("client"):
+                    mcp_clients.append(result["client"])
+                mcp_summary.append(result["summary"])
+
+        if mcp_summary:
+            add_span_event(
+                "mcp_servers_connected",
+                {
+                    "connected_count": len(mcp_summary),
+                    "total_tools": len(mcp_tools),
+                },
+            )
+            logger.info(
+                "[CHAT_CONTEXT] Connected %d MCP servers: %s (total %d tools)",
+                len(mcp_summary),
+                ", ".join(mcp_summary),
+                len(mcp_tools),
+            )
+
+        return mcp_tools, mcp_clients
+
+    async def _close_mcp_client(self, client) -> None:
+        """Close a single MCP client safely."""
+        try:
+            await client.disconnect()
+        except Exception as e:
+            logger.warning("[CHAT_CONTEXT] Failed to close MCP client: %s", e)
+
+    def _backtrack_tools_enabled(self) -> bool:
+        """Whether history-backtracking tools apply: summary compaction is active.
+
+        Mirrors the exact condition under which the summary compactor is created
+        (chat_service), so the tools/hint follow compaction rather than drifting.
+        """
+        return (
+            settings.MESSAGE_COMPRESSION_ENABLED
+            and not settings.DISABLE_SUMMARY_COMPACT
+        )
+
+    def _build_extra_tools(
+        self,
+        kb_result,
+        skill_tools: list,
+        mcp_result: tuple[list, list],
+        has_attachments: bool = False,
+        in_context_ids: frozenset[int] = frozenset(),
+        had_compaction: bool = False,
+    ) -> list:
+        """Build the complete list of extra tools from all sources.
+
+        This includes builtin tools (LoadSkillTool, WebSearchTool),
+        KB tools, skill tools, and MCP tools.
+
+        Args:
+            kb_result: KnowledgeBaseToolsResult
+            skill_tools: List of skill tools
+            mcp_result: Tuple of (mcp_tools, mcp_clients)
+
+        Returns:
+            Complete list of extra tools
+        """
+        extra_tools = (
+            list(self._request.extra_tools) if self._request.extra_tools else []
+        )
+        logger.info(
+            "[CHAT_CONTEXT] Building extra tools: task_id=%d subtask_id=%d enable_tools=%s "
+            "enable_web_search=%s is_subscription=%s preset_extra_tools=%d",
+            self._request.task_id,
+            self._request.subtask_id,
+            self._request.enable_tools,
+            self._request.enable_web_search,
+            self._request.is_subscription,
+            len(extra_tools),
+        )
+        if not self._request.enable_tools:
+            if extra_tools:
+                tool_names = [
+                    tool.name for tool in extra_tools if hasattr(tool, "name")
+                ]
+                logger.info(
+                    "[CHAT_CONTEXT] Returning preset extra tools only because enable_tools=false: "
+                    "task_id=%d subtask_id=%d tool_names=%s",
+                    self._request.task_id,
+                    self._request.subtask_id,
+                    json.dumps(tool_names, ensure_ascii=False),
+                )
+            else:
+                logger.info(
+                    "[CHAT_CONTEXT] Skipping builtin/skill/mcp tools because enable_tools=false: "
+                    "task_id=%d subtask_id=%d",
+                    self._request.task_id,
+                    self._request.subtask_id,
+                )
+            return extra_tools
+
+        # === Builtin Tools ===
+
+        # Add LoadSkillTool if available (builtin tool for on-demand skill loading)
+        if self._load_skill_tool:
+            extra_tools.append(self._load_skill_tool)
+            logger.debug(
+                "[CHAT_CONTEXT] Added LoadSkillTool with %d skills",
+                len(self._request.skill_names or []),
+            )
+
+        # Add WebSearchTool if enabled
+        if self._request.enable_web_search:
+            from chat_shell.tools.builtin import WebSearchTool
+
+            default_max_results = getattr(settings, "WEB_SEARCH_DEFAULT_MAX_RESULTS", 5)
+            search_engine = self._request.search_engine
+            extra_tools.append(
+                WebSearchTool(
+                    engine_name=search_engine,
+                    default_max_results=default_max_results,
+                )
+            )
+            logger.debug(
+                "[CHAT_CONTEXT] Added WebSearchTool: engine=%s, max_results=%d",
+                search_engine,
+                default_max_results,
+            )
+        # Add ReadAttachmentTool when the conversation carries an attachment, so
+        # the model can page the full extracted text beyond the inline preview.
+        if has_attachments:
+            from chat_shell.compression.token_counter import TokenCounter
+            from chat_shell.tools.builtin import ReadAttachmentTool
+
+            model_id = (self._request.model_config or {}).get("model_id")
+            extra_tools.append(
+                ReadAttachmentTool(
+                    task_id=self._request.task_id,
+                    token_counter=TokenCounter(model_name=model_id),
+                )
+            )
+            logger.info(
+                "[CHAT_CONTEXT] Added ReadAttachmentTool for task_id=%d",
+                self._request.task_id,
+            )
+
+        # Add history-backtracking tools only once compaction has actually
+        # summarized detail out of context (had_compaction). Most tasks never
+        # compact, so gating here keeps the tools — and their prompt hint — out of
+        # those turns entirely. Task-scoped and read-only.
+        if self._backtrack_tools_enabled() and had_compaction:
+            from chat_shell.tools.builtin import ListHistoryTool, ReadSubtaskTool
+
+            extra_tools.append(
+                ListHistoryTool(
+                    task_id=self._request.task_id,
+                    in_context_ids=in_context_ids,
+                )
+            )
+            extra_tools.append(ReadSubtaskTool(task_id=self._request.task_id))
+            logger.info(
+                "[CHAT_CONTEXT] Added history-backtracking tools for task_id=%d "
+                "(in_context_subtasks=%d)",
+                self._request.task_id,
+                len(in_context_ids),
+            )
+
+        # Note: Subscription tools (preview_subscription, create_subscription) have been moved
+        # to Backend MCP Server and are now provided via the subscription-manager skill.
+        # They are automatically injected by Backend into skill_configs for all non-subscription tasks.
+        # Note: SilentExitTool has been removed.
+        # silent_exit functionality is now provided by Backend MCP Server.
+        # For subscription tasks, the system MCP server is loaded via MCP tools.
+        logger.info(
+            "[CHAT_CONTEXT] is_subscription=%s for task_id=%d, subtask_id=%d",
+            self._request.is_subscription,
+            self._request.task_id,
+            self._request.subtask_id,
+        )
+
+        # === External Tools ===
+
+        # Add KB tools
+        if kb_result.extra_tools:
+            extra_tools.extend(kb_result.extra_tools)
+
+        # Add skill tools (dynamically created from skill configs)
+        if skill_tools:
+            extra_tools.extend(skill_tools)
+
+        # Add MCP tools
+        mcp_tools, _ = mcp_result
+        if mcp_tools:
+            extra_tools.extend(mcp_tools)
+
+        tool_names = [tool.name for tool in extra_tools if hasattr(tool, "name")]
+        logger.info(
+            "[CHAT_CONTEXT] Built extra tools: task_id=%d subtask_id=%d count=%d tool_names=%s",
+            self._request.task_id,
+            self._request.subtask_id,
+            len(extra_tools),
+            json.dumps(tool_names, ensure_ascii=False),
+        )
+        if not self._request.enable_tools and tool_names:
+            logger.warning(
+                "[CHAT_CONTEXT] enable_tools=false but tools were still attached: "
+                "task_id=%d subtask_id=%d tool_names=%s",
+                self._request.task_id,
+                self._request.subtask_id,
+                json.dumps(tool_names, ensure_ascii=False),
+            )
+
+        return extra_tools

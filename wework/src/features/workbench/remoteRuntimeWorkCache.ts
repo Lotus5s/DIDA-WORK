@@ -1,0 +1,584 @@
+import { getWorkbenchDeviceIds } from '@/lib/workbench-device'
+import { isUsableDevice } from '@/lib/device-capabilities'
+import type {
+  DeviceInfo,
+  RuntimeDeviceWorkspace,
+  RuntimeProjectRef,
+  RuntimeProjectRoot,
+  RuntimeProjectSpaceRef,
+  RuntimeProjectAiSettings,
+  RuntimeProjectWork,
+  RuntimeTaskSummary,
+  RuntimeWorkListResponse,
+} from '@/types/api'
+import { EMPTY_RUNTIME_WORK } from './workbenchCloudStatus'
+import { mergeRuntimeWorkLists } from './runtimeWorkMerge'
+
+const REMOTE_RUNTIME_WORK_CACHE_VERSION = 3
+const REMOTE_RUNTIME_WORK_CACHE_KEY_PREFIX = 'wework.workbench.remoteRuntimeWork.v3'
+
+type PersistedRuntimeTask = Pick<
+  RuntimeTaskSummary,
+  | 'taskId'
+  | 'threadId'
+  | 'workspacePath'
+  | 'workspaceKind'
+  | 'worktreeId'
+  | 'gitInfo'
+  | 'title'
+  | 'runtime'
+  | 'createdAt'
+  | 'updatedAt'
+  | 'recencyAt'
+  | 'pinned'
+  | 'pinnedOrder'
+  | 'sidebarOrder'
+>
+
+type CachedRuntimeTaskProjection = PersistedRuntimeTask & {
+  cachedProjection: true
+}
+
+interface PersistedRuntimeDeviceWorkspace {
+  id?: number | null
+  projectId?: number | null
+  deviceId: string
+  deviceName?: string | null
+  workspacePath: string
+  workspaceKind?: string | null
+  worktreeId?: string | null
+  label?: string | null
+  repoUrl?: string | null
+  repoRootFingerprint?: string | null
+  mapped?: boolean
+  tasks: PersistedRuntimeTask[]
+}
+
+interface PersistedRuntimeProjectWork {
+  project: RuntimeProjectRef
+  deviceWorkspaces: PersistedRuntimeDeviceWorkspace[]
+}
+
+interface PersistedRuntimeWorkList {
+  projects: PersistedRuntimeProjectWork[]
+  chats: PersistedRuntimeDeviceWorkspace[]
+}
+
+interface RemoteRuntimeWorkCacheEnvelope {
+  version: typeof REMOTE_RUNTIME_WORK_CACHE_VERSION
+  updatedAt: number
+  runtimeWork: PersistedRuntimeWorkList
+}
+
+function cacheKey(userId: number): string {
+  return `${REMOTE_RUNTIME_WORK_CACHE_KEY_PREFIX}.${userId}`
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function nullableStringValue(value: unknown): string | null | undefined {
+  return value === null ? null : stringValue(value)
+}
+
+function finiteNumberValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function nullableNumberValue(value: unknown): number | null | undefined {
+  return value === null ? null : finiteNumberValue(value)
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined
+}
+
+function sanitizeProjectRoot(value: unknown): RuntimeProjectRoot | null {
+  const root = recordValue(value)
+  const kind = stringValue(root.kind)
+  const path = stringValue(root.path)
+  if (!kind || !path) return null
+  return {
+    kind,
+    path,
+    ...(nullableStringValue(root.label) !== undefined
+      ? { label: nullableStringValue(root.label) }
+      : {}),
+  }
+}
+
+function sanitizeProjectRef(value: unknown): RuntimeProjectRef | null {
+  const project = recordValue(value)
+  const key = stringValue(project.key)
+  const name = stringValue(project.name)
+  if (!key || !name) return null
+
+  const roots = Array.isArray(project.roots)
+    ? project.roots
+        .map(sanitizeProjectRoot)
+        .filter((root): root is RuntimeProjectRoot => root !== null)
+    : undefined
+  const rawDefaultProjectSpace = recordValue(project.defaultProjectSpace)
+  const defaultProjectStore = stringValue(rawDefaultProjectSpace.projectStore)
+  const defaultProjectId = stringValue(rawDefaultProjectSpace.projectId)
+  const defaultProjectSpace: RuntimeProjectSpaceRef | undefined =
+    (defaultProjectStore === 'local' || defaultProjectStore === 'backend') && defaultProjectId
+      ? { projectStore: defaultProjectStore, projectId: defaultProjectId }
+      : undefined
+
+  const rawAppearance = recordValue(project.appearance)
+  const rawMarker = recordValue(rawAppearance.marker)
+  const marker =
+    rawMarker.kind === 'emoji' && stringValue(rawMarker.emoji)
+      ? { kind: 'emoji' as const, emoji: stringValue(rawMarker.emoji)! }
+      : rawMarker.kind === 'icon' && stringValue(rawMarker.icon)
+        ? { kind: 'icon' as const, icon: stringValue(rawMarker.icon)! }
+        : undefined
+  return {
+    key,
+    name,
+    ...(nullableStringValue(project.sidebarStateKey) !== undefined
+      ? { sidebarStateKey: nullableStringValue(project.sidebarStateKey) }
+      : {}),
+    ...(finiteNumberValue(project.id) !== undefined ? { id: finiteNumberValue(project.id) } : {}),
+    ...(nullableStringValue(project.description) !== undefined
+      ? { description: nullableStringValue(project.description) }
+      : {}),
+    ...(nullableStringValue(project.color) !== undefined
+      ? { color: nullableStringValue(project.color) }
+      : {}),
+    ...(stringValue(project.kind) ? { kind: stringValue(project.kind) } : {}),
+    ...(stringValue(project.source) ? { source: stringValue(project.source) } : {}),
+    ...(nullableStringValue(project.stateDeviceId) !== undefined
+      ? { stateDeviceId: nullableStringValue(project.stateDeviceId) }
+      : {}),
+    ...(stringValue(project.ownerDeviceId)
+      ? { ownerDeviceId: stringValue(project.ownerDeviceId) }
+      : {}),
+    ...(stringValue(project.ownerProjectKey)
+      ? { ownerProjectKey: stringValue(project.ownerProjectKey) }
+      : {}),
+    ...(project.aiSettings ? { aiSettings: sanitizeProjectAiSettings(project.aiSettings) } : {}),
+    ...(project.appearance
+      ? {
+          appearance: {
+            ...(stringValue(rawAppearance.color)
+              ? { color: stringValue(rawAppearance.color) }
+              : {}),
+            ...(marker ? { marker } : {}),
+          },
+        }
+      : {}),
+    ...(roots ? { roots } : {}),
+    ...(nullableNumberValue(project.sidebarOrder) !== undefined
+      ? { sidebarOrder: nullableNumberValue(project.sidebarOrder) }
+      : {}),
+    ...(booleanValue(project.pinned) !== undefined ? { pinned: booleanValue(project.pinned) } : {}),
+    ...(nullableNumberValue(project.pinnedOrder) !== undefined
+      ? { pinnedOrder: nullableNumberValue(project.pinnedOrder) }
+      : {}),
+    ...(booleanValue(project.active) !== undefined ? { active: booleanValue(project.active) } : {}),
+    ...(defaultProjectSpace ? { defaultProjectSpace } : {}),
+  }
+}
+
+function sanitizeProjectAiSettings(value: unknown): RuntimeProjectAiSettings {
+  const settings = recordValue(value)
+  const selection = recordValue(settings.modelSelection)
+  const modelType = selection.modelType
+  const plugins = Array.isArray(settings.plugins)
+    ? settings.plugins.flatMap(raw => {
+        const plugin = recordValue(raw)
+        const id = stringValue(plugin.id),
+          pluginName = stringValue(plugin.pluginName),
+          marketplaceId = stringValue(plugin.marketplaceId)
+        return id && pluginName && marketplaceId
+          ? [
+              {
+                id,
+                pluginName,
+                marketplaceId,
+                displayName: stringValue(plugin.displayName) || pluginName,
+              },
+            ]
+          : []
+      })
+    : []
+  const quickPhrases = Array.isArray(settings.quickPhrases)
+    ? settings.quickPhrases.flatMap(raw => {
+        const phrase = recordValue(raw)
+        const id = stringValue(phrase.id),
+          title = stringValue(phrase.title),
+          content = stringValue(phrase.content)
+        const mode = phrase.mode
+        return id && title && content && (mode === 'normal' || mode === 'plan' || mode === 'goal')
+          ? [{ id, title, content, mode }]
+          : []
+      })
+    : []
+  return {
+    ...(typeof settings.instructions === 'string' ? { instructions: settings.instructions } : {}),
+    modelSelection: stringValue(selection.modelName)
+      ? {
+          modelName: stringValue(selection.modelName)!,
+          modelType:
+            modelType === 'runtime' ||
+            modelType === 'public' ||
+            modelType === 'user' ||
+            modelType === 'group'
+              ? modelType
+              : null,
+          options: Object.fromEntries(
+            Object.entries(recordValue(selection.options)).filter(
+              (entry): entry is [string, string] => typeof entry[1] === 'string'
+            )
+          ),
+        }
+      : null,
+    ...(plugins.length ? { plugins } : {}),
+    ...(quickPhrases.length
+      ? { quickPhrases: quickPhrases as NonNullable<RuntimeProjectAiSettings['quickPhrases']> }
+      : {}),
+  }
+}
+
+const CACHED_GIT_INFO_KEYS = [
+  'branch',
+  'branchName',
+  'branch_name',
+  'currentBranch',
+  'current_branch',
+  'originUrl',
+  'origin_url',
+  'repoUrl',
+  'repo_url',
+  'branchMismatch',
+  'branch_mismatch',
+  'isBranchOutdated',
+  'is_branch_outdated',
+] as const
+
+function sanitizeGitInfo(value: unknown): Record<string, unknown> | null | undefined {
+  if (value === null) return null
+  const input = recordValue(value)
+  const gitInfo = Object.fromEntries(
+    CACHED_GIT_INFO_KEYS.flatMap(key => {
+      const field = input[key]
+      return typeof field === 'string' || typeof field === 'boolean' ? [[key, field]] : []
+    })
+  )
+  return Object.keys(gitInfo).length > 0 ? gitInfo : undefined
+}
+
+function parsePersistedTask(value: unknown, workspacePath: string): PersistedRuntimeTask | null {
+  const task = recordValue(value)
+  const taskId = stringValue(task.taskId)
+  const title = stringValue(task.title)
+  const runtime = stringValue(task.runtime)
+  if (!taskId || !title || !runtime) return null
+
+  const gitInfo = sanitizeGitInfo(task.gitInfo)
+  return {
+    taskId,
+    title,
+    runtime: runtime as RuntimeTaskSummary['runtime'],
+    workspacePath: stringValue(task.workspacePath) ?? workspacePath,
+    ...(nullableStringValue(task.threadId) !== undefined
+      ? { threadId: nullableStringValue(task.threadId) }
+      : {}),
+    ...(nullableStringValue(task.workspaceKind) !== undefined
+      ? { workspaceKind: nullableStringValue(task.workspaceKind) }
+      : {}),
+    ...(nullableStringValue(task.worktreeId) !== undefined
+      ? { worktreeId: nullableStringValue(task.worktreeId) }
+      : {}),
+    ...(gitInfo !== undefined ? { gitInfo } : {}),
+    ...(typeof task.createdAt === 'string' || typeof task.createdAt === 'number'
+      ? { createdAt: task.createdAt }
+      : {}),
+    ...(typeof task.updatedAt === 'string' || typeof task.updatedAt === 'number'
+      ? { updatedAt: task.updatedAt }
+      : {}),
+    ...(typeof task.recencyAt === 'string' || typeof task.recencyAt === 'number'
+      ? { recencyAt: task.recencyAt }
+      : {}),
+    ...(booleanValue(task.pinned) !== undefined ? { pinned: booleanValue(task.pinned) } : {}),
+    ...(nullableNumberValue(task.pinnedOrder) !== undefined
+      ? { pinnedOrder: nullableNumberValue(task.pinnedOrder) }
+      : {}),
+    ...(nullableNumberValue(task.sidebarOrder) !== undefined
+      ? { sidebarOrder: nullableNumberValue(task.sidebarOrder) }
+      : {}),
+  }
+}
+
+function hydratePersistedTask(task: PersistedRuntimeTask): CachedRuntimeTaskProjection {
+  return { ...task, cachedProjection: true }
+}
+
+function parsePersistedWorkspace(value: unknown): PersistedRuntimeDeviceWorkspace | null {
+  const workspace = recordValue(value)
+  const deviceId = stringValue(workspace.deviceId)
+  const workspacePath = stringValue(workspace.workspacePath)
+  if (!deviceId || !workspacePath) return null
+
+  const tasks = Array.isArray(workspace.tasks)
+    ? workspace.tasks
+        .map(task => parsePersistedTask(task, workspacePath))
+        .filter((task): task is PersistedRuntimeTask => task !== null)
+    : []
+
+  return {
+    deviceId,
+    workspacePath,
+    tasks,
+    ...(nullableNumberValue(workspace.id) !== undefined
+      ? { id: nullableNumberValue(workspace.id) }
+      : {}),
+    ...(nullableNumberValue(workspace.projectId) !== undefined
+      ? { projectId: nullableNumberValue(workspace.projectId) }
+      : {}),
+    ...(nullableStringValue(workspace.deviceName) !== undefined
+      ? { deviceName: nullableStringValue(workspace.deviceName) }
+      : {}),
+    ...(nullableStringValue(workspace.workspaceKind) !== undefined
+      ? { workspaceKind: nullableStringValue(workspace.workspaceKind) }
+      : {}),
+    ...(nullableStringValue(workspace.worktreeId) !== undefined
+      ? { worktreeId: nullableStringValue(workspace.worktreeId) }
+      : {}),
+    ...(nullableStringValue(workspace.label) !== undefined
+      ? { label: nullableStringValue(workspace.label) }
+      : {}),
+    ...(nullableStringValue(workspace.repoUrl) !== undefined
+      ? { repoUrl: nullableStringValue(workspace.repoUrl) }
+      : {}),
+    ...(nullableStringValue(workspace.repoRootFingerprint) !== undefined
+      ? { repoRootFingerprint: nullableStringValue(workspace.repoRootFingerprint) }
+      : {}),
+    ...(booleanValue(workspace.mapped) !== undefined
+      ? { mapped: booleanValue(workspace.mapped) }
+      : {}),
+  }
+}
+
+function hydratePersistedWorkspace(
+  workspace: PersistedRuntimeDeviceWorkspace
+): RuntimeDeviceWorkspace {
+  return {
+    ...workspace,
+    available: false,
+    deviceStatus: 'offline',
+    workspaceSource: 'remote',
+    remoteHostId: workspace.deviceId,
+    tasks: workspace.tasks.map(hydratePersistedTask),
+  }
+}
+
+function parsePersistedProjectWork(value: unknown): PersistedRuntimeProjectWork | null {
+  const projectWork = recordValue(value)
+  const project = sanitizeProjectRef(projectWork.project)
+  if (!project) return null
+  const deviceWorkspaces = Array.isArray(projectWork.deviceWorkspaces)
+    ? projectWork.deviceWorkspaces
+        .map(parsePersistedWorkspace)
+        .filter((workspace): workspace is PersistedRuntimeDeviceWorkspace => workspace !== null)
+    : []
+  return {
+    project,
+    deviceWorkspaces,
+  }
+}
+
+function parsePersistedRuntimeWork(value: unknown): PersistedRuntimeWorkList {
+  const runtimeWork = recordValue(value)
+  const projects = Array.isArray(runtimeWork.projects)
+    ? runtimeWork.projects
+        .map(parsePersistedProjectWork)
+        .filter((project): project is PersistedRuntimeProjectWork => project !== null)
+    : []
+  const chats = Array.isArray(runtimeWork.chats)
+    ? runtimeWork.chats
+        .map(parsePersistedWorkspace)
+        .filter((workspace): workspace is PersistedRuntimeDeviceWorkspace => workspace !== null)
+    : []
+  return { projects, chats }
+}
+
+function hydratePersistedRuntimeWork(
+  persistedRuntimeWork: PersistedRuntimeWorkList
+): RuntimeWorkListResponse {
+  const projects: RuntimeProjectWork[] = persistedRuntimeWork.projects.map(project => {
+    const deviceWorkspaces = project.deviceWorkspaces.map(hydratePersistedWorkspace)
+    return {
+      project: project.project,
+      deviceWorkspaces,
+      totalTasks: deviceWorkspaces.reduce((total, workspace) => total + workspace.tasks.length, 0),
+    }
+  })
+  const chats = persistedRuntimeWork.chats.map(hydratePersistedWorkspace)
+  return {
+    projects,
+    chats,
+    totalTasks:
+      projects.reduce((total, project) => total + (project.totalTasks ?? 0), 0) +
+      chats.reduce((total, workspace) => total + workspace.tasks.length, 0),
+  }
+}
+
+export function createRemoteRuntimeWorkCacheSnapshot(value: unknown): RuntimeWorkListResponse {
+  return hydratePersistedRuntimeWork(parsePersistedRuntimeWork(value))
+}
+
+export function readCachedRemoteRuntimeWork(userId: number): RuntimeWorkListResponse {
+  try {
+    const raw = window.localStorage.getItem(cacheKey(userId))
+    if (!raw) return EMPTY_RUNTIME_WORK
+    const envelope = recordValue(JSON.parse(raw))
+    if (envelope.version !== REMOTE_RUNTIME_WORK_CACHE_VERSION) return EMPTY_RUNTIME_WORK
+    return hydratePersistedRuntimeWork(parsePersistedRuntimeWork(envelope.runtimeWork))
+  } catch {
+    return EMPTY_RUNTIME_WORK
+  }
+}
+
+export function writeCachedRemoteRuntimeWork(
+  userId: number,
+  runtimeWork: RuntimeWorkListResponse,
+  devices?: DeviceInfo[]
+): RuntimeWorkListResponse {
+  const persistedRuntimeWork = parsePersistedRuntimeWork(
+    withCachedDeviceLabels(runtimeWork, devices)
+  )
+  const envelope: RemoteRuntimeWorkCacheEnvelope = {
+    version: REMOTE_RUNTIME_WORK_CACHE_VERSION,
+    updatedAt: Date.now(),
+    runtimeWork: persistedRuntimeWork,
+  }
+  try {
+    window.localStorage.setItem(cacheKey(userId), JSON.stringify(envelope))
+  } catch {
+    // The current runtime work remains available when persistent storage is unavailable.
+  }
+  return hydratePersistedRuntimeWork(persistedRuntimeWork)
+}
+
+function runtimeWorkspaces(runtimeWork: RuntimeWorkListResponse): RuntimeDeviceWorkspace[] {
+  return [
+    ...runtimeWork.projects.flatMap(project => project.deviceWorkspaces),
+    ...runtimeWork.chats,
+  ]
+}
+
+function workspaceAliases(workspace: RuntimeDeviceWorkspace): Set<string> {
+  return new Set(
+    [workspace.deviceId, workspace.remoteHostId]
+      .map(value => value?.trim())
+      .filter((value): value is string => Boolean(value))
+  )
+}
+
+function aliasesIntersect(left: Set<string>, right: Set<string>): boolean {
+  for (const value of left) {
+    if (right.has(value)) return true
+  }
+  return false
+}
+
+function networkHost(value?: string | null): string | null {
+  const label = value?.trim()
+  if (!label) return null
+  const bracketMatch = label.match(/^\[([^\]]+)\](?::\d+)?$/)
+  if (bracketMatch?.[1]) return bracketMatch[1]
+  const colonParts = label.split(':')
+  if (colonParts.length === 2 && /^\d+$/.test(colonParts[1])) {
+    return colonParts[0]
+  }
+  return label
+}
+
+function withCachedDeviceLabels(
+  runtimeWork: RuntimeWorkListResponse,
+  devices?: DeviceInfo[]
+): RuntimeWorkListResponse {
+  if (!devices) return runtimeWork
+  const deviceRecords = devices.map(device => ({
+    device,
+    aliases: new Set(getWorkbenchDeviceIds(device)),
+  }))
+  const annotateWorkspace = (workspace: RuntimeDeviceWorkspace): RuntimeDeviceWorkspace => {
+    const aliases = workspaceAliases(workspace)
+    const device = deviceRecords.find(record => aliasesIntersect(aliases, record.aliases))?.device
+    const deviceName =
+      networkHost(device?.client_ip) ??
+      networkHost(device?.runtime_transfer_host) ??
+      workspace.deviceName
+    return deviceName ? { ...workspace, deviceName } : workspace
+  }
+  return {
+    ...runtimeWork,
+    projects: runtimeWork.projects.map(project => ({
+      ...project,
+      deviceWorkspaces: project.deviceWorkspaces.map(annotateWorkspace),
+    })),
+    chats: runtimeWork.chats.map(annotateWorkspace),
+  }
+}
+
+function filterRuntimeWorkspaces(
+  runtimeWork: RuntimeWorkListResponse,
+  keep: (workspace: RuntimeDeviceWorkspace) => boolean
+): RuntimeWorkListResponse {
+  const projects = runtimeWork.projects
+    .map(project => {
+      const deviceWorkspaces = project.deviceWorkspaces.filter(keep)
+      return {
+        ...project,
+        deviceWorkspaces,
+        totalTasks: deviceWorkspaces.reduce(
+          (total, workspace) => total + workspace.tasks.length,
+          0
+        ),
+      }
+    })
+    .filter(project => project.deviceWorkspaces.length > 0)
+  const chats = runtimeWork.chats.filter(keep)
+  return {
+    projects,
+    chats,
+    totalTasks:
+      projects.reduce((total, project) => total + (project.totalTasks ?? 0), 0) +
+      chats.reduce((total, workspace) => total + workspace.tasks.length, 0),
+  }
+}
+
+export function reconcileCachedRemoteRuntimeWork(
+  cachedRuntimeWork: RuntimeWorkListResponse,
+  liveRuntimeWork: RuntimeWorkListResponse,
+  devices?: DeviceInfo[]
+): RuntimeWorkListResponse {
+  const cachedSnapshot = createRemoteRuntimeWorkCacheSnapshot(cachedRuntimeWork)
+  const liveWorkspaceAliases = runtimeWorkspaces(liveRuntimeWork).map(workspaceAliases)
+  const deviceRecords = devices?.map(device => ({
+    aliases: new Set(getWorkbenchDeviceIds(device)),
+    available: isUsableDevice(device),
+  }))
+
+  const preservedCache = filterRuntimeWorkspaces(cachedSnapshot, workspace => {
+    const aliases = workspaceAliases(workspace)
+    if (deviceRecords) {
+      const device = deviceRecords.find(record => aliasesIntersect(aliases, record.aliases))
+      return Boolean(device && !device.available)
+    }
+    return !liveWorkspaceAliases.some(liveAliases => aliasesIntersect(aliases, liveAliases))
+  })
+
+  return mergeRuntimeWorkLists(preservedCache, liveRuntimeWork, { devices })
+}

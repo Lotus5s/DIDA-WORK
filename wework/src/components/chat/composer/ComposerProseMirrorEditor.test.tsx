@@ -1,0 +1,1134 @@
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { Activity, createRef, useState } from 'react'
+import { EditorState } from 'prosemirror-state'
+import { describe, expect, test, vi } from 'vitest'
+import type { PluginReference } from '@/features/plugins/pluginNavigation'
+import { ComposerProseMirrorEditor, type ComposerEditorHandle } from './ComposerProseMirrorEditor'
+import {
+  composerSchema,
+  createComposerDocument,
+  serializeComposerDocument,
+  serializeComposerSlice,
+} from './composerProseMirrorModel'
+
+const TABLE_MARKDOWN = '| 项目 | 说明 |\n| --- | --- |\n| 中文 | **重点** |\n| 空单元格 |  |'
+
+const INLINE_FORMAT_CASES = [
+  { name: 'strikethrough', delimiter: '~~', selector: 's', html: '<s>example</s>' },
+  { name: 'inline code', delimiter: '`', selector: 'code', html: '<code>example</code>' },
+  { name: 'bold', delimiter: '**', selector: 'strong', html: '<strong>example</strong>' },
+  { name: 'italic', delimiter: '*', selector: 'em', html: '<em>example</em>' },
+  {
+    name: 'bold italic',
+    delimiter: '***',
+    selector: 'strong em',
+    html: '<strong><em>example</em></strong>',
+  },
+]
+
+function pasteMarkdown(editor: HTMLElement, value: string) {
+  fireEvent.paste(editor, {
+    clipboardData: {
+      files: [],
+      types: ['text/plain'],
+      getData: (type: string) => (type === 'text/plain' ? value : ''),
+    },
+  })
+}
+
+const GMAIL_REFERENCE = '[$gmail](/tmp/gmail/SKILL.md)'
+
+function renderEditor(
+  value = GMAIL_REFERENCE,
+  onBeforeInput: (event: InputEvent) => boolean = () => false,
+  onOpenMentionPlugin: (reference: PluginReference) => void = vi.fn(),
+  onOpenMentionFile: (path: string) => void = vi.fn()
+) {
+  const editorRef = createRef<ComposerEditorHandle>()
+  const textareaRef = createRef<HTMLElement>()
+  const onChange = vi.fn()
+
+  render(
+    <ComposerProseMirrorEditor
+      ref={editorRef}
+      value={value}
+      onChange={onChange}
+      onSnapshotChange={vi.fn()}
+      onKeyDown={() => false}
+      onBeforeInput={onBeforeInput}
+      onKeyUp={vi.fn()}
+      onCompositionStart={vi.fn()}
+      onCompositionEnd={vi.fn()}
+      onPaste={() => false}
+      onDrop={() => false}
+      onOpenMentionPlugin={onOpenMentionPlugin}
+      onOpenMentionFile={onOpenMentionFile}
+      onClick={vi.fn()}
+      onFocus={vi.fn()}
+      placeholder="Message"
+      testId="composer-editor"
+      rows={2}
+      textareaRef={textareaRef}
+      className="min-h-12"
+    />
+  )
+
+  return { editorRef, onChange }
+}
+
+describe('ComposerProseMirrorEditor', () => {
+  test.each([
+    '~/worksapce/skills/test-skill/SKILL.md',
+    '/tmp/skills/test-skill/SKILL.md',
+    'C:/Users/test/skills/test-skill/SKILL.md',
+    './skills/test-skill/SKILL.md',
+    './instructions.md',
+  ])('pastes a path link without a dollar prefix as an atomic file reference: %s', path => {
+    const reference = `[test-label](${path})`
+    const onOpenMentionFile = vi.fn()
+    const { editorRef } = renderEditor('', undefined, undefined, onOpenMentionFile)
+    pasteMarkdown(screen.getByTestId('composer-editor'), reference)
+
+    const chip = screen.getByTestId('composer-path-chip-test-label')
+    expect(chip).toHaveTextContent(/^test-label$/)
+    expect(chip).toHaveAttribute('contenteditable', 'false')
+    expect(chip).toHaveAttribute('data-composer-path', path)
+    expect(chip.querySelector('svg')).not.toBeNull()
+    expect(editorRef.current!.getSnapshot().value).toBe(reference)
+    fireEvent.mouseDown(chip, { button: 0 })
+    expect(onOpenMentionFile).toHaveBeenCalledWith(path)
+
+    act(() => editorRef.current!.setValue(reference, reference.length))
+    expect(screen.getByTestId('composer-path-chip-test-label')).toHaveTextContent(/^test-label$/)
+    expect(editorRef.current!.getSnapshot().value).toBe(reference)
+  })
+
+  describe.each(INLINE_FORMAT_CASES)(
+    '$name formatting boundaries',
+    ({ delimiter, selector, html }) => {
+      test('ends formatting at the boundary while preserving edits inside it', () => {
+        const doc = createComposerDocument(`${delimiter}some text${delimiter}`)
+        expect(() => doc.check()).not.toThrow()
+        const state = EditorState.create({ doc })
+        expect(serializeComposerDocument(state.tr.insertText(' appended', 10).doc)).toBe(
+          `${delimiter}some text${delimiter} appended`
+        )
+        expect(serializeComposerDocument(state.tr.insertText('new ', 6).doc)).toBe(
+          `${delimiter}some new text${delimiter}`
+        )
+      })
+
+      test.each(['markdown', 'html', 'draft'])(
+        'keeps native input outside formatting after %s insertion',
+        async kind => {
+          const value = `${delimiter}example${delimiter}`
+          const { editorRef } = renderEditor('')
+          const editor = screen.getByTestId('composer-editor')
+          if (kind === 'draft') {
+            act(() => editorRef.current!.setValue(value, value.length))
+          } else {
+            fireEvent.paste(editor, {
+              clipboardData: {
+                files: [],
+                getData: (type: string) =>
+                  type === 'text/html' && kind === 'html'
+                    ? html
+                    : type === 'text/plain'
+                      ? kind === 'html'
+                        ? 'example'
+                        : value
+                      : '',
+              },
+            })
+          }
+          const formatted = editor.querySelector(selector)!
+          act(() => {
+            const text = formatted.firstChild as Text
+            text.appendData(' appended text')
+            window.getSelection()!.collapse(text, text.length)
+            fireEvent.input(editor, { inputType: 'insertText', data: ' appended text' })
+          })
+          await waitFor(() => {
+            expect(editorRef.current!.getSnapshot().value).toBe(`${value} appended text`)
+          })
+          expect(editor.querySelector(selector)).toHaveTextContent(/^example$/)
+        }
+      )
+    }
+  )
+
+  test('preserves outer italic formatting when typing past an inner bold boundary', () => {
+    const state = EditorState.create({ doc: createComposerDocument('*some **bold** text*') })
+    const updated = state.tr.insertText(' added', 10).doc
+    expect(serializeComposerDocument(updated)).toBe('*some **bold** added text*')
+  })
+
+  test('preserves the link and italic formatting after typing past pasted bold text', async () => {
+    const { editorRef } = renderEditor('')
+    const editor = screen.getByTestId('composer-editor')
+    pasteMarkdown(editor, '[*some **bold** text*](https://example.com)')
+    expect(editorRef.current!.getSnapshot().value).toBe(
+      '*[some **bold** text](https://example.com)*'
+    )
+    const bold = editor.querySelector('strong')!
+    act(() => {
+      const text = document.createTreeWalker(bold, NodeFilter.SHOW_TEXT).nextNode() as Text
+      text.appendData('x')
+      window.getSelection()!.collapse(text, text.length)
+      fireEvent.input(editor, { inputType: 'insertText', data: 'x' })
+    })
+    await waitFor(() => {
+      expect(editorRef.current!.getSnapshot().value).toBe(
+        '*[some **bold**x text](https://example.com)*'
+      )
+    })
+    expect(editor.querySelector('strong')).toHaveTextContent(/^bold$/)
+    for (const selector of ['em', 'a[href="https://example.com"]']) {
+      expect(Array.from(editor.querySelectorAll(selector), node => node.textContent).join('')).toBe(
+        'some boldx text'
+      )
+    }
+  })
+
+  test('keeps native input after a pasted URL outside the link', async () => {
+    const url = 'https://example.com/1192966660/Riodm8zUo'
+    const { editorRef } = renderEditor('')
+    const editor = screen.getByTestId('composer-editor')
+    pasteMarkdown(editor, url)
+    const link = screen.getByTestId('composer-text-link')
+    act(() => {
+      // Simulate the DOM mutation produced by native typing at the link's end.
+      const text = link.firstChild as Text
+      text.appendData('哈哈哈哈')
+      window.getSelection()!.collapse(text, text.length)
+      fireEvent.input(editor, { inputType: 'insertText', data: '哈哈哈哈' })
+    })
+    await waitFor(() => {
+      expect(editorRef.current!.getSnapshot().value).toBe(`[${url}](${url})哈哈哈哈`)
+    })
+    expect(screen.getByTestId('composer-text-link').textContent).toBe(url)
+    expect(editor.textContent).toBe(`${url}哈哈哈哈`)
+  })
+
+  test('keeps separately pasted text outside a link after draft restoration', () => {
+    const url = 'https://example.com/page'
+    const { editorRef } = renderEditor(url)
+    const editor = screen.getByTestId('composer-editor')
+    act(() => editorRef.current!.setValue(url, url.length))
+    pasteMarkdown(editor, '后续文字')
+    expect(editorRef.current!.getSnapshot().value).toBe(`[${url}](${url})后续文字`)
+    expect(screen.getByTestId('composer-text-link').textContent).toBe(url)
+  })
+
+  test('pastes an editable table, edits a cell and navigates between cells with Tab', () => {
+    const { editorRef } = renderEditor('')
+    const editor = screen.getByTestId('composer-editor')
+    pasteMarkdown(editor, TABLE_MARKDOWN)
+    expect(editor.querySelectorAll('table')).toHaveLength(1)
+    expect(editor.querySelector('strong')).toHaveTextContent('重点')
+    const value = editorRef.current!.getSnapshot().value
+    act(() => editorRef.current!.setValue(value, value.indexOf('中文') + 2))
+    pasteMarkdown(editor, '内容')
+    expect(editorRef.current!.getSnapshot().value).toContain('| 中文内容 | **重点** |')
+    fireEvent.keyDown(editor, { key: 'Tab' })
+    expect(editorRef.current!.getSnapshot().selectionStart).toBe(
+      editorRef.current!.getSnapshot().value.indexOf('重点')
+    )
+    fireEvent.keyDown(editor, { key: 'Tab', shiftKey: true })
+    expect(editorRef.current!.getSnapshot().selectionStart).toBe(
+      editorRef.current!.getSnapshot().value.indexOf('中文内容')
+    )
+  })
+
+  test('copies the rendered table as Markdown and undoes/redoes the whole paste', () => {
+    const { editorRef } = renderEditor('')
+    const editor = screen.getByTestId('composer-editor')
+    pasteMarkdown(editor, TABLE_MARKDOWN)
+    fireEvent.keyDown(editor, { key: 'a', metaKey: true })
+    const setData = vi.fn()
+    fireEvent.copy(editor, { clipboardData: { setData } })
+    expect(setData).toHaveBeenCalledWith('text/plain', TABLE_MARKDOWN)
+    expect(setData).toHaveBeenCalledWith('text/html', expect.stringContaining('<table>'))
+    fireEvent.keyDown(editor, { key: 'z', ctrlKey: true })
+    expect(editorRef.current!.getSnapshot().value).toBe('')
+    expect(editor.querySelector('table')).toBeNull()
+    fireEvent.keyDown(editor, { key: 'y', ctrlKey: true })
+    expect(editor.querySelector('table')).not.toBeNull()
+    expect(editorRef.current!.getSnapshot().value).toBe(TABLE_MARKDOWN)
+  })
+
+  test('preserves code language and checked tasks when copying and pasting rich text', () => {
+    const value = '```typescript\nconst test = 1\n```\n\n- [x] test done\n- [ ] test pending'
+    const { editorRef } = renderEditor(value)
+    const editor = screen.getByTestId('composer-editor')
+    fireEvent.keyDown(editor, { key: 'a', metaKey: true })
+    const clipboard = new Map<string, string>()
+    fireEvent.copy(editor, {
+      clipboardData: { setData: (type: string, content: string) => clipboard.set(type, content) },
+    })
+    expect(clipboard.get('text/html')).toContain('language-typescript')
+    act(() => editorRef.current!.setValue(''))
+    fireEvent.paste(editor, {
+      clipboardData: { files: [], getData: (type: string) => clipboard.get(type) ?? '' },
+    })
+    const result = editorRef.current!.getSnapshot().value
+    expect(result).toContain('```typescript\nconst test = 1\n```')
+    expect(result).toContain('[x] test done')
+    expect(result).toContain('[ ] test pending')
+  })
+
+  test('prefers rich HTML over plain clipboard text and removes executable content', () => {
+    const { editorRef } = renderEditor('')
+    const editor = screen.getByTestId('composer-editor')
+    fireEvent.paste(editor, {
+      clipboardData: {
+        files: [],
+        getData: (type: string) =>
+          type === 'text/html'
+            ? '<p><strong>test bold</strong> <a href="https://example.invalid">test link</a></p><script>bad()</script>'
+            : 'test bold test link',
+      },
+    })
+    expect(editor.querySelector('strong')).toHaveTextContent('test bold')
+    expect(editor.querySelector('script')).toBeNull()
+    expect(editorRef.current?.getSnapshot().value).toContain('**test bold**')
+    expect(editorRef.current?.getSnapshot().value).toContain('[test link](https://example.invalid)')
+  })
+
+  test('exits the last table cell with Tab and preserves cell line breaks', () => {
+    const { editorRef } = renderEditor(TABLE_MARKDOWN)
+    const editor = screen.getByTestId('composer-editor')
+    act(() => editorRef.current!.setValue(TABLE_MARKDOWN, TABLE_MARKDOWN.lastIndexOf(' |')))
+    fireEvent.keyDown(editor, { key: 'Tab' })
+    pasteMarkdown(editor, '后文')
+    expect(editorRef.current!.getSnapshot().value).toBe(TABLE_MARKDOWN + '\n\n后文')
+    const value = editorRef.current!.getSnapshot().value
+    act(() => editorRef.current!.setValue(value, value.indexOf('中文') + 2))
+    fireEvent.keyDown(editor, { key: 'Enter', shiftKey: true })
+    pasteMarkdown(editor, '第二行')
+    expect(editorRef.current!.getSnapshot().value).toContain('中文<br>第二行')
+  })
+
+  test('keeps pasted Markdown literal inside a code block', () => {
+    const value = '```text\ncode\n```'
+    const { editorRef } = renderEditor(value)
+    act(() => editorRef.current!.setValue(value, value.indexOf('code') + 4))
+    pasteMarkdown(screen.getByTestId('composer-editor'), '\n**literal**')
+    expect(editorRef.current!.getSnapshot().value).toBe('```text\ncode\n**literal**\n```')
+    expect(screen.getByTestId('composer-editor').querySelector('strong')).toBeNull()
+  })
+
+  test('pastes a table into existing cells without nesting tables', () => {
+    const { editorRef } = renderEditor(TABLE_MARKDOWN)
+    const editor = screen.getByTestId('composer-editor')
+    act(() => editorRef.current!.setValue(TABLE_MARKDOWN, TABLE_MARKDOWN.indexOf('中文')))
+    pasteMarkdown(editor, '| 新表头 | B |\n| --- | --- |\n| 新内容 | C |')
+    expect(editor.querySelectorAll('table')).toHaveLength(1)
+    expect(editor.querySelectorAll('tr')).toHaveLength(3)
+    expect(editor.querySelectorAll('td table')).toHaveLength(0)
+    expect(editorRef.current!.getSnapshot().value).toContain('新表头')
+    expect(editorRef.current!.getSnapshot().value).toContain('新内容')
+  })
+
+  test('exposes the placeholder layer for scoped composer alignment', () => {
+    renderEditor('')
+
+    expect(screen.getByText('Message')).toHaveClass('composer-prosemirror-placeholder')
+  })
+
+  test('restores the controlled value after an Activity tab is hidden and shown', () => {
+    function ActivityEditorHarness() {
+      const [visible, setVisible] = useState(true)
+      const [value, setValue] = useState('')
+
+      return (
+        <>
+          <button type="button" onClick={() => setVisible(current => !current)}>
+            Toggle tab
+          </button>
+          <Activity mode={visible ? 'visible' : 'hidden'}>
+            <ComposerProseMirrorEditor
+              value={value}
+              onChange={setValue}
+              onSnapshotChange={vi.fn()}
+              onKeyDown={() => false}
+              onBeforeInput={() => false}
+              onKeyUp={vi.fn()}
+              onCompositionStart={vi.fn()}
+              onCompositionEnd={vi.fn()}
+              onPaste={() => false}
+              onDrop={() => false}
+              onClick={vi.fn()}
+              onFocus={vi.fn()}
+              placeholder="Message"
+              testId="composer-editor"
+              rows={2}
+              textareaRef={createRef<HTMLElement>()}
+              className="min-h-12"
+            />
+          </Activity>
+        </>
+      )
+    }
+
+    render(<ActivityEditorHarness />)
+
+    const editor = screen.getByTestId('composer-editor') as HTMLElement & { value: string }
+    expect(editor).toHaveClass('composer-prosemirror-editor')
+    act(() => {
+      editor.value = '每个标签自己的草稿'
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle tab' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle tab' }))
+
+    expect((screen.getByTestId('composer-editor') as HTMLElement & { value: string }).value).toBe(
+      '每个标签自己的草稿'
+    )
+  })
+
+  test('models skill references as non-selectable atomic inline nodes', () => {
+    const doc = createComposerDocument(GMAIL_REFERENCE)
+    const mention = doc.firstChild?.firstChild
+
+    expect(mention?.type).toBe(composerSchema.nodes.composer_mention)
+    expect(mention?.isAtom).toBe(true)
+    expect(mention?.isLeaf).toBe(true)
+    expect(mention?.type.spec.selectable).toBe(false)
+  })
+
+  test('renders path labels with the original filesystem casing', () => {
+    renderEditor('[$backend](folder://%2Fworkspace%2Fbackend) ')
+
+    const chip = screen.getByTestId('composer-path-chip-backend')
+    expect(chip).toHaveTextContent('backend')
+    expect(chip).toHaveAttribute('data-composer-skill-label', 'backend')
+  })
+
+  test.each([
+    ['mouse', () => fireEvent.click(screen.getByTestId('composer-plugin-chip-wegent-sites'))],
+    [
+      'keyboard',
+      () =>
+        fireEvent.keyDown(screen.getByTestId('composer-plugin-chip-wegent-sites'), {
+          key: 'Enter',
+        }),
+    ],
+  ])('opens plugin details with the %s interaction', (_interaction, openPlugin) => {
+    const onOpenMentionPlugin = vi.fn()
+    renderEditor('[$站点](plugin://wegent-sites@wegent-bundled) ', () => false, onOpenMentionPlugin)
+
+    const chip = screen.getByTestId('composer-plugin-chip-wegent-sites')
+    expect(chip).toHaveAttribute('role', 'link')
+    expect(chip).toHaveAttribute('tabindex', '0')
+    expect(chip).toHaveAttribute('data-composer-plugin-name', 'wegent-sites')
+    expect(chip).toHaveAttribute('data-composer-plugin-marketplace', 'wegent-bundled')
+
+    openPlugin()
+
+    expect(onOpenMentionPlugin).toHaveBeenCalledOnce()
+    expect(onOpenMentionPlugin).toHaveBeenCalledWith({
+      pluginName: 'wegent-sites',
+      marketplaceName: 'wegent-bundled',
+    })
+  })
+
+  test('serializes copied skill selections back to their markdown references', () => {
+    const value = `before ${GMAIL_REFERENCE} after`
+    const doc = createComposerDocument(value)
+
+    expect(serializeComposerSlice(doc.slice(0, doc.content.size))).toBe(value)
+  })
+
+  test.each([
+    ['LF text/plain', 'first line\nsecond line\nthird line', 'text/plain'],
+    ['LF text alias', 'first line\nsecond line\nthird line', 'text'],
+    ['CRLF text/plain', 'first line\r\nsecond line\r\nthird line', 'text/plain'],
+  ])('keeps every line when pasting %s', (_variant, pastedText, clipboardType) => {
+    const { editorRef, onChange } = renderEditor('')
+    const editor = screen.getByTestId('composer-editor')
+
+    fireEvent.paste(editor, {
+      clipboardData: {
+        files: [],
+        getData: (type: string) => (type === clipboardType ? pastedText : ''),
+        types: ['text/plain', 'text/html'],
+      },
+    })
+
+    expect(editorRef.current?.getSnapshot().value).toBe('first line\nsecond line\nthird line')
+    expect(onChange).toHaveBeenLastCalledWith('first line\nsecond line\nthird line')
+  })
+
+  test('models each plain-text line as its own paragraph', () => {
+    const doc = createComposerDocument('first line\n\nthird line')
+
+    expect(doc.childCount).toBe(3)
+    expect(doc.child(0).textContent).toBe('first line')
+    expect(doc.child(1).content.size).toBe(0)
+    expect(doc.child(2).textContent).toBe('third line')
+    expect(serializeComposerDocument(doc)).toBe('first line\n\nthird line')
+  })
+
+  test('keeps offset zero before an empty leading paragraph separator', () => {
+    const { editorRef } = renderEditor('')
+
+    act(() => editorRef.current?.setValue('\ntext', 0))
+
+    expect(editorRef.current?.getSnapshot()).toMatchObject({
+      value: '\ntext',
+      selectionOffset: 0,
+      selectionStart: 0,
+      selectionEnd: 0,
+    })
+  })
+
+  test('inserts pasted text exactly once through the ProseMirror paste pipeline', () => {
+    const { editorRef, onChange } = renderEditor('existing ')
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => editorRef.current?.setValue('existing ', 'existing '.length))
+
+    fireEvent.paste(editor, {
+      clipboardData: {
+        files: [],
+        getData: (type: string) => (type === 'text/plain' ? 'pasted text' : ''),
+        types: ['text/plain'],
+      },
+    })
+
+    expect(editorRef.current?.getSnapshot().value).toBe('existing pasted text')
+    expect(onChange).toHaveBeenCalledOnce()
+    expect(onChange).toHaveBeenLastCalledWith('existing pasted text')
+  })
+
+  test('keeps the caret immediately after text pasted in the middle', () => {
+    const { editorRef } = renderEditor('before after')
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => editorRef.current?.setValue('before after', 'before '.length))
+
+    fireEvent.paste(editor, {
+      clipboardData: {
+        files: [],
+        getData: (type: string) => (type === 'text/plain' ? 'pasted ' : ''),
+        types: ['text/plain'],
+      },
+    })
+
+    expect(editorRef.current?.getSnapshot()).toMatchObject({
+      value: 'before pasted after',
+      selectionOffset: 'before pasted '.length,
+      selectionStart: 'before pasted '.length,
+      selectionEnd: 'before pasted '.length,
+    })
+  })
+
+  test.each([
+    ['Home', 0],
+    ['End', 'before after'.length],
+  ])('moves the caret with %s without inserting a control character', (key, selectionOffset) => {
+    const { editorRef, onChange } = renderEditor('before after')
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => {
+      editorRef.current?.setValue('before after', 'before '.length)
+      editorRef.current?.focus()
+    })
+
+    expect(fireEvent.keyDown(editor, { key, code: key })).toBe(false)
+    expect(editorRef.current?.getSnapshot()).toMatchObject({
+      value: 'before after',
+      selectionOffset,
+      selectionStart: selectionOffset,
+      selectionEnd: selectionOffset,
+    })
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  test.each([
+    ['Home', 0, 'before '.length],
+    ['End', 'before '.length, 'before after'.length],
+  ])('extends the selection with Shift+%s', (key, selectionStart, selectionEnd) => {
+    const { editorRef } = renderEditor('before after')
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => {
+      editorRef.current?.setValue('before after', 'before '.length)
+      editorRef.current?.focus()
+    })
+
+    expect(fireEvent.keyDown(editor, { key, code: key, shiftKey: true })).toBe(false)
+    expect(editorRef.current?.getSnapshot()).toMatchObject({
+      value: 'before after',
+      selectionStart,
+      selectionEnd,
+    })
+  })
+
+  test.each([
+    ['Home', 0],
+    ['End', 'first line\nsecond line'.length],
+  ])('moves to the document boundary with Cmd/Ctrl+%s', (key, selectionOffset) => {
+    const { editorRef } = renderEditor('first line\nsecond line')
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => {
+      editorRef.current?.setValue('first line\nsecond line', 'first line'.length)
+      editorRef.current?.focus()
+    })
+
+    expect(
+      fireEvent.keyDown(editor, {
+        key,
+        code: key,
+        metaKey: key === 'Home',
+        ctrlKey: key === 'End',
+      })
+    ).toBe(false)
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe(selectionOffset)
+  })
+
+  test.each([
+    {
+      kind: 'paragraphs',
+      html: '<p>first line</p><p>second line</p><p>third line</p>',
+      expected: 'first line\n\nsecond line\n\nthird line',
+      paragraphs: 3,
+    },
+    {
+      kind: 'hard breaks',
+      html: '<p>first line<br>second line<br>third line</p>',
+      expected: 'first line\nsecond line\nthird line',
+      paragraphs: 1,
+    },
+  ])('preserves $kind when pasting rich text', ({ html, expected, paragraphs }) => {
+    const { editorRef, onChange } = renderEditor('')
+    const editor = screen.getByTestId('composer-editor')
+
+    fireEvent.paste(editor, {
+      clipboardData: {
+        files: [],
+        getData: (type: string) => {
+          if (type === 'text/plain') return 'first line\nsecond line\nthird line'
+          if (type === 'text/html') return html
+          return ''
+        },
+        types: ['text/plain', 'text/html'],
+      },
+    })
+
+    expect(editorRef.current?.getSnapshot().value).toBe(expected)
+    expect(editor.querySelectorAll('p')).toHaveLength(paragraphs)
+    expect(onChange).toHaveBeenCalledOnce()
+  })
+
+  test('scrolls the caret into view after inserting a line break', () => {
+    const { editorRef } = renderEditor('first line')
+    const editor = screen.getByTestId('composer-editor')
+    Object.defineProperties(editor, {
+      clientHeight: { configurable: true, value: 100 },
+      scrollHeight: { configurable: true, value: 180 },
+    })
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => {
+      callback(0)
+      return 1
+    })
+
+    act(() => editorRef.current?.setValue('first line', 'first line'.length))
+    fireEvent.keyDown(editor, {
+      key: 'Enter',
+      code: 'Enter',
+      shiftKey: true,
+    })
+
+    expect(editorRef.current?.getSnapshot().value).toBe('first line\n')
+    expect(editor.scrollTop).toBe(80)
+    expect(editor.querySelector('.composer-empty-caret')).toHaveAttribute('aria-hidden', 'true')
+  })
+
+  test('uses the native caret when the composer is completely empty', () => {
+    renderEditor('')
+
+    expect(screen.getByTestId('composer-editor').querySelector('.composer-empty-caret')).toBeNull()
+  })
+
+  test('shows the measurable empty caret only while the Electron window is focused', () => {
+    const previousRuntimeConfig = window.__WEWORK_RUNTIME_CONFIG__
+    let documentFocused = true
+    const hasFocus = vi.spyOn(document, 'hasFocus').mockImplementation(() => documentFocused)
+    window.__WEWORK_RUNTIME_CONFIG__ = {
+      ...previousRuntimeConfig,
+      desktopHost: 'electron',
+    }
+
+    try {
+      renderEditor('')
+
+      expect(
+        screen.getByTestId('composer-editor').querySelector('.composer-empty-caret')
+      ).toHaveAttribute('aria-hidden', 'true')
+
+      const editor = screen.getByTestId('composer-editor')
+      editor.focus()
+      expect(editor).toHaveAttribute('data-composer-focus-visible')
+
+      documentFocused = false
+      act(() => window.dispatchEvent(new Event('blur')))
+      expect(editor).not.toHaveAttribute('data-composer-focus-visible')
+      expect(editor).toHaveFocus()
+
+      documentFocused = true
+      act(() => window.dispatchEvent(new Event('focus')))
+      expect(editor).toHaveFocus()
+      expect(editor).toHaveAttribute('data-composer-focus-visible')
+
+      const otherButton = document.createElement('button')
+      document.body.append(otherButton)
+      otherButton.focus()
+      expect(editor).not.toHaveAttribute('data-composer-focus-visible')
+      otherButton.remove()
+    } finally {
+      hasFocus.mockRestore()
+      window.__WEWORK_RUNTIME_CONFIG__ = previousRuntimeConfig
+    }
+  })
+
+  test('keeps an explicitly native Electron composer free of caret widgets', () => {
+    const previousRuntimeConfig = window.__WEWORK_RUNTIME_CONFIG__
+    window.__WEWORK_RUNTIME_CONFIG__ = {
+      ...previousRuntimeConfig,
+      desktopHost: 'electron',
+    }
+
+    try {
+      const textareaRef = createRef<HTMLElement>()
+      render(
+        <ComposerProseMirrorEditor
+          value=""
+          onChange={vi.fn()}
+          onSnapshotChange={vi.fn()}
+          onKeyDown={() => false}
+          onBeforeInput={() => false}
+          onKeyUp={vi.fn()}
+          onCompositionStart={vi.fn()}
+          onCompositionEnd={vi.fn()}
+          onPaste={() => false}
+          onDrop={() => false}
+          onClick={vi.fn()}
+          onFocus={vi.fn()}
+          placeholder="Message"
+          testId="native-composer-editor"
+          rows={2}
+          textareaRef={textareaRef}
+          className="min-h-12"
+          nativeEmptyCaret
+        />
+      )
+
+      expect(
+        screen.getByTestId('native-composer-editor').querySelector('.composer-empty-caret')
+      ).toBeNull()
+    } finally {
+      window.__WEWORK_RUNTIME_CONFIG__ = previousRuntimeConfig
+    }
+  })
+
+  test('keeps the caret outside the skill while repeatedly moving left', () => {
+    const { editorRef, onChange } = renderEditor()
+    const editor = screen.getByTestId('composer-editor')
+    const chip = screen.getByTestId('local-skill-chip-gmail')
+
+    expect(editor).toHaveAttribute('contenteditable', 'true')
+    expect(chip).toHaveAttribute('contenteditable', 'false')
+    expect(chip).toHaveAttribute('tabindex', '-1')
+    expect(chip).toHaveAttribute('aria-label', 'Gmail')
+    expect(chip).toHaveAttribute('data-composer-skill-label', 'Gmail')
+    expect(chip).toHaveClass('composer-mention-node', 'composer-mention-link')
+    expect(editor.querySelectorAll('.composer-mention-icon')).toHaveLength(1)
+    expect(chip.firstElementChild).toHaveClass('composer-mention-icon-slot')
+    expect(chip.querySelector('.composer-mention-icon-slot')).toHaveAttribute('aria-hidden', 'true')
+    expect(chip.querySelector('.composer-mention-icon')).toBeInTheDocument()
+    expect(chip.querySelector('.composer-mention-label')).toHaveTextContent('Gmail')
+
+    act(() => {
+      editorRef.current?.setValue(GMAIL_REFERENCE, GMAIL_REFERENCE.length)
+      editorRef.current?.focus()
+    })
+
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe(GMAIL_REFERENCE.length)
+
+    expect(fireEvent.keyDown(editor, { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 })).toBe(
+      false
+    )
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe(0)
+
+    const paragraph = editor.querySelector('p')
+    expect(window.getSelection()?.anchorNode).toBe(paragraph)
+    expect(window.getSelection()?.anchorOffset).toBe(0)
+
+    for (let index = 0; index < 11; index += 1) {
+      expect(fireEvent.keyDown(editor, { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 })).toBe(
+        false
+      )
+      const snapshot = editorRef.current?.getSnapshot()
+      expect(snapshot?.selectionOffset).toBe(0)
+      expect(snapshot?.value).toBe(GMAIL_REFERENCE)
+      expect(snapshot?.value).not.toContain('\uFFFC')
+    }
+
+    expect(onChange).not.toHaveBeenCalled()
+    expect(screen.getByTestId('local-skill-chip-gmail')).toBe(chip)
+  })
+
+  test('repairs a WebKit DOM selection that drifted inside the skill', () => {
+    const { editorRef } = renderEditor()
+    const editor = screen.getByTestId('composer-editor')
+    const chip = screen.getByTestId('local-skill-chip-gmail')
+
+    act(() => {
+      editorRef.current?.setValue(GMAIL_REFERENCE, GMAIL_REFERENCE.length)
+      const range = document.createRange()
+      range.setStart(chip, 0)
+      range.collapse(true)
+      window.getSelection()?.removeAllRanges()
+      window.getSelection()?.addRange(range)
+    })
+
+    fireEvent.keyDown(editor, { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 })
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe(0)
+    expect(editorRef.current?.getSnapshot().value).toBe(GMAIL_REFERENCE)
+  })
+
+  test('moves left from the skill boundary into text typed before it', () => {
+    const value = `DF${GMAIL_REFERENCE} `
+    const { editorRef } = renderEditor(value)
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => {
+      editorRef.current?.setValue(value, 2)
+      editorRef.current?.focus()
+    })
+
+    expect(fireEvent.keyDown(editor, { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 })).toBe(
+      false
+    )
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe(1)
+    expect(editorRef.current?.getSnapshot().value).toBe(value)
+  })
+
+  test.each([
+    ['ArrowLeft', 'first\nsecond', 6, 37],
+    ['ArrowLeft', 'first\n', 6, 37],
+    ['ArrowLeft', `first\n${GMAIL_REFERENCE}`, 6, 37],
+    ['ArrowRight', 'first\nsecond', 5, 39],
+    ['ArrowRight', '\nsecond', 0, 39],
+    ['ArrowRight', `${GMAIL_REFERENCE}\nsecond`, GMAIL_REFERENCE.length, 39],
+  ] as const)(
+    'allows native %s navigation across paragraphs in %s',
+    (key, value, offset, keyCode) => {
+      const { editorRef, onChange } = renderEditor(value)
+      const editor = screen.getByTestId('composer-editor')
+      act(() => {
+        editorRef.current?.setValue(value, offset)
+        editorRef.current?.focus()
+      })
+
+      expect(fireEvent.keyDown(editor, { key, code: key, keyCode })).toBe(true)
+      expect(onChange).not.toHaveBeenCalled()
+    }
+  )
+
+  test.each(['ArrowLeft', 'ArrowRight'])(
+    'does not override modified %s visual line navigation',
+    key => {
+      const value = `first line\nsecond line with ${GMAIL_REFERENCE} content\nthird line`
+      const mentionOffset = value.indexOf(GMAIL_REFERENCE)
+      const { editorRef } = renderEditor(value)
+      const editor = screen.getByTestId('composer-editor')
+
+      act(() => {
+        editorRef.current?.setValue(value, mentionOffset)
+        editorRef.current?.focus()
+      })
+
+      expect(
+        fireEvent.keyDown(editor, {
+          key,
+          code: key,
+          keyCode: key === 'ArrowLeft' ? 37 : 39,
+          metaKey: true,
+        })
+      ).toBe(true)
+      expect(editorRef.current?.getSnapshot().selectionOffset).toBe(mentionOffset)
+    }
+  )
+
+  test.each([
+    ['a', 65],
+    ['e', 69],
+  ])('does not override macOS Control-%s visual line navigation', (key, keyCode) => {
+    const value = `first line\nsecond line with ${GMAIL_REFERENCE} content\nthird line`
+    const mentionOffset = value.indexOf(GMAIL_REFERENCE)
+    const { editorRef } = renderEditor(value)
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => {
+      editorRef.current?.setValue(value, mentionOffset)
+      editorRef.current?.focus()
+    })
+
+    expect(
+      fireEvent.keyDown(editor, { key, code: `Key${key.toUpperCase()}`, keyCode, ctrlKey: true })
+    ).toBe(true)
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe(mentionOffset)
+  })
+
+  test('keeps unmodified arrow navigation protected at a skill boundary', () => {
+    const value = `DF${GMAIL_REFERENCE} `
+    const { editorRef } = renderEditor(value)
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => {
+      editorRef.current?.setValue(value, 2)
+      editorRef.current?.focus()
+    })
+
+    expect(fireEvent.keyDown(editor, { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 })).toBe(
+      false
+    )
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe(2 + GMAIL_REFERENCE.length)
+  })
+
+  test('copies the complete markdown value after Command-A', () => {
+    const value = `before ${GMAIL_REFERENCE} after`
+    renderEditor(value)
+    const editor = screen.getByTestId('composer-editor')
+    const setData = vi.fn()
+    const copyEvent = new Event('copy', { bubbles: true, cancelable: true }) as ClipboardEvent
+    Object.defineProperty(copyEvent, 'clipboardData', { value: { setData } })
+
+    editor.focus()
+    expect(fireEvent.keyDown(editor, { key: 'a', code: 'KeyA', metaKey: true })).toBe(false)
+    expect(editor.dispatchEvent(copyEvent)).toBe(false)
+    expect(setData).toHaveBeenCalledWith('text/plain', value)
+  })
+
+  test.each(['Backspace', 'Delete'])('deletes a fully selected multiline document with %s', key => {
+    const { editorRef, onChange } = renderEditor('first line\n\nthird line')
+    const editor = screen.getByTestId('composer-editor')
+
+    editor.focus()
+    expect(fireEvent.keyDown(editor, { key: 'a', code: 'KeyA', metaKey: true })).toBe(false)
+    expect(editorRef.current?.getSnapshot()).toMatchObject({
+      selectionStart: 0,
+      selectionEnd: 'first line\n\nthird line'.length,
+    })
+
+    expect(fireEvent.keyDown(editor, { key, code: key })).toBe(false)
+    expect(editorRef.current?.getSnapshot()).toMatchObject({
+      value: '',
+      selectionOffset: 0,
+      selectionStart: 0,
+      selectionEnd: 0,
+    })
+    expect(onChange).toHaveBeenLastCalledWith('')
+  })
+
+  test.each(['Backspace', 'Delete'])('removes an empty line with %s', key => {
+    const value = 'first line\n\nthird line'
+    const { editorRef, onChange } = renderEditor(value)
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => {
+      editorRef.current?.setValue(value, 'first line\n'.length)
+      editorRef.current?.focus()
+    })
+
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe('first line\n'.length)
+    expect(fireEvent.keyDown(editor, { key, code: key })).toBe(false)
+    const expectedSelectionOffset =
+      key === 'Backspace' ? 'first line'.length : 'first line\n'.length
+    expect(editorRef.current?.getSnapshot()).toMatchObject({
+      value: 'first line\nthird line',
+      selectionOffset: expectedSelectionOffset,
+      selectionStart: expectedSelectionOffset,
+      selectionEnd: expectedSelectionOffset,
+    })
+    expect(onChange).toHaveBeenLastCalledWith('first line\nthird line')
+  })
+
+  test('moves right across the whole skill in one step', () => {
+    const { editorRef } = renderEditor()
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => {
+      editorRef.current?.setValue(GMAIL_REFERENCE, 0)
+      editorRef.current?.focus()
+    })
+
+    expect(fireEvent.keyDown(editor, { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 })).toBe(
+      false
+    )
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe(GMAIL_REFERENCE.length)
+
+    expect(fireEvent.keyDown(editor, { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 })).toBe(
+      false
+    )
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe(GMAIL_REFERENCE.length)
+  })
+
+  test('moves left across a skill after traversing its separator space', () => {
+    const value = `${GMAIL_REFERENCE} `
+    const { editorRef } = renderEditor(value)
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => {
+      editorRef.current?.setValue(value, value.length)
+      editorRef.current?.focus()
+    })
+
+    expect(editor.querySelector('.composer-mention-separator')?.textContent).toBe(' ')
+
+    expect(fireEvent.keyDown(editor, { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 })).toBe(
+      false
+    )
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe(GMAIL_REFERENCE.length)
+
+    expect(fireEvent.keyDown(editor, { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 })).toBe(
+      false
+    )
+    expect(editorRef.current?.getSnapshot().selectionOffset).toBe(0)
+    expect(editorRef.current?.getSnapshot().value).toBe(value)
+  })
+
+  test('keeps the caret stable after repeatedly moving right at the separator boundary', () => {
+    const value = `${GMAIL_REFERENCE} `
+    const { editorRef, onChange } = renderEditor(value)
+    const editor = screen.getByTestId('composer-editor')
+
+    act(() => {
+      editorRef.current?.setValue(value, value.length)
+      editorRef.current?.focus()
+    })
+
+    for (let index = 0; index < 11; index += 1) {
+      expect(
+        fireEvent.keyDown(editor, { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 })
+      ).toBe(false)
+      const snapshot = editorRef.current?.getSnapshot()
+      expect(snapshot?.selectionOffset).toBe(value.length)
+      expect(snapshot?.value).toBe(value)
+      expect(snapshot?.value).not.toContain('\uFFFC')
+    }
+
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  test('removes object replacement characters before creating editor state', () => {
+    const doc = createComposerDocument(`\uFFFC${GMAIL_REFERENCE}\uFFFCtext\uFFFC`)
+
+    expect(serializeComposerDocument(doc)).toBe(`${GMAIL_REFERENCE}text`)
+  })
+
+  test('prevents WebKit object replacement text before it mutates the document', () => {
+    const { editorRef } = renderEditor()
+    const editor = screen.getByTestId('composer-editor')
+    const event = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      data: '\uFFFC',
+      inputType: 'insertText',
+    })
+
+    expect(editor.dispatchEvent(event)).toBe(false)
+    expect(event.defaultPrevented).toBe(true)
+    expect(editorRef.current?.getSnapshot().value).toBe(GMAIL_REFERENCE)
+  })
+
+  test.each([
+    '/tmp/openai-platform-api-key/SKILL.md',
+    '~/.agents/skills/openai-platform-api-key/SKILL.md',
+    'C:/Users/me/skills/instructions.md',
+    './skills/instructions.md',
+  ])('converts a complete qualified skill reference inserted as one text input: %s', skillPath => {
+    const qualifiedReference = `[$openai-developers:openai-platform-api-key](${skillPath})`
+    const value = `${qualifiedReference} Verify the sent qualified skill mention.`
+    const { editorRef, onChange } = renderEditor('')
+    const editor = screen.getByTestId('composer-editor')
+    const event = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      data: value,
+      inputType: 'insertText',
+    })
+
+    expect(editor.dispatchEvent(event)).toBe(false)
+    expect(event.defaultPrevented).toBe(true)
+    expect(editorRef.current?.getSnapshot().value).toBe(value)
+    expect(
+      screen.getByTestId('local-skill-chip-openai-developers-openai-platform-api-key')
+    ).toBeInTheDocument()
+    expect(onChange).toHaveBeenLastCalledWith(value)
+  })
+
+  test('prevents the paragraph event emitted after a consumed autocomplete Enter', () => {
+    const onBeforeInput = vi.fn((event: InputEvent) => event.inputType === 'insertParagraph')
+    renderEditor(GMAIL_REFERENCE, onBeforeInput)
+    const editor = screen.getByTestId('composer-editor')
+    const event = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      inputType: 'insertParagraph',
+    })
+
+    expect(editor.dispatchEvent(event)).toBe(false)
+    expect(event.defaultPrevented).toBe(true)
+    expect(onBeforeInput).toHaveBeenCalledOnce()
+  })
+
+  test('snaps serialized offsets inside a skill reference to the atom boundary', () => {
+    const { editorRef, onChange } = renderEditor()
+
+    for (let offset = 1; offset < GMAIL_REFERENCE.length; offset += 1) {
+      act(() => editorRef.current?.setValue(GMAIL_REFERENCE, offset))
+      expect(editorRef.current?.getSnapshot().selectionOffset).toBe(GMAIL_REFERENCE.length)
+    }
+
+    expect(onChange).not.toHaveBeenCalled()
+  })
+})
+
+test('renders GitHub URLs as recognized inline link chips', () => {
+  renderEditor('Check https://github.com/wecode-ai/Wegent/pull/2350')
+
+  const chip = screen.getByTestId('composer-link-chip')
+  expect(chip).toHaveClass('composer-link-node', 'composer-mention-link')
+  expect(chip).toHaveAttribute(
+    'data-composer-link-url',
+    'https://github.com/wecode-ai/Wegent/pull/2350'
+  )
+  expect(chip).toHaveTextContent('wecode-ai/Wegent#2350')
+  expect(chip.querySelector('img')).toHaveAttribute(
+    'src',
+    'https://github.githubassets.com/favicons/favicon.svg'
+  )
+})
+
+test('renders Wegent Sites project markdown links as inline link chips', () => {
+  const value = '[产品发布页](wegent-sites-project://prj_product) 请说出你要做的改动'
+  renderEditor(value)
+
+  const chip = screen.getByTestId('composer-link-chip')
+  expect(chip).toHaveAttribute('data-composer-link-url', 'wegent-sites-project://prj_product')
+  expect(chip).toHaveAttribute('data-composer-link-provider', 'wegent-sites-project')
+  expect(chip).toHaveTextContent('产品发布页')
+  expect(chip.querySelector('img')).toHaveAttribute('src', '/plugin-icons/wework.svg')
+  expect(serializeComposerDocument(createComposerDocument(value))).toBe(value)
+})
+
+test('keeps unrecognized URLs as plain text', () => {
+  renderEditor('Visit https://example.com/page')
+
+  expect(screen.queryByTestId('composer-link-chip')).not.toBeInTheDocument()
+  expect(screen.getByTestId('composer-editor')).toHaveTextContent('https://example.com/page')
+})

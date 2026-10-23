@@ -1,0 +1,567 @@
+---
+sidebar_position: 10
+---
+
+# 在本地设备上执行AI任务
+
+本地设备支持允许您使用个人电脑（Mac、Linux 或 Windows）作为任务执行器，让 AI 任务直接在本地机器上运行。
+
+<img src="https://github.com/user-attachments/assets/ead0cc30-b3a4-4eb6-a6dd-77ffcbd72238" width="100%" alt="AI Device Demo"/>
+
+---
+
+## 📋 目录
+
+- [概述](#-概述)
+- [设备注册](#-设备注册)
+- [使用本地设备](#-使用本地设备)
+- [设备管理](#-设备管理)
+- [常见问题](#-常见问题)
+- [相关资源](#-相关资源)
+
+---
+
+## 🎯 概述
+
+### 什么是本地设备支持？
+
+本地设备支持允许您的个人电脑作为 Wegent 的任务执行器。任务不再在云端基础设施上运行，而是直接在您的本地机器上执行，并提供实时流式反馈。
+
+### 核心价值
+
+| 优势           | 描述                               |
+| -------------- | ---------------------------------- |
+| **更低延迟**   | 本地直接执行，无需网络传输延迟     |
+| **数据隐私**   | 您的代码和数据永远不会离开本地机器 |
+| **环境控制**   | 使用本地安装的工具、依赖和配置     |
+| **成本节约**   | 减少云端执行资源消耗               |
+| **自定义设置** | 访问本地凭证、自定义工具和专业软件 |
+
+---
+
+## 📲 设备注册
+
+### 前置条件
+
+在注册本地设备之前，请确保您具备：
+
+- [ ] 有效凭证的 Wegent 账号
+- [ ] 在您的机器上安装了 Wegent Executor
+- [ ] 能够连接到 Wegent 后端的网络
+- [ ] 已配置 Claude Code SDK（用于 ClaudeCode shell 类型）
+
+### 安装 Wegent Executor
+
+#### 一键安装（推荐）
+
+**macOS / Linux：**
+
+```bash
+curl -fsSL https://github.com/wecode-ai/Wegent/releases/latest/download/local_executor_install.sh | bash
+```
+
+**Windows (PowerShell)：**
+
+```powershell
+irm https://github.com/wecode-ai/Wegent/releases/latest/download/local_executor_install.ps1 | iex
+```
+
+安装脚本将会：
+
+- 检查并安装 Node.js 18+（Claude Code 运行所需）
+- 安装或升级 Claude Code SDK
+- 下载适合您平台的二进制文件
+- 将二进制文件添加到系统 PATH
+
+#### Linux AMD64 Claude CLI 要求
+
+Rust executor 二进制不会内置 Claude CLI。运行环境中必须存在可执行的 `claude` 命令，并满足 Wegent 要求的 Claude Code 最低版本。安装脚本和设备镜像会在 executor 二进制之外单独安装或升级 Claude Code。
+
+#### 使用个人 Codex CLI 配置
+
+默认情况下，executor 会使用 Wegent 下发的 Claude/Codex 模型和 provider 配置。需要使用个人 Codex 登录信息时，在 Wework 的【设置】->【个人】中从设备导入或上传本机 `~/.codex/auth.json`，再启用“个人配置”。设备心跳发现 executor 的 Codex Home 中缺少 `auth.json` 时，会异步调度同步；如果该文件已存在则不会覆盖。云设备默认写入 `$WEGENT_EXECUTOR_HOME/codex/auth.json`。使用 Codex 的 GPT 模型会通过该认证账户访问 Codex。
+
+如果访问 Codex 需要代理，可以先在 Wework 的【设置】->【个人】->【代理】中保存个人代理地址，再回到【Codex 认证】中启用“Codex 代理”。Wegent 会在执行 Codex 时注入 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 以及对应的小写环境变量。已有 `NO_PROXY` 或 `no_proxy` 时会沿用现有值；未配置时默认绕过 `localhost`、`127.0.0.1`、`::1` 和 `host.docker.internal`。
+
+Wegent 会根据用户设置在执行请求中显式标记 Codex 是否使用个人配置，不再通过 `WEGENT_LOCAL_CLI_CONFIG_RUNTIMES` 环境变量判断。
+
+#### 统一管理本地 Skills
+
+如果同一台本地设备同时使用 Claude Code 和 Codex，可以在 Wework 的【设置】->【编码】->【技能】中启用统一管理。Wegent 会在所选在线 Claude Code 设备上创建 `~/.agents/skills`，把 `~/.codex/skills` 和 `~/.claude/skills` 中已有的技能移动到该目录，并把两个旧目录改成指向 `~/.agents/skills` 的软链接。
+
+该操作可以重复执行。重名技能不会被覆盖；系统会为后迁移的目录追加来源后缀，并在页面展示迁移数量。启用后，输入框里的本地 Skill 自动补全会把 `~/.agents/skills` 中的技能视为 Claude 和 Codex 都可用。
+
+### 构建设备镜像
+
+仓库提供 `docker/device/Dockerfile` 用于构建云设备或本地设备基础镜像。该镜像默认基于 Ubuntu 26.04，按照 code-server 官方 `install.sh` 流程，以固定版本的 standalone 模式安装到 `/usr/local`；同时安装 Claude Code 与 Codex CLI、Node.js 22、Python、Git，并把构建出的 `wegent-executor` 放到 `/app/executor` 和 `~/.wecode/wegent-executor/bin/wegent-executor`。
+
+镜像内默认系统用户为 `wegent`，系统密码为 `wegent`，用于容器终端 shell 场景。code-server 按本地设备安装脚本的方式以 `auth: none` 启动，但只监听 `127.0.0.1:18080`；远程 IDE 访问必须经过带会话 token 校验的设备网关，不要把 18080 端口暴露到容器或主机外部。
+
+Dockerfile 会在目标平台的 builder 阶段编译 executor，并校验基础镜像 rootfs 和最终 ELF 二进制的架构。公共发布工作流会分别构建并校验 Linux AMD64 和 ARM64 镜像。
+
+```bash
+docker buildx build --platform linux/amd64 \
+  -f docker/device/Dockerfile \
+  -t wegent-device:linux-amd64 \
+  --load .
+```
+
+executor 二进制不包含 Claude Code，因此通过 npm、基础镜像或其他方式安装 Claude Code 的镜像可以直接复用 `executor/dist/wegent-executor`。
+
+运行设备镜像时通过环境变量传入 executor 连接信息，不要把 token 写入镜像：
+
+```bash
+DEVICE_SESSION_GATEWAY_PORT="${DEVICE_SESSION_GATEWAY_PORT:-17888}"
+docker run -d --platform linux/amd64 \
+  --name wegent-device \
+  -p "$DEVICE_SESSION_GATEWAY_PORT:$DEVICE_SESSION_GATEWAY_PORT" \
+  -e WEGENT_BACKEND_URL=https://backend.example.com \
+  -e WEGENT_AUTH_TOKEN="$WEGENT_AUTH_TOKEN" \
+  -e DEVICE_SESSION_GATEWAY_PORT="$DEVICE_SESSION_GATEWAY_PORT" \
+  ghcr.io/wecode-ai/wegent-device:<version>
+```
+
+`WEGENT_BACKEND_URL` 是 Executor 使用的 HTTP API 地址。`DEVICE_SESSION_GATEWAY_PORT` 控制带 token 校验的设备会话网关端口，默认值为 `17888`；宿主机映射端口和容器端口必须保持一致。Backend 会用它为设备观测到的地址拼出浏览器访问地址，因此该端口需要能被用户浏览器访问。可以通过 Dockerfile 的构建参数选择公开的软件包和系统镜像源，无需修改 Dockerfile。
+
+交互会话功能可以在容器启动时独立关闭，两个开关默认均为 `true`：
+
+- `DEVICE_CODE_SERVER_ENABLED=false`：不启动 code-server，Executor 不接受 code-server 会话，Wework 中的 IDE 按钮保持可见但不可用。code-server 仍保留在镜像内，便于使用同一镜像重新开启。
+- `DEVICE_TERMINAL_ENABLED=false`：Executor 不接受 Terminal 会话，Wework 中的终端卡片和菜单项保持可见但不可用。该开关不会隐藏整个底部工作区。
+
+例如，在 `docker run` 中增加 `-e DEVICE_CODE_SERVER_ENABLED=false` 可以运行仅启用 Terminal 的设备。Executor 会在注册和心跳中上报实际能力；旧版 Executor 没有该能力字段时，Backend 和 Wework 保持原有可用行为。
+
+### 托管云设备的持久化契约
+
+托管云设备只有在部署平台把持久卷固定挂载到 `/home/wegent/.wecode/wegent-executor` 时才能开放 Git Worktree。该目录同时保存项目工作区、Chats 工作区、托管 Worktree、Runtime Task Store、`worktrees.json`、快照 refs、能力缓存和会话状态；实例重启或替换后必须把同一持久卷重新挂载到同一绝对路径，再启动 Executor。
+
+部署必须把稳定的逻辑设备 ID 写入 `WEGENT_EXECUTOR_HOME_ID`，并保证 `LOCAL_WORKSPACE_ROOT` 位于 `WEGENT_EXECUTOR_HOME` 内。设备镜像启动时会拒绝相对路径、变化的挂载路径、不可写目录、与持久卷中既有设备 ID 不匹配的实例，以及同时写入同一 Executor Home 的第二个 Executor 进程。镜像只能验证路径、身份、写权限和单写锁，无法自行证明底层存储是否真正持久；云设备 Provider 仍需把持久卷附着、重挂载和备份恢复作为部署验收门槛。
+
+如果云平台不能保证这些条件，不得仅凭 Executor capability 开放云端 Worktree。实例重建后丢失持久卷应报告为不可恢复的存储故障，不能创建同名空目录或回退到项目主工作区继续运行。
+
+仓库提供了分阶段验收探针。第一次在旧实例运行 `seed`，由探针创建真实 Git 仓库、Git Worktree 和 Runtime 状态标记；平台替换实例并把同一持久卷挂回同一绝对路径后，在新实例运行 `verify`。`WEGENT_ACCEPTANCE_INSTANCE_ID` 必须使用 Pod UID、虚拟机实例 ID 等平台真实实例标识，第二阶段必须与第一阶段不同：
+
+```bash
+export WEGENT_EXECUTOR_HOME=/home/wegent/.wecode/wegent-executor
+export LOCAL_WORKSPACE_ROOT="$WEGENT_EXECUTOR_HOME/workspace"
+export WEGENT_EXECUTOR_HOME_ID=<stable-logical-device-id>
+export WEGENT_WORKTREE_PERSISTENT_STORAGE_VERIFIED=true
+export WEGENT_ACCEPTANCE_INSTANCE_ID=<old-instance-id>
+export WEGENT_ACCEPTANCE_VOLUME_ID=<pvc-or-pv-uid>
+scripts/acceptance/executor-home-persistence-probe.sh seed
+
+# 替换实例并重新挂载同一持久卷后：
+export WEGENT_ACCEPTANCE_INSTANCE_ID=<replacement-instance-id>
+# WEGENT_ACCEPTANCE_VOLUME_ID 必须仍是同一个平台卷 UID。
+scripts/acceptance/executor-home-persistence-probe.sh verify
+scripts/acceptance/executor-home-persistence-probe.sh cleanup
+```
+
+`seed`、`verify` 和 `cleanup` 都会通过真实 Executor App IPC 调用 `runtime.worktrees.capabilities`，并且只接受 `persistentStorageVerified=true`。Worktree 由 `runtime.worktrees.prepare` 创建，实例替换后由 `runtime.worktrees.list` 对账，最后由 `runtime.worktrees.delete` 清理，不再以手写 `git worktree add` 代替 Executor 生命周期。`verify` 还会检查平台卷 UID、逻辑设备身份、`device-config.json` 中的稳定 `runtime_instance_id`、Executor Home 和 Workspace 的绝对路径、源仓库 HEAD、Git common dir、Worktree `.git` 文件、Worktree 内容以及 Runtime 状态是否跨实例保持。相同实例 ID、不同卷 UID、不同 Runtime Instance ID、错误设备 ID、路径变化或数据丢失都会返回非零退出码，不能作为通过处理。
+
+Backend 会在 Cloud/Remote 设备首次注册时固定 `runtimeInstanceId`。后续同一逻辑设备如果携带新的或空的 Runtime Instance ID，注册会以持久存储身份不匹配失败，不能覆盖旧值或创建旁路设备记录。因此误挂全新空卷时，即使部署仍传入原 `DEVICE_ID`，新卷生成的新 Runtime Instance ID 也不能让设备静默重新上线。Local/App 设备保持原有可更新行为。
+
+### 添加远程 Docker 设备
+
+Wegent 设备列表中的 Wework 设备需要在 Wework 中升级。远程 Docker 设备显示新版本提示时，请重新拉取镜像并使用原有数据卷与设备身份重建容器。设备镜像包含 SSH 客户端并使用 `Asia/Shanghai` 时区。启动命令会显式设置 `WEGENT_WORKBENCH_HOME=/home/wegent/.wegent/workbench`，宿主机进程模式不使用这一容器路径。
+
+Wework 云端连接页的设备数量包含服务端返回的在线与离线云设备和远程设备，不包含本地设备或 Wework 自身注册。
+
+远程 Docker 设备适合把一台自管服务器或容器主机接入 Wegent。它和云设备一样通过设备 WebSocket 协议接收任务，并支持终端与 code-server 会话；区别是容器生命周期由用户自己管理，Wegent 不会自动创建、重启或销毁这台 Docker 容器。
+
+每个用户最多只能创建一台云设备。如果已经存在云设备，添加设备弹窗会禁用云设备创建入口，但仍可继续生成远程 Docker 设备命令。
+
+在 Wework 中进入 **设置** -> **连接**，或在 Wegent 的 **AI 设备** 页面点击 **添加设备**，选择 **远程 Docker 设备**并生成启动命令。生成命令时只创建连接凭据，不会提前创建离线 Device 记录；Executor 成功注册后，设备才会显示在独立的 **远程设备** 分组。
+
+生成的命令会包含类似参数：
+
+```bash
+DEVICE_SESSION_GATEWAY_PORT="${DEVICE_SESSION_GATEWAY_PORT:-17888}"
+docker run -d \
+  --name wegent-remote-device \
+  --restart unless-stopped \
+  -e DEVICE_TYPE=remote \
+  -e EXECUTOR_MODE=local \
+  -e DEVICE_ID=<generated-device-id> \
+  -e WEGENT_EXECUTOR_HOME_ID=<generated-device-id> \
+  -e WEGENT_WORKTREE_PERSISTENT_STORAGE_VERIFIED=true \
+  -e DEVICE_NAME=<generated-device-name> \
+  -e WEGENT_BACKEND_URL=https://backend.example.com \
+  -e WEGENT_AUTH_TOKEN=<generated-api-key> \
+  -e DEVICE_SESSION_GATEWAY_PORT="$DEVICE_SESSION_GATEWAY_PORT" \
+  -p "$DEVICE_SESSION_GATEWAY_PORT:$DEVICE_SESSION_GATEWAY_PORT" \
+  -v wegent-remote-device-home:/home/wegent/.wecode/wegent-executor \
+  ghcr.io/wecode-ai/wegent-device:latest
+```
+
+启动命令将 `DEVICE_SESSION_GATEWAY_PORT` 默认设置为 `17888`；执行命令前可以导出其他端口值，命令会同时更新容器环境变量和端口映射。IDE 会话的浏览器访问地址由 Backend 生成：Backend 使用它观测到的设备地址加上 Executor 上报的网关端口，因此设备需要能在不隐藏自身地址的前提下访问 Backend。观测不到可用地址时，可以在命令中额外加上 `-e RUNTIME_TRANSFER_HOST=<设备可达地址>` 手动指定。`WEGENT_AUTH_TOKEN` 每次生成命令时都会新建一把 remote device API Key，只出现在生成命令中。
+
+`-v wegent-remote-device-home:/home/wegent/.wecode/wegent-executor` 会把 Docker 命名卷 `wegent-remote-device-home` 挂载到 Executor home。该卷持久化工作区、下载的能力、配置和运行数据，使容器删除并按同名命令重建后仍能复用这些数据。`WEGENT_EXECUTOR_HOME_ID` 将该卷固定到逻辑设备；`WEGENT_WORKTREE_PERSISTENT_STORAGE_VERIFIED=true` 表示这条启动命令已经提供并验证稳定卷、固定绝对挂载路径和单写约束，Executor 才会向 Wework 开放 Remote Worktree。不要在临时目录、匿名卷或未完成持久化验收的部署中设置该值。`DEVICE_ID` 和连接 token 来自启动命令的环境变量，不由该卷保存。为避免卷中旧二进制阻碍升级，容器每次启动都会用当前镜像内的 Executor 刷新卷中的 `bin/wegent-executor`，其他数据保持不变。删除容器不会删除命名卷；只有显式执行 `docker volume rm wegent-remote-device-home` 才会清除它。
+
+设备镜像由 Backend 环境变量 `REMOTE_DEVICE_DOCKER_IMAGE` 控制，默认使用 `ghcr.io/wecode-ai/wegent-device:latest`。需要可复现部署时应固定发布版本或 digest。公共发布工作流会发布多架构镜像，并校验镜像架构、OCI 版本、源码 revision 和 Executor 版本。
+
+在开放 Remote Docker Worktree 前，应在安装了 Docker 且 daemon 可用的目标主机执行真实容器验收：
+
+```bash
+WEGENT_REMOTE_DEVICE_ACCEPTANCE_IMAGE=ghcr.io/wecode-ai/wegent-device:<version> \
+  scripts/acceptance/remote-device-worktree-persistence.sh
+```
+
+如需同时验收镜像升级，可再设置 `WEGENT_REMOTE_DEVICE_REBUILD_IMAGE=<new-version-or-digest>`。脚本会使用独立命名卷完成首个容器启动、真实 Executor Runtime Instance 初始化、Worktree capability 持久化证明、真实 Executor Worktree prepare/list/delete RPC、第二写入者拒绝、容器删除、镜像重建、同卷身份与 Runtime Instance 校验、二进制刷新、错误设备身份拒绝、再次恢复验证和清理。没有 Docker CLI、daemon 不可用或任一不变量失败时，脚本都会以非零状态退出，不会跳过。诊断时可设置 `WEGENT_ACCEPTANCE_KEEP_ARTIFACTS=1` 保留容器和卷。
+
+目标主机的内网防火墙需要允许浏览器访问配置的 session gateway 端口（默认 `17888`），但不能把该端口开放到公网。该端口只提供带短期会话 token 的 IDE 访问；session gateway 校验 token 后设置 HttpOnly Cookie，并从重定向 URL 中移除 token，不提供匿名 code-server 入口。
+
+设备镜像默认只启动 `wegent-executor` 和 code-server session gateway。Wework 项目终端通过 Backend 和 Executor 之间已有的 Socket.IO 连接中转，不要求设备有公网地址；云设备和远程 Docker 设备的 IDE/code-server 通过设备上报的 session gateway 端口访问，Backend 负责补上浏览器可达的地址，因此 Backend 观测到的设备地址必须能从用户浏览器访问。
+
+- `POST /api/projects/{project_id}/terminal`：在项目路径中启动可写 PTY，返回 `transport=socketio` 的终端会话 ID；浏览器通过 Backend `/terminal` Socket.IO namespace 连接。
+- `POST /api/projects/{project_id}/code-server`：返回带短期 token 的 code-server 访问 URL。设备镜像内的 code-server 只监听容器回环地址并使用 `auth: none`，session gateway 在外层校验短期 token，浏览器不会直接访问 code-server。
+- `POST /api/devices/{device_id}/code-server`：打开指定设备上的 code-server。请求 body 可选传入 `path`；不传时由 Executor 解析为自己的默认工作区（设备镜像中为 `/home/wegent/.wecode/wegent-executor/workspace`）。Executor 只接受默认 workspace、`WEGENT_WORKSPACE_ROOTS` 配置目录和已保存的 Codex 项目根目录，越界路径会被拒绝。
+
+Terminal 会话适用于本地设备、云设备和远程 Docker 设备：Backend 记录 `session_id`、用户、设备和 executor socket 绑定关系，前端使用登录 JWT 连接 `/terminal` namespace。浏览器加入会话 room 后，Backend 会通过 `/local-executor` namespace 发送带 ACK 的 `terminal:attach`；Executor 收到 attach 后才读取 PTY 中暂存的首屏输出，并通过 `terminal:output` 和 `terminal:exit` 回传，避免初始 Shell 提示符在浏览器订阅前丢失。Backend 还会把输入、resize、关闭事件转发给设备，设备上的 Executor 直接管理 PTY。code-server 是容器内持久进程，云设备和远程 Docker 设备通过 gateway 按项目路径打开目录；本地设备不支持 code-server 项目会话。
+
+如果项目配置了 `workspace.localPath`、`workspace.devicePath` 或 `workspace.checkoutPath`，Wework 会在确认项目时通过设备命令创建该目录，并在启动 terminal 或 code-server 前再次确保目录存在；目录创建失败时项目不会静默进入不可用状态。`localPath` 用于本机 local executor，`devicePath` 用于绑定到具体 cloud 或 remote 设备的沙箱目录。若请求携带任务 ID 且该任务记录了执行工作区路径（例如 Git 新工作树），terminal 或 code-server 会直接在任务工作区路径中启动，不会回退到项目目录。
+
+### 非项目会话工作区
+
+Wework 入口的新对话在未选择项目（`project_id=0`）且绑定到在线设备时，Executor 会默认使用独立 Chats 工作区。如需关闭，可在设备运行环境中设置 `WEGENT_EXECUTOR_STANDALONE_CHATS_ENABLED=false`。Frontend 设备对话保留旧行为，仍使用任务临时工作区。
+
+首轮任务会在 Chats 工作区树中创建目录，目录名根据日期和用户请求生成。默认根目录为 `~/.wecode/wegent-executor/workspace/chats`。如需自定义位置，可在设备运行环境中设置 `WEGENT_EXECUTOR_CHATS_DIR`。Backend 会把最终路径写入任务元数据标签 `standaloneChatWorkspacePath`，后续继续该会话或打开历史会话时会复用同一目录。
+
+项目会话不使用 Chats 工作区路径；项目会话默认使用项目配置中的 `workspace.localPath`、`workspace.devicePath` 或 `workspace.checkoutPath`。其中 `workspace.devicePath` 必须绑定到项目选择的 cloud 或 remote 设备。如果当前任务使用 Git 新工作树，项目工具会使用任务记录的工作树路径。
+
+#### 安装指定版本
+
+**macOS / Linux：**
+
+```bash
+curl -fsSL https://github.com/wecode-ai/Wegent/releases/download/v1.0.0/local_executor_install.sh | bash -s -- --version v1.0.0
+```
+
+**Windows (PowerShell)：**
+
+```powershell
+$env:WEGENT_VERSION='v1.0.0'; irm https://github.com/wecode-ai/Wegent/releases/latest/download/local_executor_install.ps1 | iex
+```
+
+#### 手动安装（开发环境）
+
+1. 克隆或下载 Wegent 仓库
+2. 安装依赖：
+
+```bash
+cd executor
+pip install -e .
+```
+
+### 启动 Executor
+
+以本地设备模式运行 executor：
+
+```bash
+# 使用环境变量或 ~/.wegent-executor/device-config.json 中的配置启动
+wegent-executor
+
+# 或用环境变量临时覆盖配置文件中的连接信息
+export WEGENT_AUTH_TOKEN=your_jwt_token
+export WEGENT_BACKEND_URL=https://your-wegent-instance.com
+wegent-executor
+```
+
+安装脚本和首次启动会创建 `~/.wegent-executor/device-config.json`。配置优先级是环境变量、device config、默认值；未设置 `WEGENT_EXECUTOR_HOME` 时默认使用 `~/.wegent-executor`。executor 启动时始终提供 HTTP server；非 `docker` 模式还会通过当前进程的 stdin/stdout 提供本地 JSONL IPC，并在设置 `WEGENT_BACKEND_URL` 或配置文件中的 `connection.backend_url` 后连接 Backend。Wework App 只与自己直接启动的 executor 子进程通信，不会发现或附着 App 外手动启动的 executor；完整退出 App 时也只回收自己管理的子进程。stdout 只承载协议帧，诊断信息写入 stderr 和 `~/.wegent-executor/logs/executor.log`。
+
+#### Claude Code 执行超时
+
+本地 executor 启动 Claude Code 子进程时，默认最长等待 24 小时。长时间代码生成、依赖安装或文件处理任务可以在这个时间内继续运行。若需要为特定环境调整该限制，可在启动 executor 前设置 `WEGENT_CLAUDE_CODE_PROCESS_TIMEOUT_SECONDS`。该配置只影响 Claude Code 子进程，不影响 native Codex app-server；Codex RPC 超时由 `WEGENT_CODEX_RPC_TIMEOUT_SECONDS` 控制。
+
+```bash
+export WEGENT_CLAUDE_CODE_PROCESS_TIMEOUT_SECONDS=172800
+wegent-executor
+```
+
+### 获取 JWT Token
+
+1. 登录 Wegent Web 界面
+2. 进入 **设置** → **API Token**
+3. 点击 **生成** 创建新 token
+4. 复制 token 用于启动 executor
+
+> **注意**：Token 有效期为 7 天，过期后需要重新生成。
+
+---
+
+## 🖥 使用本地设备
+
+### 选择设备
+
+在聊天界面中，您会看到设备选择器下拉菜单：
+
+1. 点击聊天输入框附近的 **设备选择器** 图标
+2. 查看可用设备及其状态：
+   - 🟢 **在线**：设备已连接且就绪
+   - 🔴 **离线**：设备未连接
+   - 🟡 **繁忙**：设备已达最大容量
+3. 选择您想使用的设备
+4. 像往常一样发送消息
+
+### 设备状态指示
+
+| 状态     | 图标 | 描述                      |
+| -------- | ---- | ------------------------- |
+| **在线** | 🟢   | 设备已连接，有可用槽位    |
+| **离线** | 🔴   | 设备未连接                |
+| **繁忙** | 🟡   | 所有 5 个并发槽位均被占用 |
+| **默认** | ⭐   | 您的新任务默认设备        |
+
+### 并发任务槽位
+
+每个设备支持最多 **5 个并发任务**：
+
+- 查看槽位使用情况："2/5 槽位使用中"
+- 所有槽位被占用时设备显示"繁忙"
+- 如果选择繁忙设备，任务会排队等待
+
+### 云端与本地切换
+
+您可以动态选择执行位置：
+
+| 选择             | 行为                             |
+| ---------------- | -------------------------------- |
+| **云端**（默认） | 任务在 Wegent 云端基础设施上执行 |
+| **本地设备**     | 任务在您选择的本地机器上执行     |
+
+只需在发送每条消息之前更改设备选择即可。
+
+### 项目中使用本地设备
+
+创建项目时可以选择在线或繁忙的 ClaudeCode 本地设备。项目创建后，AI 任务会在该本地设备上执行，并使用项目配置中的本地路径或检出路径。
+
+本地设备不支持项目工具栏中的云端连接能力：
+
+| 功能                 | 本地设备支持 |
+| -------------------- | ------------ |
+| **终端**             | 不支持       |
+| **IDE/code-server**  | 不支持       |
+| **云桌面**           | 不支持       |
+| **CPU/MEM/磁盘监控** | 不支持       |
+
+如果项目绑定本地设备，工作区工具栏会隐藏终端、IDE 和桌面入口，并显示本地设备能力限制提示。需要这些连接和监控能力时，请选择云设备创建项目。
+
+### 设置默认设备
+
+1. 在选择器中打开设备列表
+2. 点击您首选设备旁边的 **星号图标**
+3. 该设备将在新对话中被预先选中
+
+---
+
+## ⚙️ 设备管理
+
+### 查看已注册设备
+
+通过以下方式访问您的设备：
+
+1. **设备选择器**：聊天界面中快速访问
+2. **设置页**：进入 **设置** → **连接** 查看可连接设备
+3. **API**：`GET /devices` 用于程序化访问
+
+### 管理连接页设备
+
+**设置** → **连接** 页面会列出当前账号可连接的 ClaudeCode 设备，包括云设备和本地设备。页面仅展示 `bind_shell=claudecode` 的设备，并按云设备、本地设备分组。
+
+云设备会显示在线状态、executor 版本、CPU、内存和磁盘使用率。当没有云设备时，点击 **添加** 可以创建一台新的云设备。创建请求返回后，页面会保留“云设备创建中”的提示；初始化通常需要 2-3 分钟，设备上线后会自动出现在列表中。Wework 前端可通过 `VITE_CLOUD_DEVICE_SCALING_WIKI_URL` 配置资源说明卡中的扩容 Wiki 链接，用于引导用户在 CPU、MEM 或磁盘持续超过 80% 时申请扩容或清理工作区缓存。
+
+本地设备会显示设备名称、在线状态和 executor 版本，但不会展示 CPU、MEM、磁盘监控数据和资源监控说明，也不会展示终端、IDE、重启或删除云资源等云设备专属操作。离线本地设备会显示删除入口，用于移除该设备的注册记录；如果设备重新连接，它会自动重新注册。
+
+在线云设备和远程 Docker 设备支持直接打开终端和 IDE。
+
+| 操作     | 适用设备                 | 后端接口                                    | 说明                                                                                                                                 |
+| -------- | ------------------------ | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| **终端** | 云设备、远程 Docker 设备 | `POST /api/devices/{device_id}/terminal`    | 在默认工作目录 `/home/ubuntu/.wegent-executor/workspace` 启动 PTY；请求 body 可传 `path` 指定工作目录，并通过 Backend Socket.IO 中转 |
+| **IDE**  | 云设备、远程 Docker 设备 | `POST /api/devices/{device_id}/code-server` | 打开 code-server 会话；请求 body 可传 `path` 指定允许范围内的远程项目目录，不传时使用默认工作目录                                    |
+
+终端会话不暴露设备端口；IDE 返回的访问地址带有短期 session token，并通过设备侧 session gateway 暴露。设备离线时，对应按钮不可用。
+
+更多菜单提供低频管理操作：
+
+| 操作         | 说明                                               |
+| ------------ | -------------------------------------------------- |
+| **重命名**   | 点击设备名称或编辑图标，保存后会刷新列表           |
+| **重启设备** | 需要二次确认；设备会短暂离线，进行中的连接可能中断 |
+| **删除设备** | 需要二次确认；云资源会被释放                       |
+
+### 系统管理设备监控
+
+管理员可在 **系统管理** → **设备监控** 查看所有用户的设备。该页面支持按状态、设备类型、Shell 类型、版本和关键词筛选设备，并提供单设备升级、云设备重启等操作。
+
+页面顶部提供两个批量操作：
+
+| 操作                 | 作用范围                                                              | 说明                                                                   |
+| -------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| **升级全部本地设备** | 在线、`bindShell=claudecode`、executor 版本满足自动升级要求的本地设备 | 向符合条件的设备发送升级命令；离线、版本过低或正在运行任务的设备会跳过 |
+| **重启全部云设备**   | 所有云设备                                                            | 通过部署侧云设备重启实现批量触发；没有配置重启实现时会返回未配置结果   |
+
+批量操作提交后，接口会立即返回批次 ID，页面会轮询批次状态，避免长时间占用 HTTP 请求。批次完成后，页面会刷新设备列表和统计数据；状态结果包含总数、已触发数量、失败数量、跳过数量和逐设备错误信息，便于管理员判断是否需要按单台设备继续处理。
+
+### 设备信息
+
+每个设备显示：
+
+| 字段           | 描述                                          |
+| -------------- | --------------------------------------------- |
+| **名称**       | 设备主机名（如 "Darwin - MacBook-Pro.local"） |
+| **状态**       | 在线/离线指示器                               |
+| **版本**       | executor 版本（如适用）                       |
+| **资源使用率** | CPU、内存、磁盘使用率（仅云设备）             |
+| **槽位**       | 并发任务容量（X/5）                           |
+| **默认**       | 如果设为默认则显示星号                        |
+
+### 管理设备
+
+| 操作         | 方法                       |
+| ------------ | -------------------------- |
+| **设为默认** | 点击星号图标               |
+| **取消默认** | 再次点击当前默认设备的星号 |
+| **删除设备** | 点击删除图标               |
+
+> **注意**：本地设备的删除只是移除注册记录。如果设备重新连接，它会自动重新注册。云设备在连接设置页删除时会释放对应云资源。
+
+### 离线设备处理
+
+当设备离线时：
+
+1. 系统会先等待一个很短的重连确认窗口，避免瞬时网络抖动误判为离线
+2. 如果设备未在确认窗口内恢复，运行中的任务会自动标记为 **失败**
+3. 错误消息指示设备断开连接
+4. 任务槽位会在确认设备离线后释放
+5. 设备在选择器中显示为灰色
+
+---
+
+## ❓ 常见问题
+
+### 连接问题
+
+#### 设备无法连接
+
+**可能原因：**
+
+1. JWT token 无效或已过期
+2. 网络连接问题
+3. 后端 URL 配置错误
+
+**解决方案：**
+
+1. 从 Wegent UI 生成新的 JWT token
+2. 检查到 Wegent 后端的网络连接
+3. 验证 `~/.wegent-executor/device-config.json` 或 `WEGENT_BACKEND_URL` 环境变量
+
+#### 设备连接后立即显示离线
+
+**可能原因：**
+
+1. Token 验证失败
+2. 防火墙阻止 WebSocket
+3. 后端服务问题
+
+**解决方案：**
+
+1. 检查 token 有效性和权限
+2. 确保允许 WebSocket 连接
+3. 检查 Wegent 后端日志中的错误
+
+### 任务执行问题
+
+#### 任务立即失败
+
+**可能原因：**
+
+1. Claude Code SDK 未安装
+2. 本地机器缺少依赖
+3. 权限不足
+
+**解决方案：**
+
+1. 安装并配置 Claude Code SDK
+2. 安装所需依赖
+3. 检查文件系统权限
+
+#### 任务挂起无进展
+
+**可能原因：**
+
+1. Claude Code SDK 卡住
+2. 执行期间网络中断
+3. 本地机器资源耗尽
+
+**解决方案：**
+
+1. 重启 executor
+2. 检查网络连接
+3. 监控本地资源使用（CPU、内存）
+
+### 设备管理问题
+
+#### 多个设备显示相同名称
+
+这是正常的，如果您有多台主机名相似的机器。每个设备有基于硬件的唯一 ID。
+
+#### 无法删除设备
+
+如果设备在删除后不断重新出现，说明 executor 仍在运行并重新注册。请先停止 executor，然后再删除。
+
+---
+
+## 💡 最佳实践
+
+### 何时使用本地设备
+
+| 使用场景           | 建议                 |
+| ------------------ | -------------------- |
+| **敏感代码库**     | ✅ 本地设备          |
+| **快速迭代**       | ✅ 本地设备          |
+| **自定义工具需求** | ✅ 本地设备          |
+| **批量处理**       | 云端（更大容量）     |
+| **团队协作**       | 云端（共享访问）     |
+| **移动/远程访问**  | 云端（无需本地设置） |
+
+### 多设备设置
+
+如果您有多台机器：
+
+1. 分别注册每台设备
+2. 使用描述性主机名便于识别
+3. 将主要工作站设为默认
+4. 设备离线时使用云端作为后备
+
+### 资源管理
+
+- 任务执行期间监控本地资源使用
+- 关闭不必要的应用程序以获得更好性能
+- 考虑使用 SSD 存储以加快文件操作
+- 确保有足够的 RAM 供 Claude Code SDK 使用
+
+---
+
+## 🔗 相关资源
+
+### 文档
+
+- [核心概念](../../concepts/core-concepts.md) - 了解 Wegent 的架构
+- [管理任务](../chat/managing-tasks.md) - 了解任务执行
+
+### 技术参考
+
+- [本地设备架构](../../developer-guide/local-device-architecture.md) - 技术架构详解
+
+---
+
+## 💬 获取帮助
+
+需要帮助？
+
+- 📖 查看 [常见问题](../../faq.md)
+- 🐛 提交 [GitHub Issue](https://github.com/wecode-ai/wegent/issues)
+- 💬 加入社区讨论
+
+---
+
+<p align="center">在本地机器上执行 AI 任务，完全掌控！ 🚀</p>

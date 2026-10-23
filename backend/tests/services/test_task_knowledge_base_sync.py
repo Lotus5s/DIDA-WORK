@@ -1,0 +1,1604 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for subtask knowledge base sync to task level functionality.
+
+This module tests the following features:
+1. sync_subtask_kb_to_task method in TaskKnowledgeBaseService
+2. Knowledge base priority logic (subtask > task level)
+3. Deduplication and limit enforcement
+4. ID-based lookup and automatic migration from name-only refs
+
+NOTE:
+- KB meta prompt formatting is tested separately in chat preprocessing.
+"""
+
+import logging
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+from sqlalchemy.orm import Session
+
+from app.models.kind import Kind
+from app.models.subtask_context import SubtaskContext
+from app.models.task import TaskResource
+from app.services.knowledge import TaskKnowledgeBaseService
+from app.services.share import knowledge_share_service
+
+
+@pytest.mark.unit
+class TestPrepareContextsForCreation:
+    """Test generic context creation payload normalization."""
+
+    def test_preserves_explicit_empty_knowledge_base_scope(self):
+        from app.services.chat.preprocessing.contexts import (
+            _prepare_contexts_for_creation,
+        )
+
+        context_item = SimpleNamespace(
+            type="knowledge_base",
+            data={
+                "knowledge_id": 10,
+                "name": "Empty Folder Scope",
+                "scope_restricted": True,
+                "document_ids": [],
+            },
+        )
+
+        (
+            kb_contexts,
+            selected_docs_contexts,
+            external_contexts,
+        ) = _prepare_contexts_for_creation(
+            contexts=[context_item],
+            subtask_id=100,
+            user_id=1,
+        )
+
+        assert len(kb_contexts) == 1
+        assert selected_docs_contexts == []
+        assert external_contexts == []
+        assert kb_contexts[0].type_data == {
+            "knowledge_id": 10,
+            "document_count": None,
+            "scope_restricted": True,
+            "document_ids": [],
+        }
+
+    def test_legacy_empty_knowledge_base_scope_remains_unrestricted(self):
+        from app.services.chat.preprocessing.contexts import (
+            _prepare_contexts_for_creation,
+        )
+
+        context_item = SimpleNamespace(
+            type="knowledge_base",
+            data={
+                "knowledge_id": 10,
+                "name": "Whole KB",
+                "document_ids": [],
+            },
+        )
+
+        kb_contexts, _, external_contexts = _prepare_contexts_for_creation(
+            contexts=[context_item],
+            subtask_id=100,
+            user_id=1,
+        )
+
+        assert len(kb_contexts) == 1
+        assert external_contexts == []
+        assert kb_contexts[0].type_data == {
+            "knowledge_id": 10,
+            "document_count": None,
+            "scope_restricted": False,
+        }
+
+    def test_legacy_document_ids_imply_restricted_scope(self):
+        from app.services.chat.preprocessing.contexts import (
+            _prepare_contexts_for_creation,
+        )
+
+        context_item = SimpleNamespace(
+            type="knowledge_base",
+            data={
+                "knowledge_id": 10,
+                "name": "Selected Documents",
+                "document_ids": [101, 102],
+            },
+        )
+
+        kb_contexts, _, external_contexts = _prepare_contexts_for_creation(
+            contexts=[context_item],
+            subtask_id=100,
+            user_id=1,
+        )
+
+        assert len(kb_contexts) == 1
+        assert external_contexts == []
+        assert kb_contexts[0].type_data == {
+            "knowledge_id": 10,
+            "document_count": None,
+            "scope_restricted": True,
+            "document_ids": [101, 102],
+        }
+
+    def test_document_ids_remain_restricted_with_explicit_false(self):
+        from app.services.chat.preprocessing.contexts import (
+            _prepare_contexts_for_creation,
+        )
+
+        context_item = SimpleNamespace(
+            type="knowledge_base",
+            data={
+                "knowledge_id": 10,
+                "name": "Selected Documents",
+                "scope_restricted": False,
+                "document_ids": [101],
+            },
+        )
+
+        kb_contexts, _, external_contexts = _prepare_contexts_for_creation(
+            contexts=[context_item],
+            subtask_id=100,
+            user_id=1,
+        )
+
+        assert len(kb_contexts) == 1
+        assert external_contexts == []
+        assert kb_contexts[0].type_data == {
+            "knowledge_id": 10,
+            "document_count": None,
+            "scope_restricted": True,
+            "document_ids": [101],
+        }
+
+    def test_empty_restricted_context_builds_empty_restricted_scope(self):
+        from app.services.chat.preprocessing.contexts import (
+            _build_scopes_from_kb_contexts,
+            _prepare_contexts_for_creation,
+        )
+
+        context_item = SimpleNamespace(
+            type="knowledge_base",
+            data={
+                "knowledge_id": 10,
+                "name": "Empty Folder Scope",
+                "scope_restricted": True,
+                "document_ids": [],
+            },
+        )
+
+        kb_contexts, _, external_contexts = _prepare_contexts_for_creation(
+            contexts=[context_item],
+            subtask_id=100,
+            user_id=1,
+        )
+        scopes = _build_scopes_from_kb_contexts(kb_contexts)
+
+        assert external_contexts == []
+        assert len(scopes) == 1
+        assert scopes[0].knowledge_base_id == 10
+        assert scopes[0].scope_restricted is True
+        assert scopes[0].document_ids == []
+
+    def test_folder_scope_is_preserved_for_backend_resolution(self):
+        from app.services.chat.preprocessing.contexts import (
+            _prepare_contexts_for_creation,
+        )
+
+        context_item = SimpleNamespace(
+            type="knowledge_base",
+            data={
+                "knowledge_id": 10,
+                "name": "Folder Scope",
+                "scope_restricted": True,
+                "folder_ids": [5],
+                "folder_names": ["Specs"],
+                "include_subfolders": True,
+            },
+        )
+
+        kb_contexts, _, external_contexts = _prepare_contexts_for_creation(
+            contexts=[context_item],
+            subtask_id=100,
+            user_id=1,
+        )
+
+        assert external_contexts == []
+        assert len(kb_contexts) == 1
+        assert kb_contexts[0].type_data == {
+            "knowledge_id": 10,
+            "document_count": None,
+            "scope_restricted": True,
+            "document_ids": [],
+            "folder_ids": [5],
+            "include_subfolders": True,
+            "folder_names": ["Specs"],
+        }
+
+
+@pytest.mark.unit
+class TestSyncSubtaskKBToTask:
+    """Test sync_subtask_kb_to_task method in TaskKnowledgeBaseService"""
+
+    @pytest.fixture
+    def mock_db(self):
+        """Create a mock database session"""
+        return Mock(spec=Session)
+
+    @pytest.fixture
+    def service(self):
+        """Create TaskKnowledgeBaseService instance"""
+        return TaskKnowledgeBaseService()
+
+    @pytest.fixture
+    def mock_knowledge_base(self):
+        """Create a mock knowledge base"""
+        kb = Mock(spec=Kind)
+        kb.id = 10
+        kb.kind = "KnowledgeBase"
+        kb.namespace = "default"
+        kb.is_active = True
+        kb.json = {"spec": {"name": "Test KB", "description": "Test knowledge base"}}
+        return kb
+
+    @pytest.fixture
+    def mock_task(self):
+        """Create a mock task without any KB refs"""
+        task = Mock(spec=TaskResource)
+        task.id = 100
+        task.kind = "Task"
+        task.is_active = True
+        task.json = {
+            "spec": {
+                "title": "Test Task",
+                "is_group_chat": False,
+                "knowledgeBaseRefs": [],
+            }
+        }
+        return task
+
+    def test_sync_kb_to_task_success(
+        self, service, mock_db, mock_knowledge_base, mock_task
+    ):
+        """Test successful sync of KB from subtask to task level"""
+        # Setup mocks
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+
+        # Query returns KB only (task and user are now passed as parameters)
+        mock_query.first.return_value = mock_knowledge_base
+
+        # Mock can_access_knowledge_base to return True
+        with patch.object(
+            service, "can_access_knowledge_base", return_value=True
+        ) as mock_access:
+            # Mock flag_modified to avoid SQLAlchemy state error
+            with patch(
+                "app.stores.tasks.sqlalchemy_task_store.flag_modified"
+            ) as mock_flag:
+                result = service.sync_subtask_kb_to_task(
+                    db=mock_db,
+                    task=mock_task,
+                    knowledge_id=10,
+                    user_id=1,
+                    user_name="testuser",
+                )
+
+                assert result is True
+                mock_access.assert_called_once_with(
+                    mock_db,
+                    1,
+                    "Test KB",
+                    "default",
+                    knowledge_id=10,
+                )
+                mock_db.commit.assert_called_once()
+                mock_flag.assert_called_once()
+
+                # Verify KB ref was added to task
+                kb_refs = mock_task.json["spec"]["knowledgeBaseRefs"]
+                assert len(kb_refs) == 1
+                assert kb_refs[0]["name"] == "Test KB"
+                # Note: namespace is no longer stored in new refs - ID is sufficient
+                assert "namespace" not in kb_refs[0]
+                assert kb_refs[0]["boundBy"] == "testuser"
+
+    def test_sync_kb_to_task_already_bound(self, service, mock_db, mock_knowledge_base):
+        """Test that duplicate KB is not added (deduplication)"""
+        # Task already has the KB bound
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "knowledgeBaseRefs": [
+                    {"name": "Test KB", "namespace": "default", "boundBy": "otheruser"}
+                ]
+            }
+        }
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_knowledge_base
+
+        with patch.object(service, "can_access_knowledge_base", return_value=True):
+            result = service.sync_subtask_kb_to_task(
+                db=mock_db,
+                task=mock_task,
+                knowledge_id=10,
+                user_id=1,
+                user_name="testuser",
+            )
+
+            # Should return False (already bound, not synced again)
+            assert result is False
+            mock_db.commit.assert_not_called()
+
+    def test_sync_kb_to_task_limit_reached(self, service, mock_db, mock_knowledge_base):
+        """Test that sync is skipped when KB limit (10) is reached"""
+        # Task already has 10 KBs bound
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "knowledgeBaseRefs": [
+                    {"name": f"KB {i}", "namespace": "default"} for i in range(10)
+                ]
+            }
+        }
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_knowledge_base
+
+        with patch.object(service, "can_access_knowledge_base", return_value=True):
+            result = service.sync_subtask_kb_to_task(
+                db=mock_db,
+                task=mock_task,
+                knowledge_id=10,
+                user_id=1,
+                user_name="testuser",
+            )
+
+            # Should return False (limit reached)
+            assert result is False
+            mock_db.commit.assert_not_called()
+
+    def test_sync_kb_to_task_no_access(
+        self, service, mock_db, mock_knowledge_base, mock_task
+    ):
+        """Test that sync is skipped when user has no access to KB"""
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_knowledge_base
+
+        with patch.object(service, "can_access_knowledge_base", return_value=False):
+            result = service.sync_subtask_kb_to_task(
+                db=mock_db,
+                task=mock_task,
+                knowledge_id=10,
+                user_id=1,
+                user_name="testuser",
+            )
+
+            # Should return False (no access)
+            assert result is False
+            mock_db.commit.assert_not_called()
+
+    def test_sync_kb_to_task_logs_skip_reason_at_info_level(
+        self, service, mock_db, mock_knowledge_base, mock_task, caplog
+    ):
+        """Skip reasons should be visible in info logs for production debugging."""
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_knowledge_base
+
+        with patch.object(service, "can_access_knowledge_base", return_value=False):
+            with caplog.at_level(
+                logging.INFO,
+                logger="app.services.knowledge.task_knowledge_base_service",
+            ):
+                result = service.sync_subtask_kb_to_task(
+                    db=mock_db,
+                    task=mock_task,
+                    knowledge_id=10,
+                    user_id=1,
+                    user_name="testuser",
+                )
+
+        assert result is False
+        assert "has no access to KB Test KB/default" in caplog.text
+        assert "task_id=100" in caplog.text
+        assert "user_id=1" in caplog.text
+
+    def test_sync_kb_to_task_allows_explicitly_shared_personal_kb(
+        self, service, mock_db, mock_task
+    ):
+        """A personal KB shared via ResourceMember should still sync to task refs."""
+        shared_kb = Mock(spec=Kind)
+        shared_kb.id = 10
+        shared_kb.kind = "KnowledgeBase"
+        shared_kb.namespace = "default"
+        shared_kb.user_id = 2
+        shared_kb.is_active = True
+        shared_kb.json = {"spec": {"name": "Shared Personal KB"}}
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = shared_kb
+
+        with patch.object(
+            knowledge_share_service,
+            "_get_resource",
+            return_value=shared_kb,
+        ) as mock_get_resource:
+            with patch("app.stores.tasks.sqlalchemy_task_store.flag_modified"):
+                result = service.sync_subtask_kb_to_task(
+                    db=mock_db,
+                    task=mock_task,
+                    knowledge_id=10,
+                    user_id=1,
+                    user_name="testuser",
+                )
+
+        assert result is True
+        mock_get_resource.assert_called_once_with(mock_db, 10, 1)
+        assert mock_task.json["spec"]["knowledgeBaseRefs"][0]["id"] == 10
+        assert (
+            mock_task.json["spec"]["knowledgeBaseRefs"][0]["name"]
+            == "Shared Personal KB"
+        )
+
+    def test_sync_kb_to_task_kb_not_found(self, service, mock_db, mock_task):
+        """Test that sync is skipped when KB is not found"""
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = None
+
+        result = service.sync_subtask_kb_to_task(
+            db=mock_db,
+            task=mock_task,
+            knowledge_id=999,
+            user_id=1,
+            user_name="testuser",
+        )
+
+        # Should return False (KB not found)
+        assert result is False
+        mock_db.commit.assert_not_called()
+
+
+@pytest.mark.unit
+class TestKBPriorityLogic:
+    """Test knowledge base priority logic in _prepare_kb_tools_from_contexts"""
+
+    @pytest.fixture
+    def mock_db(self):
+        """Create a mock database session"""
+        return Mock(spec=Session)
+
+    def test_subtask_kb_takes_priority(self, mock_db):
+        """Test that subtask-level KB takes priority over task-level KB"""
+        from app.services.chat.preprocessing.contexts import (
+            _prepare_kb_tools_from_contexts,
+        )
+
+        # Create subtask KB contexts
+        kb_context = Mock(spec=SubtaskContext)
+        kb_context.knowledge_id = 10
+        kb_context.type_data = None
+
+        # Mock task-level KB (should be ignored when subtask has KB)
+        with patch(
+            "app.services.chat.preprocessing.contexts._get_bound_knowledge_base_ids"
+        ) as mock_get_bound:
+            mock_get_bound.return_value = [20, 30]  # Task-level KBs
+
+            with patch("chat_shell.tools.builtin.KnowledgeBaseTool") as mock_kb_tool:
+                mock_kb_tool.return_value = Mock()
+
+                with patch(
+                    "app.services.chat.preprocessing.contexts._get_user_kb_tool_access_mode",
+                    return_value=("full", ""),
+                ):
+                    kb_result = _prepare_kb_tools_from_contexts(
+                        kb_contexts=[kb_context],
+                        user_id=1,
+                        db=mock_db,
+                        base_system_prompt="Base prompt",
+                        task_id=100,
+                        user_subtask_id=1,
+                    )
+
+                    # Should use only subtask KB (10), not task-level (20, 30)
+                    mock_kb_tool.assert_called_once()
+                    call_args = mock_kb_tool.call_args
+                    assert call_args[1]["knowledge_base_ids"] == [10]
+                    assert len(kb_result.extra_tools) == 1
+
+    def test_scoped_context_uses_scopes_without_legacy_document_filters(self, mock_db):
+        """Scoped document IDs should only be represented by per-KB scopes."""
+        from app.services.chat.preprocessing.contexts import (
+            _prepare_kb_tools_from_contexts,
+        )
+
+        kb_context = Mock(spec=SubtaskContext)
+        kb_context.knowledge_id = 10
+        kb_context.type_data = {
+            "scope_restricted": True,
+            "document_ids": [101, 102],
+        }
+
+        with patch(
+            "app.services.chat.preprocessing.contexts.KnowledgeFolderService.resolve_document_ids_for_scope",
+            return_value=[101, 102],
+        ):
+            with patch(
+                "app.services.chat.preprocessing.contexts._get_bound_knowledge_base_ids"
+            ) as mock_get_bound:
+                mock_get_bound.return_value = []
+
+                with patch(
+                    "chat_shell.tools.builtin.ScopedKnowledgeBaseTool"
+                ) as mock_scoped_tool:
+                    mock_scoped_tool.return_value = Mock()
+
+                    with patch(
+                        "app.services.chat.preprocessing.contexts._get_user_kb_tool_access_mode",
+                        return_value=("full", ""),
+                    ):
+                        kb_result = _prepare_kb_tools_from_contexts(
+                            kb_contexts=[kb_context],
+                            user_id=1,
+                            db=mock_db,
+                            base_system_prompt="Base prompt",
+                            task_id=100,
+                            user_subtask_id=1,
+                        )
+
+        mock_scoped_tool.assert_called_once()
+        call_kwargs = mock_scoped_tool.call_args.kwargs
+        assert call_kwargs["knowledge_base_ids"] == [10]
+        assert call_kwargs["document_ids"] == []
+        assert len(call_kwargs["knowledge_base_scopes"]) == 1
+        scope = call_kwargs["knowledge_base_scopes"][0]
+        assert scope.knowledge_base_id == 10
+        assert scope.scope_restricted is True
+        assert scope.document_ids == [101, 102]
+        assert kb_result.document_ids == []
+
+    def test_folder_scope_resolves_to_document_ids(self, mock_db):
+        """Folder scope should be validated and resolved before reaching RAG."""
+        from app.services.chat.preprocessing.contexts import (
+            _prepare_kb_tools_from_contexts,
+        )
+
+        kb_context = Mock(spec=SubtaskContext)
+        kb_context.knowledge_id = 10
+        kb_context.type_data = {
+            "scope_restricted": True,
+            "folder_ids": [5],
+            "document_ids": [101],
+            "include_subfolders": True,
+        }
+
+        with patch(
+            "app.services.chat.preprocessing.contexts.KnowledgeFolderService.resolve_document_ids_for_scope",
+            return_value=[101, 102],
+        ) as mock_resolve:
+            with patch(
+                "app.services.chat.preprocessing.contexts._get_bound_knowledge_base_ids",
+                return_value=[],
+            ):
+                with patch(
+                    "chat_shell.tools.builtin.ScopedKnowledgeBaseTool"
+                ) as mock_scoped_tool:
+                    mock_scoped_tool.return_value = Mock()
+                    with patch(
+                        "app.services.chat.preprocessing.contexts._get_user_kb_tool_access_mode",
+                        return_value=("full", ""),
+                    ):
+                        kb_result = _prepare_kb_tools_from_contexts(
+                            kb_contexts=[kb_context],
+                            user_id=1,
+                            db=mock_db,
+                            base_system_prompt="Base prompt",
+                            task_id=100,
+                            user_subtask_id=1,
+                        )
+
+        mock_resolve.assert_called_once_with(
+            mock_db,
+            knowledge_base_id=10,
+            user_id=1,
+            folder_ids=[5],
+            document_ids=[101],
+            include_subfolders=True,
+        )
+        scope = mock_scoped_tool.call_args.kwargs["knowledge_base_scopes"][0]
+        assert scope.knowledge_base_id == 10
+        assert scope.scope_restricted is True
+        assert scope.document_ids == [101, 102]
+        assert kb_result.document_ids == []
+        assert kb_result.knowledge_base_scopes == [scope]
+
+    def test_fallback_to_task_kb_when_no_subtask_kb(self, mock_db):
+        """Test that task-level KB is used when subtask has no KB"""
+        from app.services.chat.preprocessing.contexts import (
+            _prepare_kb_tools_from_contexts,
+        )
+
+        # No subtask KB contexts
+        with patch(
+            "app.services.chat.preprocessing.contexts._get_bound_knowledge_base_ids"
+        ) as mock_get_bound:
+            mock_get_bound.return_value = [20, 30]  # Task-level KBs
+
+            with patch("chat_shell.tools.builtin.KnowledgeBaseTool") as mock_kb_tool:
+                mock_kb_tool.return_value = Mock()
+
+                with patch(
+                    "app.services.chat.preprocessing.contexts._get_user_kb_tool_access_mode",
+                    return_value=("full", ""),
+                ):
+                    kb_result = _prepare_kb_tools_from_contexts(
+                        kb_contexts=[],  # No subtask KB
+                        user_id=1,
+                        db=mock_db,
+                        base_system_prompt="Base prompt",
+                        task_id=100,
+                        user_subtask_id=1,
+                    )
+
+                    # Should use task-level KBs (20, 30)
+                    mock_kb_tool.assert_called_once()
+                    call_args = mock_kb_tool.call_args
+                    assert set(call_args[1]["knowledge_base_ids"]) == {20, 30}
+                    assert len(kb_result.extra_tools) == 1
+
+    def test_restricted_analyst_uses_search_only_mode(self, mock_db):
+        """Restricted Analysts should get search-only KB access instead of full denial."""
+        from app.services.chat.preprocessing.contexts import (
+            _prepare_kb_tools_from_contexts,
+        )
+
+        kb_context = Mock(spec=SubtaskContext)
+        kb_context.knowledge_id = 10
+        kb_context.type_data = None
+
+        with patch(
+            "app.services.chat.preprocessing.contexts._get_bound_knowledge_base_ids"
+        ) as mock_get_bound:
+            mock_get_bound.return_value = []
+
+            with patch("chat_shell.tools.builtin.KnowledgeBaseTool") as mock_kb_tool:
+                mock_kb_tool.return_value = Mock()
+
+                with patch(
+                    "app.services.chat.preprocessing.contexts._get_user_kb_tool_access_mode",
+                    return_value=("restricted_search_only", "test reason"),
+                ):
+                    with patch(
+                        "app.services.chat.preprocessing.contexts._build_kb_meta_prompt",
+                        return_value=(
+                            "Restricted Knowledge Bases In Scope:\n"
+                            "- KB Name: Test KB, KB ID: 10"
+                        ),
+                    ):
+                        kb_result = _prepare_kb_tools_from_contexts(
+                            kb_contexts=[kb_context],
+                            user_id=1,
+                            db=mock_db,
+                            base_system_prompt="Base prompt",
+                            task_id=100,
+                            user_subtask_id=1,
+                            model_config={"model_id": "gpt-test"},
+                        )
+
+                    mock_kb_tool.assert_called_once()
+                    call_args = mock_kb_tool.call_args
+                    assert call_args[1]["knowledge_base_ids"] == [10]
+                    assert call_args[1]["injection_mode"] == "hybrid"
+                    assert call_args[1]["tool_access_mode"] == "restricted_search_only"
+                    assert call_args[1]["current_model_name"] is None
+                    assert call_args[1]["current_model_namespace"] == "default"
+                    assert len(kb_result.extra_tools) == 1
+                    assert kb_result.knowledge_base_ids == [10]
+                    assert "Restricted Knowledge Bases In Scope" in (
+                        kb_result.kb_meta_prompt
+                    )
+                    assert "KB ID: 10" in kb_result.kb_meta_prompt
+                    assert "Summary:" not in kb_result.kb_meta_prompt
+                    assert kb_result.kb_tool_access_mode == "restricted_search_only"
+                    assert "Knowledge Base Restricted Analysis" in (
+                        kb_result.enhanced_system_prompt
+                    )
+
+    def test_no_kb_when_both_empty(self, mock_db):
+        """Test that no KB tool is created when both levels have no KB"""
+        from app.services.chat.preprocessing.contexts import (
+            _prepare_kb_tools_from_contexts,
+        )
+
+        with patch(
+            "app.services.chat.preprocessing.contexts._get_bound_knowledge_base_ids"
+        ) as mock_get_bound:
+            mock_get_bound.return_value = []  # No task-level KBs
+
+            kb_result = _prepare_kb_tools_from_contexts(
+                kb_contexts=[],  # No subtask KB
+                user_id=1,
+                db=mock_db,
+                base_system_prompt="Base prompt",
+                task_id=100,
+                user_subtask_id=1,
+            )
+
+            # Should return empty tools
+            assert kb_result.extra_tools == []
+            assert kb_result.enhanced_system_prompt == "Base prompt"
+            assert kb_result.kb_meta_prompt == ""
+            # New KB fields must also default to empty/False
+            assert kb_result.knowledge_base_ids == []
+            assert kb_result.is_user_selected_kb is False
+            assert kb_result.document_ids == []
+            assert kb_result.kb_tool_access_mode == "full"
+
+
+@pytest.mark.unit
+class TestGetBoundKnowledgeBaseIds:
+    """Test _get_bound_knowledge_base_ids function"""
+
+    @pytest.fixture
+    def mock_db(self):
+        """Create a mock database session"""
+        return Mock(spec=Session)
+
+    def test_get_bound_kb_ids_for_non_group_chat(self, mock_db):
+        """Test that KBs are returned for non-group chat tasks too"""
+        from app.services.chat.preprocessing.contexts import (
+            _get_bound_knowledge_base_ids,
+        )
+
+        # Create mock task (non-group chat) with KB refs
+        mock_task = Mock(spec=TaskResource)
+        mock_task.json = {
+            "spec": {
+                "is_group_chat": False,
+                "knowledgeBaseRefs": [
+                    {"name": "Test KB", "namespace": "default"},
+                ],
+            }
+        }
+
+        # Create mock KB
+        mock_kb = Mock(spec=Kind)
+        mock_kb.id = 10
+        mock_kb.json = {"spec": {"name": "Test KB"}}
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_task
+        mock_query.all.return_value = [mock_kb]
+
+        with patch(
+            "app.services.knowledge.knowledge_service.KnowledgeService.can_directly_access_knowledge_base",
+            return_value=True,
+        ):
+            result = _get_bound_knowledge_base_ids(mock_db, task_id=100, user_id=1)
+
+        # Should return the KB ID even for non-group chat
+        assert result == [10]
+
+    def test_get_bound_kb_ids_empty_refs(self, mock_db):
+        """Test that empty list is returned when no KB refs"""
+        from app.services.chat.preprocessing.contexts import (
+            _get_bound_knowledge_base_ids,
+        )
+
+        mock_task = Mock(spec=TaskResource)
+        mock_task.json = {
+            "spec": {
+                "is_group_chat": True,
+                "knowledgeBaseRefs": [],
+            }
+        }
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_task
+
+        result = _get_bound_knowledge_base_ids(mock_db, task_id=100, user_id=1)
+
+        assert result == []
+
+    def test_get_bound_kb_ids_task_not_found(self, mock_db):
+        """Test that empty list is returned when task not found"""
+        from app.services.chat.preprocessing.contexts import (
+            _get_bound_knowledge_base_ids,
+        )
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = None
+
+        result = _get_bound_knowledge_base_ids(mock_db, task_id=999, user_id=1)
+
+        assert result == []
+
+
+@pytest.mark.unit
+class TestKBRefIdBasedLookup:
+    """Test ID-based lookup and migration for KB references"""
+
+    @pytest.fixture
+    def mock_db(self):
+        """Create a mock database session"""
+        return Mock(spec=Session)
+
+    @pytest.fixture
+    def service(self):
+        """Create TaskKnowledgeBaseService instance"""
+        return TaskKnowledgeBaseService()
+
+    @pytest.fixture
+    def mock_knowledge_base(self):
+        """Create a mock knowledge base"""
+        kb = Mock(spec=Kind)
+        kb.id = 10
+        kb.kind = "KnowledgeBase"
+        kb.namespace = "default"
+        kb.is_active = True
+        kb.json = {"spec": {"name": "Test KB", "description": "Test knowledge base"}}
+        return kb
+
+    def test_get_kb_by_id_priority(self, service, mock_db, mock_knowledge_base):
+        """Test that ID lookup takes priority over name lookup"""
+        # Setup mock for get_knowledge_base_by_id
+        with patch.object(
+            service, "get_knowledge_base_by_id", return_value=mock_knowledge_base
+        ) as mock_by_id:
+            with patch.object(service, "get_knowledge_base_by_name") as mock_by_name:
+                ref = {"id": 10, "name": "Test KB", "namespace": "default"}
+                kb, needs_migration = service.get_knowledge_base_by_ref(mock_db, ref)
+
+                # Should use ID lookup
+                mock_by_id.assert_called_once_with(mock_db, 10)
+                # Should NOT use name lookup
+                mock_by_name.assert_not_called()
+                assert kb == mock_knowledge_base
+                assert needs_migration is False
+
+    def test_get_kb_by_name_fallback(self, service, mock_db, mock_knowledge_base):
+        """Test that name lookup is used when ID is None"""
+        with patch.object(service, "get_knowledge_base_by_id") as mock_by_id:
+            with patch.object(
+                service, "get_knowledge_base_by_name", return_value=mock_knowledge_base
+            ) as mock_by_name:
+                # Ref without ID (legacy data)
+                ref = {"name": "Test KB", "namespace": "default"}
+                kb, needs_migration = service.get_knowledge_base_by_ref(mock_db, ref)
+
+                # Should NOT use ID lookup (id is None)
+                mock_by_id.assert_not_called()
+                # Should use name lookup
+                mock_by_name.assert_called_once_with(mock_db, "Test KB", "default")
+                assert kb == mock_knowledge_base
+                assert needs_migration is True
+
+    def test_get_kb_by_id_not_found(self, service, mock_db):
+        """Test handling when KB is not found by ID (possibly deleted)"""
+        with patch.object(
+            service, "get_knowledge_base_by_id", return_value=None
+        ) as mock_by_id:
+            with patch.object(service, "get_knowledge_base_by_name") as mock_by_name:
+                ref = {"id": 999, "name": "Deleted KB", "namespace": "default"}
+                kb, needs_migration = service.get_knowledge_base_by_ref(mock_db, ref)
+
+                # Should try ID lookup
+                mock_by_id.assert_called_once_with(mock_db, 999)
+                # Should NOT fall back to name (ID was provided but not found)
+                mock_by_name.assert_not_called()
+                assert kb is None
+                assert needs_migration is False
+
+    def test_bind_kb_includes_id(self, service, mock_db, mock_knowledge_base):
+        """Test that new bindings include the ID field"""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "title": "Test Task",
+                "is_group_chat": True,
+                "knowledgeBaseRefs": [],
+            }
+        }
+
+        mock_user = Mock()
+        mock_user.user_name = "testuser"
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+
+        with patch.object(service, "get_task", return_value=mock_task):
+            with patch.object(service, "is_group_chat", return_value=True):
+                with patch.object(
+                    service, "can_access_knowledge_base", return_value=True
+                ):
+                    with patch.object(
+                        service,
+                        "get_knowledge_base_by_name",
+                        return_value=mock_knowledge_base,
+                    ):
+                        with patch.object(service, "get_user", return_value=mock_user):
+                            with patch(
+                                "app.services.knowledge.task_knowledge_base_service.task_member_service"
+                            ) as mock_member:
+                                mock_member.is_member.return_value = True
+                                with patch(
+                                    "app.stores.tasks.sqlalchemy_task_store.flag_modified"
+                                ):
+                                    with patch(
+                                        "app.services.knowledge.task_knowledge_base_service.KnowledgeService"
+                                    ) as mock_ks:
+                                        mock_ks.get_document_count.return_value = 5
+
+                                        service.bind_knowledge_base(
+                                            db=mock_db,
+                                            task_id=100,
+                                            kb_name="Test KB",
+                                            kb_namespace="default",
+                                            user_id=1,
+                                        )
+
+                                        # Verify the new ref includes ID
+                                        kb_refs = mock_task.json["spec"][
+                                            "knowledgeBaseRefs"
+                                        ]
+                                        assert len(kb_refs) == 1
+                                        assert kb_refs[0]["id"] == 10
+                                        assert kb_refs[0]["name"] == "Test KB"
+                                        # Note: namespace is no longer stored in new refs
+                                        assert "namespace" not in kb_refs[0]
+
+    def test_duplicate_check_with_id(self, service, mock_db, mock_knowledge_base):
+        """Test that duplicate detection works with ID"""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "title": "Test Task",
+                "is_group_chat": True,
+                # Already has KB bound by ID
+                "knowledgeBaseRefs": [
+                    {"id": 10, "name": "Old Name", "namespace": "default"}
+                ],
+            }
+        }
+
+        with patch.object(service, "get_task", return_value=mock_task):
+            with patch.object(service, "is_group_chat", return_value=True):
+                with patch.object(
+                    service, "can_access_knowledge_base", return_value=True
+                ):
+                    with patch.object(
+                        service,
+                        "get_knowledge_base_by_name",
+                        return_value=mock_knowledge_base,
+                    ):
+                        with patch(
+                            "app.services.knowledge.task_knowledge_base_service.task_member_service"
+                        ) as mock_member:
+                            mock_member.is_member.return_value = True
+
+                            # Should raise error because KB with ID=10 is already bound
+                            # even though name is different
+                            from fastapi import HTTPException
+
+                            with pytest.raises(HTTPException) as exc_info:
+                                service.bind_knowledge_base(
+                                    db=mock_db,
+                                    task_id=100,
+                                    kb_name="Test KB",  # Different name
+                                    kb_namespace="default",
+                                    user_id=1,
+                                )
+
+                            assert exc_info.value.status_code == 400
+                            assert "already bound" in exc_info.value.detail
+
+    def test_sync_kb_includes_id(self, service, mock_db, mock_knowledge_base):
+        """Test that sync_subtask_kb_to_task includes ID in new refs"""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "title": "Test Task",
+                "knowledgeBaseRefs": [],
+            }
+        }
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_knowledge_base
+
+        with patch.object(service, "can_access_knowledge_base", return_value=True):
+            with patch("app.stores.tasks.sqlalchemy_task_store.flag_modified"):
+                result = service.sync_subtask_kb_to_task(
+                    db=mock_db,
+                    task=mock_task,
+                    knowledge_id=10,
+                    user_id=1,
+                    user_name="testuser",
+                )
+
+                assert result is True
+                kb_refs = mock_task.json["spec"]["knowledgeBaseRefs"]
+                assert len(kb_refs) == 1
+                # Verify ID is included
+                assert kb_refs[0]["id"] == 10
+                assert kb_refs[0]["name"] == "Test KB"
+
+    def test_sync_scoped_kb_preserves_document_ids(
+        self, service, mock_db, mock_knowledge_base
+    ):
+        """Document-scoped subtask selections are persisted as task scope refs."""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "title": "Test Task",
+                "knowledgeBaseRefs": [],
+                "knowledgeBaseScopes": [],
+            }
+        }
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_knowledge_base
+
+        with patch.object(service, "can_access_knowledge_base", return_value=True):
+            with patch("app.stores.tasks.sqlalchemy_task_store.flag_modified"):
+                result = service.sync_subtask_kb_scope_to_task(
+                    db=mock_db,
+                    task=mock_task,
+                    knowledge_id=10,
+                    document_ids=[3, "4", 3],
+                    user_id=1,
+                    user_name="testuser",
+                )
+
+        assert result is True
+        assert mock_task.json["spec"]["knowledgeBaseRefs"] == []
+        scope_refs = mock_task.json["spec"]["knowledgeBaseScopes"]
+        assert len(scope_refs) == 1
+        assert scope_refs[0]["id"] == 10
+        assert scope_refs[0]["scopeRestricted"] is True
+        assert scope_refs[0]["explicitDocumentIds"] == [3, 4]
+
+    def test_sync_scoped_kb_preserves_folder_ids(
+        self, service, mock_db, mock_knowledge_base
+    ):
+        """Folder-scoped subtask selections are persisted as task scope refs."""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "title": "Test Task",
+                "knowledgeBaseRefs": [],
+                "knowledgeBaseScopes": [],
+            }
+        }
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_knowledge_base
+
+        with patch.object(service, "can_access_knowledge_base", return_value=True):
+            with patch("app.stores.tasks.sqlalchemy_task_store.flag_modified"):
+                result = service.sync_subtask_kb_scope_to_task(
+                    db=mock_db,
+                    task=mock_task,
+                    knowledge_id=10,
+                    document_ids=[],
+                    folder_ids=[5, "6", 5],
+                    include_subfolders=True,
+                    user_id=1,
+                    user_name="testuser",
+                )
+
+        assert result is True
+        scope_refs = mock_task.json["spec"]["knowledgeBaseScopes"]
+        assert len(scope_refs) == 1
+        assert scope_refs[0]["id"] == 10
+        assert scope_refs[0]["scopeRestricted"] is True
+        assert scope_refs[0]["folderIds"] == [5, 6]
+        assert scope_refs[0]["explicitDocumentIds"] == []
+        assert scope_refs[0]["includeSubfolders"] is True
+
+    def test_sync_scoped_kb_merges_folder_and_document_ids(
+        self, service, mock_db, mock_knowledge_base
+    ):
+        """Mixed folder/document selections keep both task-level scope selectors."""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "title": "Test Task",
+                "knowledgeBaseRefs": [],
+                "knowledgeBaseScopes": [
+                    {
+                        "id": 10,
+                        "name": "Test KB",
+                        "namespace": "default",
+                        "scopeRestricted": True,
+                        "folderIds": [5],
+                        "explicitDocumentIds": [3],
+                        "includeSubfolders": True,
+                    }
+                ],
+            }
+        }
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_knowledge_base
+
+        with patch.object(service, "can_access_knowledge_base", return_value=True):
+            with patch("app.stores.tasks.sqlalchemy_task_store.flag_modified"):
+                result = service.sync_subtask_kb_scope_to_task(
+                    db=mock_db,
+                    task=mock_task,
+                    knowledge_id=10,
+                    document_ids=[4, 3],
+                    folder_ids=[6, 5],
+                    include_subfolders=True,
+                    user_id=1,
+                    user_name="testuser",
+                )
+
+        assert result is True
+        scope_ref = mock_task.json["spec"]["knowledgeBaseScopes"][0]
+        assert scope_ref["folderIds"] == [5, 6]
+        assert scope_ref["explicitDocumentIds"] == [3, 4]
+        assert scope_ref["includeSubfolders"] is True
+
+    def test_sync_whole_kb_removes_existing_scoped_ref(
+        self, service, mock_db, mock_knowledge_base
+    ):
+        """Whole-KB binding supersedes document-scoped refs for the same KB."""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "title": "Test Task",
+                "knowledgeBaseRefs": [],
+                "knowledgeBaseScopes": [
+                    {
+                        "id": 10,
+                        "name": "Test KB",
+                        "namespace": "default",
+                        "scopeRestricted": True,
+                        "explicitDocumentIds": [3],
+                    },
+                    {
+                        "id": 11,
+                        "name": "Other KB",
+                        "namespace": "default",
+                        "scopeRestricted": True,
+                        "explicitDocumentIds": [8],
+                    },
+                ],
+            }
+        }
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_knowledge_base
+
+        with patch.object(service, "can_access_knowledge_base", return_value=True):
+            with patch("app.stores.tasks.sqlalchemy_task_store.flag_modified"):
+                result = service.sync_subtask_kb_to_task(
+                    db=mock_db,
+                    task=mock_task,
+                    knowledge_id=10,
+                    user_id=1,
+                    user_name="testuser",
+                )
+
+        assert result is True
+        assert mock_task.json["spec"]["knowledgeBaseRefs"][0]["id"] == 10
+        assert mock_task.json["spec"]["knowledgeBaseScopes"] == [
+            {
+                "id": 11,
+                "name": "Other KB",
+                "namespace": "default",
+                "scopeRestricted": True,
+                "explicitDocumentIds": [8],
+            }
+        ]
+
+    def test_sync_kb_appends_to_existing_task_level_refs(self, service, mock_db):
+        """Test that message-time KB sync appends to existing task-level refs."""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "title": "Test Task",
+                "knowledgeBaseRefs": [
+                    {"id": 11, "name": "Ghost Docs"},
+                    {"id": 22, "name": "Runbooks"},
+                ],
+            }
+        }
+
+        appended_kb = Mock(spec=Kind)
+        appended_kb.id = 33
+        appended_kb.kind = "KnowledgeBase"
+        appended_kb.namespace = "default"
+        appended_kb.is_active = True
+        appended_kb.json = {"spec": {"name": "Release Notes"}}
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = appended_kb
+
+        with patch.object(service, "can_access_knowledge_base", return_value=True):
+            with patch("app.stores.tasks.sqlalchemy_task_store.flag_modified"):
+                result = service.sync_subtask_kb_to_task(
+                    db=mock_db,
+                    task=mock_task,
+                    knowledge_id=33,
+                    user_id=1,
+                    user_name="testuser",
+                )
+
+                assert result is True
+                assert {
+                    ref["id"] for ref in mock_task.json["spec"]["knowledgeBaseRefs"]
+                } == {11, 22, 33}
+
+    def test_sync_kb_uses_selected_kb_when_default_namespace_has_name_collision(
+        self, service, mock_db
+    ):
+        """Sync should trust the selected KB ID even if another user has the same name."""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "title": "Test Task",
+                "knowledgeBaseRefs": [],
+            }
+        }
+
+        selected_kb = Mock(spec=Kind)
+        selected_kb.id = 10
+        selected_kb.kind = "KnowledgeBase"
+        selected_kb.namespace = "default"
+        selected_kb.user_id = 1
+        selected_kb.is_active = True
+        selected_kb.json = {"spec": {"name": "Shared Name KB"}}
+
+        other_user_same_name_kb = Mock(spec=Kind)
+        other_user_same_name_kb.id = 99
+        other_user_same_name_kb.kind = "KnowledgeBase"
+        other_user_same_name_kb.namespace = "default"
+        other_user_same_name_kb.user_id = 2
+        other_user_same_name_kb.is_active = True
+        other_user_same_name_kb.json = {"spec": {"name": "Shared Name KB"}}
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = selected_kb
+        mock_query.all.return_value = [other_user_same_name_kb, selected_kb]
+
+        with patch.object(service, "can_access_knowledge_base", return_value=True):
+            with patch("app.stores.tasks.sqlalchemy_task_store.flag_modified"):
+                result = service.sync_subtask_kb_to_task(
+                    db=mock_db,
+                    task=mock_task,
+                    knowledge_id=10,
+                    user_id=1,
+                    user_name="testuser",
+                )
+
+                assert result is True
+                kb_refs = mock_task.json["spec"]["knowledgeBaseRefs"]
+                assert len(kb_refs) == 1
+                assert kb_refs[0]["id"] == 10
+                assert kb_refs[0]["name"] == "Shared Name KB"
+                assert kb_refs[0]["boundBy"] == "testuser"
+                assert "boundAt" in kb_refs[0]
+
+    def test_sync_kb_dedup_by_id(self, service, mock_db, mock_knowledge_base):
+        """Test that sync deduplication works with ID"""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "knowledgeBaseRefs": [
+                    # Already bound by ID (different name)
+                    {"id": 10, "name": "Old Name", "namespace": "default"}
+                ]
+            }
+        }
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.first.return_value = mock_knowledge_base
+
+        with patch.object(service, "can_access_knowledge_base", return_value=True):
+            result = service.sync_subtask_kb_to_task(
+                db=mock_db,
+                task=mock_task,
+                knowledge_id=10,
+                user_id=1,
+                user_name="testuser",
+            )
+
+            # Should return False (already bound by ID)
+            assert result is False
+            mock_db.commit.assert_not_called()
+
+
+@pytest.mark.unit
+class TestKBRefAutoMigration:
+    """Test automatic migration of legacy name-only refs to include ID"""
+
+    @pytest.fixture
+    def mock_db(self):
+        """Create a mock database session"""
+        return Mock(spec=Session)
+
+    @pytest.fixture
+    def service(self):
+        """Create TaskKnowledgeBaseService instance"""
+        return TaskKnowledgeBaseService()
+
+    def test_auto_migration_on_get_bound_kb_ids(self, service, mock_db):
+        """Test that legacy refs are migrated when accessed via get_bound_knowledge_base_ids"""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                # Legacy ref without ID
+                "knowledgeBaseRefs": [{"name": "Test KB", "namespace": "default"}]
+            }
+        }
+
+        mock_kb = Mock(spec=Kind)
+        mock_kb.id = 10
+        mock_kb.json = {"spec": {"name": "Test KB"}}
+
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+
+        with patch.object(service, "get_task", return_value=mock_task):
+            # Mock resolve_kb_refs_batch to return KB with needs_migration=True
+            with patch.object(
+                service,
+                "resolve_kb_refs_batch",
+                return_value=([(0, mock_kb, True)], []),
+            ):
+                with patch.object(service, "_batch_migrate_kb_refs") as mock_migrate:
+                    result = service.get_bound_knowledge_base_ids(mock_db, task_id=100)
+
+                    assert result == [10]
+                    # Should call batch migration with the legacy ref
+                    mock_migrate.assert_called_once()
+                    call_args = mock_migrate.call_args
+                    assert call_args[0][0] == mock_db  # db
+                    assert call_args[0][1] == mock_task  # task
+                    assert call_args[0][2] == [(0, 10)]  # refs_to_migrate
+
+    def test_no_migration_when_id_exists(self, service, mock_db):
+        """Test that refs with ID are not migrated"""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                # Ref with ID (already migrated)
+                "knowledgeBaseRefs": [
+                    {"id": 10, "name": "Test KB", "namespace": "default"}
+                ]
+            }
+        }
+
+        mock_kb = Mock(spec=Kind)
+        mock_kb.id = 10
+
+        with patch.object(service, "get_task", return_value=mock_task):
+            # Mock resolve_kb_refs_batch to return KB with needs_migration=False
+            with patch.object(
+                service,
+                "resolve_kb_refs_batch",
+                return_value=([(0, mock_kb, False)], []),
+            ):
+                with patch.object(service, "_batch_migrate_kb_refs") as mock_migrate:
+                    result = service.get_bound_knowledge_base_ids(mock_db, task_id=100)
+
+                    assert result == [10]
+                    # Should NOT call batch migration
+                    mock_migrate.assert_not_called()
+
+    def test_batch_migrate_updates_refs(self, service, mock_db):
+        """Test that _batch_migrate_kb_refs correctly updates refs"""
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+        mock_task.json = {
+            "spec": {
+                "knowledgeBaseRefs": [
+                    {"name": "KB1", "namespace": "default"},
+                    {"name": "KB2", "namespace": "team1"},
+                ]
+            }
+        }
+
+        refs_to_migrate = [(0, 10), (1, 20)]
+
+        with patch("app.stores.tasks.sqlalchemy_task_store.flag_modified") as mock_flag:
+            service._batch_migrate_kb_refs(mock_db, mock_task, refs_to_migrate)
+
+            # Verify refs were updated with IDs
+            kb_refs = mock_task.json["spec"]["knowledgeBaseRefs"]
+            assert kb_refs[0]["id"] == 10
+            assert kb_refs[1]["id"] == 20
+            # Verify flag_modified was called
+            mock_flag.assert_called_once_with(mock_task, "json")
+            # Verify commit was called
+            mock_db.commit.assert_called_once()
+
+
+@pytest.mark.unit
+class TestContextsIdBasedLookup:
+    """Test _get_bound_knowledge_base_ids in contexts.py delegates to service layer"""
+
+    @pytest.fixture
+    def mock_db(self):
+        """Create a mock database session"""
+        return Mock(spec=Session)
+
+    def test_get_bound_kb_ids_delegates_to_service(self, mock_db):
+        """Test that _get_bound_knowledge_base_ids delegates to service layer"""
+        from app.services.chat.preprocessing.contexts import (
+            _get_bound_knowledge_base_ids,
+        )
+
+        with patch(
+            "app.services.knowledge.task_knowledge_base_service.task_knowledge_base_service"
+        ) as mock_service:
+            mock_service.get_bound_knowledge_base_ids.return_value = [10, 20, 30]
+
+            result = _get_bound_knowledge_base_ids(mock_db, task_id=100, user_id=1)
+
+            # Should delegate to service layer
+            mock_service.get_bound_knowledge_base_ids.assert_called_once_with(
+                mock_db, 100, user_id=1
+            )
+            assert result == [10, 20, 30]
+
+    def test_get_bound_kb_ids_handles_service_exception(self, mock_db):
+        """Test that exceptions from service are caught and empty list returned"""
+        from app.services.chat.preprocessing.contexts import (
+            _get_bound_knowledge_base_ids,
+        )
+
+        with patch(
+            "app.services.knowledge.task_knowledge_base_service.task_knowledge_base_service"
+        ) as mock_service:
+            mock_service.get_bound_knowledge_base_ids.side_effect = Exception(
+                "DB connection failed"
+            )
+
+            result = _get_bound_knowledge_base_ids(mock_db, task_id=100, user_id=1)
+
+            # Should return empty list on exception
+            assert result == []
+
+    def test_get_bound_kb_ids_returns_empty_for_no_kbs(self, mock_db):
+        """Test that empty list is returned when no KBs are bound"""
+        from app.services.chat.preprocessing.contexts import (
+            _get_bound_knowledge_base_ids,
+        )
+
+        with patch(
+            "app.services.knowledge.task_knowledge_base_service.task_knowledge_base_service"
+        ) as mock_service:
+            mock_service.get_bound_knowledge_base_ids.return_value = []
+
+            result = _get_bound_knowledge_base_ids(mock_db, task_id=100, user_id=1)
+
+            assert result == []
+
+    def test_sync_kb_contexts_logs_info_when_sync_is_skipped(self, mock_db, caplog):
+        """Test that outer context sync emits info log when service returns False."""
+        from app.services.chat.preprocessing.contexts import _sync_kb_contexts_to_task
+
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+
+        kb_context = Mock(spec=SubtaskContext)
+        kb_context.type_data = {"knowledge_id": 10}
+
+        with patch(
+            "app.services.knowledge.TaskKnowledgeBaseService"
+        ) as mock_service_cls:
+            mock_service = mock_service_cls.return_value
+            mock_service.sync_subtask_kb_to_task.return_value = False
+
+            with caplog.at_level(
+                logging.INFO,
+                logger="app.services.chat.preprocessing.contexts",
+            ):
+                _sync_kb_contexts_to_task(
+                    db=mock_db,
+                    kb_contexts=[kb_context],
+                    task=mock_task,
+                    user_id=1,
+                    user_name="testuser",
+                )
+
+        assert "Sync skipped for KB 10 on task 100" in caplog.text
+
+    def test_sync_kb_contexts_passes_folder_scope_to_task_service(self, mock_db):
+        """Outer context sync preserves folder scope selectors for task inheritance."""
+        from app.services.chat.preprocessing.contexts import _sync_kb_contexts_to_task
+
+        mock_task = Mock(spec=TaskResource)
+        mock_task.id = 100
+
+        kb_context = Mock(spec=SubtaskContext)
+        kb_context.type_data = {
+            "knowledge_id": 10,
+            "scope_restricted": True,
+            "document_ids": [3],
+            "folder_ids": [5],
+            "include_subfolders": True,
+        }
+
+        with patch(
+            "app.services.knowledge.TaskKnowledgeBaseService"
+        ) as mock_service_cls:
+            mock_service = mock_service_cls.return_value
+            mock_service.sync_subtask_kb_scope_to_task.return_value = True
+
+            _sync_kb_contexts_to_task(
+                db=mock_db,
+                kb_contexts=[kb_context],
+                task=mock_task,
+                user_id=1,
+                user_name="testuser",
+            )
+
+        mock_service.sync_subtask_kb_scope_to_task.assert_called_once_with(
+            db=mock_db,
+            task=mock_task,
+            knowledge_id=10,
+            document_ids=[3],
+            folder_ids=[5],
+            include_subfolders=True,
+            user_id=1,
+            user_name="testuser",
+        )

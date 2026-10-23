@@ -1,0 +1,1694 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Weibo, Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+.collaboration-app {
+  min-height: 100%;
+  padding: 24px;
+  color: rgb(var(--color-text-primary));
+  background: rgb(var(--color-bg-base));
+}
+
+.collaboration-app button,
+.collaboration-app input,
+.collaboration-app textarea,
+.collaboration-app select {
+  font: inherit;
+}
+
+.collaboration-panel > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.collaboration-panel h2 {
+  margin: 0;
+}
+
+.collaboration-primary-button {
+  min-height: 36px;
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 14px;
+  color: var(--collaboration-primary-foreground, rgb(var(--color-bg-base)));
+  background: var(
+    --collaboration-primary-background,
+    rgb(var(--color-text-primary))
+  );
+  cursor: pointer;
+}
+
+.collaboration-secondary-button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: rgb(var(--color-text-primary));
+  background: transparent;
+  cursor: pointer;
+}
+
+.collaboration-secondary-button:hover {
+  background: rgb(var(--color-bg-hover));
+}
+
+.collaboration-primary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.collaboration-danger-button {
+  min-height: 36px;
+  border: 1px solid rgb(var(--color-destructive));
+  border-radius: 8px;
+  padding: 8px 14px;
+  color: rgb(var(--color-destructive));
+  background: transparent;
+  cursor: pointer;
+}
+
+.collaboration-project-summary {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.collaboration-project-summary-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.collaboration-project-summary-title {
+  overflow: hidden;
+  color: rgb(var(--color-text-primary)) !important;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collaboration-project-summary-description {
+  overflow: hidden;
+  color: rgb(var(--color-text-muted)) !important;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collaboration-settings-section {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 10px;
+  padding: 14px;
+}
+
+.collaboration-settings-section legend {
+  padding: 0 6px;
+  font-weight: 600;
+}
+
+.collaboration-settings-section p,
+.collaboration-settings label small {
+  margin: 0;
+  color: rgb(var(--color-text-muted));
+}
+
+.collaboration-status-editor {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) 110px auto auto auto;
+  gap: 8px;
+}
+
+.collaboration-checkbox {
+  display: flex !important;
+  grid-template-columns: none !important;
+  align-items: center;
+  gap: 8px;
+}
+
+.collaboration-settings-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.collaboration-link-button {
+  min-height: 36px;
+  border: 0;
+  color: rgb(var(--color-text-secondary));
+  background: transparent;
+  cursor: pointer;
+}
+
+.collaboration-alert {
+  border: 1px solid rgb(var(--color-error));
+  border-radius: 8px;
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  color: rgb(var(--color-error));
+}
+
+.collaboration-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 16px;
+  background: rgb(0 0 0 / 0.35);
+}
+
+.collaboration-dialog {
+  width: min(520px, 100%);
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 14px;
+  padding: 20px;
+  background: rgb(var(--color-bg-surface));
+  box-shadow: 0 20px 50px rgb(0 0 0 / 0.2);
+}
+
+.collaboration-dialog h2 {
+  margin: 0 0 20px;
+}
+
+.collaboration-project-create-dialog {
+  display: flex;
+  width: min(560px, 100%);
+  max-height: min(800px, calc(100vh - 48px));
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+  background: rgb(var(--color-bg-base));
+}
+
+.collaboration-project-create-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 20px 0;
+}
+
+.collaboration-project-create-header h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.collaboration-project-create-header button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 8px;
+  padding: 6px;
+  color: rgb(var(--color-text-secondary));
+  background: transparent;
+  cursor: pointer;
+}
+
+.collaboration-project-create-header button:hover {
+  color: rgb(var(--color-text-primary));
+  background: rgb(var(--color-bg-hover));
+}
+
+.collaboration-project-create-body {
+  display: grid;
+  min-height: 0;
+  gap: 20px;
+  overflow-y: auto;
+  padding: 16px 20px 20px;
+}
+
+.collaboration-project-create-body section {
+  display: grid;
+  gap: 8px;
+}
+
+.collaboration-project-create-body h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.collaboration-project-create-section-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.collaboration-project-create-section-header small,
+.collaboration-project-create-field small,
+.collaboration-project-create-hint {
+  margin: 0;
+  color: rgb(var(--color-text-muted));
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.collaboration-project-create-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.collaboration-project-create-grid.columns-1 {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.collaboration-project-create-grid.columns-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.collaboration-project-create-providers {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.collaboration-project-create-choice {
+  display: flex;
+  min-width: 0;
+  min-height: 64px;
+  align-items: flex-start;
+  gap: 12px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 12px;
+  padding: 10px 12px;
+  color: rgb(var(--color-text-primary));
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+
+.collaboration-project-create-choice:hover {
+  background: rgb(var(--color-bg-hover));
+}
+
+.collaboration-project-create-choice.is-selected {
+  border-color: rgb(var(--color-text-primary));
+  background: transparent;
+}
+
+.collaboration-project-create-choice > svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: rgb(var(--color-text-secondary));
+}
+
+.collaboration-project-create-choice > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.collaboration-project-create-choice strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.collaboration-project-create-choice small {
+  color: rgb(var(--color-text-muted));
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+}
+
+.collaboration-project-create-field {
+  display: grid;
+  gap: 8px;
+  color: rgb(var(--color-text-primary)) !important;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.collaboration-project-create-field input,
+.collaboration-project-create-field select,
+.collaboration-project-create-field textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.collaboration-project-create-field select {
+  height: 40px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 8px;
+  padding: 0 12px;
+  color: rgb(var(--color-text-primary));
+  background: rgb(var(--color-bg-base));
+}
+
+.collaboration-project-create-dialog input:focus,
+.collaboration-project-create-dialog textarea:focus,
+.collaboration-project-create-dialog select:focus {
+  border-color: rgb(var(--color-text-primary));
+  outline: none;
+  box-shadow: 0 0 0 1px rgb(var(--color-text-primary) / 0.12);
+}
+
+.collaboration-project-create-dialog button:focus-visible {
+  outline: 2px solid rgb(var(--color-text-primary) / 0.45);
+  outline-offset: 2px;
+}
+
+.collaboration-project-create-dialog input[type="checkbox"] {
+  accent-color: rgb(var(--color-text-primary));
+}
+
+.collaboration-project-create-field textarea {
+  min-height: 80px;
+}
+
+.collaboration-project-create-advanced {
+  display: grid;
+}
+
+.collaboration-project-create-advanced-trigger {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 0;
+  padding: 0;
+  color: rgb(var(--color-text-secondary));
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.collaboration-project-create-advanced-trigger > svg {
+  width: 16px;
+  height: 16px;
+  transition: transform 120ms ease;
+}
+
+.collaboration-project-create-advanced-trigger[aria-expanded="true"] > svg {
+  transform: rotate(180deg);
+}
+
+.collaboration-project-create-advanced-content {
+  display: grid;
+  gap: 12px;
+  padding-top: 12px;
+}
+
+.collaboration-project-create-collaborators {
+  border-top: 1px solid rgb(var(--color-border));
+  padding-top: 20px;
+}
+
+.collaboration-project-create-collaborator-tokens {
+  display: flex;
+  min-height: 32px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.collaboration-project-create-collaborator-token {
+  display: inline-flex;
+  min-width: 0;
+  height: 32px;
+  align-items: center;
+  gap: 6px;
+  border-radius: 8px;
+  padding: 0 8px;
+  color: rgb(var(--color-text-primary));
+  background: rgb(var(--color-bg-hover));
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.collaboration-project-create-collaborator-token > svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: rgb(var(--color-text-secondary));
+}
+
+.collaboration-project-create-collaborator-token > button {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  padding: 0;
+  color: rgb(var(--color-text-muted));
+  background: transparent;
+  cursor: pointer;
+}
+
+.collaboration-project-create-collaborator-token > button:hover {
+  color: rgb(var(--color-text-primary));
+  background: rgb(var(--color-bg-base));
+}
+
+.collaboration-project-create-collaborator-token > button svg {
+  width: 12px;
+  height: 12px;
+}
+
+.collaboration-project-create-collaborator-trigger {
+  display: flex;
+  width: 100%;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: rgb(var(--color-text-muted));
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.collaboration-project-create-collaborator-trigger:hover,
+.collaboration-project-create-collaborator-trigger[aria-expanded="true"] {
+  color: rgb(var(--color-text-secondary));
+  border-color: rgb(var(--color-border-heavy, var(--color-border)));
+}
+
+.collaboration-project-create-collaborator-trigger > svg {
+  width: 16px;
+  height: 16px;
+}
+
+.collaboration-project-create-collaborator-menu {
+  z-index: var(--z-system-popover, 1000);
+  display: grid;
+  width: var(--radix-popover-trigger-width);
+  max-height: min(240px, var(--radix-popover-content-available-height, 240px));
+  gap: 4px;
+  overflow-y: auto;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 12px;
+  padding: 6px;
+  background: rgb(var(--color-popover));
+  box-shadow: 0 8px 16px -4px rgb(0 0 0 / 0.12);
+}
+
+.collaboration-project-create-collaborator-menu > div {
+  display: grid;
+  gap: 2px;
+  padding-top: 4px;
+  border-top: 1px solid rgb(var(--color-border));
+}
+
+.collaboration-project-create-collaborator-menu > div > small {
+  padding: 4px 8px 2px;
+  color: rgb(var(--color-text-muted));
+  font-size: 12px;
+}
+
+.collaboration-project-create-collaborator-menu button {
+  display: flex;
+  width: 100%;
+  align-items: flex-start;
+  gap: 10px;
+  border: 0;
+  border-radius: 8px;
+  padding: 8px;
+  color: rgb(var(--color-text-primary));
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.collaboration-project-create-collaborator-menu button:hover {
+  background: rgb(var(--color-bg-hover));
+}
+
+.collaboration-project-create-collaborator-menu button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.collaboration-project-create-collaborator-menu button > svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin-top: 2px;
+  color: rgb(var(--color-text-secondary));
+}
+
+.collaboration-project-create-collaborator-menu button > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.collaboration-project-create-collaborator-menu strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.collaboration-project-create-collaborator-menu small,
+.collaboration-project-create-collaborator-menu p {
+  margin: 0;
+  color: rgb(var(--color-text-muted));
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.collaboration-project-create-collaborator-menu > p {
+  padding: 8px;
+}
+
+.collaboration-project-create-group-recommendation {
+  display: flex;
+  gap: 12px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 12px;
+  padding: 12px;
+  background: rgb(var(--color-bg-hover) / 0.55);
+}
+
+.collaboration-project-create-group-recommendation > svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  color: rgb(var(--color-accent, 59 130 246));
+}
+
+.collaboration-project-create-group-recommendation > div {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.collaboration-project-create-group-recommendation strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.collaboration-project-create-group-recommendation p {
+  margin: 0;
+  color: rgb(var(--color-text-secondary));
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.collaboration-project-create-generation-model {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.collaboration-project-create-generation-model > span {
+  color: rgb(var(--color-text-secondary));
+  font-size: 12px;
+}
+
+.collaboration-project-create-generation-model select {
+  min-width: 0;
+  height: 32px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 8px;
+  padding: 0 8px;
+  color: rgb(var(--color-text-primary));
+  background: rgb(var(--color-bg-base));
+  font-size: 12px;
+  outline: none;
+}
+
+.collaboration-project-create-generation-model select:focus {
+  border-color: rgb(var(--color-accent, 59 130 246));
+}
+
+.collaboration-project-create-group-recommendation > div > span {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.collaboration-project-create-group-recommendation button,
+.collaboration-project-create-group-editor footer button,
+.collaboration-project-create-group-summary-header button,
+.collaboration-project-create-group-remove {
+  min-height: 30px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0 10px;
+  color: rgb(var(--color-text-secondary));
+  background: transparent;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.collaboration-project-create-group-recommendation button:hover,
+.collaboration-project-create-group-editor footer button:hover,
+.collaboration-project-create-group-summary-header button:hover,
+.collaboration-project-create-group-remove:hover {
+  color: rgb(var(--color-text-primary));
+  background: rgb(var(--color-bg-hover));
+}
+
+.collaboration-project-create-group-recommendation
+  button.collaboration-primary-button,
+.collaboration-project-create-group-editor
+  footer
+  button.collaboration-primary-button {
+  color: rgb(var(--color-bg-base));
+  background: rgb(var(--color-text-primary));
+}
+
+.collaboration-project-create-inline-error {
+  margin: 0;
+  color: rgb(var(--color-danger, 220 38 38));
+  font-size: 12px;
+}
+
+.collaboration-project-create-group-summary {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 12px;
+  padding: 12px;
+  background: rgb(var(--color-bg-hover) / 0.35);
+}
+
+.collaboration-project-create-group-summary-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.collaboration-project-create-group-summary-header > span,
+.collaboration-project-create-group-summary-header > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.collaboration-project-create-group-summary-header svg {
+  width: 16px;
+  height: 16px;
+}
+
+.collaboration-project-create-group-summary-header strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.collaboration-project-create-group-members {
+  display: grid;
+  gap: 6px;
+}
+
+.collaboration-project-create-group-members > span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.collaboration-project-create-group-members > span.is-leader {
+  background: rgb(var(--color-bg-hover));
+}
+
+.collaboration-project-create-group-members > span > svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: rgb(var(--color-text-secondary));
+}
+
+.collaboration-project-create-group-members > span > span {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.collaboration-project-create-group-members strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.collaboration-project-create-group-members small {
+  color: rgb(var(--color-text-muted));
+  font-size: 12px;
+}
+
+.collaboration-project-create-group-remove {
+  justify-self: start;
+  padding: 0;
+}
+
+.collaboration-project-create-group-principles {
+  display: grid;
+  gap: 4px;
+  border-top: 1px solid rgb(var(--color-border));
+  padding-top: 8px;
+}
+
+.collaboration-project-create-group-principles small {
+  color: rgb(var(--color-text-muted));
+  font-size: 12px;
+}
+
+.collaboration-project-create-group-principles p {
+  margin: 0;
+  color: rgb(var(--color-text-secondary));
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.collaboration-project-create-group-editor {
+  display: grid;
+  gap: 12px;
+  border: 1px solid rgb(var(--color-border-heavy, var(--color-border)));
+  border-radius: 16px;
+  padding: 16px;
+  background: rgb(var(--color-bg-base));
+  box-shadow: 0 4px 8px -2px rgb(0 0 0 / 0.1);
+}
+
+.collaboration-project-create-group-editor.is-generator {
+  border: 0;
+  border-top: 1px solid rgb(var(--color-border));
+  border-radius: 0;
+  padding: 16px 0 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.collaboration-project-create-group-dialog-backdrop {
+  display: grid;
+  position: fixed;
+  inset: 0;
+  place-items: center;
+  padding: 24px;
+  background: rgb(0 0 0 / 0.28);
+}
+
+.collaboration-project-create-group-editor.is-generator.is-dialog {
+  width: min(920px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  box-sizing: border-box;
+  overflow: auto;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 18px;
+  padding: 20px;
+  background: rgb(var(--color-bg-base));
+  box-shadow: 0 18px 48px rgb(0 0 0 / 0.18);
+}
+
+.collaboration-project-create-group-editor > header,
+.collaboration-project-create-group-editor > header > span,
+.collaboration-project-create-group-editor > header > button {
+  display: flex;
+  align-items: center;
+}
+
+.collaboration-project-create-group-editor > header {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.collaboration-project-create-group-editor > header > span {
+  gap: 8px;
+}
+
+.collaboration-project-create-group-editor > header svg {
+  width: 16px;
+  height: 16px;
+}
+
+.collaboration-project-create-group-editor > header > span > svg {
+  color: rgb(var(--color-accent, 59 130 246));
+}
+
+.collaboration-project-create-group-editor > header > button {
+  width: 28px;
+  height: 28px;
+  justify-content: center;
+  border: 0;
+  border-radius: 8px;
+  color: rgb(var(--color-text-muted));
+  background: transparent;
+  cursor: pointer;
+}
+
+.collaboration-project-create-group-workflow {
+  display: grid;
+  gap: 6px;
+}
+
+.collaboration-project-create-group-workflow > small {
+  color: rgb(var(--color-text-muted));
+  font-size: 12px;
+}
+
+.collaboration-project-create-group-workflow > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.collaboration-project-create-group-workflow > div > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.collaboration-project-create-group-workflow strong {
+  border-radius: 6px;
+  padding: 4px 8px;
+  background: rgb(var(--color-bg-hover));
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.collaboration-project-create-group-workflow svg {
+  width: 14px;
+  height: 14px;
+  color: rgb(var(--color-text-muted));
+}
+
+.collaboration-project-create-generation-progress {
+  display: grid;
+  gap: 12px;
+  border-radius: 12px;
+  padding: 12px;
+  background: rgb(var(--color-bg-hover) / 0.55);
+}
+
+.collaboration-project-create-generation-progress > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.collaboration-project-create-generation-progress > header > svg {
+  width: 16px;
+  height: 16px;
+  color: rgb(var(--color-accent, 59 130 246));
+}
+
+.collaboration-project-create-generation-progress > header > span {
+  display: grid;
+  gap: 1px;
+}
+
+.collaboration-project-create-generation-progress strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.collaboration-project-create-generation-progress small {
+  color: rgb(var(--color-text-muted));
+  font-size: 12px;
+}
+
+.collaboration-project-create-generation-progress.is-complete {
+  background: rgb(var(--color-bg-base));
+  box-shadow: inset 0 0 0 1px rgb(var(--color-border));
+}
+
+.collaboration-project-create-squad-formation {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: stretch;
+  gap: 8px;
+}
+
+.collaboration-project-create-squad-formation
+  > .collaboration-project-create-assignment-queue,
+.collaboration-project-create-squad-formation > div.is-squad {
+  display: grid;
+  min-height: 68px;
+  align-content: start;
+  gap: 6px;
+  border: 1px dashed rgb(var(--color-border-heavy, var(--color-border)));
+  border-radius: 10px;
+  padding: 8px;
+}
+
+.collaboration-project-create-assignment-queue {
+  cursor: default;
+  user-select: none;
+}
+
+.collaboration-project-create-assignment-queue > header {
+  display: grid;
+  gap: 3px;
+}
+
+.collaboration-project-create-assignment-queue > header > span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: rgb(var(--color-text-secondary));
+}
+
+.collaboration-project-create-assignment-queue > header svg {
+  width: 14px;
+  height: 14px;
+  color: rgb(var(--color-accent, 59 130 246));
+}
+
+.collaboration-project-create-assignment-queue > header strong {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.collaboration-project-create-assignment-queue > header small {
+  max-width: 620px;
+  color: rgb(var(--color-text-muted));
+  line-height: 18px;
+}
+
+.collaboration-project-create-squad-formation > div.is-squad {
+  border-style: solid;
+  background: rgb(var(--color-bg-base));
+}
+
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster {
+  gap: 8px;
+}
+
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster-item {
+  display: flex;
+  position: relative;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster-heading {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+}
+
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster-identity {
+  gap: 5px;
+  border-radius: 8px;
+  padding: 6px 9px;
+  color: rgb(var(--color-text-secondary));
+  background: rgb(var(--color-bg-hover));
+  white-space: nowrap;
+}
+
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster-identity
+  > svg {
+  width: 14px;
+  height: 14px;
+}
+
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster-identity
+  > span
+  > strong {
+  font-size: 12px;
+}
+
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster-identity
+  > span
+  > small {
+  display: none;
+}
+
+.collaboration-project-create-squad-formation > div > span {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.collaboration-project-create-squad-formation > div > span > span {
+  display: flex;
+  position: relative;
+  align-items: center;
+  gap: 8px;
+}
+
+.collaboration-project-create-member-token {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 8px;
+  padding: 6px 9px;
+  color: rgb(var(--color-text-secondary));
+  background: rgb(var(--color-bg-hover));
+  white-space: nowrap;
+}
+
+.collaboration-project-create-member-token > svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.collaboration-project-create-member-token > strong {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.collaboration-project-create-duty-bubble {
+  position: relative;
+  max-width: min(420px, calc(100% - 120px));
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 10px;
+  padding: 6px 9px;
+  color: rgb(var(--color-text-secondary));
+  background: rgb(var(--color-bg-base));
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.collaboration-project-create-duty-bubble:focus-within {
+  border-color: rgb(var(--color-text-primary) / 0.42);
+  box-shadow: 0 0 0 2px rgb(var(--color-text-primary) / 0.06);
+}
+
+.collaboration-project-create-duty-bubble::before {
+  position: absolute;
+  top: 9px;
+  left: -5px;
+  width: 8px;
+  height: 8px;
+  border-bottom: 1px solid rgb(var(--color-border));
+  border-left: 1px solid rgb(var(--color-border));
+  background: rgb(var(--color-bg-base));
+  content: "";
+  transform: rotate(45deg);
+}
+
+.collaboration-project-create-hover-editable {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.collaboration-project-create-hover-editable > span {
+  min-width: 0;
+  white-space: pre-wrap;
+}
+
+.collaboration-project-create-hover-editable > span.is-placeholder {
+  color: rgb(var(--color-text-muted));
+}
+
+.collaboration-project-create-hover-editable > span.is-clickable {
+  cursor: text;
+}
+
+.collaboration-project-create-hover-editable > button,
+.collaboration-project-create-set-leader {
+  flex: none;
+  border: 0;
+  border-radius: 6px;
+  color: rgb(var(--color-text-muted));
+  background: transparent;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.collaboration-project-create-hover-editable.is-edit-affordance-visible
+  > button {
+  opacity: 1;
+}
+
+.collaboration-project-create-hover-editable > button {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.collaboration-project-create-hover-editable > button > svg {
+  width: 13px;
+  height: 13px;
+}
+
+.collaboration-project-create-set-leader {
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+.collaboration-project-create-duty-bubble:hover
+  .collaboration-project-create-hover-editable
+  > button,
+.collaboration-project-create-hover-editable:focus-within > button,
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster-item:hover
+  .collaboration-project-create-set-leader,
+.collaboration-project-create-set-leader:focus-visible {
+  opacity: 1;
+}
+
+.collaboration-project-create-hover-editable > input,
+.collaboration-project-create-hover-editable > textarea {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  border: 1px solid rgb(var(--color-accent, 59 130 246));
+  border-radius: 7px;
+  padding: 6px 8px;
+  color: rgb(var(--color-text-primary));
+  background: rgb(var(--color-bg-base));
+  font: inherit;
+  line-height: inherit;
+  outline: none;
+  resize: vertical;
+}
+
+.collaboration-project-create-duty-bubble
+  .collaboration-project-create-inline-textarea {
+  min-height: 36px;
+  max-height: 126px;
+  overflow-y: auto;
+  field-sizing: content;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  outline: none;
+  box-shadow: none;
+  resize: none;
+}
+
+.collaboration-project-create-dialog
+  .collaboration-project-create-duty-bubble
+  .collaboration-project-create-inline-textarea:focus {
+  border-color: transparent;
+  outline: none;
+  box-shadow: none;
+}
+
+.collaboration-project-create-generated-details {
+  display: grid;
+  gap: 12px;
+}
+
+.collaboration-project-create-generated-principles {
+  display: grid;
+  gap: 6px;
+  border-top: 1px solid rgb(var(--color-border));
+  padding-top: 10px;
+  color: rgb(var(--color-text-secondary));
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.collaboration-project-create-generated-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid rgb(var(--color-border));
+  padding-top: 10px;
+}
+
+.collaboration-project-create-generated-footer > small {
+  max-width: 480px;
+}
+
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster-item.is-assigned {
+  animation: collaboration-squad-member-enter 520ms
+    cubic-bezier(0.22, 1, 0.36, 1) both;
+  will-change: opacity, transform;
+}
+
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster-item.is-assigned.is-excited
+  .collaboration-group-roster-identity {
+  animation: collaboration-squad-member-excited 960ms ease-in-out 280ms infinite;
+  transform-origin: center bottom;
+}
+
+.collaboration-project-create-squad-formation
+  > div:not(.is-squad)
+  > span
+  > span.is-waiting {
+  animation: collaboration-squad-member-anxious 760ms ease-in-out infinite;
+  transform-origin: center bottom;
+}
+
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster-item[data-leader="true"] {
+  color: rgb(var(--color-text-primary));
+}
+
+.collaboration-project-create-squad-formation
+  > div.is-squad
+  .collaboration-group-roster-item[data-leader="true"]
+  .collaboration-group-roster-identity {
+  box-shadow: inset 0 0 0 1px rgb(var(--color-text-primary) / 0.18);
+}
+
+.collaboration-project-create-live-output {
+  display: grid;
+  gap: 12px;
+}
+
+.collaboration-project-create-live-output > section {
+  display: grid;
+  gap: 6px;
+}
+
+.collaboration-project-create-live-output > section > span,
+.collaboration-project-create-live-output > section ul {
+  margin: 0;
+  border-radius: 8px;
+  padding: 8px;
+  color: rgb(var(--color-text-secondary));
+  background: rgb(var(--color-bg-base));
+}
+
+.collaboration-project-create-live-output > section ul {
+  display: grid;
+  gap: 4px;
+  padding-left: 28px;
+}
+
+.collaboration-project-create-workflow-pending {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: rgb(var(--color-text-muted));
+  font-size: 12px;
+}
+
+.collaboration-project-create-workflow-pending > svg {
+  width: 14px;
+  height: 14px;
+}
+
+.collaboration-project-create-group-workflow.is-generating
+  > div
+  > span:last-child
+  > strong {
+  animation: collaboration-workflow-stage-enter 360ms
+    cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes collaboration-squad-member-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-16px) scale(0.96);
+  }
+
+  72% {
+    opacity: 1;
+    transform: translateY(2px) scale(1);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes collaboration-workflow-stage-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes collaboration-squad-member-anxious {
+  0%,
+  38%,
+  62%,
+  100% {
+    transform: translate(0, 0) rotate(0);
+  }
+
+  18% {
+    transform: translate(-2px, -3px) rotate(-2deg);
+  }
+
+  82% {
+    transform: translate(2px, -3px) rotate(2deg);
+  }
+}
+
+@keyframes collaboration-squad-member-excited {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+
+  48% {
+    transform: translateY(-2px);
+  }
+
+  66% {
+    transform: translateY(-0.5px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .collaboration-project-create-squad-formation > div > span > span.is-waiting,
+  .collaboration-project-create-squad-formation
+    > div.is-squad
+    .collaboration-group-roster-item.is-assigned,
+  .collaboration-project-create-squad-formation
+    > div.is-squad
+    .collaboration-group-roster-item.is-assigned
+    .collaboration-group-roster-identity,
+  .collaboration-project-create-group-workflow.is-generating
+    > div
+    > span:last-child
+    > strong {
+    animation: none;
+  }
+}
+
+.collaboration-spin {
+  animation: collaboration-spin 900ms linear infinite;
+}
+
+@keyframes collaboration-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.collaboration-project-create-provider-config {
+  gap: 16px !important;
+  border-radius: 12px;
+  padding: 12px;
+  background: rgb(var(--color-bg-hover) / 0.55);
+}
+
+.collaboration-project-create-token {
+  position: relative;
+}
+
+.collaboration-project-create-token > svg {
+  position: absolute;
+  top: 11px;
+  left: 12px;
+  width: 16px;
+  height: 16px;
+  color: rgb(var(--color-text-muted));
+  pointer-events: none;
+}
+
+.collaboration-project-create-token input {
+  padding-left: 36px;
+}
+
+.collaboration-project-create-field small.is-error,
+.collaboration-project-create-error {
+  color: rgb(var(--color-error));
+}
+
+.collaboration-project-create-error {
+  border-radius: 8px;
+  margin: 0;
+  padding: 8px 12px;
+  font-size: 12px;
+  background: rgb(var(--color-error) / 0.1);
+}
+
+.collaboration-project-create-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid rgb(var(--color-border));
+  padding: 14px 20px;
+}
+
+.collaboration-project-create-footer button:not(.collaboration-primary-button) {
+  min-height: 36px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 8px;
+  padding: 8px 14px;
+  color: rgb(var(--color-text-primary));
+  background: transparent;
+  cursor: pointer;
+}
+
+.collaboration-workspace-home-dialog {
+  display: flex;
+  max-height: min(720px, calc(100vh - 32px));
+  flex-direction: column;
+}
+
+.collaboration-workspace-home-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.collaboration-workspace-home-dialog-header button {
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.collaboration-web-file-preview {
+  overflow: auto;
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.collaboration-dialog form,
+.collaboration-settings {
+  display: grid;
+  gap: 16px;
+}
+
+.collaboration-dialog label,
+.collaboration-issue-detail label,
+.collaboration-settings label {
+  display: grid;
+  gap: 6px;
+  color: rgb(var(--color-text-secondary));
+}
+
+.collaboration-dialog input,
+.collaboration-dialog textarea,
+.collaboration-dialog select,
+.collaboration-issue-detail input,
+.collaboration-issue-detail textarea,
+.collaboration-issue-detail select,
+.collaboration-settings input,
+.collaboration-settings textarea {
+  min-height: 38px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: rgb(var(--color-text-primary));
+  background: rgb(var(--color-bg-base));
+}
+
+.collaboration-dialog textarea,
+.collaboration-issue-detail textarea,
+.collaboration-settings textarea {
+  min-height: 100px;
+  resize: vertical;
+}
+
+.collaboration-dialog footer,
+.collaboration-issue-detail footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.collaboration-current-assignment {
+  margin-bottom: 16px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 12px;
+  background: rgb(var(--color-muted) / 0.45);
+  padding: 12px;
+}
+
+.collaboration-current-assignment > header,
+.collaboration-current-assignment > div {
+  display: flex;
+  align-items: center;
+}
+
+.collaboration-current-assignment > header {
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.collaboration-current-assignment > header > span,
+.collaboration-current-assignment > p,
+.collaboration-current-assignment-main small,
+.collaboration-current-assignment-source {
+  color: rgb(var(--color-text-muted));
+}
+
+.collaboration-current-assignment > p {
+  margin: 0;
+}
+
+.collaboration-current-assignment > div {
+  gap: 10px;
+}
+
+.collaboration-current-assignment-avatar {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: rgb(var(--color-text-primary));
+  color: rgb(var(--color-background));
+  font-weight: 500;
+}
+
+.collaboration-current-assignment-avatar.is-agent {
+  background: rgb(var(--color-muted));
+  color: rgb(var(--color-text-primary));
+}
+
+.collaboration-current-assignment-main {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.collaboration-current-assignment-main b,
+.collaboration-current-assignment-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collaboration-current-assignment-source {
+  flex: 0 1 auto;
+  text-align: right;
+}
+
+.collaboration-dialog footer button:not(.collaboration-primary-button) {
+  min-height: 36px;
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 8px;
+  padding: 8px 14px;
+  color: inherit;
+  background: transparent;
+}
+
+.collaboration-form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.collaboration-project-location {
+  display: flex;
+  gap: 16px;
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.collaboration-project-location legend {
+  margin-bottom: 8px;
+  color: rgb(var(--color-text-secondary));
+}
+
+.collaboration-project-location label {
+  display: inline-flex;
+  grid-template-columns: none;
+  align-items: center;
+  gap: 6px;
+}
+
+.automatic-processing-selected {
+  border-color: rgb(var(--color-focus, var(--color-primary)));
+  background: rgb(var(--color-focus, var(--color-primary)) / 0.05);
+}
+
+.automatic-processing-selected-soft {
+  border-color: rgb(var(--color-focus, var(--color-primary)) / 0.6);
+  background: rgb(var(--color-focus, var(--color-primary)) / 0.1);
+}
+
+.automatic-processing-selected-icon {
+  color: rgb(var(--color-focus, var(--color-primary)));
+}
+
+.automatic-processing-selected-avatar {
+  color: rgb(var(--color-focus, var(--color-primary)));
+  background: rgb(var(--color-focus, var(--color-primary)) / 0.1);
+}
+
+.automatic-processing-picker-open {
+  box-shadow: 0 0 0 2px rgb(var(--color-focus, var(--color-primary)) / 0.2);
+}
+
+.automatic-processing-checkbox {
+  accent-color: rgb(var(--color-focus, var(--color-primary)));
+}
+
+@media (max-width: 767px) {
+  .collaboration-project-create-dialog {
+    max-height: calc(100vh - 32px);
+  }
+
+  .collaboration-project-create-providers {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .collaboration-project-create-grid.columns-3 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .collaboration-project-create-footer button {
+    min-height: 44px;
+  }
+}

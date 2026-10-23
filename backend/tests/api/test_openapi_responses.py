@@ -1,0 +1,2527 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+API integration tests for OpenAPI v1/responses endpoints.
+"""
+
+import asyncio
+import hashlib
+import json
+from datetime import datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+from app.api.endpoints.openapi_responses import (
+    _build_result_block_streaming_chunks,
+    _create_non_streaming_response_unified,
+    _filter_current_assistant_turn,
+    _iter_callback_events,
+    _model_category_from_kind,
+    _resolve_requested_model,
+    _task_to_response_object,
+)
+from app.core.security import get_password_hash
+from app.models.api_key import KEY_TYPE_PERSONAL, APIKey
+from app.models.kind import Kind
+from app.models.namespace import Namespace
+from app.models.resource_member import MemberStatus, ResourceMember, ResourceRole
+from app.models.share_link import ResourceType
+from app.models.subtask import SenderType, Subtask, SubtaskRole, SubtaskStatus
+from app.models.task import TaskResource
+from app.models.user import User
+
+
+@pytest.mark.asyncio
+async def test_callback_event_stream_waits_for_executor_terminal_event():
+    messages = [
+        None,
+        {
+            "type": "message",
+            "data": json.dumps(
+                {"type": "block_created", "task_id": 1, "subtask_id": 2}
+            ),
+        },
+        None,
+        {
+            "type": "message",
+            "data": json.dumps({"type": "done", "task_id": 1, "subtask_id": 2}),
+        },
+    ]
+    pubsub = AsyncMock()
+    pubsub.get_message = AsyncMock(side_effect=messages)
+
+    events = [event async for event in _iter_callback_events(pubsub, asyncio.Event())]
+
+    assert [event.type for event in events] == ["block_created", "done"]
+    assert pubsub.get_message.await_count == 4
+
+
+def test_result_blocks_become_created_then_updated_streaming_chunks():
+    known_blocks = {}
+
+    created = _build_result_block_streaming_chunks(
+        {
+            "blocks": [
+                {
+                    "id": "image-1",
+                    "type": "image",
+                    "status": "streaming",
+                    "is_placeholder": True,
+                }
+            ]
+        },
+        known_blocks,
+    )
+    updated = _build_result_block_streaming_chunks(
+        {
+            "blocks": [
+                {
+                    "id": "image-1",
+                    "type": "image",
+                    "status": "done",
+                    "is_placeholder": False,
+                    "image_attachment_ids": [51],
+                }
+            ]
+        },
+        known_blocks,
+    )
+
+    assert created[0].type == "block_created"
+    assert updated[0].type == "block_updated"
+    assert updated[0].data["updates"]["status"] == "done"
+    assert known_blocks["image-1"]["image_attachment_ids"] == [51]
+
+
+def test_generation_options_reject_non_generation_openapi_model():
+    from app.api.endpoints.openapi_responses import (
+        _validate_generation_options_model,
+    )
+    from app.schemas.openapi_response import ResponseCreateInput
+
+    request_body = ResponseCreateInput(
+        model="default#test-team",
+        input="create a video",
+        wegent_options={"generation": {"duration": 5}},
+    )
+    execution_request = SimpleNamespace(model_config={"modelType": "llm"})
+
+    with pytest.raises(ValueError, match="only supported for image or video"):
+        _validate_generation_options_model(request_body, execution_request)
+
+
+@pytest.fixture
+def test_team(test_db: Session, test_user: User) -> Kind:
+    """Create a test Team Kind."""
+    team_json = {
+        "apiVersion": "agent.wecode.io/v1",
+        "kind": "Team",
+        "metadata": {"name": "test-team", "namespace": "default"},
+        "spec": {
+            "collaborationModel": "sequential",
+            "members": [
+                {
+                    "botRef": {"name": "test-bot", "namespace": "default"},
+                    "role": "worker",
+                }
+            ],
+        },
+    }
+    team = Kind(
+        user_id=test_user.id,
+        kind="Team",
+        name="test-team",
+        namespace="default",
+        json=team_json,
+        is_active=True,
+    )
+    test_db.add(team)
+    test_db.commit()
+    test_db.refresh(team)
+    return team
+
+
+@pytest.fixture
+def test_bot(test_db: Session, test_user: User) -> Kind:
+    """Create a test Bot Kind."""
+    bot_json = {
+        "apiVersion": "agent.wecode.io/v1",
+        "kind": "Bot",
+        "metadata": {"name": "test-bot", "namespace": "default"},
+        "spec": {
+            "shellRef": {"name": "chat-shell", "namespace": "default"},
+            "ghostRef": {"name": "test-ghost", "namespace": "default"},
+            "modelRef": {"name": "gpt-4", "namespace": "default"},
+        },
+    }
+    bot = Kind(
+        user_id=test_user.id,
+        kind="Bot",
+        name="test-bot",
+        namespace="default",
+        json=bot_json,
+        is_active=True,
+    )
+    test_db.add(bot)
+    test_db.commit()
+    test_db.refresh(bot)
+    return bot
+
+
+@pytest.fixture
+def test_shell(test_db: Session, test_user: User) -> Kind:
+    """Create a test Shell Kind (Chat Shell type)."""
+    shell_json = {
+        "apiVersion": "agent.wecode.io/v1",
+        "kind": "Shell",
+        "metadata": {"name": "chat-shell", "namespace": "default"},
+        "spec": {"shellType": "Chat"},
+    }
+    shell = Kind(
+        user_id=test_user.id,
+        kind="Shell",
+        name="chat-shell",
+        namespace="default",
+        json=shell_json,
+        is_active=True,
+    )
+    test_db.add(shell)
+    test_db.commit()
+    test_db.refresh(shell)
+    return shell
+
+
+@pytest.fixture
+def test_public_shell(test_db: Session) -> Kind:
+    """Create a public Shell Kind (user_id=0)."""
+    shell_json = {
+        "apiVersion": "agent.wecode.io/v1",
+        "kind": "Shell",
+        "metadata": {"name": "chat-shell", "namespace": "default"},
+        "spec": {"shellType": "Chat"},
+    }
+    shell = Kind(
+        user_id=0,
+        kind="Shell",
+        name="chat-shell",
+        namespace="default",
+        json=shell_json,
+        is_active=True,
+    )
+    test_db.add(shell)
+    test_db.commit()
+    test_db.refresh(shell)
+    return shell
+
+
+@pytest.fixture
+def test_model(test_db: Session, test_user: User) -> Kind:
+    """Create a test Model Kind."""
+    model_json = {
+        "apiVersion": "agent.wecode.io/v1",
+        "kind": "Model",
+        "metadata": {"name": "gpt-4", "namespace": "default"},
+        "spec": {"provider": "openai", "modelName": "gpt-4"},
+    }
+    model = Kind(
+        user_id=test_user.id,
+        kind="Model",
+        name="gpt-4",
+        namespace="default",
+        json=model_json,
+        is_active=True,
+    )
+    test_db.add(model)
+    test_db.commit()
+    test_db.refresh(model)
+    return model
+
+
+@pytest.fixture
+def test_task(test_db: Session, test_user: User, test_team: Kind) -> TaskResource:
+    """Create a test Task Kind."""
+    task_json = {
+        "apiVersion": "agent.wecode.io/v1",
+        "kind": "Task",
+        "metadata": {
+            "name": "task-test",
+            "namespace": "default",
+            "labels": {
+                "type": "online",
+                "taskType": "chat",
+                "source": "chat_shell",
+            },
+        },
+        "spec": {
+            "title": "Test task",
+            "prompt": "Hello",
+            "teamRef": {"name": "test-team", "namespace": "default"},
+            "workspaceRef": {"name": "workspace-1", "namespace": "default"},
+        },
+        "status": {
+            "status": "COMPLETED",
+            "progress": 100,
+            "result": {"value": "Hello! How can I help you?"},
+            "errorMessage": "",
+            "createdAt": datetime.now().isoformat(),
+            "updatedAt": datetime.now().isoformat(),
+            "completedAt": datetime.now().isoformat(),
+        },
+    }
+    # Don't set explicit id, let the database assign it
+    task = TaskResource(
+        user_id=test_user.id,
+        kind="Task",
+        name="task-test",
+        namespace="default",
+        json=task_json,
+        is_active=True,
+    )
+    test_db.add(task)
+    test_db.commit()
+    test_db.refresh(task)
+    return task
+
+
+@pytest.fixture
+def test_subtasks(
+    test_db: Session, test_user: User, test_task: TaskResource, test_team: Kind
+) -> list:
+    """Create test subtasks for a task."""
+    user_subtask = Subtask(
+        user_id=test_user.id,
+        task_id=test_task.id,
+        team_id=test_team.id,
+        title="User message",
+        bot_ids=[1],
+        role=SubtaskRole.USER,
+        executor_namespace="",
+        executor_name="",
+        prompt="Hello",
+        status=SubtaskStatus.COMPLETED,
+        progress=100,
+        message_id=1,
+        parent_id=0,
+        error_message="",
+        completed_at=datetime.now(),
+        result=None,
+        sender_type=SenderType.USER,
+        sender_user_id=test_user.id,
+    )
+    test_db.add(user_subtask)
+
+    assistant_subtask = Subtask(
+        user_id=test_user.id,
+        task_id=test_task.id,
+        team_id=test_team.id,
+        title="Assistant response",
+        bot_ids=[1],
+        role=SubtaskRole.ASSISTANT,
+        executor_namespace="",
+        executor_name="",
+        prompt="",
+        status=SubtaskStatus.COMPLETED,
+        progress=100,
+        message_id=2,
+        parent_id=1,
+        error_message="",
+        completed_at=datetime.now(),
+        result={"value": "Hello! How can I help you?"},
+        sender_type=SenderType.TEAM,
+        sender_user_id=0,
+    )
+    test_db.add(assistant_subtask)
+    test_db.commit()
+    test_db.refresh(user_subtask)
+    test_db.refresh(assistant_subtask)
+    return [user_subtask, assistant_subtask]
+
+
+def _assistant_subtask_with_pending_form(
+    *,
+    subtask_id: int,
+    task_id: int,
+    user_id: int,
+    team_id: int,
+) -> Subtask:
+    tool_use_id = f"call_mcp_{subtask_id}"
+    return Subtask(
+        id=subtask_id,
+        user_id=user_id,
+        task_id=task_id,
+        team_id=team_id,
+        title="Assistant response",
+        bot_ids=[1],
+        role=SubtaskRole.ASSISTANT,
+        executor_namespace="",
+        executor_name="",
+        prompt="",
+        status=SubtaskStatus.COMPLETED,
+        progress=100,
+        message_id=2,
+        parent_id=1,
+        error_message="",
+        completed_at=datetime.now(),
+        result={
+            "blocks": [
+                {
+                    "id": tool_use_id,
+                    "type": "tool",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "interactive_form_question",
+                    "tool_input": {
+                        "questions": [
+                            {"id": "exp_id", "question": "Enter experiment id"}
+                        ],
+                    },
+                    "tool_output": {
+                        "pending_user_input": True,
+                        "pending_user_input_payload": {
+                            "type": "interactive_form_question",
+                            "tool_use_id": tool_use_id,
+                            "submit_mode": "new_response",
+                            "submit_format": "markdown_message",
+                        },
+                    },
+                    "tool_protocol": "mcp_call",
+                    "server_label": "interactive-form",
+                    "status": "done",
+                }
+            ]
+        },
+        sender_type=SenderType.TEAM,
+        sender_user_id=0,
+    )
+
+
+@pytest.mark.api
+class TestOpenAPIResponsesCreate:
+    """Test POST /api/v1/responses endpoint."""
+
+    def test_create_response_invalid_model_format(
+        self, test_client: TestClient, test_api_key
+    ):
+        """Test create response fails with invalid model format."""
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_api_key[0]},
+            json={"model": "invalid-model-format", "input": "Hello"},
+        )
+
+        assert response.status_code == 400
+        assert "Invalid model format" in response.json()["detail"]
+
+    def test_create_response_team_not_found(
+        self,
+        test_client: TestClient,
+        test_api_key,
+        test_user: User,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Test create response fails when team not found."""
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_api_key[0]},
+            json={"model": "default#nonexistent-team", "input": "Hello"},
+        )
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"]
+        assert "[OPENAPI] Team resolution failed" in caplog.text
+        assert f"caller_user_id={test_user.id}" in caplog.text
+        assert "team_namespace=default" in caplog.text
+        assert "team_name=nonexistent-team" in caplog.text
+
+    def test_create_response_invalid_previous_response_id_format(
+        self, test_client: TestClient, test_api_key, test_team: Kind, test_bot: Kind
+    ):
+        """Document current behavior for previous_response_id without resp_ prefix."""
+        from app.schemas.openapi_response import ResponseObject
+
+        mock_response = ResponseObject(
+            id="resp_123",
+            created_at=int(datetime.now().timestamp()),
+            status="completed",
+            model="default#test-team",
+            output=[],
+        )
+
+        with patch(
+            "app.api.endpoints.openapi_responses._create_non_streaming_response_unified",
+            return_value=mock_response,
+        ) as mock_create_sync:
+            response = test_client.post(
+                "/api/v1/responses",
+                headers={"X-API-Key": test_api_key[0]},
+                json={
+                    "model": "default#test-team",
+                    "input": "Hello",
+                    "previous_response_id": "not-a-resp-id",
+                },
+            )
+
+        assert response.status_code == 200
+        mock_create_sync.assert_called_once()
+
+    def test_create_response_invalid_previous_response_id_number(
+        self, test_client: TestClient, test_api_key, test_team: Kind, test_bot: Kind
+    ):
+        """Test create response fails with invalid previous_response_id number."""
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_api_key[0]},
+            json={
+                "model": "default#test-team",
+                "input": "Hello",
+                "previous_response_id": "resp_abc",
+            },
+        )
+
+        assert response.status_code == 400
+        assert "Invalid previous_response_id format" in response.json()["detail"]
+
+    def test_create_response_previous_response_not_found(
+        self, test_client: TestClient, test_api_key, test_team: Kind, test_bot: Kind
+    ):
+        """Test create response fails when previous response not found."""
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_api_key[0]},
+            json={
+                "model": "default#test-team",
+                "input": "Hello",
+                "previous_response_id": "resp_99999",
+            },
+        )
+
+        assert response.status_code == 404
+        assert "Previous response" in response.json()["detail"]
+
+    def test_create_response_previous_response_user_isolation(
+        self,
+        test_client: TestClient,
+        test_admin_api_key,
+        test_team: Kind,
+        test_bot: Kind,
+        test_task: TaskResource,
+    ):
+        """Test previous_response_id cannot reference another user's response."""
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_admin_api_key[0]},
+            json={
+                "model": "default#test-team",
+                "input": "Hello",
+                "previous_response_id": f"resp_{test_task.id}",
+            },
+        )
+
+        assert response.status_code == 404
+        assert "Previous response" in response.json()["detail"]
+
+    def test_create_response_continuation_routes_to_task_device(
+        self,
+        test_client: TestClient,
+        test_api_key,
+        test_team: Kind,
+        test_bot: Kind,
+        test_task: TaskResource,
+        test_db: Session,
+    ):
+        """Follow-ups on a device conversation are dispatched to that device."""
+        from app.schemas.openapi_response import ResponseObject
+        from app.services.device_service import device_service
+
+        device_id = "device-continuation"
+        task_json = dict(test_task.json)
+        task_json["spec"] = {**task_json["spec"], "device_id": device_id}
+        test_task.json = task_json
+        test_db.commit()
+
+        mock_response = ResponseObject(
+            id=f"resp_{test_task.id}",
+            created_at=int(datetime.now().timestamp()),
+            status="queued",
+            model="default#test-team",
+            output=[],
+        )
+
+        with (
+            patch.object(
+                device_service,
+                "get_device_online_info",
+                new=AsyncMock(return_value={"status": "online"}),
+            ),
+            patch(
+                "app.api.endpoints.openapi_responses._create_non_streaming_response_unified",
+                return_value=mock_response,
+            ) as mock_create_sync,
+        ):
+            response = test_client.post(
+                "/api/v1/responses",
+                headers={"X-API-Key": test_api_key[0]},
+                json={
+                    "model": "default#test-team",
+                    "input": "2",
+                    "previous_response_id": f"resp_{test_task.id}",
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_create_sync.call_args.kwargs["device_id"] == device_id
+
+    def test_create_response_continuation_rejects_offline_device(
+        self,
+        test_client: TestClient,
+        test_api_key,
+        test_team: Kind,
+        test_bot: Kind,
+        test_task: TaskResource,
+        test_db: Session,
+    ):
+        """An offline device fails the follow-up instead of the executor manager."""
+        from app.services.device_service import device_service
+
+        task_json = dict(test_task.json)
+        task_json["spec"] = {**task_json["spec"], "device_id": "device-offline"}
+        test_task.json = task_json
+        test_db.commit()
+
+        with (
+            patch.object(
+                device_service,
+                "get_device_online_info",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.api.endpoints.openapi_responses._create_non_streaming_response_unified",
+            ) as mock_create_sync,
+        ):
+            response = test_client.post(
+                "/api/v1/responses",
+                headers={"X-API-Key": test_api_key[0]},
+                json={
+                    "model": "default#test-team",
+                    "input": "2",
+                    "previous_response_id": f"resp_{test_task.id}",
+                },
+            )
+
+        assert response.status_code == 503
+        assert "offline" in response.json()["detail"]
+        mock_create_sync.assert_not_called()
+
+    def test_create_response_continuation_without_device_keeps_executor_manager(
+        self,
+        test_client: TestClient,
+        test_api_key,
+        test_team: Kind,
+        test_bot: Kind,
+        test_task: TaskResource,
+    ):
+        """Tasks without a device keep the previous executor manager routing."""
+        from app.schemas.openapi_response import ResponseObject
+
+        mock_response = ResponseObject(
+            id=f"resp_{test_task.id}",
+            created_at=int(datetime.now().timestamp()),
+            status="queued",
+            model="default#test-team",
+            output=[],
+        )
+
+        with patch(
+            "app.api.endpoints.openapi_responses._create_non_streaming_response_unified",
+            return_value=mock_response,
+        ) as mock_create_sync:
+            response = test_client.post(
+                "/api/v1/responses",
+                headers={"X-API-Key": test_api_key[0]},
+                json={
+                    "model": "default#test-team",
+                    "input": "2",
+                    "previous_response_id": f"resp_{test_task.id}",
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_create_sync.call_args.kwargs["device_id"] is None
+
+    def test_create_response_model_not_found(
+        self, test_client: TestClient, test_api_key, test_team: Kind, test_bot: Kind
+    ):
+        """Test create response fails when specified model not found."""
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_api_key[0]},
+            json={"model": "default#test-team#nonexistent-model", "input": "Hello"},
+        )
+
+        assert response.status_code == 400
+        assert "not found" in response.json()["detail"]
+
+    def test_create_response_without_auth(self, test_client: TestClient):
+        """Test create response fails without authentication."""
+        response = test_client.post(
+            "/api/v1/responses",
+            json={"model": "default#test-team", "input": "Hello"},
+        )
+
+        assert response.status_code == 401
+
+    @patch("app.api.endpoints.openapi_responses._create_non_streaming_response_unified")
+    def test_create_response_allows_shared_team_api_key(
+        self,
+        mock_create_sync,
+        test_client: TestClient,
+        test_db: Session,
+        test_admin_user: User,
+        test_admin_api_key,
+        test_team: Kind,
+        test_bot: Kind,
+        test_model: Kind,
+        test_public_shell: Kind,
+    ):
+        """An API key owner can invoke a directly shared Team."""
+        from app.schemas.openapi_response import ResponseObject
+
+        member = ResourceMember(
+            resource_type=ResourceType.TEAM.value,
+            resource_id=test_team.id,
+            entity_type="user",
+            entity_id=str(test_admin_user.id),
+            role=ResourceRole.Reporter.value,
+            status=MemberStatus.APPROVED.value,
+        )
+        test_db.add(member)
+        test_db.commit()
+        mock_create_sync.return_value = ResponseObject(
+            id="resp_123",
+            created_at=int(datetime.now().timestamp()),
+            status="completed",
+            model="default#test-team",
+            output=[],
+        )
+
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_admin_api_key[0]},
+            json={"model": "default#test-team", "input": "Hello"},
+        )
+
+        assert response.status_code == 200
+        assert mock_create_sync.call_args.kwargs["user"].id == test_admin_user.id
+        assert mock_create_sync.call_args.kwargs["team"].id == test_team.id
+
+    def _create_group_with_referenced_model(
+        self,
+        test_db: Session,
+        test_user: User,
+        model: Kind,
+        *,
+        model_type: str = "llm",
+        namespace_name: str = "referenced-model-namespace",
+        caller_name: str = "referenced-model-caller",
+        caller_key: str = "wg-referenced-model-key",
+        team_name: str = "referenced-model-team",
+        bot_name: str = "referenced-model-bot",
+    ) -> tuple[User, Kind]:
+        """Create a group whose Team/Bot live in the group while the Bot's
+        modelRef points to a model only referenced into that group."""
+        caller = User(
+            user_name=caller_name,
+            password_hash=get_password_hash(f"{caller_name}password123"),
+            email=f"{caller_name}@example.com",
+            is_active=True,
+            git_info=None,
+        )
+        test_db.add(caller)
+        test_db.flush()
+
+        api_key = APIKey(
+            user_id=caller.id,
+            key_hash=hashlib.sha256(caller_key.encode()).hexdigest(),
+            key_prefix="wg-refmo...",
+            name="Referenced model key",
+            key_type=KEY_TYPE_PERSONAL,
+            description="",
+            expires_at=datetime.utcnow() + timedelta(days=365),
+            is_active=True,
+        )
+        test_db.add(api_key)
+
+        model.namespace = "default"
+        model.json = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Model",
+            "metadata": {"name": model.name, "namespace": "default"},
+            "spec": {"modelType": model_type},
+        }
+
+        namespace = Namespace(
+            name=namespace_name,
+            display_name="Referenced model namespace",
+            owner_user_id=test_user.id,
+            visibility="internal",
+            description="",
+            level="group",
+            is_active=True,
+        )
+        test_db.add(namespace)
+        test_db.flush()
+
+        team = Kind(
+            user_id=test_user.id,
+            kind="Team",
+            name=team_name,
+            namespace=namespace.name,
+            json={
+                "apiVersion": "agent.wecode.io/v1",
+                "kind": "Team",
+                "metadata": {"name": team_name, "namespace": namespace.name},
+                "spec": {
+                    "collaborationModel": "sequential",
+                    "members": [
+                        {"botRef": {"name": bot_name, "namespace": namespace.name}}
+                    ],
+                },
+            },
+            is_active=True,
+        )
+        bot = Kind(
+            user_id=test_user.id,
+            kind="Bot",
+            name=bot_name,
+            namespace=namespace.name,
+            json={
+                "apiVersion": "agent.wecode.io/v1",
+                "kind": "Bot",
+                "metadata": {"name": bot_name, "namespace": namespace.name},
+                "spec": {
+                    "shellRef": {"name": "chat-shell", "namespace": "default"},
+                    "ghostRef": {"name": "test-ghost", "namespace": "default"},
+                    "modelRef": {"name": model.name, "namespace": namespace.name},
+                },
+            },
+            is_active=True,
+        )
+        test_db.add_all([team, bot])
+        test_db.flush()
+        test_db.add_all(
+            [
+                ResourceMember(
+                    resource_type="Namespace",
+                    resource_id=namespace.id,
+                    entity_type="user",
+                    entity_id=str(caller.id),
+                    role=ResourceRole.Reporter.value,
+                    status=MemberStatus.APPROVED.value,
+                ),
+                ResourceMember(
+                    resource_type=ResourceType.TEAM.value,
+                    resource_id=team.id,
+                    entity_type="namespace",
+                    entity_id=str(namespace.id),
+                    role=ResourceRole.Reporter.value,
+                    status=MemberStatus.APPROVED.value,
+                ),
+                # The model stays in the owner's personal namespace and is only
+                # referenced into the group namespace.
+                ResourceMember(
+                    resource_type="Model",
+                    resource_id=model.id,
+                    entity_type="namespace",
+                    entity_id=str(namespace.id),
+                    role=ResourceRole.Reporter.value,
+                    status=MemberStatus.APPROVED.value,
+                ),
+            ]
+        )
+        test_db.commit()
+        return caller, namespace
+
+    @patch("app.api.endpoints.openapi_responses._create_non_streaming_response_unified")
+    def test_create_response_resolves_model_referenced_into_group(
+        self,
+        mock_create_sync,
+        test_client: TestClient,
+        test_db: Session,
+        test_user: User,
+        test_model: Kind,
+    ):
+        """A group member can invoke a group Team whose modelRef points to a
+        model referenced into the group from its owner's personal namespace."""
+        from app.schemas.openapi_response import ResponseObject
+
+        caller, namespace = self._create_group_with_referenced_model(
+            test_db, test_user, test_model
+        )
+        team = (
+            test_db.query(Kind)
+            .filter(Kind.kind == "Team", Kind.namespace == namespace.name)
+            .one()
+        )
+        mock_create_sync.return_value = ResponseObject(
+            id="resp_124",
+            created_at=int(datetime.now().timestamp()),
+            status="completed",
+            model=f"{namespace.name}#referenced-model-team",
+            output=[],
+        )
+
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": "wg-referenced-model-key"},
+            json={
+                "model": f"{namespace.name}#referenced-model-team#{test_model.name}",
+                "input": "Hello",
+            },
+        )
+
+        assert response.status_code == 200
+        assert mock_create_sync.call_args.kwargs["user"].id == caller.id
+        assert mock_create_sync.call_args.kwargs["team"].id == team.id
+
+    def test_resolve_requested_model_uses_referenced_model_type(
+        self,
+        test_db: Session,
+        test_user: User,
+        test_model: Kind,
+    ):
+        """A model referenced into the group namespace resolves with its own
+        modelType, so image/video models are not downgraded to chat."""
+        caller, namespace = self._create_group_with_referenced_model(
+            test_db, test_user, test_model, model_type="image"
+        )
+
+        resolved = _resolve_requested_model(
+            test_db, caller.id, namespace.name, test_model.name
+        )
+
+        assert resolved is not None
+        assert resolved.id == test_model.id
+        assert _model_category_from_kind(resolved) == "image"
+        assert (
+            _resolve_requested_model(
+                test_db, caller.id, namespace.name, "does-not-exist"
+            )
+            is None
+        )
+
+    @patch("app.api.endpoints.openapi_responses._create_non_streaming_response_unified")
+    def test_create_response_falls_back_to_default_referenced_model(
+        self,
+        mock_create_sync,
+        test_client: TestClient,
+        test_db: Session,
+        test_user: User,
+        test_model: Kind,
+    ):
+        """The group fallback also resolves a model referenced into the
+        caller's default namespace by another user."""
+        from app.schemas.openapi_response import ResponseObject
+
+        caller, namespace = self._create_group_with_referenced_model(
+            test_db, test_user, test_model
+        )
+        # Replace the group-level reference with a default-namespace
+        # (user-level) reference for the caller.
+        ref = (
+            test_db.query(ResourceMember)
+            .filter(
+                ResourceMember.resource_type == "Model",
+                ResourceMember.resource_id == test_model.id,
+            )
+            .one()
+        )
+        ref.entity_type = "user"
+        ref.entity_id = str(caller.id)
+        test_db.commit()
+
+        team = (
+            test_db.query(Kind)
+            .filter(Kind.kind == "Team", Kind.namespace == namespace.name)
+            .one()
+        )
+        mock_create_sync.return_value = ResponseObject(
+            id="resp_126",
+            created_at=int(datetime.now().timestamp()),
+            status="completed",
+            model=f"{namespace.name}#referenced-model-team",
+            output=[],
+        )
+
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": "wg-referenced-model-key"},
+            json={
+                "model": f"{namespace.name}#referenced-model-team#{test_model.name}",
+                "input": "Hello",
+            },
+        )
+
+        assert response.status_code == 200
+        assert mock_create_sync.call_args.kwargs["user"].id == caller.id
+        assert mock_create_sync.call_args.kwargs["team"].id == team.id
+
+    def test_resolve_requested_model_rejects_non_member_of_group(
+        self,
+        test_db: Session,
+        test_user: User,
+        test_model: Kind,
+    ):
+        """A referenced model must not resolve for callers that are not
+        members of the group namespace."""
+        caller, namespace = self._create_group_with_referenced_model(
+            test_db, test_user, test_model
+        )
+        outsider = User(
+            user_name="referenced-model-outsider",
+            password_hash=get_password_hash("outsiderpassword123"),
+            email="referenced-model-outsider@example.com",
+            is_active=True,
+            git_info=None,
+        )
+        test_db.add(outsider)
+        test_db.commit()
+
+        # Member of the group can resolve it.
+        assert (
+            _resolve_requested_model(
+                test_db, caller.id, namespace.name, test_model.name
+            )
+            is not None
+        )
+        # A non-member cannot, even though the reference exists.
+        assert (
+            _resolve_requested_model(
+                test_db, outsider.id, namespace.name, test_model.name
+            )
+            is None
+        )
+
+    @patch("app.api.endpoints.openapi_responses._create_non_streaming_response_unified")
+    def test_create_response_falls_back_to_caller_default_model(
+        self,
+        mock_create_sync,
+        test_client: TestClient,
+        test_db: Session,
+        test_user: User,
+        test_model: Kind,
+        test_api_key,
+        test_public_shell: Kind,
+    ):
+        """A group team whose bot references a model the caller owns in
+        default still resolves via the legacy caller-default fallback."""
+        from app.schemas.openapi_response import ResponseObject
+
+        namespace = Namespace(
+            name="fallback-model-namespace",
+            display_name="Fallback model namespace",
+            owner_user_id=test_user.id,
+            visibility="internal",
+            description="",
+            level="group",
+            is_active=True,
+        )
+        test_db.add(namespace)
+        test_db.flush()
+
+        team = Kind(
+            user_id=test_user.id,
+            kind="Team",
+            name="fallback-model-team",
+            namespace=namespace.name,
+            json={
+                "apiVersion": "agent.wecode.io/v1",
+                "kind": "Team",
+                "metadata": {
+                    "name": "fallback-model-team",
+                    "namespace": namespace.name,
+                },
+                "spec": {
+                    "collaborationModel": "sequential",
+                    "members": [
+                        {
+                            "botRef": {
+                                "name": "fallback-model-bot",
+                                "namespace": namespace.name,
+                            }
+                        }
+                    ],
+                },
+            },
+            is_active=True,
+        )
+        bot = Kind(
+            user_id=test_user.id,
+            kind="Bot",
+            name="fallback-model-bot",
+            namespace=namespace.name,
+            json={
+                "apiVersion": "agent.wecode.io/v1",
+                "kind": "Bot",
+                "metadata": {
+                    "name": "fallback-model-bot",
+                    "namespace": namespace.name,
+                },
+                "spec": {
+                    "shellRef": {"name": "chat-shell", "namespace": "default"},
+                    "ghostRef": {"name": "test-ghost", "namespace": "default"},
+                    "modelRef": {"name": "gpt-4", "namespace": "default"},
+                },
+            },
+            is_active=True,
+        )
+        test_db.add_all([team, bot])
+        test_db.flush()
+        test_db.add_all(
+            [
+                ResourceMember(
+                    resource_type="Namespace",
+                    resource_id=namespace.id,
+                    entity_type="user",
+                    entity_id=str(test_user.id),
+                    role=ResourceRole.Reporter.value,
+                    status=MemberStatus.APPROVED.value,
+                ),
+                ResourceMember(
+                    resource_type=ResourceType.TEAM.value,
+                    resource_id=team.id,
+                    entity_type="namespace",
+                    entity_id=str(namespace.id),
+                    role=ResourceRole.Reporter.value,
+                    status=MemberStatus.APPROVED.value,
+                ),
+            ]
+        )
+        test_db.commit()
+
+        mock_create_sync.return_value = ResponseObject(
+            id="resp_125",
+            created_at=int(datetime.now().timestamp()),
+            status="completed",
+            model=f"{namespace.name}#fallback-model-team",
+            output=[],
+        )
+
+        # The group namespace has no direct/referenced "gpt-4"; the request
+        # must fall back to the caller's personal default copy.
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_api_key[0]},
+            json={
+                "model": f"{namespace.name}#fallback-model-team#gpt-4",
+                "input": "Hello",
+            },
+        )
+
+        assert response.status_code == 200
+        assert mock_create_sync.call_args.kwargs["user"].id == test_user.id
+        assert mock_create_sync.call_args.kwargs["team"].id == team.id
+
+    @patch("app.api.endpoints.openapi_responses._create_non_streaming_response_unified")
+    def test_create_response_allows_namespace_shared_team_api_key(
+        self,
+        mock_create_sync,
+        test_client: TestClient,
+        test_db: Session,
+        test_admin_user: User,
+        test_admin_api_key,
+        test_team: Kind,
+        test_bot: Kind,
+        test_model: Kind,
+        test_public_shell: Kind,
+    ):
+        """A namespace member can invoke a Team granted to that namespace."""
+        from app.schemas.openapi_response import ResponseObject
+
+        namespace = Namespace(
+            name="openapi-shared-team-namespace",
+            display_name="OpenAPI shared Team namespace",
+            owner_user_id=test_team.user_id,
+            visibility="internal",
+            description="",
+            level="group",
+            is_active=True,
+        )
+        test_db.add(namespace)
+        test_db.flush()
+        test_db.add_all(
+            [
+                ResourceMember(
+                    resource_type="Namespace",
+                    resource_id=namespace.id,
+                    entity_type="user",
+                    entity_id=str(test_admin_user.id),
+                    role=ResourceRole.Reporter.value,
+                    status=MemberStatus.APPROVED.value,
+                ),
+                ResourceMember(
+                    resource_type=ResourceType.TEAM.value,
+                    resource_id=test_team.id,
+                    entity_type="namespace",
+                    entity_id=str(namespace.id),
+                    role=ResourceRole.Reporter.value,
+                    status=MemberStatus.APPROVED.value,
+                ),
+            ]
+        )
+        test_db.commit()
+        mock_create_sync.return_value = ResponseObject(
+            id="resp_123",
+            created_at=int(datetime.now().timestamp()),
+            status="completed",
+            model="default#test-team",
+            output=[],
+        )
+
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_admin_api_key[0]},
+            json={"model": "default#test-team", "input": "Hello"},
+        )
+
+        assert response.status_code == 200
+        assert mock_create_sync.call_args.kwargs["user"].id == test_admin_user.id
+        assert mock_create_sync.call_args.kwargs["team"].id == test_team.id
+
+    @patch("app.api.endpoints.openapi_responses._create_non_streaming_response_unified")
+    def test_create_response_sync_success(
+        self,
+        mock_create_sync,
+        test_client: TestClient,
+        test_api_key,
+        test_team: Kind,
+        test_bot: Kind,
+        test_model: Kind,
+        test_public_shell: Kind,
+    ):
+        """Test successful synchronous response creation."""
+        from app.schemas.openapi_response import (
+            OutputMessage,
+            OutputTextContent,
+            ResponseObject,
+        )
+
+        mock_response = ResponseObject(
+            id="resp_123",
+            created_at=int(datetime.now().timestamp()),
+            status="completed",
+            model="default#test-team",
+            output=[
+                OutputMessage(
+                    id="msg_1",
+                    status="completed",
+                    role="assistant",
+                    content=[OutputTextContent(text="Hello! How can I help you?")],
+                )
+            ],
+        )
+        mock_create_sync.return_value = mock_response
+
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_api_key[0]},
+            json={"model": "default#test-team", "input": "Hello", "stream": False},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == "resp_123"
+        assert data["status"] == "completed"
+        assert len(data["output"]) == 1
+
+    @patch("app.api.endpoints.openapi_responses._create_non_streaming_response_unified")
+    def test_create_response_uses_authenticated_user_not_body_user_id(
+        self,
+        mock_create_sync,
+        test_client: TestClient,
+        test_api_key,
+        test_user: User,
+        test_team: Kind,
+        test_bot: Kind,
+        test_model: Kind,
+        test_public_shell: Kind,
+    ):
+        """Task creation user must come from API key auth, not request body."""
+        from app.schemas.openapi_response import ResponseObject
+
+        mock_create_sync.return_value = ResponseObject(
+            id="resp_123",
+            created_at=int(datetime.now().timestamp()),
+            status="completed",
+            model="default#test-team",
+            output=[],
+        )
+
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_api_key[0]},
+            json={
+                "model": "default#test-team",
+                "input": "Hello",
+                "stream": False,
+                "user_id": test_user.id + 999,
+            },
+        )
+
+        assert response.status_code == 200
+        assert mock_create_sync.call_args.kwargs["user"].id == test_user.id
+
+    @patch("app.api.endpoints.openapi_responses._create_non_streaming_response_unified")
+    def test_create_response_passes_auto_delete_executor_header(
+        self,
+        mock_create_sync,
+        test_client: TestClient,
+        test_api_key,
+        test_team: Kind,
+        test_bot: Kind,
+        test_model: Kind,
+        test_public_shell: Kind,
+    ):
+        """Header auto_delete_executor should be passed into task setup."""
+        from app.schemas.openapi_response import ResponseObject
+
+        mock_create_sync.return_value = ResponseObject(
+            id="resp_123",
+            created_at=int(datetime.now().timestamp()),
+            status="queued",
+            model="default#test-team",
+            output=[],
+        )
+
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={
+                "X-API-Key": test_api_key[0],
+                "auto_delete_executor": "true",
+            },
+            json={"model": "default#test-team", "input": "Hello", "stream": False},
+        )
+
+        assert response.status_code == 200
+        assert mock_create_sync.call_args.kwargs["auto_delete_executor"] == "true"
+
+    def test_create_response_rejects_invalid_auto_delete_executor_header(
+        self,
+        test_client: TestClient,
+        test_api_key,
+        test_team: Kind,
+        test_bot: Kind,
+        test_model: Kind,
+        test_public_shell: Kind,
+    ):
+        """Invalid auto_delete_executor header values should fail fast."""
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={
+                "X-API-Key": test_api_key[0],
+                "auto_delete_executor": "maybe",
+            },
+            json={"model": "default#test-team", "input": "Hello", "stream": False},
+        )
+
+        assert response.status_code == 400
+        assert "Invalid auto_delete_executor" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_create_non_streaming_response_unified_omits_pending_user_input(
+        self,
+        test_db: Session,
+        test_user: User,
+        test_team: Kind,
+    ):
+        """Queued non-streaming responses should not expose legacy pending form state."""
+        setup = SimpleNamespace(
+            task=SimpleNamespace(id=101, json={"metadata": {"labels": {}}}),
+            task_id=101,
+            user_subtask=SimpleNamespace(id=321),
+            assistant_subtask=SimpleNamespace(id=654),
+        )
+        execution_request = SimpleNamespace(task_id=101, subtask_id=654)
+        assistant_subtask = _assistant_subtask_with_pending_form(
+            subtask_id=654,
+            task_id=101,
+            user_id=test_user.id,
+            team_id=test_team.id,
+        )
+        query_db = MagicMock()
+        query_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            assistant_subtask
+        ]
+
+        with (
+            patch(
+                "app.services.openapi.chat_session.setup_chat_session",
+                return_value=setup,
+            ),
+            patch(
+                "app.services.chat.trigger.unified.build_execution_request",
+                new=AsyncMock(return_value=execution_request),
+            ),
+            patch(
+                "app.services.execution.execution_dispatcher.supports_streaming",
+                return_value=False,
+            ),
+            patch(
+                "app.services.execution.execution_dispatcher.dispatch",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.db.session.SessionLocal",
+                return_value=query_db,
+            ),
+        ):
+            response = await _create_non_streaming_response_unified(
+                db=test_db,
+                user=test_user,
+                team=test_team,
+                model_info={"namespace": "default", "team_name": "test-team"},
+                request_body=SimpleNamespace(
+                    model="default#test-team",
+                    input="hello",
+                    previous_response_id=None,
+                    stream=False,
+                    tools=None,
+                    background=False,
+                    reasoning=None,
+                    attachment_ids=None,
+                    wegent_options=None,
+                    omit_mcp_binary_output=False,
+                ),
+                input_text="hello",
+                tool_settings={},
+            )
+
+        assert response.status == "queued"
+        assert response.pending_user_input is None
+        assert response.pending_user_input_payload is None
+        assert response.output[0].type == "mcp_call"
+        assert "pending_user_input" not in response.output[0].output
+        assert "pending_user_input_payload" not in response.output[0].output
+
+    def test_filter_current_assistant_turn_only_returns_active_subtask(
+        self,
+        test_subtasks: list,
+    ):
+        current_assistant = next(
+            subtask
+            for subtask in test_subtasks
+            if subtask.role == SubtaskRole.ASSISTANT
+        )
+        previous_assistant = Subtask(
+            user_id=current_assistant.user_id,
+            task_id=current_assistant.task_id,
+            team_id=current_assistant.team_id,
+            title="Previous assistant",
+            bot_ids=current_assistant.bot_ids,
+            role=SubtaskRole.ASSISTANT,
+            executor_namespace="",
+            executor_name="",
+            prompt="Earlier reply",
+            status=SubtaskStatus.COMPLETED,
+            progress=100,
+            message_id=current_assistant.message_id - 1,
+            parent_id=0,
+            error_message="",
+            completed_at=datetime.now(),
+            result={"value": "Earlier reply"},
+            sender_type=SenderType.TEAM,
+            sender_user_id=0,
+        )
+
+        filtered = _filter_current_assistant_turn(
+            [previous_assistant, current_assistant],
+            current_assistant.id,
+        )
+
+        assert filtered == [current_assistant]
+
+    @patch("app.api.endpoints.openapi_responses._create_streaming_response_unified")
+    def test_create_response_streaming_not_supported_for_executor(
+        self,
+        mock_create_streaming,
+        test_client: TestClient,
+        test_api_key,
+        test_team: Kind,
+        test_bot: Kind,
+        test_model: Kind,
+        test_public_shell: Kind,
+    ):
+        """Test streaming returns error when not supported by shell type.
+
+        Note: With the unified trigger architecture, streaming support is determined
+        by ExecutionRouter based on shell_type. For non-Chat Shell types, the
+        dispatch_sse_stream will raise NotImplementedError.
+        """
+        from fastapi import HTTPException
+
+        # Mock the streaming function to raise NotImplementedError (simulating non-SSE mode)
+        mock_create_streaming.side_effect = HTTPException(
+            status_code=400,
+            detail="Streaming is only supported for Chat Shell type teams",
+        )
+
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_api_key[0]},
+            json={"model": "default#test-team", "input": "Hello", "stream": True},
+        )
+
+        assert response.status_code == 400
+        assert "Streaming is only supported" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_non_sse_executor_streaming_uses_callback_path(
+        self,
+        test_db: Session,
+        test_user: User,
+        test_team: Kind,
+    ):
+        """Non-SSE executor shells can stream through the callback channel."""
+        from app.api.endpoints.openapi_responses import (
+            _create_streaming_response_unified,
+        )
+        from app.schemas.openapi_response import ResponseCreateInput
+
+        setup = SimpleNamespace(
+            task=SimpleNamespace(id=101, json={"metadata": {"labels": {}}}),
+            task_id=101,
+            user_subtask=SimpleNamespace(id=321),
+            assistant_subtask=SimpleNamespace(id=654),
+        )
+        execution_request = SimpleNamespace(
+            task_id=101,
+            subtask_id=654,
+            user={"id": test_user.id},
+            bot=[{"shell_type": "ClaudeCode"}],
+            model_config={"modelType": "llm"},
+        )
+
+        with (
+            patch(
+                "app.services.openapi.chat_session.setup_chat_session",
+                return_value=setup,
+            ),
+            patch(
+                "app.services.chat.trigger.unified.build_execution_request",
+                new=AsyncMock(return_value=execution_request),
+            ),
+            patch(
+                "app.services.execution.execution_dispatcher.supports_streaming",
+                return_value=False,
+            ),
+            patch(
+                "app.services.execution.execution_dispatcher.dispatch",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.api.endpoints.openapi_responses._persist_terminal_failure",
+                new=AsyncMock(),
+            ) as mock_persist_failure,
+        ):
+            response = await _create_streaming_response_unified(
+                db=test_db,
+                user=test_user,
+                team=test_team,
+                model_info={"namespace": "default", "team_name": "test-team"},
+                request_body=ResponseCreateInput(
+                    model="default#test-team",
+                    input="hello",
+                    stream=True,
+                ),
+                input_text="hello",
+                tool_settings={},
+            )
+
+        assert response.media_type == "text/event-stream"
+        mock_persist_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_video_streaming_returns_bad_request(
+        self,
+        test_db: Session,
+        test_user: User,
+        test_team: Kind,
+    ):
+        """Video generation is asynchronous and rejects stream=true."""
+        from fastapi import HTTPException
+
+        from app.api.endpoints.openapi_responses import (
+            _create_streaming_response_unified,
+        )
+        from app.schemas.openapi_response import ResponseCreateInput
+
+        setup = SimpleNamespace(
+            task=SimpleNamespace(id=101, json={"metadata": {"labels": {}}}),
+            task_id=101,
+            user_subtask=SimpleNamespace(id=321),
+            assistant_subtask=SimpleNamespace(id=654),
+        )
+        execution_request = SimpleNamespace(
+            task_id=101,
+            subtask_id=654,
+            model_config={"modelType": "video"},
+        )
+
+        with (
+            patch(
+                "app.services.openapi.chat_session.setup_chat_session",
+                return_value=setup,
+            ),
+            patch(
+                "app.services.chat.trigger.unified.build_execution_request",
+                new=AsyncMock(return_value=execution_request),
+            ),
+            patch(
+                "app.api.endpoints.openapi_responses._persist_terminal_failure",
+                new=AsyncMock(),
+            ) as mock_persist_failure,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await _create_streaming_response_unified(
+                    db=test_db,
+                    user=test_user,
+                    team=test_team,
+                    model_info={"namespace": "default", "team_name": "test-team"},
+                    request_body=ResponseCreateInput(
+                        model="default#test-team",
+                        input="hello",
+                        stream=True,
+                    ),
+                    input_text="hello",
+                    tool_settings={},
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "not supported for video generation" in exc_info.value.detail
+        mock_persist_failure.assert_awaited_once_with(
+            subtask_id=654,
+            task_id=101,
+            error_message=exc_info.value.detail,
+            error_code="streaming_not_supported",
+        )
+
+    @pytest.mark.asyncio
+    async def test_video_streaming_with_background_is_allowed(self):
+        """background=true takes precedence over stream=true for video."""
+        from app.api.endpoints.openapi_responses import _reject_video_streaming
+        from app.schemas.openapi_response import ResponseCreateInput
+
+        execution_request = SimpleNamespace(
+            model_config={"modelType": "video"},
+        )
+
+        with patch(
+            "app.api.endpoints.openapi_responses._persist_terminal_failure",
+            new=AsyncMock(),
+        ) as mock_persist_failure:
+            await _reject_video_streaming(
+                request_body=ResponseCreateInput(
+                    model="default#test-team",
+                    input="hello",
+                    stream=True,
+                    background=True,
+                ),
+                execution_request=execution_request,
+                subtask_id=654,
+                task_id=101,
+            )
+
+        mock_persist_failure.assert_not_awaited()
+
+    def test_video_generation_forces_background_execution(self):
+        """Video generation remains asynchronous without a caller flag."""
+        from app.api.endpoints.openapi_responses import _should_run_in_background
+
+        execution_request = SimpleNamespace(
+            model_config={"modelType": "video"},
+        )
+
+        assert _should_run_in_background(
+            requested_background=False,
+            execution_request=execution_request,
+        )
+
+    def test_create_response_with_wegent_tools(
+        self, test_client: TestClient, test_api_key
+    ):
+        """Test create response with Wegent tools parameter."""
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_api_key[0]},
+            json={
+                "model": "default#nonexistent-team",
+                "input": "Hello",
+                "tools": [{"type": "wegent_deep_thinking"}],
+            },
+        )
+
+        # Should fail at team lookup, but tools should be parsed
+        assert response.status_code == 404
+
+    def test_create_response_with_list_input(
+        self, test_client: TestClient, test_api_key
+    ):
+        """Test create response with list input format."""
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={"X-API-Key": test_api_key[0]},
+            json={
+                "model": "default#nonexistent-team",
+                "input": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        # Should fail at team lookup, but input parsing should work
+        assert response.status_code == 404
+
+    def test_create_response_with_wegent_source_header(
+        self, test_client: TestClient, test_api_key
+    ):
+        """Test create response with wegent-source header."""
+        response = test_client.post(
+            "/api/v1/responses",
+            headers={
+                "X-API-Key": test_api_key[0],
+                "wegent-source": "test-source",
+            },
+            json={"model": "default#nonexistent-team", "input": "Hello"},
+        )
+
+        # Should fail at team lookup, but header should be accepted
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_build_request_passes_user_subtask_id(
+        self,
+        test_db: Session,
+        test_user: User,
+        test_team: Kind,
+    ):
+        """OpenAPI follow-up should propagate user_subtask_id like WebSocket chat."""
+        from app.api.endpoints.openapi_responses import (
+            _create_non_streaming_response_unified,
+        )
+        from app.schemas.openapi_response import ResponseCreateInput
+
+        setup = SimpleNamespace(
+            task=SimpleNamespace(id=101, json={"metadata": {"labels": {}}}),
+            task_id=101,
+            user_subtask=SimpleNamespace(id=321),
+            assistant_subtask=SimpleNamespace(id=654),
+        )
+        execution_request = SimpleNamespace(task_id=101, subtask_id=654)
+        query_db = MagicMock()
+        query_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = (
+            []
+        )
+
+        with (
+            patch(
+                "app.services.openapi.chat_session.setup_chat_session",
+                return_value=setup,
+            ),
+            patch(
+                "app.services.chat.trigger.unified.build_execution_request",
+                new=AsyncMock(return_value=execution_request),
+            ) as mock_build_execution_request,
+            patch(
+                "app.services.execution.execution_dispatcher.supports_streaming",
+                return_value=False,
+            ),
+            patch(
+                "app.services.execution.execution_dispatcher.dispatch", new=AsyncMock()
+            ),
+            patch(
+                "app.db.session.SessionLocal",
+                return_value=query_db,
+            ),
+        ):
+            response = await _create_non_streaming_response_unified(
+                db=test_db,
+                user=test_user,
+                team=test_team,
+                model_info={"namespace": "default", "team_name": "test-team"},
+                request_body=ResponseCreateInput(
+                    model="default#test-team",
+                    input="follow-up question",
+                ),
+                input_text="follow-up question",
+                tool_settings={},
+            )
+
+        assert response.status == "queued"
+        query_db.close.assert_called()
+        assert mock_build_execution_request.await_args.kwargs["user_subtask_id"] == 321
+        assert mock_build_execution_request.await_args.kwargs["message"] == (
+            "follow-up question"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_build_request_passes_generation_and_attachment_order(
+        self,
+        test_db: Session,
+        test_user: User,
+        test_team: Kind,
+    ):
+        """OpenAPI generation options and linked attachment order reach execution."""
+        from app.api.endpoints.openapi_responses import (
+            _create_non_streaming_response_unified,
+        )
+        from app.schemas.openapi_response import ResponseCreateInput
+
+        setup = SimpleNamespace(
+            task=SimpleNamespace(id=101, json={"metadata": {"labels": {}}}),
+            task_id=101,
+            user_subtask=SimpleNamespace(id=321),
+            assistant_subtask=SimpleNamespace(id=654),
+        )
+        execution_request = SimpleNamespace(
+            task_id=101,
+            subtask_id=654,
+            model_config={"modelType": "image"},
+        )
+        query_db = MagicMock()
+        query_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = (
+            []
+        )
+
+        with (
+            patch(
+                "app.services.openapi.chat_session.setup_chat_session",
+                return_value=setup,
+            ) as setup_chat_session_mock,
+            patch(
+                "app.api.endpoints.openapi_responses.link_contexts_to_subtask",
+                return_value=[31, 12],
+            ),
+            patch(
+                "app.services.chat.trigger.unified.build_execution_request",
+                new=AsyncMock(return_value=execution_request),
+            ) as mock_build_execution_request,
+            patch(
+                "app.services.execution.execution_dispatcher.supports_streaming",
+                return_value=False,
+            ),
+            patch(
+                "app.services.execution.execution_dispatcher.dispatch",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.db.session.SessionLocal",
+                return_value=query_db,
+            ),
+        ):
+            response = await _create_non_streaming_response_unified(
+                db=test_db,
+                user=test_user,
+                team=test_team,
+                model_info={"namespace": "default", "team_name": "test-team"},
+                request_body=ResponseCreateInput(
+                    model="default#test-team",
+                    input="generate an image",
+                    attachment_ids=[12, 31],
+                    wegent_options={"generation": {"size": "1024x1024"}},
+                ),
+                input_text="generate an image",
+                tool_settings={},
+            )
+
+        assert response.status == "queued"
+        build_kwargs = mock_build_execution_request.await_args.kwargs
+        assert build_kwargs["attachment_ids"] == [31, 12]
+        assert build_kwargs["generation_params"].size == "1024x1024"
+        assert setup_chat_session_mock.call_args.kwargs["generation_params"] == {
+            "size": "1024x1024"
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_dispatch_failure_persists_failed_status(
+        self,
+        test_db: Session,
+        test_user: User,
+        test_team: Kind,
+    ):
+        """Dispatch failures before terminal events should still persist FAILED."""
+        from fastapi import HTTPException
+
+        from app.api.endpoints.openapi_responses import (
+            _create_non_streaming_response_unified,
+        )
+        from app.schemas.openapi_response import ResponseCreateInput
+
+        setup = SimpleNamespace(
+            task=SimpleNamespace(id=101, json={"metadata": {"labels": {}}}),
+            task_id=101,
+            user_subtask=SimpleNamespace(id=321),
+            assistant_subtask=SimpleNamespace(id=654),
+        )
+        execution_request = SimpleNamespace(task_id=101, subtask_id=654)
+        mock_emitter = MagicMock()
+        mock_emitter.collect = AsyncMock(return_value=("", None))
+
+        with (
+            patch(
+                "app.services.openapi.chat_session.setup_chat_session",
+                return_value=setup,
+            ),
+            patch(
+                "app.services.chat.trigger.unified.build_execution_request",
+                new=AsyncMock(return_value=execution_request),
+            ),
+            patch(
+                "app.services.execution.execution_dispatcher.supports_streaming",
+                return_value=True,
+            ),
+            patch(
+                "app.services.execution.execution_dispatcher.dispatch",
+                new=AsyncMock(side_effect=RuntimeError("dispatcher boom")),
+            ),
+            patch(
+                "app.services.execution.emitters.SSEResultEmitter",
+                return_value=mock_emitter,
+            ),
+            patch(
+                "app.api.endpoints.openapi_responses.collect_completed_result",
+                new=AsyncMock(return_value={"value": ""}),
+            ) as mock_collect_result,
+            patch(
+                "app.api.endpoints.openapi_responses.persist_completed_result",
+                new=AsyncMock(),
+            ) as mock_persist_result,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await _create_non_streaming_response_unified(
+                    db=test_db,
+                    user=test_user,
+                    team=test_team,
+                    model_info={"namespace": "default", "team_name": "test-team"},
+                    request_body=ResponseCreateInput(
+                        model="default#test-team",
+                        input="follow-up question",
+                    ),
+                    input_text="follow-up question",
+                    tool_settings={},
+                )
+
+        assert exc_info.value.status_code == 500
+        mock_collect_result.assert_awaited_once_with(
+            654,
+            status="FAILED",
+            error_message="dispatcher boom",
+            error_code=None,
+        )
+        mock_persist_result.assert_awaited_once_with(
+            subtask_id=654,
+            task_id=101,
+            status="FAILED",
+            result={"value": ""},
+            error="dispatcher boom",
+        )
+
+    def test_setup_chat_session_reuses_previous_executor_for_follow_up(
+        self,
+        test_db: Session,
+        test_user: User,
+        test_team: Kind,
+        test_bot: Kind,
+        test_model: Kind,
+        test_public_shell: Kind,
+        test_task: TaskResource,
+    ):
+        """Follow-up assistant subtask should inherit previous executor metadata."""
+        from app.services.openapi.chat_session import setup_chat_session
+
+        previous_user = Subtask(
+            user_id=test_user.id,
+            task_id=test_task.id,
+            team_id=test_team.id,
+            title="Previous user message",
+            bot_ids=[test_bot.id],
+            role=SubtaskRole.USER,
+            executor_namespace="",
+            executor_name="",
+            prompt="Draw a cat",
+            status=SubtaskStatus.COMPLETED,
+            progress=100,
+            message_id=1,
+            parent_id=0,
+            error_message="",
+            completed_at=datetime.now(),
+            result=None,
+            sender_type=SenderType.USER,
+            sender_user_id=test_user.id,
+        )
+        previous_assistant = Subtask(
+            user_id=test_user.id,
+            task_id=test_task.id,
+            team_id=test_team.id,
+            title="Previous assistant response",
+            bot_ids=[test_bot.id],
+            role=SubtaskRole.ASSISTANT,
+            executor_namespace="default",
+            executor_name="executor-123",
+            prompt="",
+            status=SubtaskStatus.COMPLETED,
+            progress=100,
+            message_id=2,
+            parent_id=1,
+            error_message="",
+            completed_at=datetime.now(),
+            result={"value": "Here is the image"},
+            sender_type=SenderType.TEAM,
+            sender_user_id=0,
+        )
+        test_db.add(previous_user)
+        test_db.add(previous_assistant)
+        test_db.commit()
+
+        setup = setup_chat_session(
+            db=test_db,
+            user=test_user,
+            team=test_team,
+            model_info={"namespace": "default", "team_name": "test-team"},
+            input_text="Make it blue",
+            tool_settings={},
+            task_id=test_task.id,
+        )
+
+        assert setup.assistant_subtask.executor_name == "executor-123"
+        assert setup.assistant_subtask.executor_namespace == "default"
+
+    def test_setup_chat_session_uses_generation_model_type_as_task_type(self):
+        from app.services.openapi.chat_session import setup_chat_session
+
+        session = SimpleNamespace(
+            task=SimpleNamespace(id=41),
+            task_id=41,
+            user_subtask=SimpleNamespace(id=42),
+            assistant_subtask=SimpleNamespace(id=43),
+            existing_subtasks=[],
+            bot_name="video-bot",
+            bot_namespace="default",
+        )
+
+        with patch(
+            "app.services.openapi.chat_session.prepare_execution_session",
+            return_value=session,
+        ) as prepare_session:
+            setup_chat_session(
+                db=MagicMock(),
+                user=SimpleNamespace(id=7),
+                team=SimpleNamespace(id=9),
+                model_info={
+                    "namespace": "default",
+                    "team_name": "video-agent",
+                    "model_type": "video",
+                },
+                input_text="Generate a video",
+                tool_settings={},
+                generation_params={
+                    "resolution": "1080p",
+                    "duration": 5,
+                },
+            )
+
+        task_params = prepare_session.call_args.kwargs["task_params"]
+        assert task_params.task_type == "video"
+        assert task_params.generate_params == {
+            "resolution": "1080p",
+            "duration": 5,
+        }
+
+
+@pytest.mark.api
+class TestOpenAPIResponsesGet:
+    """Test GET /api/v1/responses/{response_id} endpoint."""
+
+    def test_task_to_response_object_omits_pending_user_input_from_subtasks(
+        self,
+        test_user: User,
+        test_team: Kind,
+    ):
+        """GET /v1/responses/{id} should not expose legacy pending form state."""
+        task_dict = {
+            "id": 42,
+            "status": "COMPLETED",
+            "created_at": datetime.now(),
+        }
+        assistant_subtask = _assistant_subtask_with_pending_form(
+            subtask_id=204,
+            task_id=42,
+            user_id=test_user.id,
+            team_id=test_team.id,
+        )
+
+        response = _task_to_response_object(
+            task_dict,
+            "default#test-team",
+            subtasks=[assistant_subtask],
+        )
+
+        assert response.status == "completed"
+        assert response.pending_user_input is None
+        assert response.pending_user_input_payload is None
+        assert response.output[0].type == "mcp_call"
+        assert "pending_user_input" not in response.output[0].output
+        assert "pending_user_input_payload" not in response.output[0].output
+
+    def test_task_to_response_object_ignores_stale_pending_state_from_earlier_turn(
+        self,
+        test_user: User,
+        test_team: Kind,
+    ):
+        """GET reconstruction should only inspect the latest assistant turn for pending state."""
+        task_dict = {
+            "id": 43,
+            "status": "COMPLETED",
+            "created_at": datetime.now(),
+        }
+        stale_assistant = _assistant_subtask_with_pending_form(
+            subtask_id=205,
+            task_id=43,
+            user_id=test_user.id,
+            team_id=test_team.id,
+        )
+        current_assistant = Subtask(
+            user_id=test_user.id,
+            task_id=43,
+            team_id=test_team.id,
+            title="Assistant response",
+            bot_ids=[1],
+            role=SubtaskRole.ASSISTANT,
+            executor_namespace="",
+            executor_name="",
+            prompt="",
+            status=SubtaskStatus.COMPLETED,
+            progress=100,
+            message_id=3,
+            parent_id=1,
+            error_message="",
+            completed_at=datetime.now(),
+            result={"value": "done"},
+            sender_type=SenderType.TEAM,
+            sender_user_id=0,
+        )
+
+        response = _task_to_response_object(
+            task_dict,
+            "default#test-team",
+            subtasks=[stale_assistant, current_assistant],
+        )
+
+        assert response.status == "completed"
+        assert response.pending_user_input is None
+        assert response.pending_user_input_payload is None
+
+
+@pytest.mark.api
+class TestOpenAPIResponsesCancel:
+    """Test POST /api/v1/responses/{response_id}/cancel endpoint."""
+
+    def test_cancel_response_invalid_format(
+        self, test_client: TestClient, test_api_key
+    ):
+        """Test cancel response fails with invalid response_id format."""
+        response = test_client.post(
+            "/api/v1/responses/invalid_id/cancel",
+            headers={"X-API-Key": test_api_key[0]},
+        )
+
+        assert response.status_code == 400
+        assert "Invalid response_id format" in response.json()["detail"]
+
+    def test_cancel_response_invalid_number(
+        self, test_client: TestClient, test_api_key
+    ):
+        """Test cancel response fails with invalid response_id number."""
+        response = test_client.post(
+            "/api/v1/responses/resp_abc/cancel",
+            headers={"X-API-Key": test_api_key[0]},
+        )
+
+        assert response.status_code == 400
+        assert "Invalid response_id format" in response.json()["detail"]
+
+    def test_cancel_response_not_found(self, test_client: TestClient, test_api_key):
+        """Test cancel response fails when response not found."""
+        response = test_client.post(
+            "/api/v1/responses/resp_99999/cancel",
+            headers={"X-API-Key": test_api_key[0]},
+        )
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"]
+
+    def test_cancel_response_without_auth(self, test_client: TestClient):
+        """Test cancel response fails without authentication."""
+        response = test_client.post("/api/v1/responses/resp_1/cancel")
+
+        assert response.status_code == 401
+
+    @patch("app.services.chat.storage.session_manager")
+    def test_cancel_response_chat_shell_success(
+        self,
+        mock_session_manager,
+        test_client: TestClient,
+        test_api_key,
+        test_db: Session,
+        test_user: User,
+        test_team: Kind,
+    ):
+        """Test successful cancel for Chat Shell task."""
+        # Create a running task
+        task_json = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Task",
+            "metadata": {
+                "name": "task-running",
+                "namespace": "default",
+                "labels": {"source": "chat_shell"},
+            },
+            "spec": {
+                "title": "Running task",
+                "prompt": "Hello",
+                "teamRef": {"name": "test-team", "namespace": "default"},
+                "workspaceRef": {"name": "workspace-1", "namespace": "default"},
+            },
+            "status": {
+                "status": "RUNNING",
+                "progress": 50,
+                "result": None,
+                "errorMessage": "",
+                "createdAt": datetime.now().isoformat(),
+                "updatedAt": datetime.now().isoformat(),
+            },
+        }
+        task = TaskResource(
+            user_id=test_user.id,
+            kind="Task",
+            name="task-running",
+            namespace="default",
+            json=task_json,
+            is_active=True,
+        )
+        test_db.add(task)
+        test_db.commit()
+        test_db.refresh(task)
+
+        # Create running subtask
+        running_subtask = Subtask(
+            user_id=test_user.id,
+            task_id=task.id,
+            team_id=test_team.id,
+            title="Assistant response",
+            bot_ids=[1],
+            role=SubtaskRole.ASSISTANT,
+            executor_namespace="",
+            executor_name="",
+            prompt="",
+            status=SubtaskStatus.RUNNING,
+            progress=50,
+            message_id=1,
+            parent_id=0,
+            error_message="",
+            completed_at=datetime(1970, 1, 1, 0, 0, 0),
+            result=None,
+            sender_type=SenderType.TEAM,
+            sender_user_id=0,
+        )
+        test_db.add(running_subtask)
+        test_db.commit()
+        test_db.refresh(running_subtask)
+
+        # Mock session_manager methods
+        mock_session_manager.get_streaming_content = AsyncMock(
+            return_value="Partial content"
+        )
+        mock_session_manager.cancel_stream = AsyncMock()
+
+        response = test_client.post(
+            f"/api/v1/responses/resp_{task.id}/cancel",
+            headers={"X-API-Key": test_api_key[0]},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == f"resp_{task.id}"
+
+    @patch("app.services.chat.storage.session_manager")
+    def test_cancel_response_chat_shell_group_member_success(
+        self,
+        mock_session_manager,
+        test_client: TestClient,
+        test_db: Session,
+        test_user: User,
+        test_team: Kind,
+    ):
+        """Group chat members can cancel their own running response."""
+        member = User(
+            user_name="groupmember",
+            password_hash="hashed",
+            email="groupmember@example.com",
+            is_active=True,
+            git_info=None,
+        )
+        test_db.add(member)
+        test_db.flush()
+
+        raw_key = "wg-group-member-key"
+        member_key = APIKey(
+            user_id=member.id,
+            key_hash=hashlib.sha256(raw_key.encode()).hexdigest(),
+            key_prefix="wg-group...",
+            name="Group Member API Key",
+            key_type=KEY_TYPE_PERSONAL,
+            description="Group member key",
+            expires_at=datetime.utcnow() + timedelta(days=365),
+            is_active=True,
+        )
+        test_db.add(member_key)
+
+        task_json = {
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "Task",
+            "metadata": {
+                "name": "task-group-running",
+                "namespace": "default",
+                "labels": {"source": "chat_shell"},
+            },
+            "spec": {
+                "title": "Running group task",
+                "prompt": "Hello",
+                "teamRef": {"name": "test-team", "namespace": "default"},
+                "workspaceRef": {"name": "workspace-1", "namespace": "default"},
+            },
+            "status": {
+                "status": "RUNNING",
+                "progress": 50,
+                "result": None,
+                "errorMessage": "",
+                "createdAt": datetime.now().isoformat(),
+                "updatedAt": datetime.now().isoformat(),
+            },
+        }
+        task = TaskResource(
+            user_id=test_user.id,
+            kind="Task",
+            name="task-group-running",
+            namespace="default",
+            json=task_json,
+            is_active=True,
+            is_group_chat=True,
+        )
+        test_db.add(task)
+        test_db.flush()
+
+        member_record = ResourceMember(
+            resource_type=ResourceType.TASK,
+            resource_id=task.id,
+            entity_type="user",
+            entity_id=str(member.id),
+            user_id=member.id,
+            role=ResourceRole.Reporter.value,
+            status=MemberStatus.APPROVED,
+            copied_resource_id=0,
+        )
+        running_subtask = Subtask(
+            user_id=member.id,
+            task_id=task.id,
+            team_id=test_team.id,
+            title="Assistant response",
+            bot_ids=[1],
+            role=SubtaskRole.ASSISTANT,
+            executor_namespace="",
+            executor_name="",
+            prompt="",
+            status=SubtaskStatus.RUNNING,
+            progress=50,
+            message_id=1,
+            parent_id=0,
+            error_message="",
+            completed_at=datetime(1970, 1, 1, 0, 0, 0),
+            result=None,
+            sender_type=SenderType.TEAM,
+            sender_user_id=member.id,
+        )
+        test_db.add_all([member_record, running_subtask])
+        test_db.commit()
+        test_db.refresh(task)
+
+        mock_session_manager.get_streaming_content = AsyncMock(
+            return_value="Partial content"
+        )
+        mock_session_manager.cancel_stream = AsyncMock()
+
+        response = test_client.post(
+            f"/api/v1/responses/resp_{task.id}/cancel",
+            headers={"X-API-Key": raw_key},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["id"] == f"resp_{task.id}"
+
+
+@pytest.mark.api
+class TestOpenAPIResponsesHelpers:
+    """Test helper functions used in openapi_responses."""
+
+    def test_model_category_reads_a_legacy_nested_category(self):
+        """A Model that nests its category in modelConfig must not read as LLM."""
+        model = SimpleNamespace(
+            json={"spec": {"modelConfig": {"modelType": "embedding"}}}
+        )
+
+        assert _model_category_from_kind(model) == "embedding"
+
+    def test_parse_model_string_two_parts(self):
+        """Test parsing model string with namespace and team name."""
+        from app.services.openapi.helpers import parse_model_string
+
+        result = parse_model_string("default#my-team")
+        assert result["namespace"] == "default"
+        assert result["team_name"] == "my-team"
+        assert result["model_id"] is None
+
+    def test_parse_model_string_three_parts(self):
+        """Test parsing model string with namespace, team name, and model id."""
+        from app.services.openapi.helpers import parse_model_string
+
+        result = parse_model_string("default#my-team#gpt-4")
+        assert result["namespace"] == "default"
+        assert result["team_name"] == "my-team"
+        assert result["model_id"] == "gpt-4"
+
+    def test_parse_model_string_invalid(self):
+        """Test parsing invalid model string raises exception."""
+        from app.services.openapi.helpers import parse_model_string
+
+        with pytest.raises(Exception):
+            parse_model_string("invalid-format")
+
+    def test_extract_input_text_string(self):
+        """Test extracting input text from string."""
+        from app.services.openapi.helpers import extract_input_text
+
+        result = extract_input_text("Hello, world!")
+        assert result == "Hello, world!"
+
+    def test_extract_input_text_list(self):
+        """Test extracting input text from list."""
+        from app.schemas.openapi_response import InputItem
+        from app.services.openapi.helpers import extract_input_text
+
+        input_list = [
+            InputItem(role="user", content="First message"),
+            InputItem(role="assistant", content="Response"),
+            InputItem(role="user", content="Second message"),
+        ]
+        result = extract_input_text(input_list)
+        assert result == "Second message"
+
+    def test_parse_wegent_tools_empty(self):
+        """Test parsing empty tools list."""
+        from app.services.openapi.helpers import parse_wegent_tools
+
+        result = parse_wegent_tools(None)
+        assert result["enable_chat_bot"] is False
+
+    def test_parse_wegent_tools_chat_bot(self):
+        """Test parsing tools with chat bot enabled."""
+        from app.schemas.openapi_response import WegentTool
+        from app.services.openapi.helpers import parse_wegent_tools
+
+        tools = [WegentTool(type="wegent_chat_bot")]
+        result = parse_wegent_tools(tools)
+        assert result["enable_chat_bot"] is True
+
+    def test_get_inherited_knowledge_base_refs_uses_task_scopes(self):
+        """Follow-up requests without current KB refs should inherit task scopes."""
+        from unittest.mock import MagicMock
+
+        from app.api.endpoints.openapi_responses import (
+            _get_inherited_knowledge_base_refs,
+        )
+
+        task = MagicMock()
+        task.json = {
+            "spec": {
+                "knowledgeBaseScopes": [
+                    {
+                        "id": 1,
+                        "namespace": "default",
+                        "name": "kb1",
+                        "scopeRestricted": True,
+                        "folderIds": [9],
+                        "explicitDocumentIds": [101],
+                        "includeSubfolders": False,
+                    }
+                ]
+            }
+        }
+
+        refs = _get_inherited_knowledge_base_refs(task=task, current_refs=[])
+
+        assert refs == [
+            {
+                "id": 1,
+                "namespace": "default",
+                "name": "kb1",
+                "folder_ids": [9],
+                "document_ids": [101],
+                "include_subfolders": False,
+                "scope_specified": True,
+            }
+        ]
+
+    def test_get_inherited_knowledge_base_refs_skips_when_current_refs_exist(self):
+        """Current KB refs should override previously bound task scopes."""
+        from unittest.mock import MagicMock
+
+        from app.api.endpoints.openapi_responses import (
+            _get_inherited_knowledge_base_refs,
+        )
+
+        task = MagicMock()
+        task.json = {
+            "spec": {
+                "knowledgeBaseScopes": [
+                    {"id": 1, "namespace": "default", "name": "kb1"}
+                ]
+            }
+        }
+
+        refs = _get_inherited_knowledge_base_refs(
+            task=task,
+            current_refs=[{"namespace": "default", "name": "kb2"}],
+        )
+
+        assert refs == []
+
+    def test_wegent_status_to_openai_status(self):
+        """Test status conversion from Wegent to OpenAI format."""
+        from app.services.openapi.helpers import wegent_status_to_openai_status
+
+        assert wegent_status_to_openai_status("PENDING") == "queued"
+        assert wegent_status_to_openai_status("RUNNING") == "in_progress"
+        assert wegent_status_to_openai_status("COMPLETED") == "completed"
+        assert wegent_status_to_openai_status("FAILED") == "failed"
+        assert wegent_status_to_openai_status("CANCELLED") == "cancelled"
+        assert wegent_status_to_openai_status("UNKNOWN") == "incomplete"
+
+    def test_subtask_status_to_message_status(self):
+        """Test subtask status to message status conversion."""
+        from app.services.openapi.helpers import subtask_status_to_message_status
+
+        assert subtask_status_to_message_status("PENDING") == "in_progress"
+        assert subtask_status_to_message_status("RUNNING") == "in_progress"
+        assert subtask_status_to_message_status("COMPLETED") == "completed"
+        assert subtask_status_to_message_status("FAILED") == "incomplete"

@@ -1,0 +1,1148 @@
+import { DefaultRunnerSetting } from './DefaultRunnerSetting'
+import { ReplyPredictionSettings } from './ReplyPredictionSettings'
+import { useContext, useEffect, useState } from 'react'
+import {
+  Activity,
+  ArrowDown,
+  ArrowUp,
+  Bell,
+  Check,
+  CircleDot,
+  Gauge,
+  Loader2,
+  Pencil,
+  Pin,
+  Trash2,
+  X,
+  type LucideIcon,
+} from 'lucide-react'
+import { KeyboardShortcut } from '@/components/common/KeyboardShortcut'
+import { ConfirmDialog } from '@/components/common/ConfirmDialog'
+import { useTranslation } from '@/hooks/useTranslation'
+import {
+  SettingsGroup,
+  SettingsPage,
+  SettingsPageHeader,
+  SettingsRow,
+  SettingsSwitch,
+} from './settings-ui'
+import { applyLanguagePreference, languagePreferenceOptions } from '@/i18n/languagePreference'
+import { ExternalContentImportDialog } from './ExternalContentImportDialog'
+import {
+  defaultAppPreferences,
+  getAppPreferences,
+  updateAppPreferences,
+  type AppLanguagePreference,
+  type AppPreferences,
+  type AppPreferencesPatch,
+  type FixedWorkspaceTabPreference,
+  type WorkbenchMode,
+} from '@/desktop/appPreferences'
+import {
+  fixedWorkspaceTabsPatch,
+  saveFixedWorkspaceTabs as persistFixedWorkspaceTabs,
+} from '@/features/workspace-tabs/fixedWorkspaceTabs'
+import { keybindingFromKeyboardEvent, normalizeKeybinding } from '@/lib/keybindings'
+import { getWegentUsageDisplay } from '@/api/wegentUsage'
+import { useOptionalCloudConnection } from '@/features/cloud-connection/useCloudConnection'
+import { useAppPreferencesState } from '@/features/app-preferences/useAppPreferencesState'
+import { WorkbenchContext } from '@/features/workbench/useWorkbench'
+import { selectedModelExecutionFields } from '@/features/workbench/runtimeModelSelection'
+import { harnessAppsApi, type HarnessAppInstallation } from '@/api/local/harnessApps'
+import { changeWorkbenchMode } from '@/features/workbench-mode/workbenchMode'
+import { getTelemetryConfig } from '@/telemetry/config'
+import { getPlatform } from '@/lib/platform'
+
+type BooleanPreferenceKey = {
+  [Key in keyof AppPreferencesPatch]-?: AppPreferencesPatch[Key] extends boolean | undefined
+    ? Key
+    : never
+}[keyof AppPreferencesPatch]
+
+interface SwitchRowProps {
+  preferenceKey: BooleanPreferenceKey
+  testId: string
+  label: string
+  description: string
+}
+
+const GENERAL_ROW_CLASS_NAME = 'py-4'
+const GENERAL_ROW_LABEL_CLASS_NAME = 'font-normal'
+const FRIENDLY_TITLE_TASK_MODEL_VALUE = 'task-model'
+const DEFAULT_MAX_CONCURRENT_TASKS = 10
+const MAX_CONCURRENT_TASKS_LIMIT = 20
+const BUILT_IN_FIXED_TAB_OPTIONS = ['task', 'board', 'agent'] as const
+
+function moveFixedTab(
+  tabs: FixedWorkspaceTabPreference[],
+  sourceIndex: number,
+  targetIndex: number
+): FixedWorkspaceTabPreference[] {
+  const next = [...tabs]
+  const source = next[sourceIndex]
+  next[sourceIndex] = next[targetIndex]
+  next[targetIndex] = source
+  return next
+}
+
+interface TrayDisplayOption {
+  preferenceKey: BooleanPreferenceKey
+  testId: string
+  label: string
+  description: string
+  icon: LucideIcon
+}
+
+export function GeneralSettingsPage() {
+  const telemetryDistribution = getTelemetryConfig().distribution
+  const { t } = useTranslation('common')
+  const cloudConnection = useOptionalCloudConnection()
+  const appPreferences = useAppPreferencesState()
+  const workbench = useContext(WorkbenchContext)
+  const runtimeWorkApi = workbench?.services?.runtimeWorkApi
+  const [preferences, setPreferences] = useState<AppPreferences>(
+    appPreferences?.loaded ? appPreferences.preferences : defaultAppPreferences
+  )
+  const [cloudQuotaName, setCloudQuotaName] = useState<string | null>(null)
+  const [loading, setLoading] = useState(!appPreferences?.loaded)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [showImportDialog, setShowImportDialog] = useState(false)
+  const [pendingWorkbenchMode, setPendingWorkbenchMode] = useState<WorkbenchMode | null>(null)
+  const [recordingPopoutShortcut, setRecordingPopoutShortcut] = useState(false)
+  const [maxConcurrentTasks, setMaxConcurrentTasks] = useState(DEFAULT_MAX_CONCURRENT_TASKS)
+  const [installedSmartApps, setInstalledSmartApps] = useState<HarnessAppInstallation[]>([])
+  const [pendingSendKey, setPendingSendKey] = useState<'enter' | 'cmd_enter' | null>(null)
+  const [pendingFollowUpBehavior, setPendingFollowUpBehavior] = useState<'queue' | 'guide' | null>(
+    null
+  )
+  const persistedSendKey = workbench?.state?.user?.preferences?.send_key ?? 'enter'
+  const sendKey = pendingSendKey ?? persistedSendKey
+  const persistedFollowUpBehavior =
+    workbench?.state?.user?.preferences?.follow_up_behavior ?? 'queue'
+  const followUpBehavior = pendingFollowUpBehavior ?? persistedFollowUpBehavior
+
+  useEffect(() => {
+    if (appPreferences && !appPreferences.loaded) return
+
+    let cancelled = false
+
+    const runtimeSettings = Promise.resolve()
+      .then(() => runtimeWorkApi?.getRuntimeSettings())
+      .catch(runtimeSettingsError => {
+        console.debug('[DIDA] Runtime settings are unavailable', runtimeSettingsError)
+        return null
+      })
+
+    const preferences = appPreferences
+      ? Promise.resolve(appPreferences.preferences)
+      : getAppPreferences()
+
+    Promise.all([preferences, runtimeSettings])
+      .then(([nextPreferences, runtimeSettings]) => {
+        if (!cancelled) {
+          setPreferences(nextPreferences)
+          setMaxConcurrentTasks(runtimeSettings?.maxConcurrentTasks ?? DEFAULT_MAX_CONCURRENT_TASKS)
+          setError(null)
+        }
+      })
+      .catch(fetchError => {
+        console.error('[DIDA] Failed to load app preferences', fetchError)
+        if (!cancelled) {
+          setError(t('workbench.general_settings_load_failed'))
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [appPreferences, runtimeWorkApi, t])
+
+  useEffect(() => {
+    if (!preferences.experimentalFeaturesEnabled) return
+    void harnessAppsApi
+      .list()
+      .then(setInstalledSmartApps)
+      .catch(error => {
+        console.warn('[DIDA] Failed to load installed Smart apps for fixed tabs', error)
+      })
+  }, [preferences.experimentalFeaturesEnabled])
+
+  useEffect(() => {
+    if (!cloudConnection.isConnected) return
+
+    let cancelled = false
+    getWegentUsageDisplay({
+      isConnected: cloudConnection.isConnected,
+      apiBaseUrl: cloudConnection.apiBaseUrl,
+      token: cloudConnection.token,
+    })
+      .then(usage => {
+        if (!cancelled) {
+          setCloudQuotaName(usage.status === 'available' ? usage.sourceText : null)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setCloudQuotaName(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    cloudConnection.apiBaseUrl,
+    cloudConnection.isConnected,
+    cloudConnection.serviceKey,
+    cloudConnection.token,
+  ])
+
+  const handlePreferenceChange = async (key: BooleanPreferenceKey, value: boolean) => {
+    setPreferences(current => ({ ...current, [key]: value }))
+    setSaving(true)
+    setError(null)
+    try {
+      const patch: AppPreferencesPatch =
+        key === 'telemetryEnabled'
+          ? { telemetryConsentAsked: true, telemetryEnabled: value }
+          : { [key]: value }
+      const nextPreferences = await updateAppPreferences(patch)
+      setPreferences(nextPreferences)
+    } catch (saveError) {
+      console.error('[DIDA] Failed to update app preferences', saveError)
+      setPreferences(current => ({
+        ...current,
+        [key]: !value,
+      }))
+      setError(t('workbench.general_settings_save_failed'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const savePopoutShortcut = async (shortcut: string | null) => {
+    const previousShortcut = preferences.popoutWindowShortcut
+    setPreferences(current => ({ ...current, popoutWindowShortcut: shortcut }))
+    setSaving(true)
+    setError(null)
+    try {
+      const nextPreferences = await updateAppPreferences({ popoutWindowShortcut: shortcut })
+      setPreferences(nextPreferences)
+      setRecordingPopoutShortcut(false)
+    } catch (saveError) {
+      console.error('[DIDA] Failed to update Popout Window shortcut', saveError)
+      setPreferences(current => ({ ...current, popoutWindowShortcut: previousShortcut }))
+      setError(t('workbench.general_settings_popout_shortcut_save_failed'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!recordingPopoutShortcut) return undefined
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      event.preventDefault()
+      event.stopPropagation()
+      if (event.key === 'Escape') {
+        setRecordingPopoutShortcut(false)
+        return
+      }
+      const shortcut = normalizeKeybinding(keybindingFromKeyboardEvent(event))
+      if (!shortcut || !shortcut.includes('+')) return
+      setRecordingPopoutShortcut(false)
+      void savePopoutShortcut(shortcut)
+    }
+
+    window.addEventListener('keydown', handleKeyDown, true)
+    return () => window.removeEventListener('keydown', handleKeyDown, true)
+  })
+
+  const renderSwitchRow = ({ preferenceKey, testId, label, description }: SwitchRowProps) => (
+    <SettingsRow
+      label={label}
+      description={description}
+      className={GENERAL_ROW_CLASS_NAME}
+      labelClassName={GENERAL_ROW_LABEL_CLASS_NAME}
+      control={
+        <SettingsSwitch
+          data-testid={testId}
+          checked={Boolean(preferences[preferenceKey])}
+          disabled={loading || saving}
+          onCheckedChange={checked => {
+            void handlePreferenceChange(preferenceKey, checked)
+          }}
+          aria-label={label}
+        />
+      }
+    />
+  )
+
+  const displayedCloudQuotaName = cloudConnection.isConnected ? cloudQuotaName : null
+  const trayDisplayOptions: TrayDisplayOption[] = [
+    {
+      preferenceKey: 'trayUnreadEnabled',
+      testId: 'general-tray-unread-toggle',
+      label: t('workbench.general_settings_tray_unread'),
+      description: t('workbench.general_settings_tray_unread_description'),
+      icon: CircleDot,
+    },
+    {
+      preferenceKey: 'trayRunningEnabled',
+      testId: 'general-tray-running-toggle',
+      label: t('workbench.general_settings_tray_running'),
+      description: t('workbench.general_settings_tray_running_description'),
+      icon: Activity,
+    },
+    // The Codex quota is meaningless while the local Codex subscription is off:
+    // the tray has no rate limits to read, so the toggle is hidden entirely.
+    ...(preferences.localCodexSubscriptionEnabled
+      ? [
+          {
+            preferenceKey: 'trayUsageEnabled',
+            testId: 'general-tray-usage-toggle',
+            label: t('workbench.general_settings_tray_usage'),
+            description: t('workbench.general_settings_tray_usage_description'),
+            icon: Gauge,
+          } satisfies TrayDisplayOption,
+        ]
+      : []),
+    {
+      preferenceKey: 'trayWegentUsageEnabled',
+      testId: 'general-tray-wegent-usage-toggle',
+      label: displayedCloudQuotaName ?? t('workbench.general_settings_tray_wegent_usage'),
+      description: t('workbench.general_settings_tray_wegent_usage_description'),
+      icon: Gauge,
+    },
+  ]
+
+  const handleLanguageChange = async (language: AppLanguagePreference) => {
+    if (language === preferences.language) {
+      return
+    }
+
+    const previousLanguage = preferences.language
+    setPreferences(current => ({ ...current, language }))
+    setSaving(true)
+    setError(null)
+    try {
+      const nextPreferences = await updateAppPreferences({ language })
+      setPreferences(nextPreferences)
+      await applyLanguagePreference(nextPreferences.language)
+    } catch (saveError) {
+      console.error('[DIDA] Failed to update app language preference', saveError)
+      setPreferences(current => ({ ...current, language: previousLanguage }))
+      setError(t('workbench.general_settings_save_failed'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleSendKeyChange = async (nextSendKey: 'enter' | 'cmd_enter') => {
+    if (nextSendKey === sendKey || !workbench?.updateUserPreferences) return
+
+    setPendingSendKey(nextSendKey)
+    setSaving(true)
+    setError(null)
+    try {
+      await workbench.updateUserPreferences({ send_key: nextSendKey })
+    } catch (saveError) {
+      console.error('[DIDA] Failed to update message send shortcut', saveError)
+      setError(t('workbench.general_settings_send_key_save_failed'))
+    } finally {
+      setPendingSendKey(null)
+      setSaving(false)
+    }
+  }
+
+  const handleFollowUpBehaviorChange = async (nextFollowUpBehavior: 'queue' | 'guide') => {
+    if (nextFollowUpBehavior === followUpBehavior || !workbench?.updateUserPreferences) {
+      return
+    }
+
+    setPendingFollowUpBehavior(nextFollowUpBehavior)
+    setSaving(true)
+    setError(null)
+    try {
+      await workbench.updateUserPreferences({
+        follow_up_behavior: nextFollowUpBehavior,
+      })
+    } catch (saveError) {
+      console.error('[DIDA] Failed to update follow-up behavior', saveError)
+      setError(t('workbench.general_settings_follow_up_behavior_save_failed'))
+    } finally {
+      setPendingFollowUpBehavior(null)
+      setSaving(false)
+    }
+  }
+
+  const confirmWorkbenchModeChange = async () => {
+    if (!pendingWorkbenchMode) return
+    if (pendingWorkbenchMode === preferences.workbenchMode) {
+      setPendingWorkbenchMode(null)
+      return
+    }
+
+    const nextMode = pendingWorkbenchMode
+    setPreferences(current => ({ ...current, workbenchMode: nextMode }))
+    setSaving(true)
+    setError(null)
+    try {
+      setPreferences(await changeWorkbenchMode(nextMode))
+    } catch (saveError) {
+      console.error('[DIDA] Failed to update workbench mode', saveError)
+      try {
+        setPreferences(await getAppPreferences())
+      } catch (refreshError) {
+        console.error(
+          '[DIDA] Failed to refresh workbench mode after update failure',
+          refreshError
+        )
+      }
+      setError(t('workbench.general_settings_mode_save_failed'))
+    } finally {
+      setPendingWorkbenchMode(null)
+      setSaving(false)
+    }
+  }
+
+  const saveFixedWorkspaceTabs = async (
+    fixedWorkspaceTabs: FixedWorkspaceTabPreference[],
+    startupWorkspaceTabId = preferences.startupWorkspaceTabId ??
+      defaultAppPreferences.startupWorkspaceTabId
+  ) => {
+    const patch = fixedWorkspaceTabsPatch(fixedWorkspaceTabs, startupWorkspaceTabId)
+    const previousPreferences = preferences
+    setPreferences(current => ({
+      ...current,
+      ...patch,
+    }))
+    setSaving(true)
+    setError(null)
+    try {
+      setPreferences(await persistFixedWorkspaceTabs(fixedWorkspaceTabs, startupWorkspaceTabId))
+    } catch (saveError) {
+      console.error('[DIDA] Failed to update fixed workspace tabs', saveError)
+      setPreferences(previousPreferences)
+      setError(t('workbench.general_settings_save_failed'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const saveFriendlyTaskTitles = async (
+    enabled: boolean,
+    modelKey = FRIENDLY_TITLE_TASK_MODEL_VALUE
+  ) => {
+    const useTaskModel = modelKey === FRIENDLY_TITLE_TASK_MODEL_VALUE
+    const [modelType, ...nameParts] = modelKey.split(':')
+    const modelName = nameParts.join(':')
+    const selectedModel = workbench?.projectChat?.models.find(
+      model => `${model.type}:${model.name}` === `${modelType ?? ''}:${modelName}`
+    )
+    const execution = selectedModel ? selectedModelExecutionFields(selectedModel, {}) : null
+    const patch: AppPreferencesPatch = {
+      friendlyTaskTitlesEnabled: enabled && (useTaskModel || Boolean(selectedModel)),
+      friendlyTaskTitleModel: useTaskModel
+        ? null
+        : selectedModel
+          ? {
+              modelName: selectedModel.name,
+              modelType: selectedModel.type,
+              executionModelId: execution?.modelId ?? '',
+              executionModelType: execution?.modelType ?? null,
+              options: execution?.modelOptions,
+            }
+          : null,
+    }
+    const previousPreferences = preferences
+    setSaving(true)
+    setError(null)
+    try {
+      setPreferences(current => ({ ...current, ...patch }))
+      setPreferences(await updateAppPreferences(patch))
+    } catch (saveError) {
+      console.error('[DIDA] Failed to update friendly task title preferences', saveError)
+      setPreferences(previousPreferences)
+      setError(t('workbench.general_settings_save_failed'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const saveMaxConcurrentTasks = async (value: number) => {
+    const previousValue = maxConcurrentTasks
+    setMaxConcurrentTasks(value)
+    setSaving(true)
+    setError(null)
+    try {
+      const settings = await runtimeWorkApi?.updateRuntimeSettings({
+        maxConcurrentTasks: value,
+      })
+      setMaxConcurrentTasks(settings?.maxConcurrentTasks ?? value)
+      try {
+        await workbench?.refreshWorkLists()
+      } catch (refreshError) {
+        console.warn(
+          '[DIDA] Failed to refresh runtime tasks after updating concurrency settings',
+          refreshError
+        )
+      }
+    } catch (saveError) {
+      console.error('[DIDA] Failed to update runtime concurrency settings', saveError)
+      setMaxConcurrentTasks(previousValue)
+      setError(t('workbench.general_settings_save_failed'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const friendlyTitleModel = preferences.friendlyTaskTitleModel
+  const fixedWorkspaceTabs =
+    preferences.fixedWorkspaceTabs ?? defaultAppPreferences.fixedWorkspaceTabs
+  const startupWorkspaceTabId =
+    preferences.startupWorkspaceTabId ?? defaultAppPreferences.startupWorkspaceTabId
+  const friendlyTitleModels = workbench?.projectChat?.models ?? []
+  const friendlyTitleModelKey = friendlyTitleModel
+    ? `${friendlyTitleModel.modelType ?? ''}:${friendlyTitleModel.modelName}`
+    : FRIENDLY_TITLE_TASK_MODEL_VALUE
+
+  return (
+    <SettingsPage data-testid="general-settings-page">
+      <SettingsPageHeader
+        title={t('workbench.general_settings_title')}
+        description={t('workbench.general_settings_subtitle')}
+      />
+
+      <section data-testid="general-settings-basic-section">
+        <div className="mb-2 px-0.5 text-sm font-semibold text-text-primary">
+          {t('workbench.general_settings_title')}
+        </div>
+        <SettingsGroup className="rounded-xl !bg-background">
+          <DefaultRunnerSetting />
+          <SettingsRow
+            label={t('workbench.general_settings_mode')}
+            description={t('workbench.general_settings_mode_description')}
+            className={GENERAL_ROW_CLASS_NAME}
+            labelClassName={GENERAL_ROW_LABEL_CLASS_NAME}
+            control={
+              <div className="grid h-8 w-full shrink-0 grid-cols-2 rounded-md border border-border bg-background p-0.5 md:w-[300px]">
+                {(['focus', 'developer'] as const).map(mode => {
+                  const active = preferences.workbenchMode === mode
+                  return (
+                    <button
+                      key={mode}
+                      type="button"
+                      data-testid={`general-workbench-mode-${mode}-button`}
+                      disabled={loading || saving}
+                      title={t(`workbench.general_settings_mode_${mode}_description`)}
+                      aria-pressed={active}
+                      onClick={() => {
+                        if (!active) setPendingWorkbenchMode(mode)
+                      }}
+                      className={[
+                        'flex min-w-0 items-center justify-center rounded-[5px] px-2 text-sm font-medium leading-[18px] transition-colors disabled:cursor-not-allowed disabled:opacity-60',
+                        active
+                          ? 'bg-text-primary text-background shadow-sm'
+                          : 'text-text-secondary hover:bg-muted hover:text-text-primary',
+                      ].join(' ')}
+                    >
+                      <span className="truncate">
+                        {t(`workbench.general_settings_mode_${mode}`)}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+            }
+          />
+          <SettingsRow
+            label={t('workbench.general_settings_language_preference')}
+            description={t('workbench.general_settings_language_description')}
+            className={GENERAL_ROW_CLASS_NAME}
+            labelClassName={GENERAL_ROW_LABEL_CLASS_NAME}
+            control={
+              <div className="grid h-8 w-full shrink-0 grid-cols-3 rounded-md border border-border bg-background p-0.5 md:w-[300px]">
+                {languagePreferenceOptions.map(option => {
+                  const active = preferences.language === option.value
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      data-testid={`general-language-${option.value}-button`}
+                      disabled={loading || saving}
+                      title={t(`workbench.${option.descriptionKey}`)}
+                      aria-pressed={active}
+                      onClick={() => void handleLanguageChange(option.value)}
+                      className={[
+                        'flex min-w-0 items-center justify-center rounded-[5px] px-2 text-sm font-medium leading-[18px] transition-colors disabled:cursor-not-allowed disabled:opacity-60',
+                        active
+                          ? 'bg-text-primary text-background shadow-sm'
+                          : 'text-text-secondary hover:bg-muted hover:text-text-primary',
+                      ].join(' ')}
+                    >
+                      <span className="truncate">{t(`workbench.${option.shortLabelKey}`)}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            }
+          />
+          <SettingsRow
+            label={t('workbench.general_settings_send_key')}
+            description={t('workbench.general_settings_send_key_description')}
+            className={GENERAL_ROW_CLASS_NAME}
+            labelClassName={GENERAL_ROW_LABEL_CLASS_NAME}
+            control={
+              <div className="grid h-8 w-full shrink-0 grid-cols-2 rounded-md border border-border bg-background p-0.5 md:w-[300px]">
+                {(['enter', 'cmd_enter'] as const).map(option => {
+                  const active = sendKey === option
+                  const label =
+                    option === 'enter'
+                      ? t('workbench.general_settings_send_key_enter')
+                      : t(
+                          'workbench.general_settings_send_key_command_enter',
+                          '{{modifier}} Enter 发送',
+                          {
+                            modifier: getPlatform() === 'mac' ? '⌘' : 'Ctrl',
+                          }
+                        )
+                  return (
+                    <button
+                      key={option}
+                      type="button"
+                      data-testid={`general-send-key-${option}-button`}
+                      disabled={loading || saving || !workbench?.updateUserPreferences}
+                      aria-pressed={active}
+                      onClick={() => void handleSendKeyChange(option)}
+                      className={[
+                        'flex min-w-0 items-center justify-center rounded-[5px] px-2 text-sm font-medium leading-[18px] transition-colors disabled:cursor-not-allowed disabled:opacity-60',
+                        active
+                          ? 'bg-text-primary text-background shadow-sm'
+                          : 'text-text-secondary hover:bg-muted hover:text-text-primary',
+                      ].join(' ')}
+                    >
+                      <span className="truncate">{label}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            }
+          />
+          <SettingsRow
+            label={t('workbench.general_settings_follow_up_behavior')}
+            description={t('workbench.general_settings_follow_up_behavior_description')}
+            className={GENERAL_ROW_CLASS_NAME}
+            labelClassName={GENERAL_ROW_LABEL_CLASS_NAME}
+            control={
+              <div className="grid h-8 w-full shrink-0 grid-cols-2 rounded-md border border-border bg-background p-0.5 md:w-[300px]">
+                {(['queue', 'guide'] as const).map(option => {
+                  const active = followUpBehavior === option
+                  return (
+                    <button
+                      key={option}
+                      type="button"
+                      data-testid={`general-follow-up-${option}-button`}
+                      disabled={loading || saving || !workbench?.updateUserPreferences}
+                      aria-pressed={active}
+                      onClick={() => void handleFollowUpBehaviorChange(option)}
+                      className={[
+                        'flex min-w-0 items-center justify-center rounded-[5px] px-2 text-sm font-medium leading-[18px] transition-colors disabled:cursor-not-allowed disabled:opacity-60',
+                        active
+                          ? 'bg-text-primary text-background shadow-sm'
+                          : 'text-text-secondary hover:bg-muted hover:text-text-primary',
+                      ].join(' ')}
+                    >
+                      <span className="truncate">
+                        {t(`workbench.general_settings_follow_up_behavior_${option}`)}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+            }
+          />
+          <SettingsRow
+            label={t('workbench.general_settings_fixed_workspace_tabs', '固定标签页')}
+            description={t(
+              'workbench.general_settings_fixed_workspace_tabs_description',
+              '每次启动时按顺序打开；通过加号创建的普通标签页不会在重启后恢复。'
+            )}
+            className={GENERAL_ROW_CLASS_NAME}
+            labelClassName={GENERAL_ROW_LABEL_CLASS_NAME}
+            control={
+              <div className="w-full space-y-2 md:w-[360px]" data-testid="general-fixed-tabs">
+                {fixedWorkspaceTabs.map((tab, index) => {
+                  const label =
+                    tab.kind === 'smart_app'
+                      ? (tab.title ?? t('workbench.smart_apps_title', '智能工作台'))
+                      : tab.kind === 'auxiliary'
+                        ? (tab.title ?? t('workbench.workspace_tab_auxiliary', '工作区'))
+                        : (tab.title ??
+                          t(`workbench.general_settings_default_workspace_tab_${tab.kind}`))
+                  return (
+                    <div
+                      key={tab.id}
+                      data-testid={`general-fixed-tab-${tab.id}`}
+                      className="flex min-h-11 items-center gap-1 rounded-lg border border-border bg-background px-2 md:h-9 md:min-h-0"
+                    >
+                      <button
+                        type="button"
+                        data-testid={`general-fixed-tab-startup-${tab.id}`}
+                        disabled={loading || saving}
+                        aria-pressed={startupWorkspaceTabId === tab.id}
+                        aria-label={t(
+                          'workbench.general_settings_startup_workspace_tab',
+                          '设为启动标签页'
+                        )}
+                        onClick={() => void saveFixedWorkspaceTabs(fixedWorkspaceTabs, tab.id)}
+                        className="flex h-11 w-11 items-center justify-center rounded hover:bg-muted md:h-6 md:w-6"
+                        title={t(
+                          'workbench.general_settings_startup_workspace_tab',
+                          '设为启动标签页'
+                        )}
+                      >
+                        <Pin
+                          className={
+                            startupWorkspaceTabId === tab.id
+                              ? 'h-3.5 w-3.5 fill-current'
+                              : 'h-3.5 w-3.5'
+                          }
+                        />
+                      </button>
+                      <span className="min-w-0 flex-1 truncate text-sm">{label}</span>
+                      <button
+                        type="button"
+                        data-testid={`general-fixed-tab-up-${tab.id}`}
+                        disabled={loading || saving || index === 0}
+                        onClick={() => {
+                          void saveFixedWorkspaceTabs(
+                            moveFixedTab(fixedWorkspaceTabs, index, index - 1)
+                          )
+                        }}
+                        className="flex h-11 w-11 items-center justify-center rounded hover:bg-muted disabled:opacity-30 md:h-6 md:w-6"
+                        aria-label={t('workbench.move_up', '上移')}
+                      >
+                        <ArrowUp className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        data-testid={`general-fixed-tab-down-${tab.id}`}
+                        disabled={loading || saving || index === fixedWorkspaceTabs.length - 1}
+                        onClick={() => {
+                          void saveFixedWorkspaceTabs(
+                            moveFixedTab(fixedWorkspaceTabs, index, index + 1)
+                          )
+                        }}
+                        className="flex h-11 w-11 items-center justify-center rounded hover:bg-muted disabled:opacity-30 md:h-6 md:w-6"
+                        aria-label={t('workbench.move_down', '下移')}
+                      >
+                        <ArrowDown className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        data-testid={`general-fixed-tab-remove-${tab.id}`}
+                        disabled={loading || saving || fixedWorkspaceTabs.length === 1}
+                        onClick={() =>
+                          void saveFixedWorkspaceTabs(
+                            fixedWorkspaceTabs.filter(item => item.id !== tab.id)
+                          )
+                        }
+                        className="flex h-11 w-11 items-center justify-center rounded hover:bg-muted disabled:opacity-30 md:h-6 md:w-6"
+                        aria-label={t('workbench.remove', '移除')}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  )
+                })}
+                <select
+                  data-testid="general-fixed-tab-add"
+                  disabled={loading || saving}
+                  value=""
+                  onChange={event => {
+                    const value = event.target.value
+                    if (!value) return
+                    const builtIn = BUILT_IN_FIXED_TAB_OPTIONS.find(kind => kind === value)
+                    const smartApp = installedSmartApps.find(app => `smart_app:${app.id}` === value)
+                    const nextTab: FixedWorkspaceTabPreference | null = builtIn
+                      ? { id: `fixed-${builtIn}`, kind: builtIn }
+                      : smartApp
+                        ? {
+                            id: `fixed-smart-app-${smartApp.id}`,
+                            kind: 'smart_app',
+                            installationId: smartApp.id,
+                            title: smartApp.manifest.displayName,
+                          }
+                        : null
+                    if (nextTab) {
+                      void saveFixedWorkspaceTabs([...fixedWorkspaceTabs, nextTab])
+                    }
+                  }}
+                  className="h-11 w-full rounded-lg border border-dashed border-border bg-background px-2 text-sm text-text-secondary md:h-9"
+                >
+                  <option value="">
+                    {t('workbench.general_settings_add_fixed_workspace_tab', '+ 添加固定标签页')}
+                  </option>
+                  {BUILT_IN_FIXED_TAB_OPTIONS.filter(
+                    kind => !fixedWorkspaceTabs.some(tab => tab.kind === kind)
+                  ).map(kind => (
+                    <option key={kind} value={kind}>
+                      {t(`workbench.general_settings_default_workspace_tab_${kind}`)}
+                    </option>
+                  ))}
+                  {(preferences.experimentalFeaturesEnabled ? installedSmartApps : [])
+                    .filter(
+                      app =>
+                        !fixedWorkspaceTabs.some(
+                          tab => tab.kind === 'smart_app' && tab.installationId === app.id
+                        )
+                    )
+                    .map(app => (
+                      <option key={app.id} value={`smart_app:${app.id}`}>
+                        {app.manifest.displayName}
+                      </option>
+                    ))}
+                </select>
+              </div>
+            }
+          />
+          {renderSwitchRow({
+            preferenceKey: 'showMainWindowOnLaunch',
+            testId: 'general-show-main-window-on-launch-toggle',
+            label: t('workbench.general_settings_show_main_window_on_launch'),
+            description: t('workbench.general_settings_show_main_window_on_launch_description'),
+          })}
+          {renderSwitchRow({
+            preferenceKey: 'experimentalFeaturesEnabled',
+            testId: 'general-experimental-features-toggle',
+            label: t('workbench.general_settings_experimental_features'),
+            description: t('workbench.general_settings_experimental_features_description'),
+          })}
+          <SettingsRow
+            label={t('workbench.external_import_row_title')}
+            description={t('workbench.external_import_row_description')}
+            className={GENERAL_ROW_CLASS_NAME}
+            labelClassName={GENERAL_ROW_LABEL_CLASS_NAME}
+            control={
+              <button
+                type="button"
+                data-testid="general-external-content-import-button"
+                onClick={() => setShowImportDialog(true)}
+                className="h-8 rounded-md bg-surface px-3 text-sm font-medium text-text-primary hover:bg-muted"
+              >
+                {t('workbench.external_import_action')}
+              </button>
+            }
+          />
+        </SettingsGroup>
+      </section>
+
+      <section data-testid="general-settings-runtime-section" className="mt-12">
+        <div className="mb-2 px-0.5 text-sm font-semibold text-text-primary">
+          {t('workbench.general_settings_runtime_title')}
+        </div>
+        <SettingsGroup className="rounded-xl !bg-background">
+          <SettingsRow
+            label={t('workbench.general_settings_max_concurrent_tasks')}
+            description={t('workbench.general_settings_max_concurrent_tasks_description')}
+            className={GENERAL_ROW_CLASS_NAME}
+            labelClassName={GENERAL_ROW_LABEL_CLASS_NAME}
+            control={
+              <select
+                data-testid="general-max-concurrent-tasks-select"
+                value={maxConcurrentTasks}
+                disabled={loading || saving}
+                aria-label={t('workbench.general_settings_max_concurrent_tasks')}
+                onChange={event => {
+                  void saveMaxConcurrentTasks(Number(event.target.value))
+                }}
+                className="h-8 w-24 rounded-md border border-border bg-background px-2 text-sm text-text-primary"
+              >
+                {Array.from({ length: MAX_CONCURRENT_TASKS_LIMIT }, (_, index) => index + 1).map(
+                  value => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  )
+                )}
+              </select>
+            }
+          />
+          {renderSwitchRow({
+            preferenceKey: 'closeToTrayEnabled',
+            testId: 'general-close-to-tray-toggle',
+            label: t('workbench.general_settings_close_to_tray'),
+            description: preferences.closeToTrayEnabled
+              ? t('workbench.general_settings_background_description')
+              : t('workbench.general_settings_background_disabled_description'),
+          })}
+          {renderSwitchRow({
+            preferenceKey: 'preventSleepWhileTasksRunning',
+            testId: 'general-prevent-sleep-while-tasks-running-toggle',
+            label: t('workbench.general_settings_prevent_sleep_while_tasks_running'),
+            description: t(
+              'workbench.general_settings_prevent_sleep_while_tasks_running_description'
+            ),
+          })}
+          <SettingsRow
+            label={
+              <span className="flex items-center gap-2">
+                <Bell className="h-4 w-4 text-text-secondary" />
+                {t('workbench.general_settings_tray_display_content')}
+              </span>
+            }
+            description={t('workbench.general_settings_tray_display_content_description')}
+            className={GENERAL_ROW_CLASS_NAME}
+            labelClassName={GENERAL_ROW_LABEL_CLASS_NAME}
+            control={
+              <div className="grid w-[420px] max-w-full shrink-0 grid-cols-2 gap-2">
+                {trayDisplayOptions.map(option => {
+                  const Icon = option.icon
+                  const selected = Boolean(preferences[option.preferenceKey])
+                  return (
+                    <button
+                      key={option.preferenceKey}
+                      data-testid={option.testId}
+                      type="button"
+                      aria-pressed={selected}
+                      title={option.description}
+                      disabled={loading || saving}
+                      onClick={() => void handlePreferenceChange(option.preferenceKey, !selected)}
+                      className={`group flex h-9 items-center justify-between gap-2 rounded-md border px-2.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                        selected
+                          ? 'border-text-primary/50 bg-muted text-text-primary'
+                          : 'border-border bg-background text-text-secondary hover:border-text-muted/40 hover:bg-muted/40 hover:text-text-primary'
+                      }`}
+                    >
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        <Icon
+                          className={`h-4 w-4 shrink-0 ${
+                            selected ? 'text-text-primary' : 'text-text-secondary'
+                          }`}
+                        />
+                        <span className="truncate">{option.label}</span>
+                      </span>
+                      <span
+                        className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border transition ${
+                          selected
+                            ? 'border-text-primary bg-text-primary text-background'
+                            : 'border-border bg-surface group-hover:border-text-muted/40'
+                        }`}
+                      >
+                        {selected && <Check className="h-3 w-3" />}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+            }
+          />
+        </SettingsGroup>
+      </section>
+
+      <section data-testid="general-settings-ai-section" className="mt-12">
+        <div className="mb-2 px-0.5 text-sm font-semibold text-text-primary">
+          {t('workbench.general_settings_ai_title')}
+        </div>
+        <SettingsGroup className="rounded-xl !bg-background">
+          <SettingsRow
+            label={t('workbench.friendly_task_titles_title', '使用友好标题')}
+            description={t(
+              'workbench.friendly_task_titles_desc',
+              '创建任务后，用你选择的模型异步生成简洁标题。'
+            )}
+            className={GENERAL_ROW_CLASS_NAME}
+            labelClassName={GENERAL_ROW_LABEL_CLASS_NAME}
+            control={
+              <SettingsSwitch
+                data-testid="friendly-task-titles-toggle"
+                checked={preferences.friendlyTaskTitlesEnabled}
+                disabled={
+                  loading ||
+                  saving ||
+                  (!friendlyTitleModel?.modelName && !workbench?.projectChat?.selectedModel)
+                }
+                onCheckedChange={checked => {
+                  void saveFriendlyTaskTitles(checked, friendlyTitleModelKey)
+                }}
+                aria-label={t('workbench.friendly_task_titles_title', '使用友好标题')}
+              />
+            }
+          />
+          {preferences.friendlyTaskTitlesEnabled && (
+            <div data-testid="friendly-task-title-model-row" className="px-4 pb-3">
+              <div className="ml-3 flex items-center justify-between gap-4 rounded-lg bg-muted/50 px-3 py-2.5 max-sm:ml-0 max-sm:flex-col max-sm:items-stretch">
+                <div className="min-w-0">
+                  <div className="text-xs font-medium text-text-primary">
+                    {t('workbench.friendly_task_titles_model', '标题模型')}
+                  </div>
+                  <p className="mt-0.5 text-xs text-text-secondary">
+                    {t(
+                      'workbench.friendly_task_titles_model_desc',
+                      '仅用于生成任务标题，不影响当前任务使用的模型。'
+                    )}
+                  </p>
+                </div>
+                <select
+                  data-testid="friendly-task-title-model-select"
+                  value={friendlyTitleModelKey}
+                  disabled={loading || saving}
+                  onChange={event => {
+                    void saveFriendlyTaskTitles(
+                      preferences.friendlyTaskTitlesEnabled,
+                      event.target.value
+                    )
+                  }}
+                  className="h-8 w-full rounded-md border border-border bg-background px-2 text-sm text-text-primary md:w-[220px]"
+                >
+                  <option value={FRIENDLY_TITLE_TASK_MODEL_VALUE}>
+                    {t('workbench.friendly_task_titles_model_task', '与任务相同')}
+                  </option>
+                  {friendlyTitleModel &&
+                    !friendlyTitleModels.some(
+                      model =>
+                        model.name === friendlyTitleModel.modelName &&
+                        model.type === friendlyTitleModel.modelType
+                    ) && (
+                      <option value={friendlyTitleModelKey}>
+                        {t(
+                          'workbench.friendly_task_titles_model_unavailable',
+                          `${friendlyTitleModel.modelName}（不可用）`,
+                          { modelName: friendlyTitleModel.modelName }
+                        )}
+                      </option>
+                    )}
+                  {friendlyTitleModels.map(model => (
+                    <option
+                      key={`${model.type}:${model.name}`}
+                      value={`${model.type}:${model.name}`}
+                    >
+                      {model.displayName || model.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
+          <ReplyPredictionSettings />
+        </SettingsGroup>
+      </section>
+
+      {telemetryDistribution === 'public' ? (
+        <section data-testid="general-settings-privacy-section" className="mt-12">
+          <div className="mb-2 px-0.5 text-sm font-semibold text-text-primary">
+            {t('workbench.general_settings_privacy_title')}
+          </div>
+          <SettingsGroup className="rounded-xl !bg-background">
+            {renderSwitchRow({
+              preferenceKey: 'telemetryEnabled',
+              testId: 'general-telemetry-toggle',
+              label: t('workbench.general_settings_telemetry'),
+              description: t('workbench.general_settings_telemetry_description'),
+            })}
+          </SettingsGroup>
+        </section>
+      ) : null}
+
+      <section data-testid="general-settings-popout-section" className="mt-12">
+        <div className="mb-2 px-0.5 text-sm font-semibold text-text-primary">
+          {t('workbench.general_settings_popout_title')}
+        </div>
+        <SettingsGroup className="rounded-xl !bg-background">
+          <SettingsRow
+            label={t('workbench.general_settings_popout_shortcut')}
+            description={t('workbench.general_settings_popout_shortcut_description')}
+            className={GENERAL_ROW_CLASS_NAME}
+            labelClassName={GENERAL_ROW_LABEL_CLASS_NAME}
+            control={
+              <div className="flex min-w-[220px] items-center justify-end gap-1">
+                <button
+                  type="button"
+                  data-testid="general-popout-shortcut-record-button"
+                  disabled={loading || saving}
+                  onClick={() => setRecordingPopoutShortcut(true)}
+                  className="inline-flex min-h-8 items-center gap-2 rounded-lg px-2 text-sm text-text-secondary hover:bg-muted hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-60 max-md:min-h-11"
+                  aria-label={t('workbench.general_settings_popout_shortcut_edit')}
+                >
+                  {recordingPopoutShortcut ? (
+                    <span className="rounded-full bg-muted px-2.5 py-1">
+                      {t('workbench.keyboard_shortcuts_recording')}
+                    </span>
+                  ) : preferences.popoutWindowShortcut ? (
+                    <KeyboardShortcut
+                      value={preferences.popoutWindowShortcut.replace(
+                        'CommandOrControl',
+                        'Command'
+                      )}
+                      className="bg-muted text-text-secondary"
+                    />
+                  ) : (
+                    <span>{t('workbench.keyboard_shortcuts_unassigned')}</span>
+                  )}
+                  <Pencil className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  data-testid="general-popout-shortcut-clear-button"
+                  disabled={loading || saving || !preferences.popoutWindowShortcut}
+                  onClick={() => void savePopoutShortcut(null)}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-text-secondary hover:bg-muted hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40 max-md:h-11 max-md:w-11"
+                  aria-label={t('workbench.keyboard_shortcuts_clear')}
+                  title={t('workbench.keyboard_shortcuts_clear')}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            }
+          />
+          {renderSwitchRow({
+            preferenceKey: 'systemDragEnabled',
+            testId: 'general-system-drag-toggle',
+            label: t('workbench.general_settings_system_drag'),
+            description: t('workbench.general_settings_system_drag_description'),
+          })}
+        </SettingsGroup>
+      </section>
+
+      {(loading || saving || error) && (
+        <div
+          data-testid="general-settings-status"
+          className="mt-4 flex items-center gap-2 text-xs text-text-secondary"
+        >
+          {(loading || saving) && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+          <span>
+            {error ??
+              (loading ? t('common.loading', '加载中...') : t('workbench.general_settings_saving'))}
+          </span>
+        </div>
+      )}
+      {showImportDialog && (
+        <ExternalContentImportDialog onClose={() => setShowImportDialog(false)} />
+      )}
+      <ConfirmDialog
+        open={pendingWorkbenchMode !== null}
+        title={
+          pendingWorkbenchMode
+            ? t(`workbench.general_settings_mode_${pendingWorkbenchMode}_confirm_title`)
+            : ''
+        }
+        description={
+          pendingWorkbenchMode
+            ? t(`workbench.general_settings_mode_${pendingWorkbenchMode}_confirm_description`)
+            : ''
+        }
+        cancelLabel={t('common.cancel', '取消')}
+        confirmLabel={t('workbench.general_settings_mode_confirm_action')}
+        confirmTestId="general-workbench-mode-confirm-button"
+        pending={saving}
+        onClose={() => setPendingWorkbenchMode(null)}
+        onConfirm={() => void confirmWorkbenchModeChange()}
+      />
+    </SettingsPage>
+  )
+}

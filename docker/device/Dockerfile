@@ -1,0 +1,460 @@
+#
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Public multi-architecture device image used by release pipelines.
+
+ARG DEVICE_BASE_IMAGE=ubuntu:26.04
+
+# ---------------------------------------------------------------------------
+# Builder stage: compile the Rust wegent-executor binary.
+# The runtime image provides claude via npm (@anthropic-ai/claude-code).
+# Uses the same base image as runtime to ensure glibc compatibility.
+# ---------------------------------------------------------------------------
+FROM ${DEVICE_BASE_IMAGE} AS builder
+ARG TARGETPLATFORM
+ARG DEVICE_IMAGE_PLATFORM=${TARGETPLATFORM}
+ARG APP_VERSION=dev
+ARG DEVICE_APT_MIRROR=
+ARG DEVICE_APT_PORTS_MIRROR=${DEVICE_APT_MIRROR}
+ARG RUSTUP_INIT_URL=https://sh.rustup.rs
+ARG RUSTUP_DIST_SERVER=
+ARG RUSTUP_UPDATE_ROOT=
+ARG CARGO_REGISTRIES_CRATES_IO_INDEX=
+ARG CARGO_HTTPS_PROXY=
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN if [ -n "$DEVICE_APT_MIRROR" ]; then \
+        for sources_file in \
+          /etc/apt/sources.list \
+          /etc/apt/sources.list.d/ubuntu.sources; do \
+            if [ -f "$sources_file" ]; then \
+              sed -i \
+                -e "s|http://archive.ubuntu.com/ubuntu|$DEVICE_APT_MIRROR|g" \
+                -e "s|http://security.ubuntu.com/ubuntu|$DEVICE_APT_MIRROR|g" \
+                -e "s|http://ports.ubuntu.com/ubuntu-ports|$DEVICE_APT_PORTS_MIRROR|g" \
+                "$sources_file"; \
+            fi; \
+        done; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN if [ -n "$RUSTUP_DIST_SERVER" ]; then export RUSTUP_DIST_SERVER; fi; \
+    if [ -n "$RUSTUP_UPDATE_ROOT" ]; then export RUSTUP_UPDATE_ROOT; fi; \
+    curl --proto '=https' --tlsv1.2 -sSf "$RUSTUP_INIT_URL" \
+    | sh -s -- -y --profile minimal --default-toolchain stable
+
+ENV PATH=/root/.cargo/bin:${PATH}
+
+WORKDIR /build/executor
+COPY executor/Cargo.toml executor/Cargo.lock ./
+COPY executor/src ./src
+COPY sdk/plugin-auth /build/sdk/plugin-auth
+COPY sdk/plugin-creator /build/sdk/plugin-creator
+COPY shared/assets /build/shared/assets
+RUN if [ -n "$CARGO_REGISTRIES_CRATES_IO_INDEX" ]; then \
+        export CARGO_REGISTRIES_CRATES_IO_INDEX; \
+    fi; \
+    if [ -n "$CARGO_HTTPS_PROXY" ]; then \
+        export HTTPS_PROXY="$CARGO_HTTPS_PROXY"; \
+        export https_proxy="$CARGO_HTTPS_PROXY"; \
+    fi; \
+    APP_VERSION="${APP_VERSION}" cargo build --release --locked
+
+# ---------------------------------------------------------------------------
+# Runtime stage: the actual device image.
+# ---------------------------------------------------------------------------
+FROM ${DEVICE_BASE_IMAGE}
+ARG TARGETPLATFORM
+ARG DEVICE_IMAGE_PLATFORM=${TARGETPLATFORM}
+ARG APP_VERSION=dev
+ARG VCS_REF=unknown
+ARG DEVICE_APT_MIRROR=
+ARG DEVICE_APT_PORTS_MIRROR=${DEVICE_APT_MIRROR}
+ARG NODE_VERSION=22.23.2
+ARG NODE_DIST_MIRROR=https://nodejs.org/dist
+ARG NPM_REGISTRY=https://registry.npmjs.org
+ARG GH_VERSION=2.100.0
+ARG GLAB_VERSION=1.116.0
+ARG CODE_SERVER_VERSION=4.121.0
+ARG CODE_SERVER_REPOSITORY_RAW=https://raw.githubusercontent.com/coder/code-server
+ARG CODE_SERVER_HTTPS_PROXY=
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV WEGENT_EXECUTOR_VERSION=${APP_VERSION}
+ENV TZ=Asia/Shanghai
+
+LABEL org.opencontainers.image.version=${APP_VERSION} \
+      org.opencontainers.image.revision=${VCS_REF}
+
+# Install base tools, Python, and Node.js 22.
+RUN if [ -n "$DEVICE_APT_MIRROR" ]; then \
+        for sources_file in \
+          /etc/apt/sources.list \
+          /etc/apt/sources.list.d/ubuntu.sources; do \
+            if [ -f "$sources_file" ]; then \
+              sed -i \
+                -e "s|http://archive.ubuntu.com/ubuntu|$DEVICE_APT_MIRROR|g" \
+                -e "s|http://security.ubuntu.com/ubuntu|$DEVICE_APT_MIRROR|g" \
+                -e "s|http://ports.ubuntu.com/ubuntu-ports|$DEVICE_APT_PORTS_MIRROR|g" \
+                "$sources_file"; \
+            fi; \
+        done; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    file \
+    git \
+    openssh-client \
+    python3 \
+    python3-pip \
+    tzdata \
+    util-linux \
+    xz-utils \
+    && case "$DEVICE_IMAGE_PLATFORM" in \
+        linux/amd64) node_arch=x64 ;; \
+        linux/arm64) node_arch=arm64 ;; \
+        *) echo "Unsupported DEVICE_IMAGE_PLATFORM=$DEVICE_IMAGE_PLATFORM" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL \
+      "${NODE_DIST_MIRROR%/}/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" \
+      | tar -xJ --strip-components=1 -C /usr/local \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo "$TZ" > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the agent CLIs from the selected npm registry.
+RUN npm install -g --registry "$NPM_REGISTRY" \
+      @anthropic-ai/claude-code@2.1.277 @openai/codex@0.155.1 \
+    && npm cache clean --force
+
+# Install the GitHub (gh) and GitLab (glab) CLIs used by git hosting features.
+RUN case "$DEVICE_IMAGE_PLATFORM" in \
+        linux/amd64) cli_arch=amd64 ;; \
+        linux/arm64) cli_arch=arm64 ;; \
+        *) echo "Unsupported DEVICE_IMAGE_PLATFORM=$DEVICE_IMAGE_PLATFORM" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL --retry 5 --retry-all-errors \
+      "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${cli_arch}.tar.gz" \
+      | tar -xz -C /tmp \
+    && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${cli_arch}/bin/gh" /usr/local/bin/gh \
+    && rm -rf "/tmp/gh_${GH_VERSION}_linux_${cli_arch}" \
+    && curl -fsSL --retry 5 --retry-all-errors \
+      "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${cli_arch}.tar.gz" \
+      | tar -xz -C /tmp bin/glab \
+    && install -m 0755 /tmp/bin/glab /usr/local/bin/glab \
+    && rm -rf /tmp/bin \
+    && gh --version && glab --version
+
+# Follow code-server's official install.sh flow, pinned to the selected release.
+# Standalone mode avoids distro services and native npm compilation in the image.
+RUN if [ -n "$CODE_SERVER_HTTPS_PROXY" ]; then \
+      export HTTPS_PROXY="$CODE_SERVER_HTTPS_PROXY"; \
+      export https_proxy="$CODE_SERVER_HTTPS_PROXY"; \
+    fi \
+    && curl -fsSL --retry 5 --retry-all-errors \
+      "${CODE_SERVER_REPOSITORY_RAW%/}/v${CODE_SERVER_VERSION}/install.sh" \
+      -o /tmp/install-code-server.sh \
+    && sh /tmp/install-code-server.sh \
+      --method=standalone \
+      --prefix=/usr/local \
+      --version="${CODE_SERVER_VERSION}" \
+    && rm -f /tmp/install-code-server.sh \
+    && installed_code_server_version="$(code-server --version | tail -n 1 | awk '{print $1}')" \
+    && test "$installed_code_server_version" = "$CODE_SERVER_VERSION" \
+    && rm -rf /root/.config/code-server
+
+RUN set -e; \
+    rootfs_arch="$(dpkg --print-architecture)"; \
+    case "$DEVICE_IMAGE_PLATFORM" in \
+        linux/amd64) test "$rootfs_arch" = "amd64" ;; \
+        linux/arm64) test "$rootfs_arch" = "arm64" ;; \
+        *) echo "Unsupported DEVICE_IMAGE_PLATFORM=$DEVICE_IMAGE_PLATFORM" >&2; exit 1 ;; \
+    esac \
+    || { echo "Base image architecture $rootfs_arch does not match DEVICE_IMAGE_PLATFORM=$DEVICE_IMAGE_PLATFORM" >&2; exit 1; }
+
+# code-server references VS Code's optional vsda browser assets, but
+# the packaged OSS build does not include them. Provide a no-op implementation
+# so those optional static requests return 200 instead of noisy 404s.
+RUN set -e; \
+    vsda_root="/usr/local/lib/code-server-${CODE_SERVER_VERSION}/lib/vscode/node_modules/vsda"; \
+    vsda_dir="$vsda_root/rust/web"; \
+    mkdir -p "$vsda_dir"; \
+    printf '%s\n' \
+        '{"name":"vsda","version":"0.0.0","main":"index.js"}' \
+        >"$vsda_root/package.json"; \
+    printf '%s\n' \
+        'class signer {' \
+        '  sign(value) { return value; }' \
+        '}' \
+        'class validator {' \
+        '  createNewMessage(value) { return value; }' \
+        '  validate() { return "ok"; }' \
+        '  free() {}' \
+        '}' \
+        'module.exports = { signer, validator };' \
+        >"$vsda_root/index.js"; \
+    printf '%s\n' \
+        '(function (root) {' \
+        '  var api = {' \
+        '    default: async function () {},' \
+        '    sign: function (value) { return value; },' \
+        '    validator: class {' \
+        '      createNewMessage(value) { return value; }' \
+        '      validate() { return "ok"; }' \
+        '      free() {}' \
+        '    }' \
+        '  };' \
+        '  root.vsda_web = api;' \
+        '  if (typeof define === "function") {' \
+        '    define(function () { return api; });' \
+        '  }' \
+        '})(globalThis);' \
+        >"$vsda_dir/vsda.js"; \
+    : >"$vsda_dir/vsda_bg.wasm"
+
+# Create the runtime user used by cloud and local device containers.
+RUN groupadd -r wegent \
+    && useradd -r -g wegent -m -d /home/wegent -s /bin/bash wegent \
+    && echo "wegent:wegent" | chpasswd
+
+WORKDIR /app
+
+# Keep both paths available:
+# - /app/executor is the executor-manager entrypoint-compatible path.
+# - ~/.wecode/wegent-executor/bin/wegent-executor is the local device install path.
+COPY --from=builder --chown=wegent:wegent /build/executor/target/release/wegent-executor /app/executor
+RUN set -e; \
+    executor_type="$(file /app/executor)"; \
+    case "$DEVICE_IMAGE_PLATFORM" in \
+        linux/amd64) echo "$executor_type" | grep -q "ELF 64-bit.*x86-64" ;; \
+        linux/arm64) echo "$executor_type" | grep -Eq "ELF 64-bit.*(ARM aarch64|aarch64)" ;; \
+        *) echo "Unsupported DEVICE_IMAGE_PLATFORM=$DEVICE_IMAGE_PLATFORM" >&2; exit 1 ;; \
+    esac \
+    || { echo "$executor_type" >&2; echo "Built executor binary does not match DEVICE_IMAGE_PLATFORM=$DEVICE_IMAGE_PLATFORM" >&2; exit 1; } \
+    && mkdir -p \
+        /home/wegent/.wecode/wegent-executor/bin \
+        /home/wegent/.wegent/workspace \
+    && cp /app/executor /home/wegent/.wecode/wegent-executor/bin/wegent-executor \
+    && chmod 0755 /app/executor /home/wegent/.wecode/wegent-executor/bin/wegent-executor \
+    && ln -sf /home/wegent/.wecode/wegent-executor/bin/wegent-executor /usr/local/bin/wegent-executor \
+    && test "$(/app/executor --version)" = "${APP_VERSION}" \
+    && chown -R wegent:wegent /app /home/wegent
+
+ENV PATH="/home/wegent/.wegent/workbench/executor/bin:/home/wegent/.wecode/wegent-executor/bin:/home/wegent/.wecode/bin:/home/wegent/.local/bin:${PATH}"
+ENV WEGENT_BACKEND_URL=http://localhost:8000
+ENV WEGENT_EXECUTOR_HOME=/home/wegent/.wegent/workbench/executor
+ENV WEGENT_WORKTREE_PERSISTENT_STORAGE_VERIFIED=true
+ENV LOCAL_WORKSPACE_ROOT=/home/wegent/.wegent/workspace
+ENV WEGENT_WORKSPACE_ROOTS=/home/wegent
+ENV DEVICE_SESSION_GATEWAY_HOST=0.0.0.0
+ENV DEVICE_SESSION_GATEWAY_PORT=17888
+ENV DEVICE_CODE_SERVER_ENABLED=true
+ENV DEVICE_TERMINAL_ENABLED=true
+
+RUN cat >/usr/local/bin/wegent-device-entrypoint <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export WEGENT_BACKEND_URL="${WEGENT_BACKEND_URL:-http://localhost:8000}"
+export DEVICE_SESSION_GATEWAY_HOST="${DEVICE_SESSION_GATEWAY_HOST:-0.0.0.0}"
+export DEVICE_SESSION_GATEWAY_PORT="${DEVICE_SESSION_GATEWAY_PORT:-17888}"
+export DEVICE_CODE_SERVER_PORT="${DEVICE_CODE_SERVER_PORT:-18080}"
+EXPECTED_EXECUTOR_HOME="/home/wegent/.wegent/workbench/executor"
+LEGACY_EXECUTOR_HOME="/home/wegent/.wecode/wegent-executor"
+EXPECTED_DATA_ROOT="/home/wegent/.wegent"
+
+normalize_enabled_flag() {
+    local name="$1"
+    local value="${!name:-true}"
+    case "${value,,}" in
+        true | 1 | yes | on) printf 'true' ;;
+        false | 0 | no | off) printf 'false' ;;
+        *)
+            echo "$name must be true or false" >&2
+            return 1
+            ;;
+    esac
+}
+
+DEVICE_SESSION_GATEWAY_ENABLED="$(normalize_enabled_flag DEVICE_SESSION_GATEWAY_ENABLED)"
+DEVICE_CODE_SERVER_ENABLED="$(normalize_enabled_flag DEVICE_CODE_SERVER_ENABLED)"
+DEVICE_TERMINAL_ENABLED="$(normalize_enabled_flag DEVICE_TERMINAL_ENABLED)"
+export DEVICE_SESSION_GATEWAY_ENABLED DEVICE_CODE_SERVER_ENABLED DEVICE_TERMINAL_ENABLED
+
+if [[ "$WEGENT_EXECUTOR_HOME" != /* ]]; then
+    echo "WEGENT_EXECUTOR_HOME must be an absolute path" >&2
+    exit 1
+fi
+# Use the same override precedence as the Executor workspace resolver.
+LOCAL_WORKSPACE_ROOT="${WORKSPACE_ROOT:-${WEGENT_WORKSPACE_ROOT:-${LOCAL_WORKSPACE_ROOT}}}"
+export LOCAL_WORKSPACE_ROOT
+if [[ "$LOCAL_WORKSPACE_ROOT" != /* ]]; then
+    echo "LOCAL_WORKSPACE_ROOT must be an absolute path" >&2
+    exit 1
+fi
+WEGENT_EXECUTOR_HOME="$(realpath -ms -- "$WEGENT_EXECUTOR_HOME")"
+LOCAL_WORKSPACE_ROOT="$(realpath -m -- "$LOCAL_WORKSPACE_ROOT")"
+if [ "$WEGENT_EXECUTOR_HOME" != "$EXPECTED_EXECUTOR_HOME" ] && [ "$WEGENT_EXECUTOR_HOME" != "$LEGACY_EXECUTOR_HOME" ]; then
+    echo "WEGENT_EXECUTOR_HOME must remain at the stable mount path $EXPECTED_EXECUTOR_HOME" >&2
+    exit 1
+fi
+# Reuse a mounted legacy Executor Home through its canonical path. This keeps
+# the persisted identity without making the active Executor Home a symlink.
+if [ "$WEGENT_EXECUTOR_HOME" = "$EXPECTED_EXECUTOR_HOME" ] && mountpoint -q "$LEGACY_EXECUTOR_HOME"; then
+    if [ -L "$EXPECTED_EXECUTOR_HOME" ]; then
+        if [ "$(realpath -m -- "$EXPECTED_EXECUTOR_HOME")" != "$LEGACY_EXECUTOR_HOME" ]; then
+            echo "Unified Executor Home points to a different volume" >&2
+            exit 1
+        fi
+    elif [ -e "$EXPECTED_EXECUTOR_HOME" ]; then
+        echo "Both legacy and unified Executor Homes exist; refusing to merge identities" >&2
+        exit 1
+    fi
+    WEGENT_EXECUTOR_HOME="$LEGACY_EXECUTOR_HOME"
+    export WEGENT_EXECUTOR_HOME
+fi
+# Keep project state and app-server configuration in the same persisted home.
+export CODEX_HOME="${CODEX_HOME:-${WEGENT_CODEX_HOME:-$WEGENT_EXECUTOR_HOME/codex}}"
+export WEGENT_CODEX_HOME="${WEGENT_CODEX_HOME:-$CODEX_HOME}"
+case "$LOCAL_WORKSPACE_ROOT/" in
+    "$EXPECTED_DATA_ROOT/workspace/"* | "$WEGENT_EXECUTOR_HOME/workspace/"*) ;;
+    *)
+        echo "LOCAL_WORKSPACE_ROOT must be inside a persisted workspace" >&2
+        exit 1
+        ;;
+esac
+# Repository overrides must not bypass the persistent workspace boundary.
+if [ -n "${WEGENT_EXECUTOR_PROJECTS_DIR:-}" ]; then
+    if [[ "$WEGENT_EXECUTOR_PROJECTS_DIR" != /* ]]; then
+        echo "WEGENT_EXECUTOR_PROJECTS_DIR must be an absolute path" >&2
+        exit 1
+    fi
+    case "$(realpath -m -- "$WEGENT_EXECUTOR_PROJECTS_DIR")/" in
+        "$EXPECTED_DATA_ROOT/workspace/"* | "$WEGENT_EXECUTOR_HOME/workspace/"*) ;;
+        *) echo "WEGENT_EXECUTOR_PROJECTS_DIR must be inside a persisted workspace" >&2; exit 1 ;;
+    esac
+fi
+DEVICE_LOG_DIR="$WEGENT_EXECUTOR_HOME/logs"
+case "${WEGENT_WORKTREE_PERSISTENT_STORAGE_VERIFIED-true}" in
+    true)
+        storage_roots=("$EXPECTED_DATA_ROOT")
+        if [ "$WEGENT_EXECUTOR_HOME" = "$LEGACY_EXECUTOR_HOME" ]; then
+            storage_roots+=("$LEGACY_EXECUTOR_HOME")
+        fi
+        for storage_root in "${storage_roots[@]}"; do
+            if ! mountpoint -q "$storage_root"; then
+                echo "Verified Worktree persistence requires a volume at $storage_root" >&2
+                exit 1
+            fi
+        done
+        if [ -z "${WEGENT_EXECUTOR_HOME_ID:-}" ]; then
+            echo "Verified Worktree persistence requires WEGENT_EXECUTOR_HOME_ID" >&2
+            exit 1
+        fi
+        ;;
+    false | "") ;;
+    *)
+        echo "WEGENT_WORKTREE_PERSISTENT_STORAGE_VERIFIED must be true or false" >&2
+        exit 1
+        ;;
+esac
+
+# A named volume mounted at WEGENT_EXECUTOR_HOME may contain an older binary.
+# Refresh only the binary from the current image and preserve the remaining data.
+mkdir -p \
+    "$EXPECTED_DATA_ROOT" \
+    "$WEGENT_EXECUTOR_HOME/bin" \
+    "$WEGENT_EXECUTOR_HOME/runtime-work" \
+    "$WEGENT_EXECUTOR_HOME/capabilities" \
+    "$WEGENT_EXECUTOR_HOME/sessions" \
+    "$LOCAL_WORKSPACE_ROOT/projects" \
+    "$LOCAL_WORKSPACE_ROOT/chats" \
+    "$LOCAL_WORKSPACE_ROOT/worktrees" \
+    "$DEVICE_LOG_DIR"
+
+# Hold an exclusive writer lock for the lifetime of this container. This
+# prevents two Executors from mutating the same home when the backing
+# filesystem provides normal POSIX advisory locking.
+exec 9>"$WEGENT_EXECUTOR_HOME/.writer.lock"
+if ! flock -n 9; then
+    echo "Another Executor is already using WEGENT_EXECUTOR_HOME" >&2
+    exit 1
+fi
+
+exec 8>"$EXPECTED_DATA_ROOT/.writer.lock"
+if ! flock -n 8; then
+    echo "Another Executor is already using the Wegent data volume" >&2
+    exit 1
+fi
+
+# A deployment may pin the volume identity to its logical device ID. Reusing a
+# volume belonging to another device is rejected before the Executor starts.
+if [ -n "${WEGENT_EXECUTOR_HOME_ID:-}" ]; then
+    for _home_id_file in "$WEGENT_EXECUTOR_HOME/.executor-home-id" "$EXPECTED_DATA_ROOT/.executor-home-id"; do
+        if [ -f "$_home_id_file" ]; then
+            _persisted_home_id="$(cat "$_home_id_file")"
+            if [ "$_persisted_home_id" != "$WEGENT_EXECUTOR_HOME_ID" ]; then
+                echo "Executor Home identity does not match WEGENT_EXECUTOR_HOME_ID" >&2
+                exit 1
+            fi
+        else
+            printf '%s' "$WEGENT_EXECUTOR_HOME_ID" >"$_home_id_file"
+        fi
+    done
+fi
+
+_write_probe="$WEGENT_EXECUTOR_HOME/.write-probe.$$"
+printf 'ok' >"$_write_probe"
+rm -f "$_write_probe"
+install -m 0755 /app/executor "$WEGENT_EXECUTOR_HOME/bin/wegent-executor"
+
+pids=()
+
+# Match the local device installer: code-server only listens on loopback and
+# leaves remote authentication to the token-gated device session gateway.
+if [ "$DEVICE_CODE_SERVER_ENABLED" = "true" ] && [ "$DEVICE_SESSION_GATEWAY_ENABLED" = "true" ]; then
+    mkdir -p "$HOME/.config/code-server"
+    printf "bind-addr: 127.0.0.1:%s\nauth: none\ncert: false\n" "$DEVICE_CODE_SERVER_PORT" >"$HOME/.config/code-server/config.yaml"
+    code-server /home/wegent \
+        --bind-addr "127.0.0.1:${DEVICE_CODE_SERVER_PORT}" \
+        --auth none \
+        --disable-telemetry \
+        --disable-update-check \
+        >"$DEVICE_LOG_DIR/code-server.log" \
+        2>"$DEVICE_LOG_DIR/code-server-error.log" &
+    pids+=("$!")
+fi
+
+if [ -n "${WEGENT_AUTH_TOKEN:-}" ]; then
+    wegent-executor >"$DEVICE_LOG_DIR/wegent-executor.log" 2>&1 &
+    pids+=("$!")
+else
+    echo "WEGENT_AUTH_TOKEN is not set; skipping wegent-executor startup" >&2
+fi
+
+trap 'if [ "${#pids[@]}" -gt 0 ]; then kill "${pids[@]}" 2>/dev/null || true; fi' TERM INT EXIT
+if [ "${#pids[@]}" -gt 0 ]; then
+    wait -n "${pids[@]}"
+else
+    tail -f /dev/null
+fi
+EOF
+
+RUN chmod 0755 /usr/local/bin/wegent-device-entrypoint
+
+USER wegent
+
+EXPOSE 17888 18080
+
+CMD ["wegent-device-entrypoint"]

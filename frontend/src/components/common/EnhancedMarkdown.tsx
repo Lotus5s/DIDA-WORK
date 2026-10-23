@@ -1,0 +1,815 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import React, { memo, useMemo, useState, useCallback } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfmSafe from '@/lib/remark-gfm-safe'
+import { autolinkUrls } from '@/lib/autolink-urls'
+import remarkMath from 'remark-math'
+import rehypeKatex from 'rehype-katex'
+import rehypeRaw from 'rehype-raw'
+import dynamic from 'next/dynamic'
+import type { Components } from 'react-markdown'
+import katex from 'katex'
+import { Check, Copy, Code, ChevronDown, ChevronUp } from 'lucide-react'
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
+import { oneDark, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import { createSchemeAwareUrlTransform } from '@/lib/scheme'
+import { createSmartMarkdownComponents } from '@/components/common/SmartUrlRenderer'
+import { SandboxedHtmlFrame } from '@/components/common/SandboxedHtmlFrame'
+
+import 'katex/dist/katex.min.css'
+
+// Dynamically import MermaidDiagram to avoid SSR issues
+const MermaidDiagram = dynamic(() => import('./MermaidDiagram'), {
+  ssr: false,
+  loading: () => (
+    <div className="my-4 p-8 rounded-lg border border-border bg-surface flex items-center justify-center">
+      <div className="flex items-center gap-3 text-text-secondary">
+        <div className="animate-spin rounded-full h-5 w-5 border-2 border-primary border-t-transparent" />
+        <span className="text-sm">Loading diagram...</span>
+      </div>
+    </div>
+  ),
+})
+
+interface EnhancedMarkdownProps {
+  source: string
+  theme: 'light' | 'dark'
+  /** Custom components to override default rendering */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  components?: Record<string, React.ComponentType<any>>
+}
+
+type ContentPart =
+  | { type: 'markdown' | 'mermaid' | 'latex'; content: string }
+  | { type: 'artifact'; title: string; content: string }
+
+const DEFAULT_ARTIFACT_TITLE = 'Artifact'
+
+function parseArtifactTitle(attributes: string): string {
+  const match = attributes.match(/\btitle\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i)
+  const title = (match?.[1] || match?.[2] || match?.[3] || '').trim()
+  return title || DEFAULT_ARTIFACT_TITLE
+}
+
+function isInsideFencedCodeBlock(source: string, index: number): boolean {
+  const precedingText = source.slice(0, index)
+  const fenceMatches = precedingText.match(/^```/gm)
+  return (fenceMatches?.length ?? 0) % 2 === 1
+}
+
+function splitArtifactBlocks(source: string): ContentPart[] {
+  const parts: ContentPart[] = []
+  const artifactRegex = /<artifact\b([^>]*)>([\s\S]*?)<\/artifact>/gi
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+
+  while ((match = artifactRegex.exec(source)) !== null) {
+    if (isInsideFencedCodeBlock(source, match.index)) {
+      continue
+    }
+
+    const markdownContent = source.slice(lastIndex, match.index)
+    if (markdownContent.trim()) {
+      parts.push({ type: 'markdown', content: markdownContent })
+    }
+
+    const artifactContent = match[2].trim()
+    if (artifactContent) {
+      parts.push({
+        type: 'artifact',
+        title: parseArtifactTitle(match[1]),
+        content: artifactContent,
+      })
+    }
+
+    lastIndex = match.index + match[0].length
+  }
+
+  const remainingContent = source.slice(lastIndex)
+  if (remainingContent.trim()) {
+    parts.push({ type: 'markdown', content: remainingContent })
+  }
+
+  return parts
+}
+
+function splitSpecialMarkdownBlocks(markdown: string): ContentPart[] {
+  const parts: ContentPart[] = []
+  const specialBlockRegex = /```[ \t]*(mermaid|latex)\b[^\n]*\n([\s\S]*?)```/gi
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+
+  while ((match = specialBlockRegex.exec(markdown)) !== null) {
+    if (match.index > lastIndex) {
+      const markdownContent = markdown.slice(lastIndex, match.index)
+      if (markdownContent.trim()) {
+        parts.push({ type: 'markdown', content: markdownContent })
+      }
+    }
+
+    const blockType = match[1].toLowerCase() as 'mermaid' | 'latex'
+    const blockCode = match[2].trim()
+    if (blockCode) {
+      parts.push({ type: blockType, content: blockCode })
+    }
+
+    lastIndex = match.index + match[0].length
+  }
+
+  if (lastIndex < markdown.length) {
+    const remainingContent = markdown.slice(lastIndex)
+    if (remainingContent.trim()) {
+      parts.push({ type: 'markdown', content: remainingContent })
+    }
+  }
+
+  if (parts.length === 0 && markdown.trim()) {
+    parts.push({ type: 'markdown', content: markdown })
+  }
+
+  return parts
+}
+
+function ArtifactPreview({ title, html }: { title: string; html: string }) {
+  return (
+    <div className="my-4 overflow-hidden rounded-lg border border-border bg-surface">
+      <div className="flex items-center justify-between border-b border-border px-3 py-2">
+        <span className="text-xs font-medium text-text-secondary">{title}</span>
+      </div>
+      <SandboxedHtmlFrame
+        title={title}
+        content={html}
+        className="block h-[520px] max-h-[70vh] min-h-[320px] w-full border-0 bg-white"
+        testId="artifact-preview-iframe"
+      />
+    </div>
+  )
+}
+
+/**
+ * Parse YAML frontmatter string into key-value pairs
+ * Handles simple scalar values, quoted strings, and list items
+ */
+function parseFrontmatter(yaml: string): Record<string, string | string[]> {
+  const result: Record<string, string | string[]> = {}
+  const lines = yaml.split('\n')
+  let currentKey: string | null = null
+  let currentList: string[] | null = null
+
+  for (const line of lines) {
+    // List item: "  - value"
+    const listItemMatch = line.match(/^\s+-\s+(.*)$/)
+    if (listItemMatch && currentKey && currentList) {
+      const value = listItemMatch[1].trim().replace(/^["']|["']$/g, '')
+      currentList.push(value)
+      continue
+    }
+
+    // Key-value pair: "key: value"
+    const kvMatch = line.match(/^([^:]+):\s*(.*)$/)
+    if (kvMatch) {
+      // Save previous list if any
+      if (currentKey && currentList) {
+        result[currentKey] = currentList
+      }
+      currentKey = kvMatch[1].trim()
+      const rawValue = kvMatch[2].trim()
+
+      if (rawValue === '' || rawValue === null) {
+        // Empty value - may be followed by list items
+        currentList = []
+        result[currentKey] = ''
+      } else {
+        currentList = null
+        // Remove surrounding quotes
+        result[currentKey] = rawValue.replace(/^["']|["']$/g, '')
+      }
+    }
+  }
+
+  // Save last list if any
+  if (currentKey && currentList && currentList.length > 0) {
+    result[currentKey] = currentList
+  }
+
+  return result
+}
+
+/**
+ * Renders YAML frontmatter as a styled metadata card
+ */
+function FrontmatterBlock({ yaml }: { yaml: string }) {
+  const [collapsed, setCollapsed] = useState(false)
+  const data = useMemo(() => parseFrontmatter(yaml), [yaml])
+  const entries = Object.entries(data).filter(([, v]) => {
+    if (Array.isArray(v)) return v.length > 0
+    return v !== ''
+  })
+
+  if (entries.length === 0) return null
+
+  return (
+    <div className="my-4 rounded-lg border border-border bg-surface overflow-hidden">
+      {/* Header */}
+      <button
+        onClick={() => setCollapsed(prev => !prev)}
+        className="w-full flex items-center justify-between px-3 py-2 bg-surface-hover/50 border-b border-border hover:bg-surface-hover transition-colors"
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-text-secondary uppercase tracking-wide">
+            Metadata
+          </span>
+        </div>
+        {collapsed ? (
+          <ChevronDown className="w-3.5 h-3.5 text-text-muted" />
+        ) : (
+          <ChevronUp className="w-3.5 h-3.5 text-text-muted" />
+        )}
+      </button>
+
+      {/* Content */}
+      {!collapsed && (
+        <div className="px-4 py-3 space-y-2">
+          {entries.map(([key, value]) => (
+            <div key={key} className="flex flex-wrap gap-x-3 gap-y-1 text-sm">
+              <span className="font-medium text-text-secondary min-w-[80px] shrink-0">{key}</span>
+              {Array.isArray(value) ? (
+                <div className="flex flex-wrap gap-1">
+                  {value.map((item, i) => (
+                    <span
+                      key={i}
+                      className="inline-flex items-center px-2 py-0.5 rounded-full bg-primary/10 text-primary text-xs font-medium"
+                    >
+                      {item}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <span className="text-text-primary break-all">{value}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Extract YAML frontmatter from markdown source and return both the frontmatter
+ * content and the remaining markdown body
+ */
+function extractFrontmatter(source: string): { frontmatter: string | null; body: string } {
+  const match = source.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
+  if (match && isLikelyYamlFrontmatter(match[1])) {
+    return { frontmatter: match[1], body: match[2] }
+  }
+  return { frontmatter: null, body: source }
+}
+
+function isLikelyYamlFrontmatter(value: string): boolean {
+  return value.split(/\r?\n/).some(line => /^[A-Za-z0-9_-]+:\s*.*$/.test(line.trim()))
+}
+
+/**
+ * Parse LaTeX code and extract individual formulas
+ * Handles multiple $$...$$, \[...\], and standalone formulas
+ * Also removes LaTeX comments (lines starting with %)
+ */
+function parseLatexFormulas(code: string): string[] {
+  const formulas: string[] = []
+  // Remove LaTeX comments (lines starting with %)
+  const codeWithoutComments = code
+    .split('\n')
+    .filter(line => !line.trim().startsWith('%'))
+    .join('\n')
+    .trim()
+
+  // Match all $$...$$ blocks
+  const dollarBlockRegex = /\$\$([\s\S]*?)\$\$/g
+  // Match all \[...\] blocks
+  const bracketBlockRegex = /\\\[([\s\S]*?)\\\]/g
+
+  let match
+  let hasMatches = false
+
+  // Extract $$...$$ blocks
+  while ((match = dollarBlockRegex.exec(codeWithoutComments)) !== null) {
+    hasMatches = true
+    const formula = match[1].trim()
+    if (formula) {
+      formulas.push(formula)
+    }
+  }
+
+  // Extract \[...\] blocks
+  while ((match = bracketBlockRegex.exec(codeWithoutComments)) !== null) {
+    hasMatches = true
+    const formula = match[1].trim()
+    if (formula) {
+      formulas.push(formula)
+    }
+  }
+
+  // If no blocks found, treat the entire content as a single formula
+  if (!hasMatches && codeWithoutComments) {
+    formulas.push(codeWithoutComments)
+  }
+
+  return formulas
+}
+
+/**
+ * Component to render LaTeX code blocks using KaTeX
+ * Supports multiple formulas separated by $$...$$ blocks
+ * Includes toolbar with copy and view source functionality
+ */
+function LaTeXBlock({ code }: { code: string }) {
+  const [showSource, setShowSource] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const formulas = useMemo(() => parseLatexFormulas(code), [code])
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(code)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch (err) {
+      console.error('Failed to copy LaTeX code:', err)
+    }
+  }, [code])
+
+  const toggleSource = useCallback(() => {
+    setShowSource(prev => !prev)
+  }, [])
+
+  const renderedFormulas = useMemo(() => {
+    return formulas.map((formula, index) => {
+      try {
+        return {
+          html: katex.renderToString(formula, {
+            displayMode: true,
+            throwOnError: false,
+            strict: false,
+          }),
+          error: null,
+          key: index,
+        }
+      } catch (error) {
+        console.error('KaTeX rendering error:', error)
+        return {
+          html: `<span class="text-red-500">LaTeX Error: ${error instanceof Error ? error.message : 'Unknown error'}</span>`,
+          error: error,
+          key: index,
+        }
+      }
+    })
+  }, [formulas])
+
+  return (
+    <div className="group my-4 rounded-lg border border-border bg-surface overflow-hidden">
+      {/* Toolbar */}
+      <div className="flex items-center justify-between px-3 py-1.5 bg-surface-hover/50 border-b border-border">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-text-secondary">LaTeX</span>
+        </div>
+        <div className="flex items-center gap-1">
+          {/* View Source Button */}
+          <button
+            onClick={toggleSource}
+            className="flex items-center gap-1 px-2 py-1 rounded text-xs text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
+            title={showSource ? 'Hide source' : 'View source'}
+          >
+            <Code className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">{showSource ? 'Hide' : 'Source'}</span>
+            {showSource ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+          </button>
+          {/* Copy Button */}
+          <button
+            onClick={handleCopy}
+            className="flex items-center gap-1 px-2 py-1 rounded text-xs text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
+            title={copied ? 'Copied!' : 'Copy LaTeX code'}
+          >
+            {copied ? (
+              <>
+                <Check className="w-3.5 h-3.5 text-green-500" />
+                <span className="hidden sm:inline text-green-500">Copied</span>
+              </>
+            ) : (
+              <>
+                <Copy className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Copy</span>
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* Source Code (collapsible) */}
+      {showSource && (
+        <div className="px-4 py-3 bg-slate-50 dark:bg-slate-900/50 border-b border-border">
+          <pre className="text-sm font-mono text-text-primary whitespace-pre-wrap break-words overflow-x-auto">
+            {code}
+          </pre>
+        </div>
+      )}
+
+      {/* Rendered Formulas */}
+      <div className="px-4 py-3">
+        {renderedFormulas.map(item => (
+          <div
+            key={item.key}
+            className="katex-display overflow-x-auto"
+            dangerouslySetInnerHTML={{ __html: item.html }}
+          />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Component to render code blocks with syntax highlighting and copy functionality
+ * Includes toolbar with language label and copy button
+ */
+interface CodeBlockProps {
+  language: string
+  code: string
+  theme: 'light' | 'dark'
+}
+
+function CodeBlock({ language, code, theme }: CodeBlockProps) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(code)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch (err) {
+      console.error('Failed to copy code:', err)
+    }
+  }, [code])
+
+  // Map common language aliases to syntax highlighter language names
+  const normalizeLanguage = (lang: string): string => {
+    const languageMap: Record<string, string> = {
+      js: 'javascript',
+      ts: 'typescript',
+      py: 'python',
+      rb: 'ruby',
+      sh: 'bash',
+      shell: 'bash',
+      zsh: 'bash',
+      yml: 'yaml',
+      // Map markdown to text to avoid syntax highlighting issues with table tokens
+      // The Prism markdown highlighter creates table-related CSS classes that cause display problems
+      md: 'text',
+      markdown: 'text',
+      dockerfile: 'docker',
+      plaintext: 'text',
+      txt: 'text',
+    }
+    return languageMap[lang.toLowerCase()] || lang.toLowerCase()
+  }
+
+  const normalizedLanguage = normalizeLanguage(language)
+  const displayLanguage = language || 'text'
+
+  return (
+    <div className="group my-4 rounded-lg border border-border bg-surface overflow-hidden">
+      {/* Toolbar */}
+      <div className="flex items-center justify-between px-3 py-1.5 bg-surface-hover/50 border-b border-border">
+        <div className="flex items-center gap-2">
+          <Code className="w-3.5 h-3.5 text-text-secondary" />
+          <span className="text-xs font-medium text-text-secondary">{displayLanguage}</span>
+        </div>
+        <div className="flex items-center gap-1">
+          {/* Copy Button */}
+          <button
+            onClick={handleCopy}
+            className="flex items-center gap-1 px-2 py-1 rounded text-xs text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
+            title={copied ? 'Copied!' : 'Copy code'}
+          >
+            {copied ? (
+              <>
+                <Check className="w-3.5 h-3.5 text-green-500" />
+                <span className="hidden sm:inline text-green-500">Copied</span>
+              </>
+            ) : (
+              <>
+                <Copy className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Copy</span>
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* Code Content with Syntax Highlighting */}
+      <div className="overflow-x-auto">
+        <SyntaxHighlighter
+          language={normalizedLanguage}
+          style={theme === 'dark' ? oneDark : oneLight}
+          customStyle={{
+            margin: 0,
+            padding: '1rem',
+            background: 'transparent',
+            fontSize: '0.875rem',
+            lineHeight: '1.5',
+          }}
+          codeTagProps={{
+            style: {
+              fontFamily:
+                'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+            },
+          }}
+          showLineNumbers={code.split('\n').length > 3}
+          lineNumberStyle={{
+            minWidth: '2.5em',
+            paddingRight: '1em',
+            color: theme === 'dark' ? '#6b7280' : '#9ca3af',
+            userSelect: 'none',
+          }}
+          wrapLines={true}
+          wrapLongLines={false}
+        >
+          {code}
+        </SyntaxHighlighter>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Check if the content contains LaTeX math formulas
+ * Supports: $...$, $$...$$, \[...\], \(...\), \begin{...}...\end{...}, ```latex code blocks
+ */
+function containsMathFormulas(text: string): boolean {
+  // Check for inline math: $...$
+  const inlineMathRegex = /\$[^$\n]+\$/
+  // Check for block math: $$...$$
+  const blockMathRegex = /\$\$[\s\S]+?\$\$/
+  // Check for display math: \[...\]
+  const displayMathRegex = /\\\[[\s\S]+?\\\]/
+  // Check for inline math: \(...\)
+  const inlineParenMathRegex = /\\\([\s\S]+?\\\)/
+  // Check for LaTeX environments: \begin{...}...\end{...}
+  const latexEnvRegex = /\\begin\{[^}]+\}[\s\S]*?\\end\{[^}]+\}/
+  // Check for latex code blocks: ```latex
+  const latexCodeBlockRegex = /```latex\s*\n/
+
+  return (
+    inlineMathRegex.test(text) ||
+    blockMathRegex.test(text) ||
+    displayMathRegex.test(text) ||
+    inlineParenMathRegex.test(text) ||
+    latexEnvRegex.test(text) ||
+    latexCodeBlockRegex.test(text)
+  )
+}
+/**
+ * Pre-process LaTeX syntax to convert \[...\] and \(...\) to $$...$$ and $...$
+ * This is necessary because Markdown parsers escape backslashes, so \[ becomes [
+ * By converting to dollar syntax first, we ensure proper math rendering
+ */
+function preprocessLatexSyntax(text: string): string {
+  // Convert \[...\] to $$...$$ (display math)
+  // Use a regex that matches \[ followed by content and \]
+  let result = text.replace(/\\\[([\s\S]*?)\\\]/g, (_, content) => {
+    return `$$${content}$$`
+  })
+
+  // Convert \(...\) to $...$ (inline math)
+  result = result.replace(/\\\(([\s\S]*?)\\\)/g, (_, content) => {
+    return `$${content}$`
+  })
+
+  return result
+}
+
+/**
+ * Pre-process bold/italic markdown to fix CJK punctuation edge cases.
+ *
+ * Per CommonMark spec, a right-flanking delimiter run (**) requires:
+ *   - NOT preceded by Unicode whitespace, AND
+ *   - either NOT preceded by Unicode punctuation,
+ *     OR preceded by punctuation but followed by whitespace or punctuation.
+ *
+ * Full-width CJK closing punctuation (e.g. ）、。，】） is Unicode punctuation (Pe/Po),
+ * so "text）**" fails the right-flanking check when followed by a non-punctuation
+ * character like a CJK letter, causing ** to NOT be recognized as a closing delimiter.
+ *
+ * Fix: insert a zero-width space (U+200B) between the CJK/full-width punctuation
+ * and the closing **, making ** "preceded by whitespace" and thus a valid
+ * right-flanking delimiter.
+ *
+ * This is the standard approach recommended by the micromark/remark community.
+ * See: https://github.com/micromark/micromark/issues/123
+ */
+function preprocessCjkBoldEdgeCases(text: string): string {
+  // Full-width and CJK punctuation Unicode ranges:
+  //   \u3000-\u303F  CJK Symbols and Punctuation (e.g. 。、「」【】)
+  //   \uFF00-\uFFEF  Halfwidth and Fullwidth Forms (e.g. ）（！？，。)
+  //   \u2018-\u201F  General quotation marks (' ' " ")
+  //   \u2E00-\u2E7F  Supplemental Punctuation
+  // Insert U+200B (zero-width space) between such punctuation and ** or *
+  // so that the asterisks become valid right-flanking delimiters.
+  return text
+    .replace(/([\u3000-\u303F\uFF00-\uFFEF\u2018-\u201F\u2E00-\u2E7F])\*\*/g, '$1\u200B**')
+    .replace(/([\u3000-\u303F\uFF00-\uFFEF\u2018-\u201F\u2E00-\u2E7F])\*(?!\*)/g, '$1\u200B*')
+}
+
+/**
+ * Enhanced Markdown renderer with Mermaid diagram and LaTeX math formula support
+ *
+ * Detects ```mermaid code blocks and renders them using MermaidDiagram component.
+ * Supports LaTeX math formulas with $...$ for inline and $$...$$ for block math.
+ * Also supports \[...\] and \(...\) syntax by converting them to dollar syntax.
+ * All other markdown is rendered using react-markdown with remark/rehype plugins.
+ */
+export const EnhancedMarkdown = memo(function EnhancedMarkdown({
+  source,
+  theme,
+  components,
+}: EnhancedMarkdownProps) {
+  // Extract frontmatter before processing
+  const { frontmatter, body } = useMemo(() => extractFrontmatter(source), [source])
+
+  const contentParts = useMemo(() => {
+    const rawParts = splitArtifactBlocks(body)
+    const normalizedParts =
+      rawParts.length > 0 ? rawParts : [{ type: 'markdown' as const, content: body }]
+
+    return normalizedParts.flatMap(part => {
+      if (part.type === 'artifact') return [part]
+
+      const processedMarkdown = autolinkUrls(
+        preprocessCjkBoldEdgeCases(preprocessLatexSyntax(part.content))
+      )
+      return splitSpecialMarkdownBlocks(processedMarkdown)
+    })
+  }, [body])
+
+  // Check if source contains math formulas
+  const hasMath = useMemo(
+    () =>
+      contentParts.some(
+        part =>
+          (part.type === 'markdown' || part.type === 'latex') && containsMathFormulas(part.content)
+      ),
+    [contentParts]
+  )
+
+  // Default components with link handling and code block rendering
+  const defaultComponents = useMemo(
+    (): Components => ({
+      // Merge smart components for attachment and image handling
+      ...createSmartMarkdownComponents({ enableImagePreview: true }),
+      // Restore list styles that Tailwind preflight resets
+      ul: ({ children, ...props }) => (
+        <ul
+          style={{ listStyleType: 'disc', paddingLeft: '1.5em', marginBottom: '0.75em' }}
+          {...props}
+        >
+          {children}
+        </ul>
+      ),
+      ol: ({ children, ...props }) => (
+        <ol
+          style={{ listStyleType: 'decimal', paddingLeft: '1.5em', marginBottom: '0.75em' }}
+          {...props}
+        >
+          {children}
+        </ol>
+      ),
+      li: ({ children, ...props }) => (
+        <li style={{ marginBottom: '0.25em' }} {...props}>
+          {children}
+        </li>
+      ),
+      // Custom code block rendering with syntax highlighting
+      code: ({ className, children, ...props }) => {
+        // Check if this is an inline code or a code block
+        // Code blocks are wrapped in <pre> and have a className with language
+        const codeString = String(children)
+        const match = /language-(\w+)/.exec(className || '')
+        // Code blocks contain newlines, inline code does not
+        // Also check for language- prefix to handle ``` (no language) code blocks
+        const hasNewlines = codeString.includes('\n')
+        const isInline = !hasNewlines && !match && !className?.includes('language-')
+
+        // For inline code, render as simple <code> element
+        if (isInline) {
+          return (
+            <code
+              className="px-1.5 py-0.5 rounded bg-surface-hover text-text-primary font-mono text-sm"
+              {...props}
+            >
+              {children}
+            </code>
+          )
+        }
+
+        // For code blocks, extract language and code content
+        const language = match ? match[1] : ''
+        const codeBlockContent = codeString.replace(/\n$/, '')
+
+        return <CodeBlock language={language} code={codeBlockContent} theme={theme} />
+      },
+      // Override pre to avoid double wrapping
+      pre: ({ children }) => <>{children}</>,
+      ...components,
+    }),
+    [components, theme]
+  )
+
+  // Configure remark/rehype plugins based on content
+  const remarkPlugins = useMemo(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const plugins: any[] = [remarkGfmSafe]
+    if (hasMath) {
+      // Enable singleDollarTextMath to support $...$ inline math
+      plugins.push([remarkMath, { singleDollarTextMath: true }])
+    }
+    return plugins
+  }, [hasMath])
+
+  const rehypePlugins = useMemo(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const plugins: any[] = []
+    // rehypeKatex must come before rehypeRaw to properly render math formulas
+    if (hasMath) {
+      // Configure rehypeKatex with strict: false to handle edge cases
+      plugins.push([
+        rehypeKatex,
+        {
+          strict: false,
+          throwOnError: false,
+        },
+      ])
+    }
+    plugins.push(rehypeRaw)
+    return plugins
+  }, [hasMath])
+
+  // URL transform to allow wegent:// and attachment:// scheme URLs
+  const urlTransform = useMemo(() => createSchemeAwareUrlTransform(['wegent:', 'attachment:']), [])
+
+  // Render markdown content
+  const renderMarkdown = (content: string) => (
+    <ReactMarkdown
+      remarkPlugins={remarkPlugins}
+      rehypePlugins={rehypePlugins}
+      components={defaultComponents}
+      urlTransform={urlTransform}
+    >
+      {content}
+    </ReactMarkdown>
+  )
+
+  // If no special blocks, render normally
+  if (contentParts.length === 1 && contentParts[0].type === 'markdown') {
+    return (
+      <div className="wmde-markdown markdown-content" data-color-mode={theme}>
+        {frontmatter && <FrontmatterBlock yaml={frontmatter} />}
+        {renderMarkdown(contentParts[0].content)}
+      </div>
+    )
+  }
+
+  // Render mixed content with mermaid diagrams and latex blocks
+  return (
+    <div className="wmde-markdown enhanced-markdown" data-color-mode={theme}>
+      {frontmatter && <FrontmatterBlock yaml={frontmatter} />}
+      {contentParts.map((part, index) => {
+        if (part.type === 'mermaid') {
+          return <MermaidDiagram key={`mermaid-${index}`} code={part.content} />
+        }
+
+        if (part.type === 'latex') {
+          return <LaTeXBlock key={`latex-${index}`} code={part.content} />
+        }
+
+        if (part.type === 'artifact') {
+          return (
+            <ArtifactPreview key={`artifact-${index}`} title={part.title} html={part.content} />
+          )
+        }
+
+        return (
+          <div key={`markdown-${index}`} className="markdown-content">
+            {renderMarkdown(part.content)}
+          </div>
+        )
+      })}
+    </div>
+  )
+})
+
+export default EnhancedMarkdown

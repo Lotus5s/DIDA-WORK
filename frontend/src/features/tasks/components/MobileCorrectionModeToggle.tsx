@@ -1,0 +1,215 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import React, { useState, useEffect, useMemo, useRef } from 'react'
+import { Sparkles } from 'lucide-react'
+import { cn } from '@/lib/utils'
+import { useTranslation } from '@/hooks/useTranslation'
+import { MobileSwitchIndicator } from './mobile-switch-indicator'
+import { Drawer, DrawerContent, DrawerTitle } from '@/components/ui/drawer'
+import {
+  ModelCascadeContent,
+  type ModelCascadeLabels,
+} from '@/components/model-select/ModelCascadeSelect'
+import { modelApis, UnifiedModel } from '@/apis/models'
+import { correctionApis, CorrectionModeState } from '@/apis/correction'
+
+interface MobileCorrectionModeToggleProps {
+  enabled: boolean
+  onToggle: (enabled: boolean, modelId?: string, modelName?: string) => void
+  disabled?: boolean
+  correctionModelName?: string | null
+  taskId: number | null
+  onSelectorOpenChange?: (open: boolean) => void
+}
+
+/**
+ * Mobile-specific Correction Mode Toggle
+ * Renders as a full-width clickable row with a switch
+ */
+export default function MobileCorrectionModeToggle({
+  enabled,
+  onToggle,
+  disabled = false,
+  correctionModelName,
+  taskId,
+  onSelectorOpenChange,
+}: MobileCorrectionModeToggleProps) {
+  const { t } = useTranslation('chat')
+  const [showModelSelector, setShowModelSelector] = useState(false)
+  const [models, setModels] = useState<UnifiedModel[]>([])
+  const [isLoading, setIsLoading] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+
+  const prevTaskIdRef = useRef<number | null | undefined>(undefined)
+
+  useEffect(() => {
+    if (showModelSelector) {
+      loadModels()
+    }
+  }, [showModelSelector])
+
+  useEffect(() => {
+    const prevTaskId = prevTaskIdRef.current
+
+    if (prevTaskId === null && taskId !== null && taskId > 0) {
+      const migratedState = correctionApis.migrateCorrectionModeState(null, taskId)
+      if (migratedState && migratedState.enabled && migratedState.correctionModelId) {
+        onToggle(
+          true,
+          migratedState.correctionModelId,
+          migratedState.correctionModelName || undefined
+        )
+        prevTaskIdRef.current = taskId
+        return
+      }
+    }
+
+    const savedState = correctionApis.getCorrectionModeState(taskId)
+    if (savedState.enabled && savedState.correctionModelId) {
+      onToggle(true, savedState.correctionModelId, savedState.correctionModelName || undefined)
+    } else {
+      onToggle(false)
+    }
+
+    prevTaskIdRef.current = taskId
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskId])
+
+  const loadModels = async () => {
+    setIsLoading(true)
+    try {
+      const response = await modelApis.getUnifiedModels(undefined, false, 'all', undefined, 'llm')
+      setModels(response.data || [])
+    } catch (error) {
+      console.error('Failed to load models:', error)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleClick = () => {
+    if (disabled) return
+
+    if (!enabled) {
+      handleModelSelectorOpenChange(true)
+    } else {
+      onToggle(false)
+      correctionApis.clearCorrectionModeState(taskId)
+    }
+  }
+
+  const handleModelSelect = (model: UnifiedModel) => {
+    const displayName = model.displayName || model.name
+    onToggle(true, model.name, displayName)
+
+    const state: CorrectionModeState = {
+      enabled: true,
+      correctionModelId: model.name,
+      correctionModelName: displayName,
+      enableWebSearch: true,
+    }
+    correctionApis.saveCorrectionModeState(taskId, state)
+
+    handleModelSelectorOpenChange(false)
+  }
+
+  const handleModelSelectorOpenChange = (open: boolean) => {
+    setShowModelSelector(open)
+    onSelectorOpenChange?.(open)
+    if (!open) {
+      setSearchQuery('')
+    }
+  }
+
+  const cascadeLabels: ModelCascadeLabels = useMemo(
+    () => ({
+      ungrouped: t('common:models.ungrouped', 'Ungrouped'),
+      uncategorized: t('common:models.uncategorized', 'Uncategorized'),
+      searchPlaceholder: t('common:models.search_models', 'Search models or groups...'),
+      searchResults: t('common:models.search_results', 'Search results'),
+      noModels: t('correction.no_models'),
+      noMatch: t('common:models.no_match', 'No matching models'),
+      primaryGroups: t('common:models.primary_groups', 'Primary groups'),
+      secondaryGroups: t('common:models.secondary_groups', 'Secondary groups'),
+    }),
+    [t]
+  )
+
+  return (
+    <>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={enabled}
+        onClick={handleClick}
+        disabled={disabled}
+        data-testid="mobile-correction-mode-toggle"
+        className={cn(
+          'w-full min-h-11 flex items-center justify-between px-3 py-2.5',
+          'text-left transition-colors',
+          'hover:bg-hover active:bg-hover',
+          'disabled:opacity-50 disabled:cursor-not-allowed'
+        )}
+      >
+        <div className="flex items-center gap-3">
+          <Sparkles className="h-4 w-4 text-text-muted" />
+          <div className="flex flex-col">
+            <span className="text-sm">{t('correction.label')}</span>
+            {enabled && correctionModelName && (
+              <span className="text-xs text-text-muted truncate max-w-[120px]">
+                {correctionModelName}
+              </span>
+            )}
+          </div>
+        </div>
+        <MobileSwitchIndicator checked={enabled} disabled={disabled} />
+      </button>
+
+      <Drawer
+        open={showModelSelector}
+        onOpenChange={handleModelSelectorOpenChange}
+        shouldScaleBackground={false}
+      >
+        <DrawerContent
+          className="max-h-[85vh] overflow-hidden bg-[#f2f2f7] dark:bg-[#1c1c1e]"
+          showHandle={false}
+          data-testid="mobile-correction-model-drawer"
+        >
+          <div className="flex justify-center pb-3 pt-2">
+            <div className="h-1 w-9 rounded-full bg-[#3c3c43]/30 dark:bg-[#5c5c5e]" />
+          </div>
+          <DrawerTitle className="px-4 pb-2 text-base font-semibold text-text-primary">
+            {t('correction.select_model')}
+          </DrawerTitle>
+          {isLoading ? (
+            <div className="flex h-[320px] items-center justify-center">
+              <div className="h-6 w-6 animate-spin rounded-full border-b-2 border-primary" />
+            </div>
+          ) : (
+            <ModelCascadeContent
+              models={models}
+              labels={cascadeLabels}
+              searchValue={searchQuery}
+              onSearchValueChange={setSearchQuery}
+              onSelectModel={handleModelSelect}
+              getModelKey={model => `${model.type}-${model.name}`}
+              variant="mobile"
+              className="w-full bg-transparent [&_input]:h-11"
+              renderModelBadges={model => (
+                <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-text-muted">
+                  {model.type === 'public'
+                    ? t('correction.public_model')
+                    : t('correction.user_model')}
+                </span>
+              )}
+            />
+          )}
+        </DrawerContent>
+      </Drawer>
+    </>
+  )
+}

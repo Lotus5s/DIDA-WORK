@@ -1,0 +1,438 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for executor recovery in the unified dispatch path."""
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.models.subtask import Subtask
+from app.models.task import TaskResource
+from app.services.execution.dispatcher import ExecutionDispatcher
+from app.services.execution.router import CommunicationMode, ExecutionTarget
+from shared.models import ExecutionRequest
+
+
+@pytest.mark.asyncio
+async def test_dispatch_recovers_deleted_executor_before_http_callback():
+    """HTTP callback dispatch should recover a deleted executor before dispatching."""
+    dispatcher = ExecutionDispatcher()
+    request = ExecutionRequest(
+        task_id=1385,
+        subtask_id=1861,
+        message_id=3,
+        user={"id": 7, "name": "user7"},
+        user_id=7,
+        user_name="user7",
+        bot=[{"shell_type": "ClaudeCode"}],
+        executor_name="old-executor",
+    )
+    emitter = AsyncMock()
+
+    subtask = MagicMock(spec=Subtask)
+    subtask.executor_deleted_at = True
+    subtask.executor_name = "old-executor"
+    subtask.executor_namespace = ""
+
+    task = MagicMock(spec=TaskResource)
+    task.id = 1385
+    task.kind = "Task"
+
+    db = MagicMock()
+
+    async def recover_side_effect(*, db, subtask, task, request):
+        # Recovery service now returns executor info instead of updating subtask
+        request.executor_name = "recovered-executor"
+        request.executor_namespace = "default"
+        return {
+            "executor_name": "recovered-executor",
+            "executor_namespace": "default",
+        }
+
+    recovery_service = MagicMock()
+    recovery_service.recover = AsyncMock(side_effect=recover_side_effect)
+
+    target = ExecutionTarget(
+        mode=CommunicationMode.HTTP_CALLBACK,
+        url="http://executor-manager/executor-manager",
+    )
+
+    with (
+        patch(
+            "app.services.execution.dispatcher.SessionLocal",
+            return_value=db,
+            create=True,
+        ),
+        patch(
+            "app.services.execution.dispatcher.recovery_service",
+            recovery_service,
+            create=True,
+        ),
+        patch(
+            "app.services.execution.dispatcher.subtask_store.get_by_id",
+            return_value=subtask,
+        ) as get_subtask_mock,
+        patch(
+            "app.services.execution.dispatcher.task_store.get_by_id",
+            return_value=task,
+        ) as get_task_mock,
+        patch.object(dispatcher.router, "route", return_value=target),
+        patch.object(dispatcher, "_update_subtask_to_running", AsyncMock()),
+        patch.object(
+            dispatcher, "_dispatch_http_callback", AsyncMock()
+        ) as dispatch_mock,
+    ):
+        await dispatcher.dispatch(request, emitter=emitter)
+
+    recovery_service.recover.assert_awaited_once()
+    get_subtask_mock.assert_called_once_with(db, subtask_id=request.subtask_id)
+    get_task_mock.assert_called_once_with(db, task_id=request.task_id)
+    db.query.assert_not_called()
+    assert request.executor_name == "recovered-executor"
+    assert request.executor_namespace == "default"
+    dispatch_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_raises_when_recovery_returns_false_and_emits_error():
+    """Dispatch should fail fast when executor recovery reports failure."""
+    dispatcher = ExecutionDispatcher()
+    request = ExecutionRequest(
+        task_id=2468,
+        subtask_id=9753,
+        message_id=7,
+        user={"id": 7, "name": "user7"},
+        user_id=7,
+        user_name="user7",
+        bot=[{"shell_type": "ClaudeCode"}],
+        executor_name="deleted-executor",
+    )
+    emitter = AsyncMock()
+
+    subtask = MagicMock(spec=Subtask)
+    subtask.executor_deleted_at = True
+    subtask.executor_name = "deleted-executor"
+    subtask.executor_namespace = ""
+
+    task = MagicMock(spec=TaskResource)
+    task.id = 2468
+    task.kind = "Task"
+
+    db = MagicMock()
+    task.json = {}
+
+    recovery_service = MagicMock()
+    recovery_service.recover = AsyncMock(
+        return_value=None
+    )  # Failed recovery returns None
+
+    with (
+        patch(
+            "app.services.execution.dispatcher.SessionLocal",
+            return_value=db,
+            create=True,
+        ),
+        patch(
+            "app.services.execution.dispatcher.recovery_service",
+            recovery_service,
+            create=True,
+        ),
+        patch(
+            "app.services.execution.dispatcher.subtask_store.get_by_id",
+            return_value=subtask,
+        ) as get_subtask_mock,
+        patch(
+            "app.services.execution.dispatcher.task_store.get_by_id",
+            return_value=task,
+        ) as get_task_mock,
+        patch.object(dispatcher, "_update_subtask_to_running", AsyncMock()),
+        patch.object(
+            dispatcher, "_dispatch_http_callback", AsyncMock()
+        ) as dispatch_mock,
+    ):
+        with pytest.raises(RuntimeError, match="Failed to recover executor"):
+            await dispatcher.dispatch(request, emitter=emitter)
+
+    recovery_service.recover.assert_awaited_once()
+    get_subtask_mock.assert_called_once_with(db, subtask_id=request.subtask_id)
+    get_task_mock.assert_called_once_with(db, task_id=request.task_id)
+    db.query.assert_not_called()
+    dispatch_mock.assert_not_awaited()
+    emitter.emit_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_recovery_for_chat_shell():
+    """Recovery should not run for non-local executor shell types."""
+    dispatcher = ExecutionDispatcher()
+    request = ExecutionRequest(
+        task_id=1385,
+        subtask_id=1861,
+        message_id=3,
+        user={"id": 7, "name": "user7"},
+        user_id=7,
+        user_name="user7",
+        bot=[{"shell_type": "Chat"}],
+        executor_name="existing-executor",
+    )
+    emitter = AsyncMock()
+
+    recovery_service = MagicMock()
+    recovery_service.recover = AsyncMock()
+
+    target = ExecutionTarget(
+        mode=CommunicationMode.HTTP_CALLBACK,
+        url="http://executor-manager/executor-manager",
+    )
+
+    with (
+        patch(
+            "app.services.execution.dispatcher.recovery_service",
+            recovery_service,
+            create=True,
+        ),
+        patch.object(dispatcher.router, "route", return_value=target),
+        patch.object(dispatcher, "_update_subtask_to_running", AsyncMock()),
+        patch.object(
+            dispatcher, "_dispatch_http_callback", AsyncMock()
+        ) as dispatch_mock,
+    ):
+        await dispatcher.dispatch(request, emitter=emitter)
+
+    recovery_service.recover.assert_not_awaited()
+    dispatch_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_does_not_scan_historical_deleted_subtasks():
+    """Dispatch should only recover when the current subtask is marked deleted."""
+    dispatcher = ExecutionDispatcher()
+    request = ExecutionRequest(
+        task_id=1385,
+        subtask_id=1861,
+        message_id=3,
+        user={"id": 7, "name": "user7"},
+        user_id=7,
+        user_name="user7",
+        bot=[{"shell_type": "ClaudeCode"}],
+        executor_name="active-executor",
+        executor_namespace="default",
+    )
+    emitter = AsyncMock()
+
+    subtask = MagicMock(spec=Subtask)
+    subtask.id = 1861
+    subtask.executor_deleted_at = False
+    subtask.executor_name = "active-executor"
+    subtask.executor_namespace = "default"
+
+    db = MagicMock()
+
+    recovery_service = MagicMock()
+    recovery_service.recover = AsyncMock()
+
+    target = ExecutionTarget(
+        mode=CommunicationMode.HTTP_CALLBACK,
+        url="http://executor-manager/executor-manager",
+    )
+
+    with (
+        patch(
+            "app.services.execution.dispatcher.SessionLocal",
+            return_value=db,
+            create=True,
+        ),
+        patch(
+            "app.services.execution.dispatcher.recovery_service",
+            recovery_service,
+            create=True,
+        ),
+        patch(
+            "app.services.execution.dispatcher.subtask_store.get_by_id",
+            return_value=subtask,
+        ) as get_subtask_mock,
+        patch.object(dispatcher.router, "route", return_value=target),
+        patch.object(dispatcher, "_update_subtask_to_running", AsyncMock()),
+        patch.object(
+            dispatcher, "_dispatch_http_callback", AsyncMock()
+        ) as dispatch_mock,
+    ):
+        await dispatcher.dispatch(request, emitter=emitter)
+
+    recovery_service.recover.assert_not_awaited()
+    get_subtask_mock.assert_called_once_with(db, subtask_id=request.subtask_id)
+    db.query.assert_not_called()
+    dispatch_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_restores_fork_workspace_archive_before_first_run():
+    """A forked task with workspace archive should restore it before dispatch."""
+    dispatcher = ExecutionDispatcher()
+    request = ExecutionRequest(
+        task_id=1385,
+        subtask_id=1861,
+        message_id=3,
+        user={"id": 7, "name": "user7"},
+        user_id=7,
+        user_name="user7",
+        bot=[{"shell_type": "ClaudeCode"}],
+        executor_name=None,
+        fork_runtime={
+            "workspaceArchive": {
+                "sourceTaskId": 1,
+                "storageKey": "workspace-archives/1/archive.tar.gz",
+            }
+        },
+    )
+    emitter = AsyncMock()
+
+    subtask = MagicMock(spec=Subtask)
+    subtask.id = 1861
+    subtask.executor_deleted_at = False
+    subtask.executor_name = None
+    subtask.executor_namespace = None
+
+    task = MagicMock(spec=TaskResource)
+    task.id = 1385
+    task.kind = "Task"
+
+    db = MagicMock()
+
+    recovery_service = MagicMock()
+    recovery_service.recover = AsyncMock(
+        return_value={
+            "executor_name": "fork-restored-executor",
+            "executor_namespace": "default",
+        }
+    )
+
+    target = ExecutionTarget(
+        mode=CommunicationMode.HTTP_CALLBACK,
+        url="http://executor-manager/executor-manager",
+    )
+
+    with (
+        patch(
+            "app.services.execution.dispatcher.SessionLocal",
+            return_value=db,
+            create=True,
+        ),
+        patch(
+            "app.services.execution.dispatcher.recovery_service",
+            recovery_service,
+            create=True,
+        ),
+        patch(
+            "app.services.execution.dispatcher.subtask_store.get_by_id",
+            return_value=subtask,
+        ) as get_subtask_mock,
+        patch(
+            "app.services.execution.dispatcher.task_store.get_by_id",
+            return_value=task,
+        ) as get_task_mock,
+        patch.object(dispatcher.router, "route", return_value=target),
+        patch.object(dispatcher, "_update_subtask_to_running", AsyncMock()),
+        patch.object(
+            dispatcher, "_dispatch_http_callback", AsyncMock()
+        ) as dispatch_mock,
+    ):
+        await dispatcher.dispatch(request, emitter=emitter)
+
+    recovery_service.recover.assert_awaited_once()
+    get_subtask_mock.assert_called_once_with(db, subtask_id=request.subtask_id)
+    get_task_mock.assert_called_once_with(db, task_id=request.task_id)
+    assert request.executor_name == "fork-restored-executor"
+    assert request.executor_namespace == "default"
+    dispatch_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_does_not_restore_fork_archive_for_device_target():
+    """Device-targeted forks should let the local executor restore the archive."""
+    dispatcher = ExecutionDispatcher()
+    request = ExecutionRequest(
+        task_id=1385,
+        subtask_id=1861,
+        message_id=3,
+        user={"id": 7, "name": "user7"},
+        user_id=7,
+        user_name="user7",
+        bot=[{"shell_type": "ClaudeCode"}],
+        executor_name=None,
+        fork_runtime={
+            "workspaceArchive": {
+                "sourceTaskId": 1,
+                "storageKey": "workspace-archives/1/archive.tar.gz",
+            }
+        },
+    )
+    emitter = AsyncMock()
+
+    recovery_service = MagicMock()
+    recovery_service.recover = AsyncMock()
+
+    target = ExecutionTarget(
+        mode=CommunicationMode.WEBSOCKET,
+        url="ws://device",
+    )
+
+    with (
+        patch(
+            "app.services.execution.dispatcher.SessionLocal",
+            side_effect=AssertionError("device fork should not open recovery DB"),
+            create=True,
+        ),
+        patch(
+            "app.services.execution.dispatcher.recovery_service",
+            recovery_service,
+            create=True,
+        ),
+        patch.object(dispatcher.router, "route", return_value=target),
+        patch.object(dispatcher, "_update_subtask_to_running", AsyncMock()),
+        patch.object(dispatcher, "_dispatch_websocket", AsyncMock()) as dispatch_mock,
+    ):
+        await dispatcher.dispatch(request, device_id="macbook", emitter=emitter)
+
+    recovery_service.recover.assert_not_awaited()
+    dispatch_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_marks_exception_when_frontend_error_is_emitted():
+    """Dispatch should mark exceptions that already reached the frontend error path."""
+
+    dispatcher = ExecutionDispatcher()
+    request = ExecutionRequest(
+        task_id=4321,
+        subtask_id=9876,
+        message_id=5,
+        user={"id": 7, "name": "user7"},
+        user_id=7,
+        user_name="user7",
+        bot=[{"shell_type": "ClaudeCode"}],
+    )
+    emitter = AsyncMock()
+    target = ExecutionTarget(
+        mode=CommunicationMode.HTTP_CALLBACK,
+        url="http://executor-manager/executor-manager",
+    )
+    dispatch_error = RuntimeError("boom")
+
+    with (
+        patch.object(dispatcher.router, "route", return_value=target),
+        patch.object(dispatcher, "_recover_executor_if_needed", AsyncMock()),
+        patch.object(dispatcher, "_update_subtask_to_running", AsyncMock()),
+        patch.object(
+            dispatcher,
+            "_dispatch_http_callback",
+            AsyncMock(side_effect=dispatch_error),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            await dispatcher.dispatch(request, emitter=emitter)
+
+    emitter.emit_error.assert_awaited_once()
+    assert getattr(dispatch_error, "_frontend_error_emitted", False) is True

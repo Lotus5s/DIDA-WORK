@@ -1,0 +1,676 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""DingTalk document sync service.
+
+Syncs DingTalk document nodes from the user's MCP server into the local database.
+Uses the MCP client protocol to connect to the user's DingTalk Docs MCP server URL.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
+
+from app.models.dingtalk_doc import DingTalkNodeSource, DingtalkSyncedNode
+from app.models.user import User
+from app.services.user_mcp_oauth import UserMcpOAuthService
+from app.services.user_mcp_service import UserMCPService
+
+logger = logging.getLogger(__name__)
+
+DINGTALK_PROVIDER_ID = "dingtalk"
+DOCS_SERVICE_ID = "docs"
+
+# MCP tool names for DingTalk Docs
+MCP_TOOL_LIST_NODES = "list_nodes"
+MCP_TOOL_SEARCH_DOCUMENTS = "search_documents"
+
+# Maximum recursion depth for folder traversal
+MAX_RECURSION_DEPTH = 10
+
+# Maximum nodes to sync per user (safety limit)
+MAX_NODES_PER_SYNC = 5000
+
+DOCS_SOURCE = DingTalkNodeSource.DOCS
+
+
+class DingTalkMCPToolError(RuntimeError):
+    """Raised when an MCP tool returns a protocol-level error result."""
+
+
+class DingTalkDocService:
+    """Service for syncing and querying DingTalk document nodes."""
+
+    @staticmethod
+    def get_user_dingtalk_mcp_url(user: User, service_id: str = "docs") -> str | None:
+        """Read and decrypt the user's DingTalk Docs MCP URL from preferences.
+
+        Returns the decrypted URL if configured and enabled, None otherwise.
+        """
+        config = UserMCPService.get_provider_service_config(
+            user.preferences,
+            provider_id="dingtalk",
+            service_id=service_id,
+        )
+        if not config.get("enabled"):
+            return None
+        url = (config.get("url") or "").strip()
+        return url if url else None
+
+    @staticmethod
+    def is_configured(user: User) -> bool:
+        """Check if the user has DingTalk Docs MCP configured and enabled."""
+        return DingTalkDocService.get_user_dingtalk_mcp_url(user) is not None
+
+    @staticmethod
+    def is_online_document(node: dict[str, Any]) -> bool:
+        """Identify online text documents, not other ALIDOC formats."""
+        content_type = node.get("contentType")
+        extension = node.get("extension")
+        return (
+            str(node.get("nodeType", "")).strip().lower() != "folder"
+            and isinstance(content_type, str)
+            and content_type.strip().upper() == "ALIDOC"
+            and isinstance(extension, str)
+            and extension.strip().lower() == "adoc"
+        )
+
+    @staticmethod
+    async def sync_dingtalk_docs(user: User, db: Session) -> dict[str, Any]:
+        """Sync DingTalk document nodes from the user's MCP server.
+
+        Connects to the user's DingTalk Docs MCP server, recursively lists all
+        document nodes, and updates the local database.
+
+        Returns a dict with sync statistics: added, updated, deleted, total.
+        """
+        mcp_url = DingTalkDocService.get_user_dingtalk_mcp_url(user)
+        if not mcp_url:
+            raise ValueError("DingTalk Docs MCP URL is not configured or not enabled")
+
+        headers = await UserMcpOAuthService.provider_service_headers(
+            db,
+            user=user,
+            provider_id=DINGTALK_PROVIDER_ID,
+            service_id=DOCS_SERVICE_ID,
+        )
+
+        # Fetch all nodes from MCP server
+        all_nodes = await DingTalkDocService._fetch_all_nodes(mcp_url, headers)
+
+        if len(all_nodes) > MAX_NODES_PER_SYNC:
+            logger.warning(
+                "User %s has %d DingTalk nodes, truncating to %d",
+                user.id,
+                len(all_nodes),
+                MAX_NODES_PER_SYNC,
+            )
+            all_nodes = all_nodes[:MAX_NODES_PER_SYNC]
+
+        # Sync to database - use local time (no timezone) consistent with created_at
+        now = datetime.now()
+        stats = DingTalkDocService._sync_nodes_to_db(
+            user.id, all_nodes, now, db, source=DOCS_SOURCE
+        )
+        stats["mcp_nodes_fetched"] = len(all_nodes)
+
+        return stats
+
+    @staticmethod
+    async def _fetch_all_nodes(
+        mcp_url: str, headers: dict[str, str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Fetch all document nodes from the DingTalk MCP server.
+
+        Uses the MCP client protocol to connect and call list_nodes recursively.
+        """
+        try:
+            from mcp import ClientSession
+            from mcp.client.streamable_http import streamablehttp_client
+        except ImportError:
+            logger.error("mcp package not available for DingTalk doc sync")
+            raise
+
+        all_nodes: list[dict[str, Any]] = []
+
+        async with streamablehttp_client(url=mcp_url, headers=headers or None) as (
+            read_stream,
+            write_stream,
+            _,
+        ):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+
+                # Start from root (no folderId, no workspaceId)
+                await DingTalkDocService._list_nodes_recursive(
+                    session,
+                    folder_id=None,
+                    workspace_id=None,
+                    all_nodes=all_nodes,
+                    depth=0,
+                )
+
+        return all_nodes
+
+    @staticmethod
+    async def _list_nodes_recursive(
+        session: Any,
+        folder_id: str | None,
+        workspace_id: str | None,
+        all_nodes: list[dict[str, Any]],
+        depth: int,
+    ) -> None:
+        """Recursively list nodes from the MCP server.
+
+        Traverses folders and any node explicitly reporting children.
+
+        The DingTalk MCP list_nodes tool does NOT return parent node information
+        in the node data. Instead, the parent relationship is implicit: when we
+        call list_nodes(folderId=X), all returned nodes are children of X.
+        We therefore inject the parentId manually into each returned node so
+        that _sync_nodes_to_db can persist the correct parent_node_id.
+        """
+        if depth >= MAX_RECURSION_DEPTH:
+            logger.warning(
+                "Max recursion depth %d reached at folder %s",
+                depth,
+                folder_id,
+            )
+            return
+
+        page_token = None
+        while True:
+            # Build arguments for list_nodes tool
+            args: dict[str, Any] = {"pageSize": 50}
+            if folder_id:
+                args["folderId"] = folder_id
+            if workspace_id:
+                args["workspaceId"] = workspace_id
+            if page_token:
+                args["pageToken"] = page_token
+
+            result = await session.call_tool(MCP_TOOL_LIST_NODES, args)
+
+            # Parse the result - MCP returns content items
+            nodes_data, parsed_page_token = DingTalkDocService._parse_list_nodes_result(
+                result
+            )
+
+            # Inject parentId into each node: the MCP API does not return parent
+            # information, but we know the parent because we called list_nodes
+            # with folderId=folder_id. Root-level nodes have folder_id=None.
+            for node in nodes_data:
+                if folder_id and not node.get("parentId"):
+                    node["parentId"] = folder_id
+
+            all_nodes.extend(nodes_data)
+
+            # Documents (reported as files by MCP) can also contain children.
+            # Always traverse folders: their hasChildren flag is unreliable.
+            for node in nodes_data:
+                if node.get("nodeType") == "folder" or node.get("hasChildren") is True:
+                    node_id = node.get("nodeId", "")
+                    ws_id = node.get("workspaceId") or workspace_id
+                    await DingTalkDocService._list_nodes_recursive(
+                        session,
+                        folder_id=node_id,
+                        workspace_id=ws_id,
+                        all_nodes=all_nodes,
+                        depth=depth + 1,
+                    )
+
+            # Check for more pages: prefer token from parsed payload, fall back to result.meta
+            page_token = parsed_page_token
+            if not page_token and hasattr(result, "meta") and result.meta:
+                page_token = result.meta.get("nextPageToken")
+            if not page_token:
+                break
+
+    # Known list keys in DingTalk MCP list_nodes/list_wikiSpaces responses.
+    # Add new keys only after validating them against real MCP payloads.
+    _NODE_LIST_KEYS = (
+        "items",
+        "nodes",
+        "wikiSpaces",
+        "spaces",
+        "spaceList",
+    )
+
+    @staticmethod
+    def _normalize_mcp_node(
+        node: dict[str, Any], *, allow_workspace_id: bool = False
+    ) -> dict[str, Any]:
+        """Keep the upstream snapshot separate from locally normalized fields."""
+        normalized = {**node, "_raw_metadata": dict(node)}
+        id_keys = (
+            ["workspaceId", "nodeId", "id", "dingtalk_node_id"]
+            if allow_workspace_id
+            else ["nodeId", "id", "dingtalk_node_id"]
+        )
+
+        for key in id_keys:
+            value = node.get(key)
+            if value is None:
+                continue
+            node_id = str(value).strip()
+            if node_id:
+                normalized["nodeId"] = node_id
+                break
+
+        return normalized
+
+    @staticmethod
+    def _parse_list_nodes_result(
+        result: Any,
+        *,
+        allow_workspace_id: bool = False,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Parse the result from MCP list_nodes tool call.
+
+        The MCP tool returns content items that contain the node list data.
+        Handles various response envelope shapes used by different DingTalk
+        MCP servers (docs MCP vs wikiSpace/knowledge-base MCP).
+
+        Returns a tuple of (nodes, next_page_token).
+        """
+        nodes: list[dict[str, Any]] = []
+        next_page_token: str | None = None
+
+        if getattr(result, "isError", False) is True:
+            raise DingTalkMCPToolError("DingTalk MCP tool returned an error result")
+
+        if not hasattr(result, "content") or not result.content:
+            logger.debug("list_nodes result has no content attribute or empty content")
+            return nodes, next_page_token
+
+        for content_item in result.content:
+            # Text content contains JSON data
+            if hasattr(content_item, "type") and content_item.type == "text":
+                raw_text = getattr(content_item, "text", "") or ""
+                try:
+                    data = json.loads(raw_text)
+                except (json.JSONDecodeError, TypeError):
+                    logger.debug(
+                        "Failed to parse list_nodes result content as JSON. "
+                        "Raw text (first 500 chars): %.500s",
+                        raw_text,
+                    )
+                    continue
+
+                if isinstance(data, dict) and data.get("success") is False:
+                    raise DingTalkMCPToolError(
+                        "DingTalk MCP tool returned an unsuccessful result"
+                    )
+
+                if isinstance(data, list):
+                    # Direct list of node objects
+                    nodes.extend(
+                        DingTalkDocService._normalize_mcp_node(
+                            item, allow_workspace_id=allow_workspace_id
+                        )
+                        for item in data
+                        if isinstance(item, dict)
+                    )
+                elif isinstance(data, dict):
+                    # Wrapped response envelope — try known list keys
+                    found_list: list[dict[str, Any]] | None = None
+                    for key in DingTalkDocService._NODE_LIST_KEYS:
+                        candidate = data.get(key)
+                        if isinstance(candidate, list):
+                            found_list = [
+                                DingTalkDocService._normalize_mcp_node(
+                                    item, allow_workspace_id=allow_workspace_id
+                                )
+                                for item in candidate
+                                if isinstance(item, dict)
+                            ]
+                            break
+
+                    if found_list is not None:
+                        nodes.extend(found_list)
+                    else:
+                        # Log keys so we can diagnose unknown envelope shapes
+                        logger.debug(
+                            "list_nodes response dict has no recognised list key. "
+                            "Available keys: %s",
+                            list(data.keys()),
+                        )
+
+                    # Extract pagination token (several possible key names)
+                    token = (
+                        data.get("nextPageToken")
+                        or data.get("next_page_token")
+                        or data.get("pageToken")
+                        or data.get("cursor")
+                    )
+                    if token and isinstance(token, str):
+                        next_page_token = token
+                else:
+                    logger.debug(
+                        "list_nodes response content is neither list nor dict: %s",
+                        type(data).__name__,
+                    )
+
+        return nodes, next_page_token
+
+    @staticmethod
+    def _normalize_source(source: DingTalkNodeSource | str) -> str:
+        """Normalize a DingTalk node source into its persisted string value."""
+        if isinstance(source, DingTalkNodeSource):
+            return source.value
+
+        try:
+            return DingTalkNodeSource(source).value
+        except ValueError as exc:
+            raise ValueError(f"Unsupported DingTalk node source: {source}") from exc
+
+    @staticmethod
+    def _sync_nodes_to_db(
+        user_id: int,
+        nodes: list[dict[str, Any]],
+        sync_time: datetime,
+        db: Session,
+        source: DingTalkNodeSource = DOCS_SOURCE,
+    ) -> dict[str, Any]:
+        """Sync fetched nodes to the database.
+
+        Compares with existing records and performs add/update/delete operations.
+        Only operates on nodes with the given source value.
+
+        """
+        source_value = DingTalkDocService._normalize_source(source)
+        # A provider response may repeat a node; persist its last complete value once.
+        nodes_by_id = {node["nodeId"]: node for node in nodes if node.get("nodeId")}
+        nodes = list(nodes_by_id.values())
+        added = 0
+        updated = 0
+        deleted = 0
+
+        # Build a map of current DingTalk node IDs
+        dingtalk_node_ids = set(nodes_by_id)
+
+        # Mark nodes no longer in DingTalk as inactive (filter by source)
+        existing_active = (
+            db.query(DingtalkSyncedNode)
+            .filter(
+                DingtalkSyncedNode.user_id == user_id,
+                DingtalkSyncedNode.source == source_value,
+                DingtalkSyncedNode.is_active == True,  # noqa: E712
+            )
+            .all()
+        )
+
+        for existing in existing_active:
+            if existing.dingtalk_node_id not in dingtalk_node_ids:
+                existing.is_active = False
+                existing.updated_at = sync_time
+                deleted += 1
+
+        # Collect all non-empty node IDs for a single batch lookup (avoids N+1 queries)
+        node_ids = list(nodes_by_id)
+        existing_nodes_map: dict[str, DingtalkSyncedNode] = {}
+        if node_ids:
+            existing_rows = (
+                db.query(DingtalkSyncedNode)
+                .filter(
+                    DingtalkSyncedNode.user_id == user_id,
+                    DingtalkSyncedNode.source == source_value,
+                    DingtalkSyncedNode.dingtalk_node_id.in_(node_ids),
+                )
+                .all()
+            )
+            existing_nodes_map = {row.dingtalk_node_id: row for row in existing_rows}
+
+        # Upsert nodes from DingTalk
+        for node_data in nodes:
+            node_id = node_data["nodeId"]
+
+            name = node_data.get("name", node_data.get("title", "Untitled"))
+            node_type_raw = str(node_data.get("nodeType", "")).strip().lower()
+
+            # Provider file nodes include both online documents and other formats.
+            if node_type_raw == "folder":
+                node_type = "folder"
+            elif DingTalkDocService.is_online_document(node_data):
+                node_type = "doc"
+            else:
+                node_type = "file"
+
+            # Build document URL
+            doc_url = node_data.get("url", "")
+            if not doc_url:
+                doc_url = f"https://alidocs.dingtalk.com/i/nodes/{node_id}"
+
+            parent_node_id = (
+                node_data.get("parentId") or node_data.get("parentDentryUuid") or ""
+            )
+            workspace_id = node_data.get("workspaceId") or ""
+            content_type = node_data.get("contentType") or ""
+            raw_metadata = node_data.get("_raw_metadata", node_data)
+            content_updated_at = DingTalkDocService._parse_update_time(
+                node_data.get("updateTime"), sync_time
+            )
+
+            # Look up existing node from pre-fetched map (avoids per-node DB query)
+            existing = existing_nodes_map.get(node_id)
+
+            if existing:
+                # Update existing node
+                changed = False
+                if existing.name != name:
+                    existing.name = name
+                    changed = True
+                if existing.doc_url != doc_url:
+                    existing.doc_url = doc_url
+                    changed = True
+                if existing.parent_node_id != parent_node_id:
+                    existing.parent_node_id = parent_node_id
+                    changed = True
+                if existing.node_type != node_type:
+                    existing.node_type = node_type
+                    changed = True
+                if existing.workspace_id != workspace_id:
+                    existing.workspace_id = workspace_id
+                    changed = True
+                if existing.content_type != content_type:
+                    existing.content_type = content_type
+                    changed = True
+                if json.dumps(existing.raw_metadata, sort_keys=True) != json.dumps(
+                    raw_metadata, sort_keys=True
+                ):
+                    existing.raw_metadata = raw_metadata
+                    # Python/ORM equality conflates JSON booleans and numbers.
+                    flag_modified(existing, "raw_metadata")
+                    changed = True
+                if existing.content_updated_at != content_updated_at:
+                    existing.content_updated_at = content_updated_at
+                    changed = True
+                if not existing.is_active:
+                    existing.is_active = True
+                    changed = True
+
+                if changed:
+                    existing.last_synced_at = sync_time
+                    existing.updated_at = sync_time
+                    updated += 1
+                else:
+                    existing.last_synced_at = sync_time
+            else:
+                # Create new node
+                new_node = DingtalkSyncedNode(
+                    user_id=user_id,
+                    dingtalk_node_id=node_id,
+                    name=name,
+                    doc_url=doc_url,
+                    parent_node_id=parent_node_id,
+                    node_type=node_type,
+                    workspace_id=workspace_id,
+                    content_type=content_type,
+                    raw_metadata=raw_metadata,
+                    content_updated_at=content_updated_at,
+                    is_active=True,
+                    last_synced_at=sync_time,
+                    source=source_value,
+                )
+                db.add(new_node)
+                added += 1
+
+        try:
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.error(
+                "Failed to commit synced nodes for user %s (source=%s, error=%s)",
+                user_id,
+                source_value,
+                type(exc).__name__,
+            )
+            # Database errors may embed the complete raw metadata in SQL parameters.
+            raise RuntimeError("Failed to persist DingTalk directory nodes") from None
+
+        total = (
+            db.query(DingtalkSyncedNode)
+            .filter(
+                DingtalkSyncedNode.user_id == user_id,
+                DingtalkSyncedNode.source == source_value,
+                DingtalkSyncedNode.is_active == True,  # noqa: E712
+            )
+            .count()
+        )
+
+        return {
+            "added": added,
+            "updated": updated,
+            "deleted": deleted,
+            "total": total,
+            "sync_time": sync_time,
+        }
+
+    @staticmethod
+    def _parse_update_time(update_time: Any, fallback: datetime) -> datetime:
+        """Parse updateTime from list_nodes response into a datetime (local time).
+
+        The DingTalk MCP API may return updateTime as a Unix timestamp (int/float,
+        in seconds or milliseconds) or as an ISO 8601 string. The result is
+        converted to local time (no tzinfo) to be consistent with created_at.
+        Falls back to the provided fallback datetime if parsing fails or absent.
+        """
+        if update_time is None:
+            return fallback
+        try:
+            if isinstance(update_time, (int, float)):
+                # Treat values > 1e10 as milliseconds, otherwise seconds
+                ts = float(update_time)
+                if ts > 1e10:
+                    ts = ts / 1000.0
+                # fromtimestamp without tz converts to local time directly
+                return datetime.fromtimestamp(ts)
+            if isinstance(update_time, str):
+                # Try ISO 8601 parse, then convert to local time
+                dt = datetime.fromisoformat(update_time.replace("Z", "+00:00"))
+                if dt.tzinfo is not None:
+                    # Convert to local time and strip tzinfo
+                    dt = dt.astimezone().replace(tzinfo=None)
+                return dt
+        except (ValueError, OSError, OverflowError):
+            logger.warning("Failed to parse updateTime value: %r", update_time)
+        return fallback
+
+    @staticmethod
+    def get_dingtalk_docs(user_id: int, db: Session) -> list[DingtalkSyncedNode]:
+        """Get all active DingTalk document nodes for a user."""
+        return (
+            db.query(DingtalkSyncedNode)
+            .filter(
+                DingtalkSyncedNode.user_id == user_id,
+                DingtalkSyncedNode.source == DOCS_SOURCE.value,
+                DingtalkSyncedNode.is_active == True,  # noqa: E712
+            )
+            .order_by(DingtalkSyncedNode.node_type, DingtalkSyncedNode.name)
+            .all()
+        )
+
+    @staticmethod
+    def get_sync_status(user: User, db: Session) -> dict[str, Any]:
+        """Get sync status for a user's DingTalk documents."""
+        is_configured = DingTalkDocService.is_configured(user)
+
+        last_synced = (
+            db.query(DingtalkSyncedNode.last_synced_at)
+            .filter(
+                DingtalkSyncedNode.user_id == user.id,
+                DingtalkSyncedNode.source == DOCS_SOURCE.value,
+                DingtalkSyncedNode.is_active == True,  # noqa: E712
+            )
+            .order_by(DingtalkSyncedNode.last_synced_at.desc())
+            .first()
+        )
+
+        total = (
+            db.query(DingtalkSyncedNode)
+            .filter(
+                DingtalkSyncedNode.user_id == user.id,
+                DingtalkSyncedNode.source == DOCS_SOURCE.value,
+                DingtalkSyncedNode.is_active == True,  # noqa: E712
+            )
+            .count()
+        )
+
+        return {
+            "last_synced_at": last_synced[0] if last_synced else None,
+            "total_nodes": total,
+            "is_configured": is_configured,
+            "ai_table_configured": bool(
+                DingTalkDocService.get_user_dingtalk_mcp_url(user, "ai_table")
+            ),
+            "table_configured": bool(
+                DingTalkDocService.get_user_dingtalk_mcp_url(user, "table")
+            ),
+        }
+
+    @staticmethod
+    def delete_synced_node(
+        node_id: int,
+        user_id: int,
+        db: Session,
+        source: DingTalkNodeSource | None = DOCS_SOURCE,
+    ) -> bool:
+        """Delete a synced document node (local cache only).
+
+        Args:
+            node_id: The database ID of the node to delete.
+            user_id: The user ID who owns the node.
+            db: Database session.
+            source: Source filter for the node (docs by default).
+                    Pass None explicitly only when cross-source deletion is intended.
+
+        Returns:
+            True if the node was found and deleted, False otherwise.
+        """
+        filters = [
+            DingtalkSyncedNode.id == node_id,
+            DingtalkSyncedNode.user_id == user_id,
+        ]
+        if source is not None:
+            filters.append(
+                DingtalkSyncedNode.source
+                == DingTalkDocService._normalize_source(source)
+            )
+
+        node = db.query(DingtalkSyncedNode).filter(*filters).first()
+        if not node:
+            return False
+
+        db.delete(node)
+        db.commit()
+        return True
+
+
+dingtalk_doc_service = DingTalkDocService()

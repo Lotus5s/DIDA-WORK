@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, ConfigDict
+
+
+class MCPServer(BaseModel):
+    """MCP Server definition"""
+
+    id: str  # Provider-prefixed ID: @bailian/{id}
+    name: str  # Display name
+    description: Optional[str] = None
+    type: str  # "streamable-http" | "sse"
+    base_url: Optional[str] = None  # Server URL
+    command: Optional[str] = None  # For stdio type
+    args: Optional[List[str]] = None  # Command arguments
+    env: Optional[Dict[str, str]] = None  # Environment variables
+    headers: Optional[Dict[str, str]] = None  # HTTP headers (auth)
+    is_active: bool = True
+    provider: str  # Provider name
+    provider_url: Optional[str] = None
+    logo_url: Optional[str] = None
+    tags: Optional[List[str]] = None
+    installState: str = "not_installed"
+    installedMcpId: Optional[int] = None
+    enabled: bool = False
+
+
+class MCPProviderInfo(BaseModel):
+    """MCP Provider metadata"""
+
+    key: str
+    name: str
+    name_en: Optional[str] = None
+    description: str
+    discover_url: str
+    api_key_url: str
+    token_field_name: str
+    has_token: bool = False  # Whether user has configured token
+    requires_token: bool = True  # Whether this provider requires API key from user
+
+
+class MCPProviderListResponse(BaseModel):
+    """Response for listing providers"""
+
+    providers: List[MCPProviderInfo]
+
+
+class MCPServerListResponse(BaseModel):
+    """Response for listing servers"""
+
+    success: bool
+    message: str
+    servers: List[MCPServer]
+    error_details: Optional[str] = None
+
+
+class MCPProviderKeysRequest(BaseModel):
+    """Request to update MCP provider API keys
+
+    Supports dynamic fields for flexible provider key storage.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    # Legacy fields for backward compatibility
+    bailian: Optional[str] = None
+    modelscope: Optional[str] = None
+    mcp_router: Optional[str] = None
+
+
+class MCPProviderKeysResponse(BaseModel):
+    """Response for MCP provider keys update"""
+
+    success: bool
+    message: str
+
+
+class MCPToolInfo(BaseModel):
+    """Information about a single MCP tool"""
+
+    name: str
+    description: str
+
+
+class MCPTestRequest(BaseModel):
+    """Request to test an MCP server connection"""
+
+    server_name: str
+    server_config: Dict[str, Any]  # Raw server config: type/url/headers/command/args
+
+
+class MCPTestResponse(BaseModel):
+    """Response for MCP server connection test"""
+
+    success: bool
+    error: Optional[str] = None
+    tools: List[MCPToolInfo] = []

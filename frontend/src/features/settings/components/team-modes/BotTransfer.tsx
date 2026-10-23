@@ -1,0 +1,468 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import React, { useCallback, useMemo } from 'react'
+import { Transfer } from '@/components/ui/transfer'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { Tag } from '@/components/ui/tag'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { RiMagicLine } from 'react-icons/ri'
+import { Edit, Plus, Copy } from 'lucide-react'
+import { Bot, type PipelineContextPassing } from '@/types/api'
+import { useTranslation } from '@/hooks/useTranslation'
+import { getPromptBadgeStyle, type PromptBadgeVariant } from '@/utils/styles'
+
+const PIPELINE_MEMBER_GRID_CLASS =
+  'grid w-full grid-cols-[minmax(120px,1fr)_minmax(118px,140px)_minmax(64px,72px)_48px] items-center gap-3'
+
+export interface BotTransferProps {
+  bots: Bot[]
+  selectedBotKeys: React.Key[]
+  setSelectedBotKeys: React.Dispatch<React.SetStateAction<React.Key[]>>
+  leaderBotId?: number | null
+  setLeaderBotId?: React.Dispatch<React.SetStateAction<number | null>>
+  unsavedPrompts: Record<string, string>
+  teamPromptMap: Map<number, boolean>
+  isDifyLeader?: boolean
+  selectedShellType?: string | null
+  /** Whether to exclude leader from transfer list */
+  excludeLeader?: boolean
+  /** Whether to auto-set first selected bot as leader */
+  autoSetLeader?: boolean
+  /** Whether to enable drag-and-drop sorting in the right list */
+  sortable?: boolean
+  /** Pipeline mode: requireConfirmation settings for each bot */
+  requireConfirmationMap?: Record<number, boolean>
+  setRequireConfirmationMap?: React.Dispatch<React.SetStateAction<Record<number, boolean>>>
+  /** Pipeline mode: context passing settings for each bot */
+  contextPassingMap?: Record<number, PipelineContextPassing>
+  setContextPassingMap?: React.Dispatch<
+    React.SetStateAction<Record<number, PipelineContextPassing>>
+  >
+  onEditBot: (botId: number) => void
+  onCreateBot: () => void
+  onCloneBot: (botId: number) => void
+  onOpenPromptDrawer: () => void
+}
+
+export default function BotTransfer({
+  bots,
+  selectedBotKeys,
+  setSelectedBotKeys,
+  leaderBotId,
+  setLeaderBotId,
+  unsavedPrompts,
+  teamPromptMap,
+  isDifyLeader = false,
+  selectedShellType = null,
+  excludeLeader = false,
+  autoSetLeader = false,
+  sortable = false,
+  requireConfirmationMap,
+  setRequireConfirmationMap,
+  contextPassingMap,
+  setContextPassingMap,
+  onEditBot,
+  onCreateBot,
+  onCloneBot,
+  onOpenPromptDrawer,
+}: BotTransferProps) {
+  const { t } = useTranslation()
+
+  const configuredPromptBadgeStyle = useMemo(() => getPromptBadgeStyle('configured'), [])
+
+  // Calculate prompt summary
+  const promptSummary = useMemo<{ label: string; variant: PromptBadgeVariant }>(() => {
+    let configuredCount = 0
+    teamPromptMap.forEach(value => {
+      if (value) configuredCount += 1
+    })
+    const unsavedHasContent = Object.values(unsavedPrompts).some(
+      value => (value ?? '').trim().length > 0
+    )
+
+    if (unsavedHasContent) {
+      const countText =
+        configuredCount > 0
+          ? ` - ${t('common:team.prompts_tag_configured', { count: configuredCount })}`
+          : ''
+      return {
+        label: `${t('common:team.prompts_tag_pending')}${countText}`,
+        variant: 'pending',
+      }
+    }
+
+    if (configuredCount > 0) {
+      return {
+        label: t('common:team.prompts_tag_configured', { count: configuredCount }),
+        variant: 'configured',
+      }
+    }
+
+    return {
+      label: t('common:team.prompts_tag_none'),
+      variant: 'none',
+    }
+  }, [teamPromptMap, unsavedPrompts, t])
+
+  const promptSummaryStyle = useMemo(
+    () => getPromptBadgeStyle(promptSummary.variant),
+    [promptSummary.variant]
+  )
+
+  // Data source for Transfer
+  const transferData = useMemo(() => {
+    let filteredBots = bots
+
+    // Exclude leader if specified
+    if (excludeLeader && leaderBotId !== null) {
+      filteredBots = bots.filter(b => b.id !== leaderBotId)
+    }
+
+    return filteredBots.map(b => ({
+      key: String(b.id),
+      title: b.name,
+      description: b.shell_type,
+      disabled:
+        isDifyLeader ||
+        // Disable options not matching shell_type if already selected
+        (selectedShellType !== null && b.shell_type !== selectedShellType),
+    }))
+  }, [bots, isDifyLeader, selectedShellType, excludeLeader, leaderBotId])
+
+  // Transfer change handler
+  const onTransferChange = (
+    targetKeys: string[],
+    direction: 'left' | 'right',
+    moveKeys: string[]
+  ) => {
+    if (direction === 'right') {
+      const newKeys = [...new Set(selectedBotKeys.concat(moveKeys))]
+      setSelectedBotKeys(newKeys)
+      // Auto-set first bot as leader if enabled and no leader is set
+      if (autoSetLeader && setLeaderBotId && leaderBotId === null && newKeys.length > 0) {
+        setLeaderBotId(Number(newKeys[0]))
+      }
+      return
+    }
+    setSelectedBotKeys(targetKeys)
+    // If leader was removed and auto-set is enabled, set new leader
+    if (
+      autoSetLeader &&
+      setLeaderBotId &&
+      leaderBotId !== null &&
+      !targetKeys.includes(String(leaderBotId))
+    ) {
+      if (targetKeys.length > 0) {
+        setLeaderBotId(Number(targetKeys[0]))
+      } else {
+        setLeaderBotId(null)
+      }
+    }
+  }
+
+  // Handle order change from drag-and-drop
+  const onOrderChange = (newOrder: string[]) => {
+    setSelectedBotKeys(newOrder)
+    // If auto-set leader is enabled, update leader to first item
+    if (autoSetLeader && setLeaderBotId && newOrder.length > 0) {
+      setLeaderBotId(Number(newOrder[0]))
+    }
+  }
+
+  // Handle requireConfirmation toggle for pipeline mode
+  const handleRequireConfirmationChange = useCallback(
+    (botId: number, checked: boolean) => {
+      if (setRequireConfirmationMap) {
+        setRequireConfirmationMap(prev => ({
+          ...prev,
+          [botId]: checked,
+        }))
+      }
+    },
+    [setRequireConfirmationMap]
+  )
+
+  const handleContextPassingChange = useCallback(
+    (botId: number, value: PipelineContextPassing) => {
+      if (setContextPassingMap) {
+        setContextPassingMap(prev => ({
+          ...prev,
+          [botId]: value,
+        }))
+      }
+    },
+    [setContextPassingMap]
+  )
+
+  // Check if pipeline mode features should be shown (when requireConfirmationMap is provided)
+  const showPipelineFeatures =
+    requireConfirmationMap !== undefined && setRequireConfirmationMap !== undefined
+  const showContextPassing = contextPassingMap !== undefined && setContextPassingMap !== undefined
+
+  const selectedBotKeyStrings = selectedBotKeys.map(String)
+
+  return (
+    <div className="flex flex-col min-h-0 mt-1 flex-1">
+      <div className="flex items-center justify-between mb-1">
+        <label className="block text-lg font-semibold text-text-primary">
+          {t('common:team.bots')}
+        </label>
+      </div>
+      <div className="flex items-center gap-2 mb-2">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="link"
+              size="sm"
+              className="h-auto p-0 text-primary hover:text-primary/80"
+              onClick={onOpenPromptDrawer}
+            >
+              <RiMagicLine className="mr-1 h-4 w-4" />
+              {t('common:team.prompts_link')}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>
+            <p>{t('common:team.prompts_tooltip')}</p>
+          </TooltipContent>
+        </Tooltip>
+        <Tag
+          className="!m-0 !px-2 !py-0 text-xs leading-5"
+          variant="default"
+          style={promptSummaryStyle}
+        >
+          {promptSummary.label}
+        </Tag>
+      </div>
+
+      {/* Transfer component with flex-1 to fill remaining space */}
+      <div className="relative flex-1 min-h-0">
+        {/* Overlay mask for Dify leader mode */}
+        {isDifyLeader && (
+          <div className="absolute inset-0 bg-white/50 dark:bg-black/50 z-10 flex items-center justify-center rounded-md backdrop-blur-[1px]">
+            <div className="bg-background/95 px-4 py-2 rounded-md shadow-sm border border-border text-sm text-muted-foreground">
+              {t('common:team.dify_no_members_hint') ||
+                'Dify bots handle execution independently and do not support team members.'}
+            </div>
+          </div>
+        )}
+        <Transfer
+          dataSource={transferData}
+          targetKeys={selectedBotKeys.map(String)}
+          onChange={onTransferChange}
+          onOrderChange={onOrderChange}
+          disabled={isDifyLeader}
+          sortable={sortable}
+          render={item => {
+            const botId = Number(item.key)
+            const isSelected = selectedBotKeyStrings.includes(item.key)
+            const isFinalSelectedBot =
+              selectedBotKeyStrings[selectedBotKeyStrings.length - 1] === item.key
+            const showPipelineTableRow = showPipelineFeatures && isSelected
+            const showContextControl = showContextPassing && !isFinalSelectedBot
+            const requiresConfirmation = requireConfirmationMap?.[botId] ?? false
+            const confirmationLabel = t('common:team.require_confirmation_checkbox_label')
+            const promptBadge = teamPromptMap.get(botId) ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Tag
+                    className="!m-0 !px-1.5 !py-0 text-[11px] leading-4"
+                    variant="default"
+                    style={configuredPromptBadgeStyle}
+                  >
+                    {t('common:team.prompts_badge')}
+                  </Tag>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>{t('common:team.prompts_badge_tooltip')}</p>
+                </TooltipContent>
+              </Tooltip>
+            ) : null
+            const memberName = (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="min-w-0 truncate">
+                    {item.title}
+                    <span className="text-xs text-text-muted">({item.description})</span>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>{`${item.title} (${item.description})`}</p>
+                </TooltipContent>
+              </Tooltip>
+            )
+            const actionButtons = (
+              <div className="flex shrink-0 items-center justify-end gap-1">
+                <button
+                  type="button"
+                  className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                  aria-label={`${t('common:actions.edit')} ${item.title}`}
+                  data-testid={`edit-bot-button-${item.key}`}
+                  onClick={e => {
+                    e.stopPropagation()
+                    onEditBot(botId)
+                  }}
+                >
+                  <Edit className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                  aria-label={`${t('common:actions.copy')} ${item.title}`}
+                  data-testid={`copy-bot-button-${item.key}`}
+                  onClick={e => {
+                    e.stopPropagation()
+                    onCloneBot(botId)
+                  }}
+                >
+                  <Copy className="h-4 w-4" />
+                </button>
+              </div>
+            )
+
+            if (!showPipelineTableRow) {
+              return (
+                <div
+                  className="flex w-full min-w-0 items-center justify-between gap-2"
+                  data-testid={`member-row-header-${item.key}`}
+                >
+                  <div className="flex min-w-0 items-center gap-2">
+                    {memberName}
+                    {promptBadge}
+                  </div>
+                  {actionButtons}
+                </div>
+              )
+            }
+
+            return (
+              <div
+                className={`${PIPELINE_MEMBER_GRID_CLASS} min-w-0 text-sm`}
+                data-testid={`pipeline-member-row-${item.key}`}
+              >
+                <div
+                  className="flex min-w-0 items-center gap-2"
+                  data-testid={`member-row-header-${item.key}`}
+                >
+                  {memberName}
+                  {promptBadge}
+                </div>
+
+                <div
+                  className="min-w-0"
+                  data-testid={`pipeline-controls-${item.key}`}
+                  onClick={e => e.stopPropagation()}
+                >
+                  {showContextControl ? (
+                    <Select
+                      value={contextPassingMap?.[botId] ?? 'none'}
+                      onValueChange={value =>
+                        handleContextPassingChange(botId, value as PipelineContextPassing)
+                      }
+                    >
+                      <SelectTrigger
+                        className="h-8 w-full rounded-md bg-base px-2 text-xs"
+                        aria-label={`${t('common:team.context_passing_label')} ${item.title}`}
+                        data-testid={`context-passing-select-${item.key}`}
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="none">
+                          {t('common:team.context_passing_none')}
+                        </SelectItem>
+                        <SelectItem value="original_user">
+                          {t('common:team.context_passing_original_user')}
+                        </SelectItem>
+                        <SelectItem value="previous_bot">
+                          {t('common:team.context_passing_previous_bot')}
+                        </SelectItem>
+                        <SelectItem value="original_and_previous">
+                          {t('common:team.context_passing_original_and_previous')}
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <span
+                      className="inline-flex h-8 w-full items-center rounded-md border border-border bg-surface px-2 text-xs text-text-muted"
+                      data-testid={`context-passing-final-${item.key}`}
+                    >
+                      {t('common:team.context_passing_last_step')}
+                    </span>
+                  )}
+                </div>
+
+                {!isFinalSelectedBot ? (
+                  <div
+                    className="flex min-w-0 items-center justify-center"
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <Checkbox
+                      checked={requiresConfirmation}
+                      onCheckedChange={checked =>
+                        handleRequireConfirmationChange(botId, checked === true)
+                      }
+                      aria-label={`${item.title}: ${confirmationLabel}`}
+                      data-testid={`require-confirmation-toggle-${item.key}`}
+                    />
+                  </div>
+                ) : (
+                  <span
+                    className="text-xs text-text-muted"
+                    data-testid={`require-confirmation-final-${item.key}`}
+                  >
+                    {t('common:team.require_confirmation_not_needed')}
+                  </span>
+                )}
+
+                {actionButtons}
+              </div>
+            )
+          }}
+          rightListHeader={
+            showPipelineFeatures ? (
+              <div
+                className={`${PIPELINE_MEMBER_GRID_CLASS} min-w-0`}
+                data-testid="pipeline-member-grid-header"
+              >
+                <span>{t('common:team.pipeline_column_member')}</span>
+                <span>{t('common:team.pipeline_column_next_input')}</span>
+                <span>{t('common:team.pipeline_column_review')}</span>
+                <span className="text-right">{t('common:team.pipeline_column_actions')}</span>
+              </div>
+            ) : undefined
+          }
+          titles={[t('common:team.candidates'), t('common:team.in_team')]}
+          className="h-full transfer-fill"
+          listStyle={{
+            backgroundColor: 'rgb(var(--color-bg-surface))',
+            borderColor: 'rgb(var(--color-border))',
+          }}
+          leftFooter={
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full"
+              onClick={onCreateBot}
+              disabled={isDifyLeader}
+            >
+              <Plus className="mr-2 h-4 w-4" />
+              {t('common:bots.new_bot')}
+            </Button>
+          }
+        />
+      </div>
+    </div>
+  )
+}

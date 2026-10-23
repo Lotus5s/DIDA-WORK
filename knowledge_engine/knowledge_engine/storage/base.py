@@ -1,0 +1,535 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Base storage backend interface for RAG functionality.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+from llama_index.core.schema import BaseNode
+
+from shared.knowledge_contracts import RetrievalScope
+
+if TYPE_CHECKING:
+    from knowledge_engine.storage.chunk_metadata import ChunkMetadata
+
+RETRIEVAL_TEXT_METADATA_KEY = "retrieval_text"
+DISPLAY_TEXT_METADATA_KEY = "display_text"
+
+
+def resolve_retrieval_text(
+    metadata: Dict[str, Any] | None,
+    *,
+    fallback: str,
+) -> str:
+    """Resolve embedding text from metadata with a plain-text fallback."""
+    if metadata:
+        retrieval_text = metadata.get(RETRIEVAL_TEXT_METADATA_KEY)
+        if isinstance(retrieval_text, str) and retrieval_text.strip():
+            return retrieval_text
+    return fallback
+
+
+def resolve_display_text(
+    metadata: Dict[str, Any] | None,
+    *,
+    fallback: str,
+) -> str:
+    """Resolve display text from metadata with a plain-text fallback."""
+    if metadata:
+        display_text = metadata.get(DISPLAY_TEXT_METADATA_KEY)
+        if isinstance(display_text, str) and display_text.strip():
+            return display_text
+    return fallback
+
+
+class BaseStorageBackend(ABC):
+    """Abstract base class for storage backends."""
+
+    # Subclasses should override this with their supported methods
+    SUPPORTED_RETRIEVAL_METHODS: ClassVar[List[str]] = []
+    supports_retrieval_scope: ClassVar[bool] = False
+
+    # Index name prefix for different storage types (can be overridden)
+    INDEX_PREFIX: ClassVar[str] = "index"
+
+    def __init__(self, config: Dict):
+        """
+        Initialize storage backend.
+
+        Args:
+            config: Storage configuration dict containing:
+                - url: Connection URL
+                - username: Optional username
+                - password: Optional password
+                - apiKey: Optional API key
+                - indexStrategy: Index naming strategy config
+                - ext: Additional provider-specific config
+        """
+        self.config = config
+        self.url = config.get("url")
+        self.username = config.get("username")
+        self.password = config.get("password")
+        self.api_key = config.get("apiKey")
+        self.index_strategy = config.get("indexStrategy", {})
+        self.ext = config.get("ext", {})
+
+    def extract_chunk_text(self, raw_content: Any) -> str:
+        """Extract normalized plain text from raw chunk content.
+
+        Some storage providers (e.g., LlamaIndex-based backends) may store
+        serialized node objects (such as TextNode JSON) in the content field
+        when using get_all_chunks. For direct injection we only want the
+        human-readable `text` field and should drop internal fields
+        (id_, embedding, relationships, etc.).
+
+        This helper attempts to parse such JSON structures and extract the
+        `text` value. If parsing fails or the expected structure is missing,
+        it falls back to the original content.
+        """
+        if raw_content is None:
+            return ""
+
+        # Most backends already return plain text
+        if not isinstance(raw_content, str):
+            return str(raw_content)
+
+        stripped = raw_content.strip()
+        # Fast path: not a JSON object or does not contain a `text` key
+        if not stripped.startswith("{") or '"text"' not in stripped:
+            return raw_content
+
+        try:
+            data = json.loads(stripped)
+        except Exception:
+            # If parsing fails, fall back to original content
+            return raw_content
+
+        if isinstance(data, dict):
+            text = data.get("text")
+            if isinstance(text, str):
+                return text
+
+        # Fallback: return original content
+        return raw_content
+
+    def get_node_embedding_text(self, node: BaseNode) -> str:
+        """Return the text that should be embedded for a node."""
+        return resolve_retrieval_text(
+            node.metadata,
+            fallback=node.text or "",
+        )
+
+    def get_node_display_text(self, node: BaseNode) -> str:
+        """Return the text that should be shown to users and query callers."""
+        return self.get_display_text_from_metadata(
+            node.metadata,
+            fallback=node.text or "",
+        )
+
+    def get_display_text_from_metadata(
+        self,
+        metadata: Dict[str, Any] | None,
+        *,
+        fallback: str,
+    ) -> str:
+        """Resolve display text from metadata, falling back to stored text."""
+        return resolve_display_text(metadata, fallback=fallback)
+
+    def prepare_nodes_for_embedding(self, nodes: List[BaseNode]) -> List[BaseNode]:
+        """Clone nodes with retrieval text while preserving display metadata."""
+        prepared_nodes: List[BaseNode] = []
+        for node in nodes:
+            embedding_text = self.get_node_embedding_text(node)
+            if embedding_text == (node.text or ""):
+                prepared_nodes.append(node)
+                continue
+            prepared_nodes.append(node.model_copy(update={"text": embedding_text}))
+        return prepared_nodes
+
+    def _validate_prefix(self, mode: str) -> str:
+        """
+        Validate and return prefix for index naming.
+
+        Args:
+            mode: Index strategy mode
+
+        Returns:
+            Validated prefix string
+
+        Raises:
+            ValueError: If prefix is empty or None
+        """
+        prefix = self.index_strategy.get("prefix", "wegent")
+        if not prefix:
+            raise ValueError(f"prefix cannot be empty for '{mode}' index strategy mode")
+        return prefix
+
+    def _validate_knowledge_id(self, knowledge_id: str, mode: str) -> None:
+        """
+        Validate knowledge_id is not None or empty.
+
+        Args:
+            knowledge_id: Knowledge base ID to validate
+            mode: Index strategy mode (for error message)
+
+        Raises:
+            ValueError: If knowledge_id is None or empty
+        """
+        if not knowledge_id:
+            raise ValueError(
+                f"knowledge_id is required for '{mode}' index strategy mode"
+            )
+
+    def get_index_name(self, knowledge_id: str, **kwargs) -> str:
+        """
+        Get index/collection name based on strategy.
+
+        Strategies:
+        - fixed: Use a single fixed index name (requires fixedName)
+        - rolling: Use rolling indices based on numeric knowledge_id (uses prefix)
+                   Groups N knowledge bases per index, where N = rollingStep (default 10)
+                   e.g., step=10: kb_id 1-10 -> index_0, kb_id 11-20 -> index_10, etc.
+        - per_dataset: Use separate index per knowledge base (default)
+        - per_user: Use separate index per user (requires user_id)
+
+        Args:
+            knowledge_id: Knowledge base ID (must be numeric string for rolling mode)
+            **kwargs: Additional parameters (e.g., user_id for per_user strategy)
+
+        Returns:
+            Index/collection name
+        """
+        mode = self.index_strategy.get("mode", "per_dataset")
+
+        # Debug logging for index strategy
+        logger.debug(
+            f"get_index_name called: knowledge_id={knowledge_id}, "
+            f"index_strategy={self.index_strategy}, mode={mode}"
+        )
+
+        if mode == "fixed":
+            fixed_name = self.index_strategy.get("fixedName")
+            if not fixed_name:
+                raise ValueError(
+                    "fixedName is required for 'fixed' index strategy mode"
+                )
+            return fixed_name
+        elif mode == "rolling":
+            # Validate knowledge_id and prefix
+            self._validate_knowledge_id(knowledge_id, mode)
+            prefix = self._validate_prefix(mode)
+
+            # Validate rollingStep (number of knowledge_ids per index bucket)
+            step = self.index_strategy.get("rollingStep", 10)
+            if not isinstance(step, int) or step <= 0:
+                raise ValueError(f"rollingStep must be a positive integer, got: {step}")
+
+            # Convert knowledge_id to integer for bucket calculation
+            # knowledge_id is expected to be a numeric string (e.g., "1", "2", "123")
+            try:
+                kb_id_num = int(knowledge_id)
+            except ValueError:
+                raise ValueError(
+                    f"knowledge_id must be a numeric value for 'rolling' mode, got: {knowledge_id}"
+                )
+
+            # Calculate index base using floor division
+            # e.g., step=10: kb_id 1-10 -> index_0, kb_id 11-20 -> index_10, etc.
+            # Using (kb_id_num - 1) to make it 0-indexed:
+            #   kb_id 1-10 -> bucket 0 -> index_0
+            #   kb_id 11-20 -> bucket 1 -> index_10
+            bucket_num = (kb_id_num - 1) // step if kb_id_num > 0 else 0
+            index_base = bucket_num * step
+            index_name = f"{prefix}_{self.INDEX_PREFIX}_{index_base}"
+
+            logger.debug(
+                f"Rolling index: step={step}, kb_id_num={kb_id_num}, "
+                f"bucket_num={bucket_num}, index_base={index_base}, index_name={index_name}"
+            )
+            return index_name
+        elif mode == "per_dataset":
+            # Validate knowledge_id and prefix
+            self._validate_knowledge_id(knowledge_id, mode)
+            prefix = self._validate_prefix(mode)
+            return f"{prefix}_kb_{knowledge_id}"
+        elif mode == "per_user":
+            # Per-user index strategy: separate index for each user
+            user_id = kwargs.get("user_id")
+            if not user_id:
+                raise ValueError(
+                    "user_id is required for 'per_user' index strategy mode"
+                )
+            prefix = self._validate_prefix(mode)
+            return f"{prefix}_user_{user_id}"
+        else:
+            raise ValueError(f"Unknown index strategy mode: {mode}")
+
+    @classmethod
+    def get_supported_retrieval_methods(cls) -> List[str]:
+        """
+        Return list of supported retrieval methods.
+
+        Returns:
+            List of method names supported by this backend
+        """
+        return cls.SUPPORTED_RETRIEVAL_METHODS.copy()
+
+    def can_drop_physical_index(self) -> bool:
+        """Return True when the storage backend owns a dedicated KB index."""
+        return self.index_strategy.get("mode", "per_dataset") == "per_dataset"
+
+    def _ensure_can_drop_physical_index(self) -> None:
+        if not self.can_drop_physical_index():
+            raise ValueError(
+                "Physical index drop is only allowed for 'per_dataset' index strategy"
+            )
+
+    @abstractmethod
+    def create_vector_store(self, index_name: str):
+        """
+        Create vector store instance.
+
+        Args:
+            index_name: Index/collection name
+
+        Returns:
+            Vector store instance compatible with LlamaIndex
+        """
+        pass
+
+    @abstractmethod
+    def index_with_metadata(
+        self,
+        nodes: List[BaseNode],
+        chunk_metadata: ChunkMetadata,
+        embed_model,
+        **kwargs,
+    ) -> Dict:
+        """
+        Index nodes into storage.
+
+        Note: Metadata is already applied to nodes by the indexer layer via
+        chunk_metadata.apply_to_nodes() before calling this method. Storage
+        backends should NOT apply metadata to nodes again.
+
+        Args:
+            nodes: List of nodes to index (metadata already applied)
+            chunk_metadata: ChunkMetadata instance containing:
+                - knowledge_id: Knowledge base ID
+                - doc_ref: Document reference ID (doc_xxx format)
+                - source_file: Source file name
+                - created_at: Creation timestamp (ISO 8601)
+                - chunk_index: Set per node during apply_to_nodes()
+            embed_model: Embedding model
+            **kwargs: Additional parameters (e.g., user_id for per_user index strategy)
+
+        Returns:
+            Indexing result dict with:
+                - indexed_count: Number of nodes indexed
+                - index_name: Index/collection name
+                - status: Indexing status
+        """
+        pass
+
+    @abstractmethod
+    def retrieve(
+        self,
+        knowledge_id: str,
+        query: str,
+        embed_model,
+        retrieval_setting: Dict[str, Any],
+        scope: Optional[RetrievalScope] = None,
+        metadata_condition: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> Dict:
+        """
+        Retrieve nodes from storage (Dify-compatible API).
+
+        Args:
+            knowledge_id: Knowledge base ID
+            query: Search query
+            embed_model: Embedding model
+            retrieval_setting: Dict with keys:
+                - top_k: Maximum number of results
+                - score_threshold: Minimum similarity score (0-1)
+                - retrieval_mode: Optional, 'vector'/'keyword'/'hybrid'
+                - vector_weight: Optional, weight for vector search
+                - keyword_weight: Optional, weight for keyword search
+            metadata_condition: Optional metadata filtering conditions
+            scope: Optional domain-level retrieval scope
+            **kwargs: Additional parameters
+
+        Returns:
+            Dict with Dify-compatible format:
+                {
+                    "records": [
+                        {
+                            "content": str,      # Chunk text content
+                            "score": float,      # Relevance score (0-1)
+                            "title": str,        # Document title/source file
+                            "metadata": dict     # Additional metadata
+                        }
+                    ]
+                }
+        """
+        pass
+
+    @abstractmethod
+    def delete_document(self, knowledge_id: str, doc_ref: str, **kwargs) -> Dict:
+        """
+        Delete document from storage.
+
+        Args:
+            knowledge_id: Knowledge base ID
+            doc_ref: Document reference ID
+            **kwargs: Additional parameters
+
+        Returns:
+            Deletion result dict
+        """
+        pass
+
+    @abstractmethod
+    def delete_knowledge(self, knowledge_id: str, **kwargs) -> Dict:
+        """
+        Delete all chunks for a knowledge base from storage.
+
+        Args:
+            knowledge_id: Knowledge base ID
+            **kwargs: Additional parameters
+
+        Returns:
+            Deletion result dict
+        """
+        pass
+
+    @abstractmethod
+    def drop_knowledge_index(self, knowledge_id: str, **kwargs) -> Dict:
+        """
+        Physically drop the backing index/collection for a knowledge base.
+
+        Args:
+            knowledge_id: Knowledge base ID
+            **kwargs: Additional parameters
+
+        Returns:
+            Drop result dict
+        """
+        pass
+
+    @abstractmethod
+    def get_document(self, knowledge_id: str, doc_ref: str, **kwargs) -> Dict:
+        """
+        Get document details.
+
+        Args:
+            knowledge_id: Knowledge base ID
+            doc_ref: Document reference ID
+            **kwargs: Additional parameters
+
+        Returns:
+            Document details dict
+        """
+        pass
+
+    @abstractmethod
+    def list_documents(
+        self, knowledge_id: str, page: int = 1, page_size: int = 20, **kwargs
+    ) -> Dict:
+        """
+        List documents in knowledge base.
+
+        Args:
+            knowledge_id: Knowledge base ID
+            page: Page number
+            page_size: Page size
+            **kwargs: Additional parameters
+
+        Returns:
+            Document list dict
+        """
+        pass
+
+    @abstractmethod
+    def test_connection(self) -> bool:
+        """
+        Test connection to storage backend.
+
+        Returns:
+            True if connection successful, False otherwise
+        """
+        pass
+
+    @abstractmethod
+    def get_all_chunks(
+        self,
+        knowledge_id: str,
+        max_chunks: int = 10000,
+        metadata_condition: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all chunks from a knowledge base.
+
+        This method retrieves all chunks stored for a specific knowledge base,
+        used for direct context injection when content fits within context window.
+
+        Args:
+            knowledge_id: Knowledge base ID
+            max_chunks: Maximum number of chunks to retrieve (safety limit)
+            metadata_condition: Optional metadata filtering conditions
+            **kwargs: Additional parameters (e.g., user_id for per_user strategy)
+
+        Returns:
+            List of chunk dicts with:
+                - content: str, chunk text content
+                - title: str, source document name
+                - chunk_id: int, chunk index within document
+                - doc_ref: str, document reference ID
+                - metadata: dict, additional metadata
+        """
+        pass
+
+    def get_parent_store_name(self, knowledge_id: str, **kwargs) -> str:
+        """Return the dedicated sidecar store name for hierarchical parent nodes."""
+        return f"{self.get_index_name(knowledge_id, **kwargs)}__parents"
+
+    def save_parent_nodes(
+        self,
+        knowledge_id: str,
+        parent_nodes: List[BaseNode],
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Persist hierarchical parent nodes for later recall."""
+        del knowledge_id, parent_nodes, kwargs
+        return {"stored_count": 0}
+
+    def delete_parent_nodes(
+        self,
+        knowledge_id: str,
+        doc_ref: str,
+        **kwargs,
+    ) -> int:
+        """Delete hierarchical parent nodes for a document."""
+        del knowledge_id, doc_ref, kwargs
+        return 0
+
+    def get_parent_nodes(
+        self,
+        knowledge_id: str,
+        parent_node_ids: List[str],
+        **kwargs,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Load hierarchical parent nodes by id."""
+        del knowledge_id, parent_node_ids, kwargs
+        return {}

@@ -1,0 +1,136 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import type { KnowledgeBasesResponse, PersonalKnowledgeBaseGroup } from '@/types/api'
+import type {
+  AllGroupedKnowledgeResponse,
+  DocumentDetailResponse,
+  KnowledgeBaseSummaryResponse,
+} from '@/types/knowledge'
+import client from './client'
+
+export const knowledgeBaseApi = {
+  /**
+   * List all knowledge bases accessible to the user
+   */
+  list: async (params?: {
+    scope?: string
+    group_name?: string
+  }): Promise<KnowledgeBasesResponse> => {
+    const queryParams = new URLSearchParams()
+    if (params?.scope) queryParams.append('scope', params.scope)
+    if (params?.group_name) queryParams.append('group_name', params.group_name)
+
+    const queryString = queryParams.toString()
+    // Use the correct endpoint from /api/knowledge-bases
+    const url = `/knowledge-bases${queryString ? `?${queryString}` : ''}`
+
+    const response = await client.get<KnowledgeBasesResponse>(url)
+    return response
+  },
+
+  /**
+   * Get personal knowledge bases grouped by ownership
+   * Returns { created_by_me: KnowledgeBase[], shared_with_me: KnowledgeBase[] }
+   */
+  getPersonalGrouped: async (): Promise<PersonalKnowledgeBaseGroup> => {
+    const response = await client.get<PersonalKnowledgeBaseGroup>(
+      '/knowledge-bases/personal/grouped'
+    )
+    return response
+  },
+
+  /**
+   * Get all knowledge bases accessible to the user, grouped by scope.
+   * This endpoint returns all knowledge bases in a single request, solving the N+1 query problem.
+   *
+   * Returns:
+   * - personal: Knowledge bases created by the user and shared with the user
+   * - groups: Knowledge bases from team groups the user has access to
+   * - organization: Organization-level knowledge bases (visible to all)
+   * - summary: Counts for each category
+   */
+  getAllGrouped: async (): Promise<AllGroupedKnowledgeResponse> => {
+    const response = await client.get<AllGroupedKnowledgeResponse>('/knowledge-bases/all-grouped')
+    return response
+  },
+
+  /**
+   * Get document detail including content and summary
+   * Supports pagination with offset/limit for large documents
+   */
+  getDocumentDetail: async (
+    kbId: number,
+    docId: number,
+    options?: {
+      includeContent?: boolean
+      includeSummary?: boolean
+      offset?: number
+      limit?: number
+    }
+  ): Promise<DocumentDetailResponse> => {
+    const queryParams = new URLSearchParams()
+    if (options?.includeContent !== undefined) {
+      queryParams.append('include_content', String(options.includeContent))
+    }
+    if (options?.includeSummary !== undefined) {
+      queryParams.append('include_summary', String(options.includeSummary))
+    }
+    if (options?.offset !== undefined) {
+      queryParams.append('offset', String(options.offset))
+    }
+    if (options?.limit !== undefined) {
+      queryParams.append('limit', String(options.limit))
+    }
+
+    const queryString = queryParams.toString()
+    const url = `/knowledge-bases/${kbId}/documents/${docId}/detail${queryString ? `?${queryString}` : ''}`
+
+    const response = await client.get<DocumentDetailResponse>(url)
+    return response
+  },
+
+  /**
+   * Refresh document summary
+   */
+  refreshDocumentSummary: async (kbId: number, docId: number): Promise<void> => {
+    await client.post(`/knowledge-bases/${kbId}/documents/${docId}/summary/refresh`)
+  },
+
+  /**
+   * Get knowledge base summary
+   */
+  getKnowledgeBaseSummary: async (kbId: number): Promise<KnowledgeBaseSummaryResponse> => {
+    const response = await client.get<KnowledgeBaseSummaryResponse>(
+      `/knowledge-bases/${kbId}/summary`
+    )
+    return response
+  },
+
+  /**
+   * Refresh knowledge base summary
+   */
+  refreshKnowledgeBaseSummary: async (kbId: number): Promise<void> => {
+    await client.post(`/knowledge-bases/${kbId}/summary/refresh`)
+  },
+
+  /**
+   * Update document content (TEXT type only)
+   * Updates the extracted_text field and triggers RAG re-indexing.
+   * @param docId Document ID
+   * @param content New Markdown content
+   * @returns Success status and message
+   */
+  updateDocumentContent: async (
+    docId: number,
+    content: string
+  ): Promise<{ success: boolean; document_id: number; message: string }> => {
+    const response = await client.put<{
+      success: boolean
+      document_id: number
+      message: string
+    }>(`/knowledge-documents/${docId}/content`, { content })
+    return response
+  },
+}

@@ -1,0 +1,203 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! MySQL data access for `GET /api/teams/{team_id}/skills`.
+//!
+//! Mirrors the source SQLAlchemy renderings token-for-token: the full
+//! `kinds` projection (labeled `kinds_<column>`) and the
+//! `resource_members` projection used by the share-access check. Variable
+//! values are bound as `?` parameters; the replay matcher materializes them
+//! against the recorded inline literals.
+use brz_mysql::{FromMysqlRow, Json, Mysql, MysqlResult};
+use chrono::NaiveDateTime;
+
+use super::super::teams_repository::KIND_COLUMNS;
+
+/// The CRD `json` column payload of a `kinds` row. The source stores the
+/// full Kubernetes-style CRD document here; the team-skills endpoint
+/// deserializes the `spec` sub-object into typed `TeamSpec`/`BotSpec`/
+/// `GhostSpec` structs (see `handler.rs`). The payload is kept as the
+/// driver's `Json` wrapper around an opaque raw JSON value (the CRD
+/// document is not fully typed at the repository layer), matching the
+/// existing `kinds` repositories.
+pub(crate) type KindJson = Json<serde_json::value::Value>;
+
+/// One `kinds` row loaded by the team-skills chain (Team, Bot, Ghost). The
+/// projection mirrors the source `db.query(Kind)` column list (labeled
+/// `kinds_<column>`); fields the endpoint does not read carry
+/// `#[allow(dead_code)]`.
+#[derive(Debug, Clone, FromMysqlRow)]
+pub struct KindRow {
+    #[allow(dead_code)]
+    pub kinds_id: i64,
+    #[allow(dead_code)]
+    pub kinds_user_id: i64,
+    #[allow(dead_code)]
+    pub kinds_kind: String,
+    #[allow(dead_code)]
+    pub kinds_name: String,
+    pub kinds_namespace: String,
+    pub kinds_json: KindJson,
+    #[allow(dead_code)]
+    pub kinds_is_active: i8,
+    #[allow(dead_code)]
+    pub kinds_created_at: NaiveDateTime,
+    #[allow(dead_code)]
+    pub kinds_updated_at: NaiveDateTime,
+}
+
+/// `team_share_service._get_resource` team lookup
+/// (`team_kinds_service.get_team_skills` -> `get_resource_for_use`): one
+/// active Team `kinds` row by id, a plain `db.query(Kind)` that does not go
+/// through the cached kind reader. The source inlines the id as a text
+/// literal; the target binds it as a parameter, which the replay matcher
+/// accepts. The `is_active IS true` rendering mirrors the source's
+/// `Kind.is_active.is_(True)`.
+pub async fn team_by_id<M>(mysql: &M, team_id: i64) -> MysqlResult<Option<KindRow>>
+where
+    M: Mysql,
+{
+    mysql
+        .fetch_optional(
+            format!(
+                "SELECT {KIND_COLUMNS} \nFROM kinds \n\
+                 WHERE kinds.id = ? AND kinds.kind = 'Team' \
+                 AND kinds.is_active IS true \n LIMIT 1"
+            )
+            .as_str(),
+            (team_id,),
+        )
+        .await
+}
+
+/// `batch_load_kinds_by_refs` personal rows: the user's active kinds with
+/// the given names in the `default` namespace. `names` keeps the caller's
+/// order. Retained for parity with the source's direct kind-ref queries; the
+/// cached reader resolves personal lookups on the request path.
+#[allow(dead_code)]
+pub async fn kinds_by_names<M>(
+    mysql: &M,
+    user_id: i64,
+    kind: &str,
+    names: &[(String, String)],
+) -> MysqlResult<Vec<KindRow>>
+where
+    M: Mysql,
+{
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = names
+        .iter()
+        .map(|(_, name)| format!("'{}'", escape_sql_string(name)))
+        .collect::<Vec<String>>()
+        .join(", ");
+    mysql
+        .fetch_all(
+            &format!(
+                "SELECT {KIND_COLUMNS} \nFROM kinds \nWHERE kinds.user_id = ? \
+             AND kinds.kind = '{kind}' AND kinds.namespace = 'default' \
+             AND kinds.name IN ({list}) AND kinds.is_active = true"
+            ),
+            (user_id,),
+        )
+        .await
+}
+
+/// `batch_load_kinds_by_refs` public rows (`user_id = 0`). Retained for
+/// parity with the source's `KindReader.get_public` repository path.
+#[allow(dead_code)]
+pub async fn public_kinds_by_names<M>(
+    mysql: &M,
+    kind: &str,
+    names: &[(String, String)],
+) -> MysqlResult<Vec<KindRow>>
+where
+    M: Mysql,
+{
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = names
+        .iter()
+        .map(|(_, name)| format!("'{}'", escape_sql_string(name)))
+        .collect::<Vec<String>>()
+        .join(", ");
+    mysql
+        .fetch_all(
+            &format!(
+                "SELECT {KIND_COLUMNS} \nFROM kinds \nWHERE kinds.user_id = 0 \
+             AND kinds.kind = '{kind}' AND kinds.namespace = 'default' \
+             AND kinds.name IN ({list}) AND kinds.is_active = true"
+            ),
+            (),
+        )
+        .await
+}
+
+/// `batch_load_kinds_by_refs` group rows (namespace-scoped). Retained for
+/// parity with the source's `KindReader.get_group` repository path.
+#[allow(dead_code)]
+pub async fn group_kinds_by_names<M>(
+    mysql: &M,
+    kind: &str,
+    refs: &[(String, String)],
+) -> MysqlResult<Vec<KindRow>>
+where
+    M: Mysql,
+{
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let namespace_list = refs
+        .iter()
+        .map(|(namespace, _)| format!("'{}'", escape_sql_string(namespace)))
+        .collect::<Vec<String>>()
+        .join(", ");
+    let name_list = refs
+        .iter()
+        .map(|(_, name)| format!("'{}'", escape_sql_string(name)))
+        .collect::<Vec<String>>()
+        .join(", ");
+    mysql
+        .fetch_all(
+            &format!(
+                "SELECT {KIND_COLUMNS} \nFROM kinds \nWHERE kinds.kind = '{kind}' \
+             AND kinds.namespace IN ({namespace_list}) \
+             AND kinds.name IN ({name_list}) AND kinds.is_active = true"
+            ),
+            (),
+        )
+        .await
+}
+
+/// Escape one string literal with MySQL's default quoting rules (the same
+/// helper the kind-ref queries use for inline COM_QUERY literals).
+fn escape_sql_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'\'' => out.push_str("\\'"),
+            b'\\' => out.push_str("\\\\"),
+            b'\0' => out.push_str("\\0"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            0x1a => out.push_str("\\Z"),
+            other => out.push(other as char),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapes_single_quotes_and_backslashes() {
+        assert_eq!(escape_sql_string("a'b"), "a\\'b");
+        assert_eq!(escape_sql_string("a\\b"), "a\\\\b");
+        assert_eq!(escape_sql_string("wegent-chat"), "wegent-chat");
+    }
+}

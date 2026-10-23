@@ -1,0 +1,328 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+pub mod cli;
+mod shutdown;
+
+use crate::config::device::{load_device_config, DeviceConfig};
+use crate::local::{
+    app_ipc::normalize_device_id,
+    backend::{serve_local_app_endpoint, serve_local_app_sidecar, serve_remote_local_backend},
+};
+use crate::logging::{
+    init_executor_logging, log_executor_event, reserve_executor_stdout_for_protocol,
+};
+use crate::process_environment::ShellEnvironmentLoad;
+use crate::server::{self, ServerConfig};
+use crate::services::updater::UpdaterService;
+use crate::version::get_version;
+use cli::CliArgs;
+use std::env;
+use std::fmt;
+use std::net::SocketAddr;
+
+#[derive(Debug)]
+pub enum AppError {
+    Cli(cli::CliError),
+    Config(crate::config::device::ConfigError),
+    Server(String),
+    ServerConfig(crate::server::ServerConfigError),
+    Upgrade(String),
+}
+
+impl AppError {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Cli(_) => 2,
+            Self::Config(_) => 1,
+            Self::Server(_) => 1,
+            Self::ServerConfig(_) => 1,
+            Self::Upgrade(_) => 1,
+        }
+    }
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cli(error) => write!(formatter, "{error}"),
+            Self::Config(error) => write!(formatter, "{error}"),
+            Self::Server(error) => write!(formatter, "{error}"),
+            Self::ServerConfig(error) => write!(formatter, "{error}"),
+            Self::Upgrade(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl From<cli::CliError> for AppError {
+    fn from(error: cli::CliError) -> Self {
+        Self::Cli(error)
+    }
+}
+
+impl From<crate::config::device::ConfigError> for AppError {
+    fn from(error: crate::config::device::ConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<crate::server::ServerConfigError> for AppError {
+    fn from(error: crate::server::ServerConfigError) -> Self {
+        Self::ServerConfig(error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupPlan {
+    pub http_server: Option<HttpServerPlan>,
+    pub local_sidecar: Option<LocalSidecarPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpServerPlan {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSidecarPlan {
+    pub backend_enabled: bool,
+    pub device_id: String,
+    pub transport: LocalSidecarTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalSidecarTransport {
+    RemoteBackend,
+    Stdio,
+    LocalEndpoint,
+}
+
+impl HttpServerPlan {
+    pub fn bind_addr(&self) -> Result<SocketAddr, AppError> {
+        self.server_config().bind_addr().map_err(AppError::from)
+    }
+
+    fn server_config(&self) -> ServerConfig {
+        ServerConfig {
+            host: self.host.clone(),
+            port: self.port,
+        }
+    }
+}
+
+pub async fn run_from_env() -> Result<(), AppError> {
+    let args = CliArgs::parse_from(env::args())?;
+    run(args).await
+}
+
+pub async fn run(args: CliArgs) -> Result<(), AppError> {
+    run_with_shell_environment(args, None).await
+}
+
+pub async fn run_with_shell_environment(
+    args: CliArgs,
+    shell_environment: Option<Result<Option<ShellEnvironmentLoad>, String>>,
+) -> Result<(), AppError> {
+    if args.help {
+        println!("{}", CliArgs::usage());
+        return Ok(());
+    }
+
+    if args.version {
+        println!("{}", get_version());
+        return Ok(());
+    }
+
+    crate::config::paths::migrate_default_home()
+        .map_err(|error| AppError::Server(format!("Executor Home migration failed: {error}")))?;
+
+    if args.upgrade {
+        let config = load_device_config(args.config_path.as_deref())?;
+        return run_upgrade(config.update, args.yes).await;
+    }
+
+    if app_ipc_enabled() && !local_endpoint_enabled() {
+        reserve_executor_stdout_for_protocol();
+    }
+    init_executor_logging(&DeviceConfig::default());
+    log_shell_environment_load(shell_environment);
+    let config = load_device_config(args.config_path.as_deref())?;
+    init_executor_logging(&config);
+    let plan = startup_plan_for_config(&config)?;
+    crate::local::capabilities::initialize_default_manifest()
+        .map_err(|error| AppError::Server(error.to_string()))?;
+    if plan
+        .local_sidecar
+        .as_ref()
+        .is_some_and(|sidecar| sidecar.transport == LocalSidecarTransport::Stdio)
+    {
+        reserve_executor_stdout_for_protocol();
+    }
+
+    let mut shutdown = shutdown::ShutdownRequest::install();
+    let outcome = tokio::select! {
+        outcome = serve_runtime_plan(config, plan) => outcome,
+        request = shutdown.wait() => {
+            log_executor_event("executor stop requested", &[("request", request.to_owned())]);
+            Ok(())
+        }
+    };
+    // The runtime stopped because the desktop app went away or asked us to stop:
+    // take the agent processes it drove down with us instead of letting them
+    // outlive this executor, and release the blocking reads parked on their
+    // stdio.
+    crate::agents::terminate_agent_processes().await;
+    outcome
+}
+
+async fn serve_runtime_plan(
+    config: crate::config::device::DeviceConfig,
+    plan: StartupPlan,
+) -> Result<(), AppError> {
+    match (plan.http_server, plan.local_sidecar) {
+        (Some(http_server), None) => server::serve(http_server.server_config())
+            .await
+            .map_err(AppError::Server),
+        (None, Some(local_sidecar)) => serve_local_sidecar(config, local_sidecar)
+            .await
+            .map_err(AppError::Server),
+        (Some(http_server), Some(local_sidecar)) => {
+            let server_config = http_server.server_config();
+            let local_sidecar_future = serve_local_sidecar(config, local_sidecar);
+            tokio::select! {
+                result = server::serve(server_config) => result.map_err(AppError::Server),
+                result = local_sidecar_future => result.map_err(AppError::Server),
+            }
+        }
+        (None, None) => Err(AppError::Server(
+            "startup plan has no runtime target".to_owned(),
+        )),
+    }
+}
+
+fn log_shell_environment_load(result: Option<Result<Option<ShellEnvironmentLoad>, String>>) {
+    match result {
+        Some(Ok(Some(loaded))) => {
+            log_executor_event(
+                "user login shell environment loaded",
+                &[
+                    ("shell", loaded.shell),
+                    ("path_entries", loaded.path_entry_count.to_string()),
+                ],
+            );
+        }
+        Some(Ok(None)) | None => {}
+        Some(Err(error)) => {
+            log_executor_event(
+                "user login shell environment load failed",
+                &[("error", error), ("fallback", "process_path".to_string())],
+            );
+        }
+    }
+}
+
+async fn serve_local_sidecar(
+    config: crate::config::device::DeviceConfig,
+    plan: LocalSidecarPlan,
+) -> Result<(), String> {
+    match plan.transport {
+        LocalSidecarTransport::RemoteBackend => serve_remote_local_backend(config).await,
+        LocalSidecarTransport::Stdio => serve_local_app_sidecar(config).await,
+        LocalSidecarTransport::LocalEndpoint => {
+            let endpoint = required_environment("WEGENT_APP_IPC_ENDPOINT")?;
+            let owner_token = required_environment("WEGENT_APP_IPC_OWNER_TOKEN")?;
+            let token = required_environment("WEGENT_APP_IPC_TOKEN")?;
+            serve_local_app_endpoint(config, &endpoint, &token, &owner_token).await
+        }
+    }
+}
+
+async fn run_upgrade(
+    update_config: crate::config::device::UpdateConfig,
+    auto_confirm: bool,
+) -> Result<(), AppError> {
+    println!("wegent-executor v{}", get_version());
+    println!();
+
+    let result = UpdaterService::new(update_config, auto_confirm)
+        .check_and_update()
+        .await;
+    if result.success {
+        if result.already_latest {
+            println!("Already running the latest version");
+        } else {
+            println!("Update complete!");
+            println!("Please restart the executor:");
+            println!("  wegent-executor");
+        }
+        return Ok(());
+    }
+
+    Err(AppError::Upgrade(format!(
+        "Update failed: {}",
+        result.error.unwrap_or_else(|| "unknown error".to_owned())
+    )))
+}
+
+pub fn startup_plan(args: CliArgs) -> Result<StartupPlan, AppError> {
+    let config = load_device_config(args.config_path.as_deref())?;
+    startup_plan_for_config(&config)
+}
+
+fn startup_plan_for_config(
+    config: &crate::config::device::DeviceConfig,
+) -> Result<StartupPlan, AppError> {
+    if config.runtime_mode() == crate::config::device::RuntimeMode::Docker {
+        let server = ServerConfig::from_env()?;
+        return Ok(StartupPlan {
+            http_server: Some(HttpServerPlan {
+                host: server.host,
+                port: server.port,
+            }),
+            local_sidecar: None,
+        });
+    }
+
+    let backend_enabled = !config.connection.backend_url.trim().is_empty();
+    let app_ipc_enabled = app_ipc_enabled();
+    Ok(StartupPlan {
+        http_server: Some(HttpServerPlan {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+        }),
+        local_sidecar: Some(LocalSidecarPlan {
+            backend_enabled,
+            device_id: normalize_device_id(config.device_id.clone()),
+            transport: if local_endpoint_enabled() {
+                LocalSidecarTransport::LocalEndpoint
+            } else if backend_enabled && !app_ipc_enabled {
+                LocalSidecarTransport::RemoteBackend
+            } else {
+                LocalSidecarTransport::Stdio
+            },
+        }),
+    })
+}
+
+fn app_ipc_enabled() -> bool {
+    local_endpoint_enabled()
+        || env::var("WEGENT_APP_IPC_DEVICE_ID")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn local_endpoint_enabled() -> bool {
+    env::var("WEGENT_APP_IPC_ENDPOINT")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn required_environment(name: &str) -> Result<String, String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{name} is required"))
+}

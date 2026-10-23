@@ -1,0 +1,789 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import React, { type Dispatch, type SetStateAction } from 'react'
+import { CircleStop } from 'lucide-react'
+import ModelSelector, { Model } from '../selector/ModelSelector'
+import UnifiedRepositorySelector from '../selector/UnifiedRepositorySelector'
+import ChatContextInput from '../chat/ChatContextInput'
+import AttachmentButton from '../AttachmentButton'
+import SendButton from './SendButton'
+import LoadingDots from '../message/LoadingDots'
+import ChatToolbarStatus from './ChatToolbarStatus'
+import { ActionButton } from '@/components/ui/action-button'
+import type {
+  Team,
+  GitRepoInfo,
+  GitBranch,
+  TaskDetail,
+  MultiAttachmentUploadState,
+  TaskType,
+} from '@/types/api'
+import type { ContextItem } from '@/types/context'
+import type { UnifiedSkill } from '@/apis/skills'
+import {
+  canSwitchModelAfterMessages,
+  canUseChatContexts,
+  isChatShell,
+} from '../../service/messageService'
+import { supportsAttachments } from '../../service/attachmentService'
+import { useIsMobile } from '@/features/layout/hooks/useMediaQuery'
+import { MobileChatInputControls } from './MobileChatInputControls'
+import { SkillSelectorPopoverRef } from '../selector/SkillSelectorPopover'
+import {
+  ImageSizeSelector,
+  GenerateModeSelector,
+  isGenerateMode,
+  VideoGenerationModeSelector,
+  VideoSettingsPopover,
+} from '../selector'
+import type { GenerateMode } from '../selector'
+import type { AspectRatioOption, ResolutionOption, VideoGenerationMode } from '@/apis/models'
+import { ProjectSelectorTab } from '@/features/projects/components/ProjectSelectorTab'
+import { getChatSendState } from './chatSendState'
+import AgentSkillSelectorMenu from './AgentSkillSelectorMenu'
+import InputMoreActionsMenu from './InputMoreActionsMenu'
+import {
+  teamSupportsBothGenerationModes,
+  type TeamModeFilter,
+} from '../selector/team-selector-utils'
+import { getVideoParamVisibility } from '../../utils/teamModeSpec'
+
+export interface ChatInputControlsProps {
+  /** Task type to determine which controls to show */
+  taskType?: TaskType
+  /** Mode used to filter visible teams in selectors. */
+  teamModeFilter?: TeamModeFilter
+  // Team and Model
+  selectedTeam: Team | null
+  /** Available teams for team selector */
+  teams?: Team[]
+  onTeamChange?: (team: Team) => void
+  onClearTeam?: () => void
+  showClearTeamButton?: boolean
+  /** Callback to refresh teams list after creation */
+  onTeamsRefresh?: () => Promise<void>
+  selectedModel: Model | null
+  setSelectedModel: (model: Model | null) => void
+  forceOverride: boolean
+  setForceOverride: (value: boolean) => void
+  /** Current team ID for model preference storage */
+  teamId?: number | null
+  /** Current task ID for session-level model preference storage (null for new chat) */
+  taskId?: number | null
+  /** Task's model_id from backend - used as fallback when no session preference exists */
+  taskModelId?: string | null
+  /** Knowledge base ID to exclude from context selector (used in notebook mode) */
+  knowledgeBaseId?: number
+
+  // Repository and Branch
+  showRepositorySelector: boolean
+  selectedRepo: GitRepoInfo | null
+  setSelectedRepo: (repo: GitRepoInfo | null) => void
+  selectedBranch: GitBranch | null
+  setSelectedBranch: (branch: GitBranch | null) => void
+  selectedTaskDetail: TaskDetail | null
+  /** Effective requires workspace value (considering user override) */
+  effectiveRequiresWorkspace?: boolean
+  /** Callback when user toggles the requires workspace switch */
+  onRequiresWorkspaceChange?: (value: boolean) => void
+
+  // Deep Thinking and Clarification
+  enableDeepThinking: boolean
+  setEnableDeepThinking: (value: boolean) => void
+  enableClarification: boolean
+  setEnableClarification: (value: boolean) => void
+
+  // Correction mode
+  enableCorrectionMode?: boolean
+  correctionModelName?: string | null
+  onCorrectionModeToggle?: (enabled: boolean, modelId?: string, modelName?: string) => void
+
+  // Context selection (knowledge bases)
+  selectedContexts: ContextItem[]
+  setSelectedContexts: Dispatch<SetStateAction<ContextItem[]>>
+
+  // Attachment (multi-attachment)
+  attachmentState: MultiAttachmentUploadState
+  onFileSelect: (files: File | File[]) => void
+  onAttachmentRemove: (attachmentId: number) => void
+
+  // State flags
+  isStreaming: boolean
+  isStopping: boolean
+  hasMessages: boolean
+  shouldCollapseSelectors: boolean
+  shouldHideToolbarStatus: boolean
+  shouldHideChatInput: boolean
+  isModelSelectionRequired: boolean
+  isAttachmentReadyToSend: boolean
+  taskInputMessage: string
+  submitBlockedReason?: string | null
+  canQueueMessage?: boolean
+  canSendGuidance?: boolean
+  canCancelTask?: boolean
+
+  // Actions
+  onStopStream: () => void
+  onCancelTask?: () => void
+  onSendMessage: () => void
+  onSendGuidance?: () => void
+
+  // Whether there are no available teams (shows disabled state)
+  hasNoTeams?: boolean
+
+  // Skill selector support
+  availableSkills?: UnifiedSkill[]
+  teamSkillNames?: string[]
+  preloadedSkillNames?: string[]
+  selectedSkillIds?: number[]
+  selectedSkillNames?: string[]
+  onToggleSkill?: (skill: UnifiedSkill) => void
+
+  // Ref for skill selector button (for fly animation)
+  skillSelectorRef?: React.RefObject<SkillSelectorPopoverRef | null>
+
+  // Video mode props (only used when taskType === 'video')
+  videoModels?: Model[]
+  selectedVideoModel?: Model | null
+  onVideoModelChange?: (model: Model) => void
+  isVideoModelsLoading?: boolean
+  selectedResolution?: string
+  onResolutionChange?: (resolution: string) => void
+  availableResolutions?: string[]
+  resolutionOptions?: ResolutionOption[]
+  selectedRatio?: string
+  onRatioChange?: (ratio: string) => void
+  availableRatios?: string[]
+  ratioOptions?: AspectRatioOption[]
+  selectedDuration?: number
+  onDurationChange?: (duration: number) => void
+  availableDurations?: number[]
+  videoGenerationModes?: VideoGenerationMode[]
+  selectedVideoGenerationMode?: string
+  onVideoGenerationModeChange?: (modeId: string) => void
+  materialAccept?: string
+  showVideoControlsInChat?: boolean
+  hideDurationSelector?: boolean
+
+  // Image mode props (only used when taskType === 'image')
+  selectedImageModel?: Model | null
+  onImageModelChange?: (model: Model) => void
+  isImageModelsLoading?: boolean
+  selectedImageSize?: string
+  onImageSizeChange?: (size: string) => void
+
+  // Generate mode switch props (only used when taskType is 'video' or 'image')
+  /** Callback when user switches between video and image mode */
+  onGenerateModeChange?: (mode: GenerateMode) => void
+
+  /** When true, hide all selectors - only show send button and toolbar status */
+  hideSelectors?: boolean
+
+  /** Project ID for project selector (workspace projects) */
+  projectId?: number | null
+}
+
+/**
+ * ChatInputControls Component
+ *
+ * Renders the bottom control bar of the chat input area, including:
+ * - File upload button
+ * - Clarification toggle
+ * - Model selector
+ * - Repository selector (for code tasks)
+ * - Branch selector (for code tasks)
+ * - Toolbar status display
+ * - Deep thinking toggle
+ * - Send/Stop button
+ *
+ * This component is used in both the empty state (no messages) and
+ * the messages state (floating input) of ChatArea.
+ */
+export function ChatInputControls({
+  taskType,
+  teamModeFilter = taskType ?? 'chat',
+  selectedTeam,
+  teams = [],
+  onTeamChange,
+  onClearTeam,
+  showClearTeamButton = false,
+  onTeamsRefresh,
+  selectedModel,
+  setSelectedModel,
+  forceOverride,
+  setForceOverride,
+  teamId,
+  taskId,
+  taskModelId,
+  knowledgeBaseId,
+  showRepositorySelector,
+  selectedRepo,
+  setSelectedRepo,
+  selectedBranch,
+  setSelectedBranch,
+  selectedTaskDetail,
+  effectiveRequiresWorkspace,
+  onRequiresWorkspaceChange,
+  enableClarification,
+  setEnableClarification,
+  enableCorrectionMode = false,
+  correctionModelName,
+  onCorrectionModeToggle,
+  selectedContexts,
+  setSelectedContexts,
+  attachmentState,
+  onFileSelect,
+  onAttachmentRemove: _onAttachmentRemove,
+  isStreaming,
+  isStopping,
+  hasMessages,
+  shouldCollapseSelectors,
+  shouldHideToolbarStatus,
+  shouldHideChatInput,
+  isModelSelectionRequired,
+  isAttachmentReadyToSend,
+  taskInputMessage,
+  submitBlockedReason,
+  canQueueMessage = false,
+  canSendGuidance = false,
+  canCancelTask,
+  onStopStream,
+  onCancelTask,
+  onSendMessage,
+  onSendGuidance,
+  hasNoTeams = false,
+  availableSkills = [],
+  teamSkillNames = [],
+  preloadedSkillNames = [],
+  selectedSkillIds,
+  selectedSkillNames = [],
+  onToggleSkill,
+  skillSelectorRef,
+  // Video mode props
+  videoModels: _videoModels = [],
+  selectedVideoModel,
+  onVideoModelChange,
+  isVideoModelsLoading = false,
+  selectedResolution = '720p',
+  onResolutionChange,
+  availableResolutions,
+  resolutionOptions,
+  selectedRatio = '16:9',
+  onRatioChange,
+  availableRatios,
+  ratioOptions,
+  selectedDuration = 5,
+  onDurationChange,
+  availableDurations,
+  videoGenerationModes = [],
+  selectedVideoGenerationMode,
+  onVideoGenerationModeChange,
+  materialAccept,
+  showVideoControlsInChat = false,
+  hideDurationSelector = false,
+  // Image mode props
+  selectedImageModel,
+  onImageModelChange,
+  isImageModelsLoading = false,
+  selectedImageSize = '1024x1024',
+  onImageSizeChange,
+  // Generate mode switch props
+  onGenerateModeChange,
+  // Hide all selectors (for OpenClaw devices)
+  hideSelectors,
+  // Project context
+  projectId,
+}: ChatInputControlsProps) {
+  // Check if we're in video or image mode
+  const isVideoMode = taskType === 'video' || showVideoControlsInChat
+  const isImageMode = taskType === 'image'
+  const hiddenVideoParams = selectedTeam?.mode_spec?.hiddenVideoParams ?? []
+  const videoParamVisibility = getVideoParamVisibility(hiddenVideoParams, !hideDurationSelector)
+  // Check if we're in generation mode (video or image)
+  const isGenerationMode = isVideoMode || isImageMode
+  // Always use compact mode (icon only) to save space
+  const shouldUseCompactToolbarStatus = true
+  const isMobile = useIsMobile()
+  const showChatContexts = canUseChatContexts(taskType, selectedTeam)
+
+  // Determine the send button state
+  const renderSendButton = () => {
+    const sendState = getChatSendState({
+      isStreaming,
+      isStopping,
+      isModelSelectionRequired,
+      isAttachmentReadyToSend,
+      hasNoTeams,
+      shouldHideChatInput,
+      taskInputMessage,
+      hasAttachments: attachmentState.attachments.length > 0,
+      canQueueMessage,
+      canCancelTask,
+    })
+
+    const renderStopAction = () => (
+      <ActionButton
+        onClick={onStopStream}
+        title="Stop generating"
+        icon={<CircleStop className="h-4 w-4 text-orange-500" />}
+        className="hover:bg-orange-100"
+        data-testid="stop-stream-button"
+      />
+    )
+
+    const renderStoppingAction = () => (
+      <ActionButton
+        variant="loading"
+        icon={
+          <>
+            <div className="absolute inset-0 rounded-full border-2 border-orange-200 border-t-orange-500 animate-spin" />
+            <CircleStop className="h-4 w-4 text-orange-500" />
+          </>
+        }
+      />
+    )
+
+    const renderCancelTaskAction = () => {
+      return (
+        <ActionButton
+          onClick={onCancelTask}
+          title="Cancel task"
+          icon={<CircleStop className="h-4 w-4 text-orange-500" />}
+          className="hover:bg-orange-100"
+          data-testid="cancel-task-button"
+        />
+      )
+    }
+
+    if (sendState.primaryAction === 'loading') {
+      if (sendState.showStopAction) {
+        return renderStoppingAction()
+      }
+
+      if (sendState.showPendingAction) {
+        return <ActionButton disabled variant="loading" icon={<LoadingDots />} />
+      }
+
+      return <ActionButton disabled variant="loading" icon={<LoadingDots />} />
+    }
+
+    if (sendState.primaryAction === 'stop') {
+      return renderStopAction()
+    }
+
+    if (sendState.primaryAction === 'cancel') {
+      return renderCancelTaskAction()
+    }
+
+    if (sendState.primaryAction === 'queue') {
+      return (
+        <div className="flex items-center gap-2">
+          {renderStopAction()}
+          <SendButton
+            onClick={onSendMessage}
+            disabled={sendState.isPrimaryDisabled}
+            isLoading={false}
+            ariaLabel="Queue message"
+            disabledReason={submitBlockedReason}
+          />
+        </div>
+      )
+    }
+
+    return (
+      <SendButton
+        onClick={onSendMessage}
+        disabled={sendState.isPrimaryDisabled}
+        isLoading={false}
+        disabledReason={submitBlockedReason}
+      />
+    )
+  }
+
+  // Mobile: delegate to MobileChatInputControls
+  if (isMobile) {
+    return (
+      <MobileChatInputControls
+        selectedTeam={selectedTeam}
+        teams={teams}
+        onTeamChange={onTeamChange}
+        onClearTeam={onClearTeam}
+        showClearTeamButton={showClearTeamButton}
+        taskType={taskType}
+        teamModeFilter={teamModeFilter}
+        selectedModel={selectedModel}
+        setSelectedModel={setSelectedModel}
+        forceOverride={forceOverride}
+        setForceOverride={setForceOverride}
+        teamId={teamId}
+        taskId={taskId}
+        taskModelId={taskModelId}
+        knowledgeBaseId={knowledgeBaseId}
+        showRepositorySelector={showRepositorySelector}
+        selectedRepo={selectedRepo}
+        setSelectedRepo={setSelectedRepo}
+        selectedBranch={selectedBranch}
+        setSelectedBranch={setSelectedBranch}
+        selectedTaskDetail={selectedTaskDetail}
+        effectiveRequiresWorkspace={effectiveRequiresWorkspace}
+        onRequiresWorkspaceChange={hasMessages ? undefined : onRequiresWorkspaceChange}
+        enableClarification={enableClarification}
+        setEnableClarification={setEnableClarification}
+        enableCorrectionMode={enableCorrectionMode}
+        correctionModelName={correctionModelName}
+        onCorrectionModeToggle={onCorrectionModeToggle}
+        selectedContexts={selectedContexts}
+        setSelectedContexts={setSelectedContexts}
+        onFileSelect={onFileSelect}
+        isStreaming={isStreaming}
+        isStopping={isStopping}
+        hasMessages={hasMessages}
+        shouldHideChatInput={shouldHideChatInput}
+        isModelSelectionRequired={isModelSelectionRequired}
+        isAttachmentReadyToSend={isAttachmentReadyToSend}
+        taskInputMessage={taskInputMessage}
+        submitBlockedReason={submitBlockedReason}
+        hasAttachments={attachmentState.attachments.length > 0}
+        canQueueMessage={canQueueMessage}
+        canSendGuidance={canSendGuidance}
+        canCancelTask={canCancelTask}
+        onStopStream={onStopStream}
+        onCancelTask={onCancelTask}
+        onSendMessage={onSendMessage}
+        onSendGuidance={onSendGuidance}
+        hasNoTeams={hasNoTeams}
+        availableSkills={availableSkills}
+        teamSkillNames={teamSkillNames}
+        preloadedSkillNames={preloadedSkillNames}
+        selectedSkillIds={selectedSkillIds}
+        selectedSkillNames={selectedSkillNames}
+        onToggleSkill={onToggleSkill}
+        hideSelectors={hideSelectors}
+        attachmentAccept={isGenerationMode ? materialAccept : undefined}
+        videoGenerationModes={videoGenerationModes}
+        selectedVideoGenerationMode={selectedVideoGenerationMode}
+        onVideoGenerationModeChange={onVideoGenerationModeChange}
+        selectedVideoModel={selectedVideoModel}
+        onVideoModelChange={onVideoModelChange}
+        isVideoModelsLoading={isVideoModelsLoading}
+        selectedImageModel={selectedImageModel}
+        onImageModelChange={onImageModelChange}
+        isImageModelsLoading={isImageModelsLoading}
+        selectedImageSize={selectedImageSize}
+        onImageSizeChange={onImageSizeChange}
+        showVideoControlsInChat={showVideoControlsInChat}
+        selectedResolution={selectedResolution}
+        onResolutionChange={onResolutionChange}
+        availableResolutions={availableResolutions}
+        resolutionOptions={resolutionOptions}
+        selectedRatio={selectedRatio}
+        onRatioChange={onRatioChange}
+        availableRatios={availableRatios}
+        ratioOptions={ratioOptions}
+        selectedDuration={selectedDuration}
+        onDurationChange={onDurationChange}
+        availableDurations={availableDurations}
+        hideDurationSelector={hideDurationSelector}
+      />
+    )
+  }
+
+  const selectorsDisabled = isStreaming
+  const showClarificationAction = isChatShell(selectedTeam)
+  const showCorrectionAction = isChatShell(selectedTeam) && Boolean(onCorrectionModeToggle)
+  const compactVideoControls = isVideoMode && shouldCollapseSelectors
+  const compactVideoMenuItems = compactVideoControls ? (
+    <>
+      {videoParamVisibility.showModel && onVideoModelChange && (
+        <ModelSelector
+          selectedModel={selectedVideoModel ?? null}
+          setSelectedModel={model => model && onVideoModelChange(model)}
+          forceOverride={false}
+          setForceOverride={() => {}}
+          selectedTeam={selectedTeam}
+          disabled={isStreaming}
+          isLoading={isVideoModelsLoading}
+          modelCategoryType="video"
+          triggerVariant="menu-item"
+          popoverSide="right"
+        />
+      )}
+      {onVideoGenerationModeChange && videoGenerationModes.length > 1 && (
+        <VideoGenerationModeSelector
+          modes={videoGenerationModes}
+          value={selectedVideoGenerationMode}
+          onChange={onVideoGenerationModeChange}
+          disabled={isStreaming}
+          triggerVariant="menu-item"
+          popoverSide="right"
+        />
+      )}
+    </>
+  ) : null
+  const controlsSpacingClass = shouldHideChatInput
+    ? 'py-3'
+    : shouldCollapseSelectors
+      ? 'pb-2'
+      : 'pb-2 -mt-2.5'
+
+  // Desktop layout
+  return (
+    <div
+      className={`flex items-center justify-between px-2 ${compactVideoControls ? 'gap-1' : 'gap-2'} ${controlsSpacingClass}`}
+    >
+      <div
+        className={`flex min-w-0 flex-1 items-center gap-1 overflow-visible ${
+          compactVideoControls ? 'flex-nowrap' : 'flex-wrap'
+        }`}
+        data-tour="input-controls"
+        data-testid="input-controls"
+      >
+        {/* Generate Mode Selector - show when in video or image mode */}
+        {isGenerateMode(taskType) &&
+          onGenerateModeChange &&
+          teamSupportsBothGenerationModes(selectedTeam) && (
+            <GenerateModeSelector
+              selectedMode={taskType as GenerateMode}
+              onModeChange={onGenerateModeChange}
+              disabled={isStreaming || hasMessages}
+            />
+          )}
+
+        {/* Reference image upload button - show for image and video generation modes,
+            placed between the mode toggle and the model selector */}
+        {isGenerationMode && selectedVideoGenerationMode !== 'first_last_frame' && (
+          <AttachmentButton
+            onFileSelect={onFileSelect}
+            disabled={isStreaming}
+            accept={materialAccept ?? 'image/*'}
+          />
+        )}
+
+        {/* Video Mode Controls - show when taskType is 'video' */}
+        {isVideoMode && (
+          <>
+            {!compactVideoControls && onVideoGenerationModeChange && (
+              <VideoGenerationModeSelector
+                modes={videoGenerationModes}
+                value={selectedVideoGenerationMode}
+                onChange={onVideoGenerationModeChange}
+                disabled={isStreaming}
+              />
+            )}
+            {/* Video Model Selector - using unified ModelSelector with video category */}
+            {!compactVideoControls && videoParamVisibility.showModel && onVideoModelChange && (
+              <ModelSelector
+                selectedModel={selectedVideoModel ?? null}
+                setSelectedModel={model => model && onVideoModelChange(model)}
+                forceOverride={false}
+                setForceOverride={() => {}}
+                selectedTeam={selectedTeam}
+                disabled={isStreaming}
+                isLoading={isVideoModelsLoading}
+                modelCategoryType="video"
+              />
+            )}
+
+            {/* Unified Video Settings Popover (ratio + duration + resolution) */}
+            {videoParamVisibility.showSettings &&
+              onResolutionChange &&
+              onRatioChange &&
+              onDurationChange && (
+                <VideoSettingsPopover
+                  selectedRatio={selectedRatio}
+                  onRatioChange={onRatioChange}
+                  availableRatios={availableRatios ?? ['16:9', '9:16', '1:1']}
+                  ratioOptions={ratioOptions}
+                  selectedDuration={selectedDuration}
+                  onDurationChange={onDurationChange}
+                  availableDurations={availableDurations ?? [5, 10]}
+                  selectedResolution={selectedResolution}
+                  onResolutionChange={onResolutionChange}
+                  availableResolutions={availableResolutions ?? ['480p', '720p', '1080p']}
+                  resolutionOptions={resolutionOptions}
+                  disabled={isStreaming}
+                  showDuration={!hideDurationSelector}
+                  hiddenVideoParams={hiddenVideoParams}
+                  iconOnly={compactVideoControls}
+                />
+              )}
+            {compactVideoMenuItems && (
+              <InputMoreActionsMenu
+                showClarification={false}
+                enableClarification={enableClarification}
+                setEnableClarification={setEnableClarification}
+                showCorrection={false}
+                enableCorrectionMode={enableCorrectionMode}
+                onCorrectionModeToggle={onCorrectionModeToggle}
+                correctionModelName={correctionModelName}
+                taskId={selectedTaskDetail?.id ?? null}
+                disabled={selectorsDisabled}
+                selectedTeam={selectedTeam}
+                hasMessages={hasMessages}
+                availableSkills={[]}
+                teamSkillNames={[]}
+                preloadedSkillNames={[]}
+                selectedSkillNames={[]}
+                additionalItems={compactVideoMenuItems}
+              />
+            )}
+          </>
+        )}
+
+        {/* Image Mode Controls - show when taskType is 'image' */}
+        {isImageMode && (
+          <>
+            {/* Image Model Selector - using unified ModelSelector with image category */}
+            {onImageModelChange && (
+              <ModelSelector
+                selectedModel={selectedImageModel ?? null}
+                setSelectedModel={model => model && onImageModelChange(model)}
+                forceOverride={false}
+                setForceOverride={() => {}}
+                selectedTeam={selectedTeam}
+                disabled={isStreaming}
+                isLoading={isImageModelsLoading}
+                modelCategoryType="image"
+              />
+            )}
+
+            {/* Image Size Selector */}
+            {onImageSizeChange && (
+              <ImageSizeSelector
+                selectedSize={selectedImageSize}
+                onSizeChange={onImageSizeChange}
+                disabled={isStreaming}
+              />
+            )}
+          </>
+        )}
+
+        {/* Non-generation mode controls (chat, code, etc.) */}
+        {!isGenerationMode && (
+          <div
+            className={`flex items-center gap-1 ${hideSelectors ? 'opacity-50 pointer-events-none' : ''}`}
+            data-testid="input-left-actions"
+          >
+            {/* File Upload Button - show for shells that support attachments (Chat, ClaudeCode) */}
+            {supportsAttachments(selectedTeam) && (
+              <AttachmentButton onFileSelect={onFileSelect} disabled={isStreaming} />
+            )}
+
+            {/* Divider between attachment and other controls */}
+            {supportsAttachments(selectedTeam) && selectedTeam && (
+              <div
+                className="w-px h-4 bg-border mx-1 flex-shrink-0"
+                data-testid="attachment-actions-divider"
+              />
+            )}
+
+            <AgentSkillSelectorMenu
+              selectedTeam={selectedTeam}
+              teams={teams}
+              onTeamChange={onTeamChange}
+              onTeamsRefresh={onTeamsRefresh}
+              selectedTaskDetail={selectedTaskDetail}
+              taskType={taskType}
+              teamModeFilter={teamModeFilter}
+              hasMessages={hasMessages}
+              isLoading={false}
+              isStreaming={isStreaming}
+              hasNoTeams={hasNoTeams}
+            />
+
+            {showChatContexts && (
+              <ChatContextInput
+                selectedContexts={selectedContexts}
+                onContextsChange={setSelectedContexts}
+                excludeKnowledgeBaseId={knowledgeBaseId}
+                iconOnly
+              />
+            )}
+
+            <InputMoreActionsMenu
+              showClarification={showClarificationAction}
+              enableClarification={enableClarification}
+              setEnableClarification={setEnableClarification}
+              showCorrection={showCorrectionAction}
+              enableCorrectionMode={enableCorrectionMode}
+              onCorrectionModeToggle={onCorrectionModeToggle}
+              correctionModelName={correctionModelName}
+              taskId={selectedTaskDetail?.id ?? null}
+              disabled={selectorsDisabled}
+              selectedTeam={selectedTeam}
+              hasMessages={hasMessages}
+              availableSkills={availableSkills}
+              teamSkillNames={teamSkillNames}
+              preloadedSkillNames={preloadedSkillNames}
+              selectedSkillIds={selectedSkillIds}
+              selectedSkillNames={selectedSkillNames}
+              onToggleSkill={onToggleSkill}
+              skillSelectorRef={skillSelectorRef}
+            />
+
+            {/* Project Selector - show when in project context */}
+            {projectId && <ProjectSelectorTab projectId={projectId} disabled={hasMessages} />}
+
+            {/* Repository and Branch Unified Selector - show when repository selector is enabled */}
+            {/* Always show when showRepositorySelector is true, let component handle the display */}
+            {showRepositorySelector && (
+              <UnifiedRepositorySelector
+                selectedRepo={selectedRepo}
+                selectedBranch={selectedBranch}
+                onRepoChange={setSelectedRepo}
+                onBranchChange={setSelectedBranch}
+                disabled={hasMessages}
+                taskDetail={selectedTaskDetail}
+                compact={shouldCollapseSelectors}
+                requiresWorkspace={effectiveRequiresWorkspace}
+                onRequiresWorkspaceChange={hasMessages ? undefined : onRequiresWorkspaceChange}
+              />
+            )}
+          </div>
+        )}
+      </div>
+
+      <div
+        className="ml-auto flex items-center gap-1.5 flex-shrink-0"
+        data-testid="input-right-actions"
+      >
+        {!isGenerationMode && (
+          <div
+            className={`flex items-center gap-1.5 ${hideSelectors ? 'opacity-50 pointer-events-none' : ''}`}
+          >
+            <ModelSelector
+              selectedModel={selectedModel}
+              setSelectedModel={setSelectedModel}
+              forceOverride={forceOverride}
+              setForceOverride={setForceOverride}
+              selectedTeam={selectedTeam}
+              disabled={
+                !selectedTeam ||
+                isStreaming ||
+                (hasMessages && !canSwitchModelAfterMessages(selectedTeam))
+              }
+              compact={shouldCollapseSelectors}
+              teamId={teamId}
+              taskId={taskId}
+              taskModelId={taskModelId}
+            />
+          </div>
+        )}
+
+        {/* Toolbar Status */}
+        {!shouldHideToolbarStatus && (
+          <ChatToolbarStatus className="flex-shrink-0" compact={shouldUseCompactToolbarStatus} />
+        )}
+
+        {/* Send/Stop Button */}
+        {renderSendButton()}
+      </div>
+    </div>
+  )
+}
+
+export default ChatInputControls

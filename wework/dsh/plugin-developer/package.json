@@ -1,0 +1,33 @@
+{
+  "name": "@wegent/dsh-wework-plugin-developer",
+  "displayName": "DIDA Work 插件开发",
+  "description": "Creates and debugs DIDA Work Core DSH plugins.",
+  "version": "0.1.9",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "wework": {
+    "codexPlugin": "./codex-plugin"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@wegent/dsh-app-wework"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.2.0-rc.2"
+  }
+}

@@ -1,0 +1,624 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Knowledge Base Indexing Service - Shared logic for RAG document indexing.
+
+This module provides the core indexing functionality used by both:
+- REST API (via BackgroundTasks or Celery)
+- MCP Tools (via Celery)
+- Celery Tasks
+
+By centralizing the indexing logic here, we:
+1. Eliminate circular imports between endpoints, orchestrator, and tasks
+2. Provide a single source of truth for indexing logic
+3. Make it easy to switch between BackgroundTasks and Celery
+
+Key concepts:
+- KnowledgeBaseIndexInfo: Container for KB-related indexing metadata
+- RAGIndexingParams: Parameters needed for scheduling RAG indexing
+- run_document_indexing: Core function that performs the actual indexing
+"""
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.db.session import SessionLocal
+from app.models.kind import Kind
+from app.models.subtask_context import ContextType, SubtaskContext
+from app.schemas.rag import SplitterConfig
+from app.services.knowledge.index_runtime import (
+    KnowledgeBaseIndexInfo,
+    build_kb_index_info,
+    get_kb_index_info,
+    resolve_kb_index_info,
+)
+from app.services.knowledge.splitter_config import (
+    SplitterConfigModel,
+    normalize_runtime_splitter_config,
+    serialize_splitter_config,
+)
+from app.services.rag.gateway_factory import get_rag_gateway
+from app.services.rag.runtime_resolver import RagRuntimeResolver
+from shared.telemetry import add_span_event
+
+logger = logging.getLogger(__name__)
+runtime_resolver = RagRuntimeResolver()
+
+# Excel file size limit for RAG indexing (2MB)
+EXCEL_FILE_SIZE_LIMIT = 2 * 1024 * 1024  # 2MB in bytes
+EXCEL_EXTENSIONS = frozenset({".xls", ".xlsx"})
+
+
+class OldIndexCleanupError(RuntimeError):
+    """Raised when a rebuild cannot remove the previous generation's chunks.
+
+    Writing the new generation on top of an index that still holds the old one
+    would leave both queryable, so the rebuild stops instead of continuing.
+    """
+
+
+@dataclass
+class RAGIndexingParams:
+    """Parameters for scheduling RAG document indexing."""
+
+    knowledge_base_id: str
+    attachment_id: int
+    document_id: int
+    retriever_name: str
+    retriever_namespace: str
+    embedding_model_name: str
+    embedding_model_namespace: str
+    user_id: int
+    user_name: str
+    splitter_config: Optional[SplitterConfig]
+    kb_index_info: KnowledgeBaseIndexInfo
+
+
+@dataclass
+class _IndexingPreparation:
+    runtime_spec: Any | None
+    delete_spec: Any | None
+    kb_info: KnowledgeBaseIndexInfo | None
+    skip_result: dict | None
+    gateway: Any | None = None
+
+
+def normalize_document_extension(file_extension: Optional[str]) -> str:
+    """Normalize a document extension for indexing checks."""
+    ext = (file_extension or "").strip().lower()
+    if not ext:
+        return ""
+    if not ext.startswith("."):
+        return f".{ext}"
+    return ext
+
+
+def get_rag_indexing_skip_reason(
+    file_extension: Optional[str],
+    file_size: Optional[int] = None,
+) -> Optional[str]:
+    """Return the reason why a document should skip RAG indexing, if any.
+
+    Args:
+        file_extension: The file extension (e.g., ".xlsx", "pdf")
+        file_size: The file size in bytes (optional, used for Excel file size check)
+
+    Returns:
+        A string describing the reason to skip indexing, or None if indexing is allowed
+    """
+    normalized_extension = normalize_document_extension(file_extension)
+
+    # Check Excel file size limit (2MB)
+    if normalized_extension in EXCEL_EXTENSIONS:
+        if file_size is not None and file_size > EXCEL_FILE_SIZE_LIMIT:
+            size_mb = file_size / (1024 * 1024)
+            limit_mb = EXCEL_FILE_SIZE_LIMIT / (1024 * 1024)
+            # Return error code with parameters for i18n support
+            # Format: EXCEL_FILE_SIZE_EXCEEDED|extension|limit|size
+            return f"EXCEL_FILE_SIZE_EXCEEDED|{normalized_extension}|{limit_mb:.0f}|{size_mb:.2f}"
+
+    return None
+
+
+def _serialize_splitter_config(
+    splitter_config: Optional[SplitterConfig],
+    splitter_config_dict: Optional[dict],
+) -> Optional[dict]:
+    """Normalize splitter config to a plain dict for runtime spec transport."""
+    raw_config: dict | SplitterConfigModel | None
+    if splitter_config_dict is not None:
+        raw_config = splitter_config_dict
+    else:
+        raw_config = splitter_config
+
+    normalized = normalize_runtime_splitter_config(raw_config)
+    return serialize_splitter_config(normalized)
+
+
+def extract_rag_config_from_knowledge_base(
+    db: Session, knowledge_base: Kind, current_user_id: int
+) -> Optional[RAGIndexingParams]:
+    """
+    Extract RAG indexing configuration from a knowledge base.
+
+    Returns None if the knowledge base doesn't have complete RAG configuration.
+    Otherwise returns a dict with all configuration values needed for indexing.
+
+    Args:
+        db: Database session
+        knowledge_base: The knowledge base Kind object
+        current_user_id: The current user's ID for determining index owner
+
+    Returns:
+        RAGIndexingParams with extracted config, or None if incomplete config
+    """
+    spec = (knowledge_base.json or {}).get("spec", {})
+    retrieval_config = spec.get("retrievalConfig")
+
+    logger.debug(
+        f"[Indexing] KB {knowledge_base.id}: retrievalConfig = {retrieval_config}"
+    )
+
+    if not retrieval_config:
+        logger.warning(
+            f"[Indexing] KB {knowledge_base.id}: No retrievalConfig found in spec"
+        )
+        return None
+
+    retriever_name = retrieval_config.get("retriever_name")
+    retriever_namespace = retrieval_config.get("retriever_namespace", "default")
+    embedding_config = retrieval_config.get("embedding_config")
+
+    logger.debug(
+        f"[Indexing] KB {knowledge_base.id}: retriever_name={retriever_name}, "
+        f"retriever_namespace={retriever_namespace}, embedding_config={embedding_config}"
+    )
+
+    if not retriever_name or not embedding_config:
+        logger.warning(
+            f"[Indexing] KB {knowledge_base.id}: Missing retriever_name or embedding_config. "
+            f"retriever_name={retriever_name}, embedding_config={embedding_config}"
+        )
+        return None
+
+    embedding_model_name = embedding_config.get("model_name")
+    embedding_model_namespace = embedding_config.get("model_namespace", "default")
+
+    if not embedding_model_name:
+        logger.warning(
+            f"[Indexing] KB {knowledge_base.id}: Missing embedding model_name. "
+            f"embedding_config={embedding_config}"
+        )
+        return None
+
+    kb_index_info = build_kb_index_info(
+        db=db,
+        knowledge_base=knowledge_base,
+        current_user_id=current_user_id,
+    )
+
+    # Return partial params - document-specific fields will be filled by caller
+    return RAGIndexingParams(
+        knowledge_base_id="",  # To be filled by caller
+        attachment_id=0,  # To be filled by caller
+        document_id=0,  # To be filled by caller
+        retriever_name=retriever_name,
+        retriever_namespace=retriever_namespace,
+        embedding_model_name=embedding_model_name,
+        embedding_model_namespace=embedding_model_namespace,
+        user_id=current_user_id,
+        user_name="",  # To be filled by caller
+        splitter_config=None,  # To be filled by caller
+        kb_index_info=kb_index_info,
+    )
+
+
+def _prepare_indexing_runtime(
+    *,
+    db: Session,
+    knowledge_base_id: str,
+    attachment_id: int,
+    retriever_name: str,
+    retriever_namespace: str,
+    embedding_model_name: str,
+    embedding_model_namespace: str,
+    user_id: int,
+    user_name: str,
+    splitter_config: Optional[SplitterConfig],
+    splitter_config_dict: Optional[dict],
+    document_id: Optional[int],
+    kb_index_info: Optional[KnowledgeBaseIndexInfo],
+    caller_user_id: int | None,
+) -> _IndexingPreparation:
+    file_extension = None
+    file_size = None
+
+    if document_id is not None:
+        from app.models.knowledge import KnowledgeDocument
+
+        document = (
+            db.query(KnowledgeDocument)
+            .filter(KnowledgeDocument.id == document_id)
+            .first()
+        )
+        if document:
+            file_extension = document.file_extension
+            file_size = document.file_size
+    elif attachment_id:
+        attachment = (
+            db.query(SubtaskContext)
+            .filter(
+                SubtaskContext.id == attachment_id,
+                SubtaskContext.context_type == ContextType.ATTACHMENT.value,
+            )
+            .first()
+        )
+        if attachment:
+            file_extension = attachment.file_extension
+            file_size = attachment.file_size
+
+    skip_reason = get_rag_indexing_skip_reason(file_extension, file_size)
+    if skip_reason:
+        logger.info(
+            f"[Indexing] Skipping: kb_id={knowledge_base_id}, "
+            f"document_id={document_id}, attachment_id={attachment_id}, "
+            f"reason={skip_reason}"
+        )
+        add_span_event(
+            "rag.indexing.skipped",
+            {
+                "kb_id": str(knowledge_base_id),
+                "document_id": str(document_id),
+                "attachment_id": str(attachment_id),
+                "reason": skip_reason,
+            },
+        )
+        return _IndexingPreparation(
+            runtime_spec=None,
+            delete_spec=None,
+            kb_info=None,
+            skip_result={
+                "status": "skipped",
+                "reason": skip_reason,
+                "document_id": document_id,
+                "knowledge_base_id": knowledge_base_id,
+                "indexed_count": 0,
+                "index_name": None,
+            },
+        )
+
+    kb_info = resolve_kb_index_info(
+        db=db,
+        knowledge_base_id=knowledge_base_id,
+        user_id=user_id,
+        kb_index_info=kb_index_info,
+    )
+    add_span_event(
+        "rag.indexing.kb_info.resolved",
+        {
+            "kb_id": str(knowledge_base_id),
+            "index_owner_user_id": str(kb_info.index_owner_user_id),
+            "summary_enabled": str(kb_info.summary_enabled),
+        },
+    )
+
+    index_gateway = get_rag_gateway()
+    runtime_spec = runtime_resolver.build_index_runtime_spec(
+        db=db,
+        knowledge_base_id=knowledge_base_id,
+        attachment_id=attachment_id,
+        retriever_name=retriever_name,
+        retriever_namespace=retriever_namespace,
+        embedding_model_name=embedding_model_name,
+        embedding_model_namespace=embedding_model_namespace,
+        user_id=user_id,
+        user_name=user_name,
+        caller_user_id=caller_user_id,
+        document_id=document_id,
+        splitter_config_dict=_serialize_splitter_config(
+            splitter_config=splitter_config,
+            splitter_config_dict=splitter_config_dict,
+        ),
+        kb_index_info=kb_info,
+    )
+
+    delete_spec = None
+    if document_id is not None:
+        try:
+            delete_spec = runtime_resolver.build_delete_runtime_spec(
+                db=db,
+                knowledge_base_id=int(knowledge_base_id),
+                document_ref=str(document_id),
+                index_owner_user_id=kb_info.index_owner_user_id,
+            )
+        except Exception as e:
+            logger.error(
+                f"[Indexing] Error preparing old index delete for document {document_id}: "
+                f"{type(e).__name__}: {e}"
+            )
+            add_span_event(
+                "rag.indexing.old_index_delete_failed",
+                {
+                    "kb_id": str(knowledge_base_id),
+                    "document_id": str(document_id),
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+            )
+            # The old generation cannot be addressed any more, so the new
+            # generation must not be written on top of it.
+            raise OldIndexCleanupError(
+                f"Cannot prepare the deletion of the old index for document "
+                f"{document_id}: {e}"
+            ) from e
+
+    return _IndexingPreparation(
+        runtime_spec=runtime_spec,
+        delete_spec=delete_spec,
+        kb_info=kb_info,
+        skip_result=None,
+        gateway=index_gateway,
+    )
+
+
+def _run_indexing_gateway_calls(
+    *,
+    gateway: Any,
+    runtime_spec: Any,
+    delete_spec: Any | None,
+    document_id: Optional[int],
+    knowledge_base_id: str,
+    kb_info: KnowledgeBaseIndexInfo,
+    embedding_model_name: str,
+    embedding_model_namespace: str,
+) -> dict:
+    loop = asyncio.new_event_loop()
+    # Do NOT call asyncio.set_event_loop — that would overwrite the thread-local
+    # loop with one we are about to close, breaking any subsequent async work on
+    # this thread (e.g. the next Celery task in a thread-pool worker).
+    try:
+        if delete_spec is not None:
+            try:
+                delete_result = loop.run_until_complete(
+                    gateway.delete_document_index(delete_spec, db=None)
+                )
+                deleted_chunks = delete_result.get("deleted_chunks", 0)
+                if deleted_chunks > 0:
+                    logger.info(
+                        f"[Indexing] Deleted old index before re-indexing: document_id={document_id}, "
+                        f"deleted_chunks={deleted_chunks}"
+                    )
+                    add_span_event(
+                        "rag.indexing.old_index_deleted",
+                        {
+                            "kb_id": str(knowledge_base_id),
+                            "document_id": str(document_id),
+                            "deleted_chunks": deleted_chunks,
+                        },
+                    )
+                else:
+                    logger.info(
+                        f"[Indexing] No old index found for document {document_id}, proceeding with indexing"
+                    )
+                    add_span_event(
+                        "rag.indexing.old_index_not_found",
+                        {
+                            "kb_id": str(knowledge_base_id),
+                            "document_id": str(document_id),
+                        },
+                    )
+            except Exception as e:
+                logger.error(
+                    f"[Indexing] Error deleting old index for document {document_id}: {type(e).__name__}: {e}"
+                )
+                add_span_event(
+                    "rag.indexing.old_index_delete_failed",
+                    {
+                        "kb_id": str(knowledge_base_id),
+                        "document_id": str(document_id),
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                    },
+                )
+                # A rebuild that cannot drop the previous generation would leave
+                # both generations queryable, so fail instead of continuing.
+                raise OldIndexCleanupError(
+                    f"Cannot delete the old index for document {document_id}: {e}"
+                ) from e
+
+        logger.info(
+            f"[Indexing] Starting gateway index_document: kb_id={knowledge_base_id}, "
+            f"index_owner_user_id={kb_info.index_owner_user_id}"
+        )
+        add_span_event(
+            "rag.indexing.gateway.index_document.started",
+            {
+                "kb_id": str(knowledge_base_id),
+                "index_owner_user_id": str(kb_info.index_owner_user_id),
+                "embedding_model_name": embedding_model_name,
+                "embedding_model_namespace": embedding_model_namespace,
+            },
+        )
+        result = loop.run_until_complete(gateway.index_document(runtime_spec, db=None))
+        logger.info(
+            "[Indexing] gateway index_document returned: status=%s indexed_count=%s index_name=%s",
+            result.get("status"),
+            result.get("indexed_count"),
+            result.get("index_name"),
+        )
+        return result
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
+def run_document_indexing(
+    knowledge_base_id: str,
+    attachment_id: int,
+    retriever_name: str,
+    retriever_namespace: str,
+    embedding_model_name: str,
+    embedding_model_namespace: str,
+    user_id: int,
+    user_name: str,
+    splitter_config: Optional[SplitterConfig] = None,
+    splitter_config_dict: Optional[dict] = None,
+    document_id: Optional[int] = None,
+    kb_index_info: Optional[KnowledgeBaseIndexInfo] = None,
+    trigger_summary: bool = True,
+    db: Optional[Session] = None,
+    caller_user_id: int | None = None,
+) -> dict:
+    """
+    Core function for RAG document indexing.
+
+    This is a synchronous function that creates its own event loop to run
+    the async indexing code. It can be called from:
+    - FastAPI BackgroundTasks
+    - Celery tasks
+    - Directly from other services
+
+    Args:
+        knowledge_base_id: Knowledge base ID
+        attachment_id: Attachment ID
+        retriever_name: Retriever name
+        retriever_namespace: Retriever namespace
+        embedding_model_name: Embedding model name
+        embedding_model_namespace: Embedding model namespace
+        user_id: User ID (the user who triggered the indexing)
+        user_name: Username for placeholder resolution
+        splitter_config: Optional splitter configuration object
+        splitter_config_dict: Optional splitter config as dict (for Celery serialization)
+        document_id: Optional document ID to use as doc_ref
+        kb_index_info: Pre-computed KB info (avoids redundant DB query if provided)
+        trigger_summary: Whether to trigger summary generation after indexing
+        db: Optional database session (will create new one if not provided)
+
+    Returns:
+        Dict with status, document_id, and indexed_count
+    """
+    logger.info(
+        f"[Indexing] Starting: kb_id={knowledge_base_id}, "
+        f"attachment_id={attachment_id}, document_id={document_id}"
+    )
+    add_span_event(
+        "rag.indexing.started",
+        {
+            "kb_id": str(knowledge_base_id),
+            "attachment_id": str(attachment_id),
+            "document_id": str(document_id),
+        },
+    )
+
+    own_session = db is None
+    if own_session:
+        db = SessionLocal()
+
+    try:
+        preparation = _prepare_indexing_runtime(
+            db=db,
+            knowledge_base_id=knowledge_base_id,
+            attachment_id=attachment_id,
+            retriever_name=retriever_name,
+            retriever_namespace=retriever_namespace,
+            embedding_model_name=embedding_model_name,
+            embedding_model_namespace=embedding_model_namespace,
+            user_id=user_id,
+            user_name=user_name,
+            document_id=document_id,
+            splitter_config=splitter_config,
+            splitter_config_dict=splitter_config_dict,
+            kb_index_info=kb_index_info,
+            caller_user_id=caller_user_id,
+        )
+    except Exception as e:
+        logger.error(
+            f"[Indexing] FAILED: kb_id={knowledge_base_id}, document_id={document_id}, "
+            f"error={str(e)}",
+            exc_info=True,
+        )
+        add_span_event(
+            "rag.indexing.failed",
+            {
+                "kb_id": str(knowledge_base_id),
+                "document_id": str(document_id),
+                "error": str(e),
+            },
+        )
+        raise
+
+    finally:
+        if own_session:
+            db.close()
+            logger.debug(
+                f"[Indexing] Closed database session: kb_id={knowledge_base_id}, "
+                f"document_id={document_id}"
+            )
+
+    if preparation.skip_result:
+        return preparation.skip_result
+
+    try:
+        result = _run_indexing_gateway_calls(
+            gateway=preparation.gateway,
+            runtime_spec=preparation.runtime_spec,
+            delete_spec=preparation.delete_spec,
+            document_id=document_id,
+            knowledge_base_id=knowledge_base_id,
+            kb_info=preparation.kb_info,
+            embedding_model_name=embedding_model_name,
+            embedding_model_namespace=embedding_model_namespace,
+        )
+
+        indexed_count = result.get("indexed_count", 0)
+        index_name = result.get("index_name", "unknown")
+        indexing_status = result.get("status", "unknown")
+
+        logger.info(
+            f"[Indexing] Completed: kb_id={knowledge_base_id}, "
+            f"document_id={document_id}, indexed_count={indexed_count}, "
+            f"index_name={index_name}, status={indexing_status}"
+        )
+        add_span_event(
+            "rag.indexing.completed",
+            {
+                "kb_id": str(knowledge_base_id),
+                "document_id": str(document_id),
+                "indexed_count": indexed_count,
+                "index_name": index_name,
+                "status": indexing_status,
+            },
+        )
+
+        return {
+            "status": indexing_status,
+            "reason": result.get("reason"),
+            "document_id": document_id,
+            "knowledge_base_id": knowledge_base_id,
+            "indexed_count": indexed_count,
+            "index_name": index_name,
+            "chunks_data": result.get("chunks_data"),
+        }
+
+    except Exception as e:
+        logger.error(
+            f"[Indexing] FAILED: kb_id={knowledge_base_id}, document_id={document_id}, "
+            f"error={str(e)}",
+            exc_info=True,
+        )
+        add_span_event(
+            "rag.indexing.failed",
+            {
+                "kb_id": str(knowledge_base_id),
+                "document_id": str(document_id),
+                "error": str(e),
+            },
+        )
+        raise

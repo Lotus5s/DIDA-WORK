@@ -1,0 +1,1944 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+OpenAPI v1/responses endpoint.
+Compatible with OpenAI Responses API format.
+
+This module uses the unified trigger architecture:
+- setup_chat_session: Creates task and subtasks
+- build_execution_request: Builds ExecutionRequest using TaskRequestBuilder
+- execution_dispatcher.dispatch: Unified dispatch with SSEResultEmitter for streaming
+"""
+
+import json
+import logging
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+
+from app.api.dependencies import get_db
+from app.api.endpoints import wework_api
+from app.core import security
+from app.core.config import settings
+from app.core.rate_limit import get_limiter
+from app.models.subtask import Subtask, SubtaskRole, SubtaskStatus
+from app.models.task import TaskResource
+from app.models.user import User
+from app.schemas.kind import Bot, Task, Team, resolve_model_category
+from app.schemas.openapi_response import (
+    ResponseCreateInput,
+    ResponseError,
+    ResponseObject,
+)
+from app.schemas.wework_api import (
+    UnifiedResponseCreate,
+    WeworkResponseCreate,
+    WeworkResponseObject,
+    is_wework_response_id,
+)
+from app.services.adapters.task_kinds import task_kinds_service
+from app.services.chat.preprocessing.contexts import link_contexts_to_subtask
+from app.services.chat.trigger.lifecycle import (
+    collect_completed_result,
+    persist_completed_result,
+)
+from app.services.openapi.helpers import (
+    extract_input_text,
+    parse_model_string,
+    parse_wegent_tools,
+    wegent_status_to_openai_status,
+)
+from app.services.openapi.output_builder import (
+    build_response_output,
+    extract_pending_user_input_state,
+)
+from app.services.rag.sources import ExternalRefValidationError
+from app.services.readers.kinds import KindType, kindReader
+from app.stores.tasks import subtask_store, task_access_store, task_store
+from shared.db.capability_reference import resolve_model_kind
+from shared.telemetry.decorators import (
+    add_span_event,
+    set_span_attribute,
+    trace_async,
+    trace_async_generator,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# Get rate limiter instance
+limiter = get_limiter()
+
+
+class _DispatchWithoutTerminalError(RuntimeError):
+    """Raised when dispatch fails before any terminal event is emitted."""
+
+
+async def _iter_callback_events(pubsub_obj: Any, cancel_event: Any):
+    """Yield callback events until the executor sends a terminal event."""
+    from shared.models import EventType, ExecutionEvent
+
+    while True:
+        if cancel_event.is_set():
+            return
+        message = await pubsub_obj.get_message(
+            ignore_subscribe_messages=True,
+            timeout=1.0,
+        )
+        if message is None or message.get("type") != "message":
+            continue
+        data = message["data"]
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        event = ExecutionEvent.from_dict(json.loads(data))
+        yield event
+        if event.type in (
+            EventType.DONE.value,
+            EventType.ERROR.value,
+            EventType.CANCELLED.value,
+        ):
+            return
+
+
+def _build_result_block_streaming_chunks(
+    result: Any,
+    known_blocks: Dict[str, Dict[str, Any]],
+) -> list[Any]:
+    """Convert result blocks carried by chunk/done events into streaming chunks."""
+    from app.services.openapi.streaming import StreamingChunk
+
+    if not isinstance(result, dict):
+        return []
+    blocks = result.get("blocks")
+    if not isinstance(blocks, list):
+        return []
+
+    chunks: list[StreamingChunk] = []
+    for block in blocks:
+        if not isinstance(block, dict) or not block.get("id"):
+            continue
+        block_id = str(block["id"])
+        if block_id not in known_blocks:
+            known_blocks[block_id] = dict(block)
+            chunks.append(
+                StreamingChunk(
+                    type="block_created",
+                    data={"block": block},
+                )
+            )
+            continue
+
+        updates = {key: value for key, value in block.items() if key != "id"}
+        known_blocks[block_id].update(updates)
+        chunks.append(
+            StreamingChunk(
+                type="block_updated",
+                data={
+                    "block_id": block_id,
+                    "updates": updates,
+                },
+            )
+        )
+    return chunks
+
+
+def _normalize_auto_delete_executor_header(value: Optional[str]) -> Optional[str]:
+    """Normalize auto-delete header values to task label strings."""
+    if value is None:
+        return None
+
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return "true"
+    if normalized in {"false", "0", "no", "off", ""}:
+        return "false"
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Invalid auto_delete_executor header value. Expected true or false.",
+    )
+
+
+def _task_to_response_object(
+    task_dict: Dict[str, Any],
+    model_string: str,
+    subtasks: list = None,
+    previous_response_id: str = None,
+    omit_mcp_binary_output: bool = False,
+) -> ResponseObject:
+    """Convert task dictionary to ResponseObject."""
+    task_id = task_dict.get("id")
+    wegent_status = task_dict.get("status", "PENDING")
+    created_at = task_dict.get("created_at")
+
+    # Convert datetime to unix timestamp
+    if isinstance(created_at, datetime):
+        created_at_unix = int(created_at.timestamp())
+    else:
+        created_at_unix = int(datetime.now().timestamp())
+
+    output = []
+    if subtasks:
+        output = build_response_output(
+            subtasks,
+            omit_mcp_binary_output=omit_mcp_binary_output,
+        )
+    pending_user_input, pending_user_input_payload = extract_pending_user_input_state(
+        _latest_assistant_subtask(subtasks or [])
+    )
+
+    # Build error if failed
+    error = None
+    error_message = task_dict.get("error_message")
+    if wegent_status == "FAILED" and error_message:
+        error = ResponseError(code="task_failed", message=error_message)
+
+    return ResponseObject(
+        id=f"resp_{task_id}",
+        created_at=created_at_unix,
+        status=wegent_status_to_openai_status(wegent_status),
+        error=error,
+        model=model_string,
+        output=output,
+        pending_user_input=pending_user_input or None,
+        pending_user_input_payload=pending_user_input_payload,
+        previous_response_id=previous_response_id,
+    )
+
+
+def _filter_current_assistant_turn(
+    subtasks: list[Subtask],
+    assistant_subtask_id: int,
+) -> list[Subtask]:
+    return [subtask for subtask in subtasks if subtask.id == assistant_subtask_id]
+
+
+def _latest_assistant_subtask(subtasks: list[Subtask]) -> list[Subtask]:
+    for subtask in reversed(subtasks or []):
+        if subtask.role == SubtaskRole.ASSISTANT:
+            return [subtask]
+    return []
+
+
+def _get_current_knowledge_base_refs(tool_settings: Dict[str, Any]) -> list[dict]:
+    """Return explicitly requested normalized KB refs from the current request."""
+    refs = tool_settings.get("knowledge_base_refs") or []
+    return refs if isinstance(refs, list) else []
+
+
+def _get_inherited_knowledge_base_refs(
+    *,
+    task: TaskResource,
+    current_refs: list[dict],
+) -> list[dict]:
+    """Return task-level API KB scopes only when the current request has no KB refs."""
+    if current_refs:
+        return []
+
+    from app.services.openapi.kb_context import get_task_knowledge_base_scope_refs
+
+    return get_task_knowledge_base_scope_refs(task)
+
+
+def _exception_message(exc: HTTPException) -> str:
+    """Convert HTTPException detail to a readable persisted error message."""
+    if isinstance(exc.detail, str):
+        return exc.detail
+    return json.dumps(exc.detail, ensure_ascii=False)
+
+
+def _model_category_from_kind(model: Any) -> str:
+    """Return the normalized model category stored in a Model CRD."""
+    model_json = model.json if model and isinstance(model.json, dict) else {}
+    spec = model_json.get("spec") if isinstance(model_json, dict) else None
+    return resolve_model_category(spec)
+
+
+def _resolve_requested_model(
+    db: Session, user_id: int, namespace: str, name: str
+) -> Optional[Any]:
+    """Resolve a requested Model through the caller-visible namespace scope.
+
+    Directly-owned models win; a model shared into the namespace keeps living
+    in its owner's namespace and is resolved through its capability reference.
+
+    A referenced model is only visible to members of the namespace (for the
+    "default" namespace, to the user it was shared with). This keeps group
+    references from leaking to unrelated callers that happen to know the
+    namespace/model name.
+    """
+    from app.services.readers.group_members import groupMemberReader
+
+    model = resolve_model_kind(db, name=name, namespace=namespace, user_id=user_id)
+    if model is None or namespace == "default":
+        return model
+    if not groupMemberReader.is_member(db, namespace, user_id):
+        return None
+    return model
+
+
+def _generation_options(request_body: ResponseCreateInput) -> Any:
+    wegent_options = getattr(request_body, "wegent_options", None)
+    return getattr(wegent_options, "generation", None)
+
+
+def _generation_options_dict(
+    request_body: ResponseCreateInput,
+) -> Optional[Dict[str, Any]]:
+    generation_options = _generation_options(request_body)
+    if generation_options is None:
+        return None
+    return generation_options.model_dump(exclude_none=True)
+
+
+def _execution_model_type(execution_request: Any) -> str:
+    """Return the normalized model type from an execution request."""
+    model_config = getattr(execution_request, "model_config", {}) or {}
+    return str(model_config.get("modelType") or "").lower()
+
+
+def _validate_generation_options_model(
+    request_body: ResponseCreateInput,
+    execution_request: Any,
+) -> None:
+    """Reject OpenAPI generation options for non-generation execution models."""
+    if _generation_options(request_body) is None:
+        return
+    if _execution_model_type(execution_request) not in {"image", "video"}:
+        raise ValueError(
+            "Generation options are only supported for image or video models"
+        )
+
+
+def _should_run_in_background(
+    *,
+    requested_background: bool,
+    execution_request: Any,
+) -> bool:
+    """Video generation is always asynchronous."""
+    return requested_background or _execution_model_type(execution_request) == "video"
+
+
+async def _reject_video_streaming(
+    *,
+    request_body: ResponseCreateInput,
+    execution_request: Any,
+    subtask_id: int,
+    task_id: int,
+) -> None:
+    """Reject video streaming while preserving callback streaming for executors."""
+    if (
+        not request_body.stream
+        or request_body.background
+        or _execution_model_type(execution_request) != "video"
+    ):
+        return
+
+    error_message = (
+        "Streaming is not supported for video generation. "
+        "Use stream=false and poll GET /api/v1/responses/{id}."
+    )
+    await _persist_terminal_failure(
+        subtask_id=subtask_id,
+        task_id=task_id,
+        error_message=error_message,
+        error_code="streaming_not_supported",
+    )
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=error_message,
+    )
+
+
+async def _persist_terminal_failure(
+    *,
+    subtask_id: int,
+    task_id: int,
+    error_message: str,
+    error_code: Optional[str] = None,
+) -> None:
+    """Persist a terminal FAILED result when execution aborts before emitting one."""
+    result = await collect_completed_result(
+        subtask_id,
+        status="FAILED",
+        error_message=error_message,
+        error_code=error_code,
+    )
+    await persist_completed_result(
+        subtask_id=subtask_id,
+        task_id=task_id,
+        status="FAILED",
+        result=result,
+        error=error_message,
+    )
+
+
+async def _resolve_continuation_device_id(
+    *,
+    db: Session,
+    user: User,
+    task: TaskResource,
+) -> Optional[str]:
+    """Resolve the device runtime a follow-up response must be dispatched to.
+
+    A conversation started on a device runs through the device Runtime and its
+    assistant subtask carries a ``device-*`` executor name. Reusing that name
+    while dispatching through the Kubernetes executor manager fails with
+    "Executor is deleted. Please create a new session.", so device bound tasks
+    have to be routed back to the device Runtime.
+    """
+    from app.services.chat.task_device_resolution import resolve_task_device_id
+    from app.services.device_service import device_service
+
+    device_id = resolve_task_device_id(db, user_id=user.id, task=task)
+    if not device_id:
+        return None
+
+    online_info = await device_service.get_device_online_info(user.id, device_id)
+    if not online_info:
+        logger.warning(
+            "[OPENAPI] Continuation device is offline: caller_user_id=%s, "
+            "task_id=%s, device_id=%s",
+            user.id,
+            task.id,
+            device_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"Device '{device_id}' is offline. Bring the device online and "
+                "retry, or start a new conversation."
+            ),
+        )
+
+    logger.info(
+        "[OPENAPI] Continuation routed to device: caller_user_id=%s, "
+        "task_id=%s, device_id=%s",
+        user.id,
+        task.id,
+        device_id,
+    )
+    return device_id
+
+
+@router.post("")
+@limiter.limit(settings.RATE_LIMIT_CREATE_RESPONSE)
+@trace_async(
+    span_name="openapi.create_response",
+    tracer_name="backend.openapi",
+    extract_attributes=lambda request, request_body, db, auth_context: {
+        "user.id": str(auth_context.user.id),
+        "user.name": auth_context.user.user_name,
+        "request.model": request_body.model,
+        "request.stream": request_body.stream,
+        "request.background": request_body.background,
+    },
+)
+async def create_response(
+    request: Request,
+    request_body: UnifiedResponseCreate,
+    db: Session = Depends(get_db),
+    auth_context: security.AuthContext = Depends(security.get_auth_context),
+):
+    """
+    Create a new response (execute a task).
+
+    This endpoint is compatible with OpenAI's Responses API format.
+
+    For Chat Shell type teams:
+    - When stream=True: Returns SSE stream with OpenAI v1/responses compatible events.
+    - When stream=False (default): Blocks until LLM completes, returns completed response.
+    - When background=True: Returns immediately with status 'in_progress', task runs asynchronously.
+
+    For non-Chat Shell type teams (Executor-based):
+    - Returns response with status 'queued' immediately.
+    - Use GET /api/v1/responses/{response_id} to poll for completion.
+
+    Args:
+        request_body: ResponseCreateInput containing:
+        - model: Format "namespace#team_name" or "namespace#team_name#model_id"
+        - input: The user prompt (string or list of messages)
+        - stream: Whether to enable streaming output (default: False)
+        - background: Whether to run in background mode (default: False).
+          When true, the request returns immediately with status 'in_progress'
+          and the task runs asynchronously. Use GET /responses/{response_id} to poll.
+        - tools: Optional Wegent tools to enable server-side capabilities:
+          - {"type": "wegent_chat_bot"}: Enable all server-side capabilities
+            (deep thinking with web search, server MCP tools, message enhancement)
+        - previous_response_id: Optional, for follow-up conversations
+
+    Note:
+        - By default, API calls use "clean mode" without server-side enhancements
+        - Bot/Ghost MCP tools are always available (configured in the bot's Ghost CRD)
+        - Use wegent_chat_bot to enable full server-side capabilities
+        - background=True and stream=True are mutually exclusive; background takes precedence
+
+    Returns:
+        ResponseObject with status 'completed' (Chat Shell sync mode)
+        or StreamingResponse with SSE events (Chat Shell + stream=true)
+        or ResponseObject with status 'in_progress' (background=true)
+        or ResponseObject with status 'queued' (non-Chat Shell)
+    """
+    if isinstance(request_body, WeworkResponseCreate):
+        user = wework_api.current_api_user(request, db)
+        return await wework_api.create_response(request, request_body, db, user)
+
+    # Extract user and api_key_name from auth context
+    current_user = auth_context.user
+    api_key_name = auth_context.api_key_name
+    auto_delete_executor = _normalize_auto_delete_executor_header(
+        request.headers.get("auto_delete_executor")
+        or request.headers.get("auto-delete-executor")
+    )
+
+    # Parse model string
+    model_info = parse_model_string(request_body.model)
+
+    # Parse tools for settings
+    tool_settings = parse_wegent_tools(request_body.tools)
+
+    # Extract input text
+    input_text = extract_input_text(request_body.input)
+
+    # Determine task_id from previous_response_id if provided
+    task_id = None
+    previous_task_id = None
+    previous_task = None
+    if request_body.previous_response_id:
+        # Extract task_id from resp_{task_id} format
+        if request_body.previous_response_id.startswith("resp_"):
+            try:
+                previous_task_id = int(request_body.previous_response_id[5:])
+                task_id = previous_task_id  # For follow-up, use the same task_id
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid previous_response_id format: '{request_body.previous_response_id}'",
+                )
+
+            # Verify previous task exists and belongs to the current user
+            existing_task = task_store.get_task_by_states(
+                db,
+                task_id=previous_task_id,
+                states=[TaskResource.STATE_ACTIVE],
+                owner_user_id=current_user.id,
+            )
+            if not existing_task:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Previous response '{request_body.previous_response_id}' not found",
+                )
+            previous_task = existing_task
+
+    # A follow-up runs on the same runtime as the previous turn. Device
+    # conversations are executed by the device Runtime, so the device recorded
+    # on the task has to reach the dispatcher. Without it the dispatcher falls
+    # back to the executor manager, which cannot host the inherited
+    # ``device-*`` executor.
+    device_id = None
+    if previous_task is not None:
+        device_id = await _resolve_continuation_device_id(
+            db=db,
+            user=current_user,
+            task=previous_task,
+        )
+
+    # Verify team exists and user has access
+    team = kindReader.get_by_name_and_namespace(
+        db,
+        current_user.id,
+        KindType.TEAM,
+        model_info["namespace"],
+        model_info["team_name"],
+    )
+    if not team:
+        logger.warning(
+            "[OPENAPI] Team resolution failed: caller_user_id=%s, "
+            "caller_username=%s, team_namespace=%s, team_name=%s, "
+            "api_key_name=%s",
+            current_user.id,
+            current_user.user_name,
+            model_info["namespace"],
+            model_info["team_name"],
+            api_key_name,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Team '{model_info['namespace']}#{model_info['team_name']}' not found or not accessible",
+        )
+
+    # If model_id is provided, verify that the model exists
+    if model_info.get("model_id"):
+        model_name = model_info["model_id"]
+        model_namespace = model_info["namespace"]
+
+        # Resolve direct models first, then capabilities referenced into the
+        # caller-visible namespace (shared personal/group models). A model
+        # shared into the group keeps living in its owner's namespace, so a
+        # plain namespace query would not find it.
+        model = _resolve_requested_model(
+            db, current_user.id, model_namespace, model_name
+        )
+
+        # If not found and namespace is not default, fall back to the caller's
+        # default namespace. This preserves the legacy "group#team#model_id"
+        # behavior where the model lives under the caller's own default
+        # namespace, and also resolves models referenced into the caller's
+        # default namespace by another user.
+        if not model and model_namespace != "default":
+            model = _resolve_requested_model(db, current_user.id, "default", model_name)
+
+        if not model:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Model '{model_namespace}/{model_name}' not found",
+            )
+        model_info["model_type"] = _model_category_from_kind(model)
+    else:
+        # If model_id is not provided, verify that all team's bots have valid modelRef
+        # Parse team JSON to Team CRD object
+        team_crd = Team.model_validate(team.json)
+
+        if not team_crd.spec.members:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Team '{model_info['namespace']}#{model_info['team_name']}' has no members configured",
+            )
+
+        # Validate all members' bots have valid modelRef
+        for member_index, member in enumerate(team_crd.spec.members):
+            bot_ref = member.botRef
+            bot_name = bot_ref.name
+            bot_namespace = bot_ref.namespace
+
+            if not bot_name:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Team '{model_info['namespace']}#{model_info['team_name']}' has invalid bot reference",
+                )
+
+            # Query the bot using kindReader
+            bot_kind = kindReader.get_by_name_and_namespace(
+                db,
+                team.user_id,
+                KindType.BOT,
+                bot_namespace,
+                bot_name,
+            )
+
+            if not bot_kind:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Bot '{bot_namespace}/{bot_name}' not found",
+                )
+
+            # Parse bot JSON to Bot CRD object and check modelRef
+            bot_crd = Bot.model_validate(bot_kind.json)
+
+            # modelRef must exist and have non-empty name and namespace
+            model_ref = bot_crd.spec.modelRef
+            if not model_ref or not model_ref.name or not model_ref.namespace:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Bot '{bot_namespace}/{bot_name}' does not have a valid model configured. Please specify model_id in the request or configure modelRef for the bot.",
+                )
+            if member_index == 0:
+                # Resolve the same way as an explicit model_id so that models
+                # referenced into the team namespace are recognized here too.
+                default_model = _resolve_requested_model(
+                    db,
+                    current_user.id,
+                    model_ref.namespace,
+                    model_ref.name,
+                )
+                if default_model:
+                    model_info["model_type"] = _model_category_from_kind(default_model)
+
+    # Use unified trigger architecture for all shell types
+    # ExecutionRouter will automatically select communication mode based on shell_type
+    if request_body.stream and not request_body.background:
+        # Streaming mode: use dispatch_sse_stream
+        # Note: background=True takes precedence over stream=True
+        return await _create_streaming_response_unified(
+            db=db,
+            user=current_user,
+            team=team,
+            model_info=model_info,
+            request_body=request_body,
+            input_text=input_text,
+            tool_settings=tool_settings,
+            task_id=task_id,
+            api_key_name=api_key_name,
+            auto_delete_executor=auto_delete_executor,
+            device_id=device_id,
+        )
+    else:
+        # Non-streaming mode: background or sync
+        return await _create_non_streaming_response_unified(
+            db=db,
+            user=current_user,
+            team=team,
+            model_info=model_info,
+            request_body=request_body,
+            input_text=input_text,
+            tool_settings=tool_settings,
+            task_id=task_id,
+            api_key_name=api_key_name,
+            auto_delete_executor=auto_delete_executor,
+            background=request_body.background,
+            device_id=device_id,
+        )
+
+
+async def _create_non_streaming_response_unified(
+    db: Session,
+    user: User,
+    team,
+    model_info: Dict[str, Any],
+    request_body: ResponseCreateInput,
+    input_text: str,
+    tool_settings: Dict[str, Any],
+    task_id: Optional[int] = None,
+    api_key_name: Optional[str] = None,
+    auto_delete_executor: Optional[str] = None,
+    background: bool = False,
+    device_id: Optional[str] = None,
+) -> ResponseObject:
+    """Create non-streaming response using unified trigger architecture.
+
+    Handles both sync and background modes:
+    - background=False (sync): Blocks until LLM completes, returns completed response
+    - background=True: Returns immediately with 'in_progress', task runs asynchronously
+
+    For non-SSE shell types, always returns queued response regardless of background flag.
+    """
+    import asyncio
+
+    from app.db.session import SessionLocal
+    from app.services.chat.trigger.unified import build_execution_request
+    from app.services.execution import execution_dispatcher
+    from app.services.execution.emitters import SSEResultEmitter
+    from app.services.openapi.chat_session import setup_chat_session
+    from shared.models import EventType
+
+    # Set up chat session (creates task and subtasks)
+    setup = setup_chat_session(
+        db,
+        user,
+        team,
+        model_info,
+        input_text,
+        tool_settings,
+        task_id,
+        api_key_name,
+        auto_delete_executor,
+        generation_params=_generation_options_dict(request_body),
+        omit_mcp_binary_output=request_body.omit_mcp_binary_output,
+    )
+
+    response_id = f"resp_{setup.task_id}"
+    created_at = int(datetime.now().timestamp())
+    assistant_subtask_id = setup.assistant_subtask.id
+    task_kind_id = setup.task_id
+    enable_chat_bot = tool_settings.get("enable_chat_bot", False)
+    preload_skills = tool_settings.get("preload_skills", [])
+    user_id = user.id
+
+    current_kb_refs = _get_current_knowledge_base_refs(tool_settings)
+    inherited_kb_refs = _get_inherited_knowledge_base_refs(
+        task=setup.task,
+        current_refs=current_kb_refs,
+    )
+
+    # Auto-enable tools when knowledge_base is specified
+    # This ensures KB tools and skill tools are actually added to the agent
+    enable_tools = enable_chat_bot or bool(current_kb_refs) or bool(inherited_kb_refs)
+
+    # Link attachments to user subtask if provided
+    linked_attachment_ids = None
+    if request_body.attachment_ids:
+        linked_attachment_ids = link_contexts_to_subtask(
+            db=db,
+            subtask_id=setup.user_subtask.id,
+            user_id=user.id,
+            attachment_ids=request_body.attachment_ids,
+            task=setup.task,
+        )
+        logger.info(
+            f"[OPENAPI] Linked {len(request_body.attachment_ids)} attachments "
+            f"to subtask {setup.user_subtask.id}"
+        )
+
+    # Convert reasoning config from Pydantic model to dict
+    reasoning_config = None
+    if request_body.reasoning:
+        reasoning_config = request_body.reasoning.model_dump()
+
+    # Build execution request
+    try:
+        execution_request = await build_execution_request(
+            task=setup.task,
+            assistant_subtask=setup.assistant_subtask,
+            team=team,
+            user=user,
+            message=input_text,
+            enable_tools=enable_tools,
+            user_subtask_id=setup.user_subtask.id,
+            enable_deep_thinking=enable_chat_bot,
+            enable_web_search=enable_chat_bot and settings.WEB_SEARCH_ENABLED,
+            preload_skills=preload_skills,
+            knowledge_base_refs=current_kb_refs,
+            reasoning_config=reasoning_config,
+            generation_params=_generation_options(request_body),
+            attachment_ids=linked_attachment_ids,
+        )
+        _validate_generation_options_model(request_body, execution_request)
+    except ExternalRefValidationError as e:
+        logger.warning("Failed to build execution request: %s", e)
+        await _persist_terminal_failure(
+            subtask_id=assistant_subtask_id,
+            task_id=task_kind_id,
+            error_message=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except HTTPException as e:
+        logger.warning("Failed to build execution request: %s", e.detail)
+        await _persist_terminal_failure(
+            subtask_id=assistant_subtask_id,
+            task_id=task_kind_id,
+            error_message=_exception_message(e),
+        )
+        raise
+    except ValueError as e:
+        logger.warning("Invalid execution request: %s", e)
+        await _persist_terminal_failure(
+            subtask_id=assistant_subtask_id,
+            task_id=task_kind_id,
+            error_message=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except Exception as e:
+        logger.error(f"Failed to build execution request: {e}")
+        await _persist_terminal_failure(
+            subtask_id=assistant_subtask_id,
+            task_id=task_kind_id,
+            error_message=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to build execution request: {str(e)}",
+        )
+
+    # Helper: close db session
+    def _close_db():
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        db.close()
+
+    try:
+        await _reject_video_streaming(
+            request_body=request_body,
+            execution_request=execution_request,
+            subtask_id=assistant_subtask_id,
+            task_id=task_kind_id,
+        )
+    except HTTPException:
+        _close_db()
+        raise
+
+    # Helper: execute and collect content using SSEResultEmitter
+    async def _execute_and_collect() -> tuple[str, Optional[Any]]:
+        emitter = SSEResultEmitter(
+            task_id=execution_request.task_id,
+            subtask_id=execution_request.subtask_id,
+        )
+        dispatch_task = asyncio.create_task(
+            execution_dispatcher.dispatch(
+                execution_request,
+                device_id=device_id,
+                emitter=emitter,
+            )
+        )
+        accumulated_content, final_event = await emitter.collect()
+        dispatch_error = None
+        try:
+            await dispatch_task
+        except Exception as exc:
+            dispatch_error = exc
+
+        if final_event and final_event.type == EventType.ERROR.value:
+            raise RuntimeError(final_event.error or "Unknown error")
+        if dispatch_error is not None and final_event is None:
+            raise _DispatchWithoutTerminalError(str(dispatch_error)) from dispatch_error
+
+        return accumulated_content, final_event
+
+    # Helper: query subtasks
+    def _query_subtasks():
+        query_db = SessionLocal()
+        try:
+            return subtask_store.list_by_task_for_user_ordered(
+                query_db,
+                task_id=task_kind_id,
+                user_id=user_id,
+            )
+        finally:
+            query_db.close()
+
+    # Check if SSE mode is supported. Device dispatch always streams its events
+    # through the execution callback channel, never through a direct SSE
+    # connection, so target devices always take the non-SSE path.
+    supports_sse = (
+        execution_dispatcher.supports_streaming(execution_request) and not device_id
+    )
+    background = _should_run_in_background(
+        requested_background=background,
+        execution_request=execution_request,
+    )
+
+    # Non-SSE mode: dispatch and return queued response
+    if not supports_sse:
+        _close_db()
+        asyncio.create_task(
+            execution_dispatcher.dispatch(
+                execution_request,
+                device_id=device_id,
+                emitter=None,
+            )
+        )
+        logger.info(
+            f"[OPENAPI] Dispatched non-SSE task: task_id={task_kind_id}, "
+            f"subtask_id={assistant_subtask_id}"
+        )
+        subtasks = _filter_current_assistant_turn(
+            _query_subtasks(),
+            assistant_subtask_id,
+        )
+        pending_user_input, pending_user_input_payload = (
+            extract_pending_user_input_state(subtasks)
+        )
+        return ResponseObject(
+            id=response_id,
+            created_at=created_at,
+            status="queued",
+            model=request_body.model,
+            output=build_response_output(
+                subtasks,
+                active_assistant_subtask_id=assistant_subtask_id,
+                active_assistant_status="in_progress",
+                omit_mcp_binary_output=request_body.omit_mcp_binary_output,
+            ),
+            pending_user_input=pending_user_input or None,
+            pending_user_input_payload=pending_user_input_payload,
+            previous_response_id=request_body.previous_response_id,
+        )
+
+    # SSE mode with background=True: fire-and-forget
+    if background:
+        _close_db()
+
+        async def _run_background_task():
+            try:
+                accumulated_content, _ = await _execute_and_collect()
+                logger.info(
+                    f"[BACKGROUND] Task completed: task_id={task_kind_id}, "
+                    f"subtask_id={assistant_subtask_id}, content_len={len(accumulated_content)}"
+                )
+            except _DispatchWithoutTerminalError as e:
+                await _persist_terminal_failure(
+                    subtask_id=assistant_subtask_id,
+                    task_id=task_kind_id,
+                    error_message=str(e),
+                )
+                logger.exception(f"[BACKGROUND] Error in background task: {e}")
+            except Exception as e:
+                logger.exception(f"[BACKGROUND] Error in background task: {e}")
+
+        asyncio.create_task(_run_background_task())
+        logger.info(
+            f"[BACKGROUND] Task started: task_id={task_kind_id}, "
+            f"subtask_id={assistant_subtask_id}"
+        )
+        subtasks = _filter_current_assistant_turn(
+            _query_subtasks(),
+            assistant_subtask_id,
+        )
+        pending_user_input, pending_user_input_payload = (
+            extract_pending_user_input_state(subtasks)
+        )
+        return ResponseObject(
+            id=response_id,
+            created_at=created_at,
+            status="in_progress",
+            model=request_body.model,
+            output=build_response_output(
+                subtasks,
+                active_assistant_subtask_id=assistant_subtask_id,
+                active_assistant_status="in_progress",
+                omit_mcp_binary_output=request_body.omit_mcp_binary_output,
+            ),
+            pending_user_input=pending_user_input or None,
+            pending_user_input_payload=pending_user_input_payload,
+            previous_response_id=request_body.previous_response_id,
+        )
+
+    # SSE mode with background=False: sync wait for completion
+    _close_db()
+    try:
+        accumulated_content, _ = await _execute_and_collect()
+        logger.info(f"[OPENAPI] Sync completed for subtask {assistant_subtask_id}")
+    except _DispatchWithoutTerminalError as e:
+        await _persist_terminal_failure(
+            subtask_id=assistant_subtask_id,
+            task_id=task_kind_id,
+            error_message=str(e),
+        )
+        logger.exception(f"Error in sync chat response: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"LLM request failed: {str(e)}",
+        )
+    except Exception as e:
+        logger.exception(f"Error in sync chat response: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"LLM request failed: {str(e)}",
+        )
+
+    subtasks = _filter_current_assistant_turn(
+        _query_subtasks(),
+        assistant_subtask_id,
+    )
+    pending_user_input, pending_user_input_payload = extract_pending_user_input_state(
+        subtasks
+    )
+    return ResponseObject(
+        id=response_id,
+        created_at=created_at,
+        status="completed",
+        model=request_body.model,
+        output=build_response_output(
+            subtasks,
+            active_assistant_subtask_id=assistant_subtask_id,
+            active_assistant_status="completed",
+            active_assistant_content=accumulated_content,
+            omit_mcp_binary_output=request_body.omit_mcp_binary_output,
+        ),
+        pending_user_input=pending_user_input or None,
+        pending_user_input_payload=pending_user_input_payload,
+        previous_response_id=request_body.previous_response_id,
+    )
+
+
+@trace_async(
+    span_name="openapi.streaming_response",
+    tracer_name="backend.openapi",
+    extract_attributes=lambda db, user, team, model_info, request_body, input_text, tool_settings, task_id, api_key_name, auto_delete_executor=None, device_id=None: {
+        "task.id": str(task_id) if task_id else "new",
+        "user.id": str(user.id),
+        "team.name": model_info.get("team_name"),
+        "team.namespace": model_info.get("namespace"),
+        "model.id": model_info.get("model_id", "default"),
+        "stream.enabled": True,
+        "task.auto_delete_executor": auto_delete_executor or "default",
+        "task.device_id": device_id or "",
+    },
+)
+async def _create_streaming_response_unified(
+    db: Session,
+    user: User,
+    team,
+    model_info: Dict[str, Any],
+    request_body: ResponseCreateInput,
+    input_text: str,
+    tool_settings: Dict[str, Any],
+    task_id: Optional[int] = None,
+    api_key_name: Optional[str] = None,
+    auto_delete_executor: Optional[str] = None,
+    device_id: Optional[str] = None,
+) -> StreamingResponse:
+    """Create streaming response using unified trigger architecture.
+
+    Uses direct SSE for Chat shells and callback streaming for executor shells.
+    """
+    from app.services.chat.storage import session_manager
+    from app.services.chat.trigger.unified import build_execution_request
+    from app.services.execution import execution_dispatcher
+    from app.services.openapi.chat_session import setup_chat_session
+    from app.services.openapi.streaming import streaming_service
+    from shared.models import EventType
+
+    # Set up chat session (creates task and subtasks)
+    setup = setup_chat_session(
+        db,
+        user,
+        team,
+        model_info,
+        input_text,
+        tool_settings,
+        task_id,
+        api_key_name,
+        auto_delete_executor,
+        generation_params=_generation_options_dict(request_body),
+        omit_mcp_binary_output=request_body.omit_mcp_binary_output,
+    )
+
+    # Add trace events for session setup
+    add_span_event(
+        "streaming.session_setup",
+        {
+            "task_id": str(setup.task_id),
+            "assistant_subtask_id": str(setup.assistant_subtask.id),
+            "user_subtask_id": str(setup.user_subtask.id),
+        },
+    )
+    set_span_attribute("task.id", setup.task_id)
+    set_span_attribute("subtask.id", setup.assistant_subtask.id)
+    set_span_attribute("user.id", str(user.id))
+
+    response_id = f"resp_{setup.task_id}"
+    created_at = int(datetime.now().timestamp())
+    assistant_subtask_id = setup.assistant_subtask.id
+    task_kind_id = setup.task_id
+    enable_chat_bot = tool_settings.get("enable_chat_bot", False)
+    preload_skills = tool_settings.get("preload_skills", [])
+
+    # Extract data needed for streaming before closing db
+    user_id = user.id
+    user_name = user.user_name
+    team_owner_user_id = team.user_id
+
+    current_kb_refs = _get_current_knowledge_base_refs(tool_settings)
+    inherited_kb_refs = _get_inherited_knowledge_base_refs(
+        task=setup.task,
+        current_refs=current_kb_refs,
+    )
+
+    # Auto-enable tools when knowledge_base is specified
+    # This ensures KB tools and skill tools are actually added to the agent
+    enable_tools = enable_chat_bot or bool(current_kb_refs) or bool(inherited_kb_refs)
+
+    # Link attachments to user subtask if provided
+    linked_attachment_ids = None
+    if request_body.attachment_ids:
+        linked_attachment_ids = link_contexts_to_subtask(
+            db=db,
+            subtask_id=setup.user_subtask.id,
+            user_id=user.id,
+            attachment_ids=request_body.attachment_ids,
+            task=setup.task,
+        )
+        logger.info(
+            f"[OPENAPI] Linked {len(request_body.attachment_ids)} attachments "
+            f"to subtask {setup.user_subtask.id}"
+        )
+
+    # Convert reasoning config from Pydantic model to dict
+    reasoning_config = None
+    if request_body.reasoning:
+        reasoning_config = request_body.reasoning.model_dump()
+
+    # Build execution request using unified builder
+    try:
+        execution_request = await build_execution_request(
+            task=setup.task,
+            assistant_subtask=setup.assistant_subtask,
+            team=team,
+            user=user,
+            message=input_text,
+            enable_tools=enable_tools,
+            user_subtask_id=setup.user_subtask.id,
+            enable_deep_thinking=enable_chat_bot,
+            enable_web_search=enable_chat_bot and settings.WEB_SEARCH_ENABLED,
+            preload_skills=preload_skills,
+            knowledge_base_refs=current_kb_refs,
+            reasoning_config=reasoning_config,
+            generation_params=_generation_options(request_body),
+            attachment_ids=linked_attachment_ids,
+        )
+        _validate_generation_options_model(request_body, execution_request)
+    except ExternalRefValidationError as e:
+        logger.warning("Failed to build execution request: %s", e)
+        await _persist_terminal_failure(
+            subtask_id=assistant_subtask_id,
+            task_id=task_kind_id,
+            error_message=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except HTTPException as e:
+        logger.warning("Failed to build execution request: %s", e.detail)
+        await _persist_terminal_failure(
+            subtask_id=assistant_subtask_id,
+            task_id=task_kind_id,
+            error_message=_exception_message(e),
+        )
+        raise
+    except ValueError as e:
+        logger.warning("Invalid execution request: %s", e)
+        await _persist_terminal_failure(
+            subtask_id=assistant_subtask_id,
+            task_id=task_kind_id,
+            error_message=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except Exception as e:
+        logger.error(f"Failed to build execution request: {e}")
+        await _persist_terminal_failure(
+            subtask_id=assistant_subtask_id,
+            task_id=task_kind_id,
+            error_message=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to build execution request: {str(e)}",
+        )
+    finally:
+        # Close the database session before streaming starts
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        db.close()
+
+    await _reject_video_streaming(
+        request_body=request_body,
+        execution_request=execution_request,
+        subtask_id=assistant_subtask_id,
+        task_id=task_kind_id,
+    )
+
+    if not execution_dispatcher.supports_streaming(execution_request):
+        target = execution_dispatcher.router.route(
+            execution_request, device_id=device_id
+        )
+        shell_type = (
+            execution_request.bot[0].get("shell_type", "Chat")
+            if execution_request.bot
+            else "Chat"
+        )
+        logger.warning(
+            "[OPENAPI] Non-SSE streaming request: "
+            "caller_user_id=%s, caller_username=%s, team_owner_user_id=%s, "
+            "team_namespace=%s, team_name=%s, api_key_name=%s, "
+            "shell_type=%s, route_mode=%s, task_id=%d, subtask_id=%d",
+            user_id,
+            user_name,
+            team_owner_user_id,
+            model_info.get("namespace"),
+            model_info.get("team_name"),
+            api_key_name,
+            shell_type,
+            target.mode.value,
+            task_kind_id,
+            assistant_subtask_id,
+        )
+
+    @trace_async_generator(
+        span_name="openapi.raw_chat_stream",
+        tracer_name="backend.openapi",
+        extract_attributes=lambda: {
+            "task.id": str(task_kind_id),
+            "subtask.id": str(assistant_subtask_id),
+        },
+    )
+    async def raw_chat_stream():
+        """Generate raw text and reasoning chunks from ExecutionDispatcher."""
+        import asyncio
+
+        from app.services.execution.emitters import SSEResultEmitter
+        from app.services.openapi.streaming import StreamingChunk
+
+        accumulated_content = ""
+        accumulated_reasoning = ""
+        tool_states: Dict[str, Dict[str, Any]] = {}
+        response_blocks: Dict[str, Dict[str, Any]] = {}
+        next_output_index = 0
+        reasoning_output_started = False
+        message_output_started = False
+
+        def allocate_output_index() -> int:
+            nonlocal next_output_index
+            assigned = next_output_index
+            next_output_index += 1
+            return assigned
+
+        def _normalize_protocol_type(
+            value: str | None, tool_name: str | None = None
+        ) -> str:
+            if value in {"mcp", "mcp_call"}:
+                return "mcp_call"
+            if value == "shell_call":
+                return "shell_call"
+            if tool_name == "exec":
+                return "shell_call"
+            return "function_call"
+
+        emitter = None
+        dispatch_task = None
+        pubsub_redis_client = None
+        pubsub_obj = None
+
+        try:
+            cancel_event = await session_manager.register_stream(assistant_subtask_id)
+            add_span_event(
+                "sse.stream_registered",
+                {
+                    "subtask_id": str(assistant_subtask_id),
+                    "task_id": str(execution_request.task_id),
+                },
+            )
+
+            # Device dispatch reports its events through the execution callback
+            # channel, so a device target is never handled by the SSE emitter.
+            is_sse = (
+                execution_dispatcher.supports_streaming(execution_request)
+                and not device_id
+            )
+            add_span_event(
+                "sse.mode_determined",
+                {
+                    "is_sse_mode": is_sse,
+                    "shell_type": (
+                        execution_request.bot[0].get("shell_type", "Chat")
+                        if execution_request.bot
+                        else "Chat"
+                    ),
+                },
+            )
+
+            if is_sse:
+                # SSE mode (Chat shell): stream directly via OpenAI client
+                emitter = SSEResultEmitter(
+                    task_id=execution_request.task_id,
+                    subtask_id=execution_request.subtask_id,
+                )
+                dispatch_task = asyncio.create_task(
+                    execution_dispatcher.dispatch(
+                        execution_request,
+                        device_id=device_id,
+                        emitter=emitter,
+                    )
+                )
+            else:
+                # HTTP+Callback mode (ClaudeCode/Agno/Dify): subscribe to Redis
+                # pub/sub channel; the /internal/callback handler publishes events
+                (
+                    pubsub_redis_client,
+                    pubsub_obj,
+                ) = await session_manager.subscribe_callback_channel(
+                    assistant_subtask_id
+                )
+                if pubsub_redis_client is None:
+                    raise RuntimeError("Failed to subscribe to callback stream channel")
+                # Fire-and-forget; executor sends events back via /internal/callback
+                asyncio.create_task(
+                    execution_dispatcher.dispatch(
+                        execution_request,
+                        device_id=device_id,
+                        emitter=None,
+                    )
+                )
+
+            async def _iter_events():
+                """Yield ExecutionEvents from either SSE emitter or callback pub/sub."""
+                if is_sse:
+                    async for ev in emitter.stream():
+                        yield ev
+                else:
+                    async for ev in _iter_callback_events(pubsub_obj, cancel_event):
+                        yield ev
+
+            # Stream events from the unified source
+            event_count = 0
+            try:
+                add_span_event(
+                    "sse.event_iteration_start",
+                    {
+                        "subtask_id": str(assistant_subtask_id),
+                        "is_sse_mode": is_sse,
+                    },
+                )
+                async for event in _iter_events():
+                    event_count += 1
+                    if cancel_event.is_set() or await session_manager.is_cancelled(
+                        assistant_subtask_id
+                    ):
+                        logger.info(
+                            f"Stream cancelled for subtask {assistant_subtask_id}"
+                        )
+                        add_span_event(
+                            "sse.stream_cancelled",
+                            {
+                                "subtask_id": str(assistant_subtask_id),
+                                "events_processed": event_count,
+                            },
+                        )
+                        break
+
+                    if event.type == EventType.CHUNK.value:
+                        for block_chunk in _build_result_block_streaming_chunks(
+                            event.result,
+                            response_blocks,
+                        ):
+                            yield block_chunk
+                        content = event.content or ""
+                        if content:
+                            if not message_output_started:
+                                message_output_started = True
+                                allocate_output_index()
+                            accumulated_content += content
+                            yield StreamingChunk(type="text", content=content)
+                    elif event.type == EventType.THINKING.value:
+                        # Handle reasoning/thinking content
+                        reasoning = event.content or ""
+                        if reasoning:
+                            if not reasoning_output_started:
+                                reasoning_output_started = True
+                                allocate_output_index()
+                            accumulated_reasoning += reasoning
+                            yield StreamingChunk(type="reasoning", content=reasoning)
+                    elif event.type == EventType.BLOCK_CREATED.value:
+                        block = event.data.get("block") if event.data else None
+                        if isinstance(block, dict):
+                            block_id = str(block.get("id") or "")
+                            if block_id:
+                                response_blocks[block_id] = dict(block)
+                            yield StreamingChunk(
+                                type="block_created",
+                                data={"block": block},
+                            )
+                    elif event.type == EventType.BLOCK_UPDATED.value:
+                        block_id = event.data.get("block_id") if event.data else None
+                        updates = event.data.get("updates") if event.data else None
+                        if block_id and isinstance(updates, dict):
+                            block_id = str(block_id)
+                            if block_id in response_blocks:
+                                response_blocks[block_id].update(updates)
+                            yield StreamingChunk(
+                                type="block_updated",
+                                data={
+                                    "block_id": block_id,
+                                    "updates": updates,
+                                },
+                            )
+                    elif event.type == EventType.TOOL_START.value:
+                        tool_use_id = event.tool_use_id or ""
+                        if not tool_use_id:
+                            continue
+
+                        tool_protocol = _normalize_protocol_type(
+                            event.data.get("tool_protocol") if event.data else None,
+                            event.tool_name,
+                        )
+                        tool_name = event.tool_name or ""
+                        tool_input = (
+                            event.tool_input if event.tool_input is not None else {}
+                        )
+                        tool_state = {
+                            "protocol": tool_protocol,
+                            "name": tool_name,
+                            "arguments": tool_input,
+                            "output_index": allocate_output_index(),
+                        }
+                        if event.data and event.data.get("server_label"):
+                            tool_state["server_label"] = event.data["server_label"]
+                        tool_states[tool_use_id] = tool_state
+
+                        if tool_protocol == "mcp_call":
+                            yield StreamingChunk(
+                                type="mcp_call_added",
+                                data={
+                                    "item_id": tool_use_id,
+                                    "name": tool_name,
+                                    "server_label": tool_state.get("server_label", ""),
+                                    "output_index": tool_state["output_index"],
+                                },
+                            )
+                        elif tool_protocol == "shell_call":
+                            yield StreamingChunk(
+                                type="shell_call_added",
+                                data={
+                                    "call_id": tool_use_id,
+                                    "name": tool_name,
+                                    "arguments": tool_input,
+                                    "output_index": tool_state["output_index"],
+                                },
+                            )
+                        else:
+                            yield StreamingChunk(
+                                type="function_call_added",
+                                data={
+                                    "call_id": tool_use_id,
+                                    "name": tool_name,
+                                    "arguments": (
+                                        json.dumps(tool_input, ensure_ascii=False)
+                                        if tool_input is not None
+                                        else ""
+                                    ),
+                                    "output_index": tool_state["output_index"],
+                                },
+                            )
+                    elif event.type == EventType.TOOL.value:
+                        tool_use_id = event.tool_use_id or ""
+                        if not tool_use_id:
+                            continue
+                        tool_state = tool_states.get(tool_use_id)
+                        if not tool_state:
+                            continue
+                        if tool_state.get("protocol") == "mcp_call":
+                            tool_state["arguments"] = (
+                                event.tool_input if event.tool_input is not None else {}
+                            )
+                    elif event.type == EventType.ERROR.value:
+                        error_msg = event.error or "Unknown error"
+                        logger.error(f"[OPENAPI] Error from execution: {error_msg}")
+                        raise Exception(error_msg)
+                    elif event.type == EventType.TOOL_RESULT.value:
+                        tool_use_id = event.tool_use_id or ""
+                        if not tool_use_id:
+                            continue
+                        tool_state = tool_states.pop(tool_use_id, None)
+                        if tool_state is None:
+                            tool_state = {
+                                "protocol": _normalize_protocol_type(
+                                    (
+                                        event.data.get("tool_protocol")
+                                        if event.data
+                                        else None
+                                    ),
+                                    event.tool_name,
+                                ),
+                                "name": event.tool_name or "",
+                                "arguments": (
+                                    event.tool_input
+                                    if event.tool_input is not None
+                                    else {}
+                                ),
+                                "output_index": allocate_output_index(),
+                            }
+                            if event.data and event.data.get("server_label"):
+                                tool_state["server_label"] = event.data["server_label"]
+                        tool_protocol = _normalize_protocol_type(
+                            tool_state.get("protocol")
+                            or (
+                                event.data.get("tool_protocol") if event.data else None
+                            ),
+                            tool_state.get("name") or event.tool_name,
+                        )
+                        tool_name = tool_state.get("name") or event.tool_name or ""
+                        arguments = (
+                            event.tool_input
+                            if event.tool_input is not None
+                            else tool_state.get("arguments") or {}
+                        )
+                        output_index = tool_state["output_index"]
+
+                        if tool_protocol == "mcp_call":
+                            yield StreamingChunk(
+                                type="mcp_call_done",
+                                data={
+                                    "item_id": tool_use_id,
+                                    "name": tool_name,
+                                    "server_label": tool_state.get("server_label", ""),
+                                    "arguments": (
+                                        json.dumps(arguments, ensure_ascii=False)
+                                        if arguments
+                                        else ""
+                                    ),
+                                    "output_index": output_index,
+                                    "output": event.tool_output,
+                                    "status": (
+                                        "failed"
+                                        if event.data
+                                        and event.data.get("status") == "failed"
+                                        else "completed"
+                                    ),
+                                    "error": event.error
+                                    or (
+                                        event.data.get("error") if event.data else None
+                                    ),
+                                },
+                            )
+                        elif tool_protocol == "shell_call":
+                            yield StreamingChunk(
+                                type="shell_call_done",
+                                data={
+                                    "call_id": tool_use_id,
+                                    "name": tool_name,
+                                    "arguments": arguments,
+                                    "output_index": output_index,
+                                    "status": (
+                                        "failed"
+                                        if event.data
+                                        and event.data.get("status") == "failed"
+                                        else "completed"
+                                    ),
+                                },
+                            )
+                        else:
+                            yield StreamingChunk(
+                                type="function_call_done",
+                                data={
+                                    "call_id": tool_use_id,
+                                    "name": tool_name,
+                                    "arguments": (
+                                        json.dumps(arguments, ensure_ascii=False)
+                                        if arguments
+                                        else ""
+                                    ),
+                                    "output_index": output_index,
+                                },
+                            )
+                    if event.type == EventType.DONE.value:
+                        for block_chunk in _build_result_block_streaming_chunks(
+                            event.result,
+                            response_blocks,
+                        ):
+                            yield block_chunk
+                        logger.info(
+                            f"[OPENAPI] Stream completed for subtask {assistant_subtask_id}"
+                        )
+                        add_span_event(
+                            "sse.terminal_event",
+                            {
+                                "event_type": "DONE",
+                                "total_events": event_count,
+                            },
+                        )
+                add_span_event(
+                    "sse.event_iteration_complete",
+                    {
+                        "subtask_id": str(assistant_subtask_id),
+                        "total_events": event_count,
+                    },
+                )
+            finally:
+                # Wait for SSE dispatch task to complete
+                if dispatch_task is not None:
+                    try:
+                        await dispatch_task
+                    except Exception:
+                        pass  # Error already handled via emitter
+
+        except NotImplementedError as e:
+            # Streaming not supported for this shell type
+            logger.error(f"[OPENAPI] Streaming not supported: {e}")
+            raise
+        except Exception as e:
+            logger.exception(f"Error in streaming: {e}")
+            raise
+        finally:
+            if pubsub_obj is not None:
+                try:
+                    await pubsub_obj.aclose()
+                except Exception:
+                    pass
+            if pubsub_redis_client is not None:
+                try:
+                    await pubsub_redis_client.aclose()
+                except Exception:
+                    pass
+            await session_manager.unregister_stream(assistant_subtask_id)
+            await session_manager.delete_streaming_content(assistant_subtask_id)
+
+    async def generate():
+        event_count = 0
+        add_span_event(
+            "sse.generate_start",
+            {
+                "response_id": response_id,
+                "task_id": str(task_kind_id),
+                "subtask_id": str(assistant_subtask_id),
+            },
+        )
+        try:
+            async for event in streaming_service.create_streaming_response(
+                response_id=response_id,
+                model_string=request_body.model,
+                chat_stream=raw_chat_stream(),
+                created_at=created_at,
+                previous_response_id=request_body.previous_response_id,
+                omit_mcp_binary_output=request_body.omit_mcp_binary_output,
+                task_context=(
+                    {
+                        "task_id": task_kind_id,
+                        "task_path": f"/chat?task_id={task_kind_id}",
+                    }
+                    if request_body.wegent_options
+                    and request_body.wegent_options.include_task_context
+                    else None
+                ),
+            ):
+                event_count += 1
+                # Log every 100 events and first 5 events
+                if event_count <= 5 or event_count % 100 == 0:
+                    add_span_event(
+                        "sse.event_yielded",
+                        {
+                            "event_number": event_count,
+                            "response_id": response_id,
+                        },
+                    )
+                yield event
+            add_span_event(
+                "sse.generate_complete",
+                {
+                    "total_events_sent": event_count,
+                    "response_id": response_id,
+                },
+            )
+        except NotImplementedError as e:
+            add_span_event(
+                "sse.generate_not_implemented",
+                {
+                    "error": str(e),
+                },
+            )
+            # Return error in SSE format
+            import json
+
+            error_response = ResponseObject(
+                id=response_id,
+                created_at=created_at,
+                status="failed",
+                error=ResponseError(code="not_implemented", message=str(e)),
+                model=request_body.model,
+                output=[],
+                previous_response_id=request_body.previous_response_id,
+            )
+            yield f"data: {json.dumps({'response': error_response.model_dump(), 'type': 'response.failed'})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/{response_id}/cancel", response_model=WeworkResponseObject | ResponseObject
+)
+@limiter.limit(settings.RATE_LIMIT_CANCEL_RESPONSE)
+async def cancel_response(
+    request: Request,
+    response_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(security.get_current_user_flexible),
+):
+    """
+    Cancel a running response.
+
+    For Chat Shell type tasks (source="chat_shell"), this will stop the model request
+    and save partial content to the subtask result.
+
+    For other task types (Executor-based), this will call the executor_manager to cancel.
+
+    Args:
+        response_id: Response ID in format "resp_{task_id}"
+
+    Returns:
+        ResponseObject with status 'cancelled' or current status
+    """
+    if is_wework_response_id(response_id):
+        user = wework_api.current_api_user(request, db)
+        return await wework_api.cancel_response(response_id, db, user)
+
+    from app.services.chat.storage import session_manager
+
+    # Extract task_id from response_id
+    if not response_id.startswith("resp_"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid response_id format: '{response_id}'",
+        )
+
+    try:
+        task_id = int(response_id[5:])
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid response_id format: '{response_id}'",
+        )
+
+    # Get task to check if it's a Chat Shell type
+    task_kind = task_store.get_task_by_states(
+        db,
+        task_id=task_id,
+        states=[TaskResource.STATE_ACTIVE],
+        owner_user_id=current_user.id,
+    )
+    if not task_kind:
+        member_task = task_store.get_task_by_states(
+            db,
+            task_id=task_id,
+            states=[TaskResource.STATE_ACTIVE],
+        )
+        if member_task and task_access_store.is_member(
+            db,
+            task_id=task_id,
+            user_id=current_user.id,
+        ):
+            task_kind = member_task
+
+    if not task_kind:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Response '{response_id}' not found",
+        )
+
+    # Check if this is a Chat Shell task (source="chat_shell")
+    task_crd = Task.model_validate(task_kind.json)
+    source_label = (
+        task_crd.metadata.labels.get("source") if task_crd.metadata.labels else None
+    )
+    is_chat_shell = source_label == "chat_shell"
+
+    logger.info(
+        f"[CANCEL] task_id={task_id}, source={source_label}, is_chat_shell={is_chat_shell}"
+    )
+
+    if is_chat_shell:
+        # For Chat Shell tasks, use session_manager to cancel the stream
+        # Find running assistant subtask
+        running_subtask = subtask_store.get_latest_assistant_for_user_by_statuses(
+            db,
+            task_id=task_id,
+            user_id=current_user.id,
+            statuses=[SubtaskStatus.PENDING, SubtaskStatus.RUNNING],
+        )
+
+        if running_subtask:
+            logger.info(
+                f"[CANCEL] Found running subtask: id={running_subtask.id}, status={running_subtask.status}"
+            )
+
+            # Get partial content from Redis before cancelling
+            partial_content = await session_manager.get_streaming_content(
+                running_subtask.id
+            )
+            logger.info(
+                f"[CANCEL] Got partial content from Redis: length={len(partial_content) if partial_content else 0}"
+            )
+
+            # Cancel the stream (this sets the cancel event)
+            await session_manager.cancel_stream(running_subtask.id)
+            logger.info(f"[CANCEL] Stream cancelled for subtask {running_subtask.id}")
+
+            # Update subtask status to COMPLETED with partial content
+            subtask_store.update_fields(
+                db,
+                subtask=running_subtask,
+                status=SubtaskStatus.COMPLETED,
+                progress=100,
+                completed_at=datetime.now(),
+                result={"value": partial_content or ""},
+            )
+
+            # Update task status to COMPLETED
+            if task_crd.status:
+                task_crd.status.status = "COMPLETED"
+                task_crd.status.errorMessage = ""
+                task_crd.status.updatedAt = datetime.now()
+                task_crd.status.completedAt = datetime.now()
+                task_crd.status.result = {"value": partial_content or ""}
+
+            task_store.update_json(
+                db,
+                task=task_kind,
+                payload=task_crd.model_dump(mode="json"),
+            )
+
+            db.commit()
+            db.refresh(task_kind)
+            db.refresh(running_subtask)
+
+            logger.info(
+                f"[CANCEL] Chat Shell task cancelled: task_id={task_id}, subtask_id={running_subtask.id}"
+            )
+        else:
+            logger.info(f"[CANCEL] No running subtask found for task {task_id}")
+    else:
+        # For Executor-based tasks, use the existing cancel service
+        try:
+            await task_kinds_service.cancel_task(
+                db=db,
+                task_id=task_id,
+                user_id=current_user.id,
+                background_task_runner=background_tasks.add_task,
+            )
+        except HTTPException as e:
+            if e.status_code == 404:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Response '{response_id}' not found",
+                )
+            raise
+
+    # Get updated task data for response
+    try:
+        task_dict = task_kinds_service.get_task_by_id(
+            db, task_id=task_id, user_id=current_user.id
+        )
+    except HTTPException:
+        # If task not found after cancel, return minimal response
+        return ResponseObject(
+            id=response_id,
+            created_at=int(datetime.now().timestamp()),
+            status="cancelled",
+            model="unknown",
+            output=[],
+        )
+
+    # Get subtasks for output (to include partial content)
+    subtasks = subtask_store.list_by_task_for_user_ordered(
+        db,
+        task_id=task_id,
+        user_id=current_user.id,
+    )
+
+    # Reconstruct model string
+    model_string = "unknown"
+    omit_mcp_binary_output = False
+    if task_kind and task_kind.json:
+        task_crd = Task.model_validate(task_kind.json)
+        team_name = task_crd.spec.teamRef.name
+        team_namespace = task_crd.spec.teamRef.namespace
+        labels = task_crd.metadata.labels or {}
+        model_id = labels.get("modelId")
+        omit_mcp_binary_output = labels.get("omitMcpBinaryOutput") == "true"
+        if model_id:
+            model_string = f"{team_namespace}#{team_name}#{model_id}"
+        else:
+            model_string = f"{team_namespace}#{team_name}"
+
+    return _task_to_response_object(
+        task_dict,
+        model_string,
+        subtasks=subtasks,
+        omit_mcp_binary_output=omit_mcp_binary_output,
+    )

@@ -1,0 +1,1314 @@
+import { beforeEach, describe, expect, test, vi } from 'vitest'
+import { clipboard, type WebContents } from 'electron'
+import { resolve } from 'node:path'
+import type { EmbeddedBrowserManager } from './embedded-browser-manager.js'
+import type {
+  HostCapability,
+  HostCapabilityHandler,
+  HostCapabilityRouter,
+} from './capability-router.js'
+import {
+  captureWebContentsDataUrl,
+  createElectronCapabilityRouter,
+  coreGrantedCapabilities,
+  cpuLoadRatioBetween,
+  e2eOpenDialogOverride,
+  e2eSaveDialogOverride,
+  createWorkbenchCapabilityRouter,
+  WEWORK_APP_PRINCIPAL,
+  WEWORK_WORKBENCH_PRINCIPAL,
+  registerAppUpdateCapabilities,
+  registerBrowserHistoryCapabilities,
+  registerCoreDshPluginCapabilities,
+  registerDesktopServiceCapabilities,
+  registerPluginDevelopmentCapabilities,
+  registerRendererStorageCapabilities,
+  showElectronNotification,
+  type ElectronDesktopServices,
+  type ElectronE2EHost,
+} from './electron-capabilities.js'
+import { HOST_CAPABILITIES } from './capability-router.js'
+import type { AppUpdateService } from './app-update-service.js'
+import type { FeedbackBundleManager } from './feedback-bundle-manager.js'
+import type { RendererStorageStore } from './renderer-storage-store.js'
+
+const electronMocks = vi.hoisted(() => ({
+  appGetPath: vi.fn(() => '/tmp'),
+  appGetVersion: vi.fn(() => '0.0.0-test'),
+  clipboardRead: vi.fn(
+    async () => [] as Array<{ types: string[]; getType: (type: string) => Promise<Blob> }>
+  ),
+  clipboardReadText: vi.fn(() => 'native text'),
+  clipboardWriteText: vi.fn(),
+  dialogShowMessageBox: vi.fn(),
+  dialogShowOpenDialog: vi.fn(),
+  dialogShowSaveDialog: vi.fn(),
+  powerMonitorGetSystemIdleTime: vi.fn(() => 0),
+  notificationOnce: vi.fn<(event: string, listener: () => void) => void>(),
+  notificationShow: vi.fn(),
+  notificationIsSupported: vi.fn(() => true),
+  shellOpenExternal: vi.fn(async () => undefined),
+  shellOpenPath: vi.fn(async () => ''),
+  shellShowItemInFolder: vi.fn(),
+}))
+
+vi.mock('electron', () => ({
+  app: {
+    getPath: electronMocks.appGetPath,
+    getVersion: electronMocks.appGetVersion,
+  },
+  BrowserWindow: class BrowserWindow {},
+  clipboard: {
+    read: electronMocks.clipboardRead,
+    readText: electronMocks.clipboardReadText,
+    writeText: electronMocks.clipboardWriteText,
+  },
+  dialog: {
+    showMessageBox: electronMocks.dialogShowMessageBox,
+    showOpenDialog: electronMocks.dialogShowOpenDialog,
+    showSaveDialog: electronMocks.dialogShowSaveDialog,
+  },
+  Notification: class Notification {
+    static isSupported = electronMocks.notificationIsSupported
+    constructor(readonly options: { title: string; body: string }) {}
+    once = electronMocks.notificationOnce
+    show = electronMocks.notificationShow
+  },
+  powerMonitor: {
+    getSystemIdleTime: electronMocks.powerMonitorGetSystemIdleTime,
+  },
+  shell: {
+    openExternal: electronMocks.shellOpenExternal,
+    openPath: electronMocks.shellOpenPath,
+    showItemInFolder: electronMocks.shellShowItemInFolder,
+  },
+}))
+
+describe('cpuLoadRatioBetween', () => {
+  test('calculates system utilization from cumulative CPU times', () => {
+    expect(cpuLoadRatioBetween({ idle: 100, total: 200 }, { idle: 130, total: 300 })).toBeCloseTo(
+      0.7
+    )
+    expect(cpuLoadRatioBetween({ idle: 100, total: 200 }, { idle: 100, total: 200 })).toBe(0)
+  })
+})
+
+describe('Smart App verification capabilities', () => {
+  test('grants only the named inspect and verify operations', () => {
+    expect(HOST_CAPABILITIES).toContain('smartApps.inspectVerification')
+    expect(HOST_CAPABILITIES).toContain('smartApps.verify')
+  })
+
+  test('allows an empty parent and purpose when creating a workbench', async () => {
+    const createDirectory = vi.fn(async () => ({ id: 'created-app' }))
+    const { router } = createIsolatedClipboardRouter(true, undefined, { createDirectory })
+    const input = {
+      parentPath: '',
+      name: 'created-app',
+      displayName: 'Created App',
+      description: '',
+      template: 'web',
+    }
+
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'smartApps.createDirectory', input)
+    ).resolves.toEqual({ id: 'created-app' })
+    expect(createDirectory).toHaveBeenCalledWith(input)
+  })
+})
+
+describe('e2eOpenDialogOverride', () => {
+  test('returns the selected directory only for a controlled desktop E2E process', () => {
+    expect(
+      e2eOpenDialogOverride({
+        WEWORK_E2E_CONTROL_URL: 'http://127.0.0.1:1234',
+        WEWORK_E2E_OPEN_DIALOG_PATH: '/workspace/plugin',
+      })
+    ).toEqual({
+      canceled: false,
+      filePaths: [resolve('/workspace/plugin')],
+    })
+  })
+
+  test('does not bypass the native dialog without both E2E signals', () => {
+    expect(e2eOpenDialogOverride({ WEWORK_E2E_OPEN_DIALOG_PATH: '/workspace/plugin' })).toBeNull()
+    expect(e2eOpenDialogOverride({ WEWORK_E2E_CONTROL_URL: 'http://127.0.0.1:1234' })).toBeNull()
+  })
+})
+
+describe('e2eSaveDialogOverride', () => {
+  test('returns the selected path only for a controlled desktop E2E process', () => {
+    expect(
+      e2eSaveDialogOverride({
+        WEWORK_E2E_CONTROL_URL: 'http://127.0.0.1:1234',
+        WEWORK_E2E_SAVE_DIALOG_PATH: '/workspace/export.zip',
+      })
+    ).toEqual({
+      canceled: false,
+      filePath: resolve('/workspace/export.zip'),
+    })
+  })
+
+  test('does not bypass the native dialog without both E2E signals', () => {
+    expect(
+      e2eSaveDialogOverride({ WEWORK_E2E_SAVE_DIALOG_PATH: '/workspace/export.zip' })
+    ).toBeNull()
+    expect(e2eSaveDialogOverride({ WEWORK_E2E_CONTROL_URL: 'http://127.0.0.1:1234' })).toBeNull()
+  })
+})
+
+describe('showElectronNotification', () => {
+  beforeEach(() => {
+    electronMocks.notificationOnce.mockClear()
+    electronMocks.notificationShow.mockClear()
+  })
+
+  test('carries the URL through the actual notification capability and click callback', async () => {
+    const { router, notificationNavigation } = createIsolatedClipboardRouter()
+    const url = 'wework://boards/12/issues/ISSUE-1'
+
+    await router.invoke(WEWORK_APP_PRINCIPAL, 'notification.show', {
+      title: 'Assigned',
+      body: 'Open the project task.',
+      url,
+    })
+    expect(notificationNavigation.openScheme).not.toHaveBeenCalled()
+    expect(electronMocks.notificationShow).toHaveBeenCalledOnce()
+
+    const click = electronMocks.notificationOnce.mock.calls[0][1]
+    click()
+
+    expect(notificationNavigation.openScheme).toHaveBeenCalledExactlyOnceWith(url)
+    expect(notificationNavigation.openRuntimeTask).not.toHaveBeenCalled()
+  })
+
+  test('uses the production click action for desktop regression activation', async () => {
+    const { router, notificationNavigation } = createIsolatedClipboardRouter()
+    const url = 'wework://tasks/device-1/task-1'
+
+    await router.invoke(WEWORK_APP_PRINCIPAL, 'e2e.activateNotification', { url })
+
+    expect(notificationNavigation.openScheme).toHaveBeenCalledExactlyOnceWith(url)
+    expect(notificationNavigation.openRuntimeTask).not.toHaveBeenCalled()
+  })
+
+  test('rejects external notification destinations before displaying them', () => {
+    const createNotification = vi.fn()
+    expect(() =>
+      showElectronNotification(
+        { title: 'Ready', body: 'Open.', url: 'https://example.com' },
+        { openScheme: vi.fn(), openRuntimeTask: vi.fn() },
+        createNotification
+      )
+    ).toThrow('Notification links must use wework://')
+    expect(createNotification).not.toHaveBeenCalled()
+  })
+
+  test('opens the targeted runtime task when the notification is clicked', () => {
+    const openRuntimeTask = vi.fn()
+    const listeners = new Map<string, () => void>()
+    const notification = {
+      once: vi.fn((event: string, listener: () => void) => {
+        listeners.set(event, listener)
+      }),
+      show: vi.fn(),
+    }
+
+    showElectronNotification(
+      {
+        title: 'Task completed',
+        body: 'The reply is ready.',
+        taskAddressId: 'device-1:task-1',
+      },
+      { openRuntimeTask, openScheme: vi.fn() },
+      () => notification
+    )
+    listeners.get('click')?.()
+
+    expect(notification.show).toHaveBeenCalledOnce()
+    expect(openRuntimeTask).toHaveBeenCalledWith('device-1:task-1')
+  })
+
+  test('does not add click navigation without a task target', () => {
+    const notification = {
+      once: vi.fn(),
+      show: vi.fn(),
+    }
+
+    showElectronNotification(
+      {
+        title: 'Assigned',
+        body: 'A project task was assigned.',
+      },
+      { openRuntimeTask: vi.fn(), openScheme: vi.fn() },
+      () => notification
+    )
+
+    expect(notification.once).toHaveBeenCalledWith('close', expect.any(Function))
+    expect(notification.show).toHaveBeenCalledOnce()
+  })
+
+  test.each([
+    'wework://tasks/device-1/task-1',
+    'wework://boards/12/issues/gitlab%3A12%2Fissue%233',
+    'wework://boards/local/local-project-1/issues/OFF-1',
+  ])('queues the same destination as an in-app notification on click: %s', url => {
+    const navigation = { openRuntimeTask: vi.fn(), openScheme: vi.fn() }
+    const listeners = new Map<string, () => void>()
+    const notification = {
+      once: vi.fn((event: string, listener: () => void) => {
+        listeners.set(event, listener)
+      }),
+      show: vi.fn(),
+    }
+    showElectronNotification(
+      { title: 'Ready', body: 'Open the result.', url },
+      navigation,
+      () => notification
+    )
+
+    expect(navigation.openScheme).not.toHaveBeenCalled()
+    expect(notification.once).toHaveBeenCalledWith('click', expect.any(Function))
+    listeners.get('click')!()
+
+    expect(navigation.openScheme).toHaveBeenCalledExactlyOnceWith(url)
+    expect(navigation.openRuntimeTask).not.toHaveBeenCalled()
+  })
+})
+
+function createWebContents(input: {
+  captureDataUrl?: string
+  captureEmpty?: boolean
+  captureError?: Error
+  capturePending?: boolean
+  debuggerData?: string
+  debuggerError?: Error
+  debuggerPending?: boolean
+}) {
+  let debuggerAttached = false
+  const debuggerSession = {
+    attach: vi.fn(() => {
+      debuggerAttached = true
+    }),
+    detach: vi.fn(() => {
+      debuggerAttached = false
+    }),
+    isAttached: vi.fn(() => debuggerAttached),
+    sendCommand: vi.fn(async () => {
+      if (input.debuggerPending) return new Promise<never>(() => undefined)
+      if (input.debuggerError) throw input.debuggerError
+      return { data: input.debuggerData }
+    }),
+  }
+  const capturePage = vi.fn(async () => {
+    if (input.capturePending) return new Promise<never>(() => undefined)
+    if (input.captureError) throw input.captureError
+    return {
+      isEmpty: () => input.captureEmpty ?? false,
+      toDataURL: () => input.captureDataUrl ?? '',
+    }
+  })
+  const contents = {
+    capturePage,
+    debugger: debuggerSession,
+  } as unknown as WebContents
+  return { capturePage, contents, debuggerSession }
+}
+
+function createIsolatedClipboardRouter(
+  focused = true,
+  popoutHost?: Partial<ElectronE2EHost>,
+  smartApps?: { createDirectory: (input: Record<string, string>) => Promise<unknown> },
+  services?: Partial<ElectronDesktopServices>,
+  storedPreferences: Record<string, unknown> = { workbenchMode: 'developer' }
+) {
+  const notificationNavigation = { openRuntimeTask: vi.fn(), openScheme: vi.fn() }
+  const targetWindow = {
+    isDestroyed: vi.fn(() => false),
+    isFocused: vi.fn(() => focused),
+  }
+  const router = createElectronCapabilityRouter(
+    () => targetWindow as never,
+    () => ({
+      crashCount: 0,
+      generation: 1,
+      reason: null,
+      state: 'ready',
+      updatedAt: '2026-09-12T00:00:00.000Z',
+    }),
+    () => (smartApps ?? null) as never,
+    { read: vi.fn().mockResolvedValue(storedPreferences) } as never,
+    {} as never,
+    {} as never,
+    {} as never,
+    {
+      executorHome: '/tmp/wework-clipboard-test/executor',
+      cleanupStaleTemporaryImages: vi.fn(),
+      coreDshPlugins: () => null,
+      events: {
+        publish: vi.fn(),
+        read: vi.fn(() => ({ events: [], latestSequence: 0, historyLost: false })),
+      },
+      feedback: {} as never,
+      ...notificationNavigation,
+      pendingSchemes: {
+        acknowledge: vi.fn(),
+        read: vi.fn(() => ({ items: [] })),
+      },
+      pluginDevelopment: () => null,
+      secureStorage: {
+        delete: vi.fn(),
+        get: vi.fn(),
+        set: vi.fn(),
+      },
+      ...services,
+    } as never,
+    popoutHost as never
+  )
+  return { router, targetWindow, notificationNavigation }
+}
+
+describe('Process explorer capabilities', () => {
+  test('stays read-only', () => {
+    expect(HOST_CAPABILITIES).not.toContain('diagnostics.endProcess')
+  })
+})
+
+describe('Core DSH runtime capabilities', () => {
+  test('commits a mode before scheduling its restart outside the renderer lifetime', async () => {
+    const stored = { workbenchMode: 'developer' }
+    const updatePreferences = vi.fn(async patch => Object.assign(stored, patch))
+    const scheduleCoreDshRestart = vi.fn()
+    const completions: Array<() => void | Promise<void>> = []
+    const { router } = createIsolatedClipboardRouter(
+      true,
+      { scheduleCoreDshRestart },
+      undefined,
+      { updatePreferences },
+      stored
+    )
+
+    await expect(
+      router.invoke(
+        WEWORK_APP_PRINCIPAL,
+        'runtime.changeWorkbenchMode',
+        { mode: 'focus' },
+        { onResponseSent: completion => completions.push(completion) }
+      )
+    ).resolves.toEqual({ workbenchMode: 'focus' })
+
+    expect(stored.workbenchMode).toBe('focus')
+    expect(scheduleCoreDshRestart).not.toHaveBeenCalled()
+    expect(completions).toHaveLength(1)
+    await completions[0]()
+    expect(scheduleCoreDshRestart).toHaveBeenCalledOnce()
+    expect(updatePreferences).toHaveBeenCalledExactlyOnceWith({ workbenchMode: 'focus' })
+    expect(stored.workbenchMode).toBe('focus')
+  })
+
+  test('does not restart an unchanged persisted mode', async () => {
+    const scheduleCoreDshRestart = vi.fn()
+    const updatePreferences = vi.fn().mockResolvedValue({ workbenchMode: 'developer' })
+    const { router } = createIsolatedClipboardRouter(true, { scheduleCoreDshRestart }, undefined, {
+      updatePreferences,
+    })
+
+    await router.invoke(WEWORK_APP_PRINCIPAL, 'runtime.changeWorkbenchMode', { mode: 'developer' })
+
+    expect(scheduleCoreDshRestart).not.toHaveBeenCalled()
+  })
+
+  test('does not schedule a mode restart when persistence fails', async () => {
+    const completions = vi.fn()
+    const updatePreferences = vi.fn().mockRejectedValue(new Error('disk unavailable'))
+    const { router } = createIsolatedClipboardRouter(true, undefined, undefined, {
+      updatePreferences,
+    })
+
+    await expect(
+      router.invoke(
+        WEWORK_APP_PRINCIPAL,
+        'runtime.changeWorkbenchMode',
+        { mode: 'focus' },
+        { onResponseSent: completions }
+      )
+    ).rejects.toThrow('disk unavailable')
+
+    expect(completions).not.toHaveBeenCalled()
+  })
+
+  test('rejects unsupported modes before writing preferences', async () => {
+    const updatePreferences = vi.fn()
+    const { router } = createIsolatedClipboardRouter(true, undefined, undefined, {
+      updatePreferences,
+    })
+
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'runtime.changeWorkbenchMode', { mode: 'unknown' })
+    ).rejects.toThrow()
+
+    expect(updatePreferences).not.toHaveBeenCalled()
+  })
+
+  test('publishes persisted preferences to every subscribed window', async () => {
+    const updated = { fixedWorkspaceTabs: [{ id: 'task-1', kind: 'task' }] }
+    const publish = vi.fn()
+    const updatePreferences = vi.fn().mockResolvedValue(updated)
+    const { router } = createIsolatedClipboardRouter(true, undefined, undefined, {
+      updatePreferences,
+      events: { publish } as never,
+    })
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'preferences.update', { patch: updated })
+    ).resolves.toEqual(updated)
+    expect(publish).toHaveBeenCalledWith('preferences.changed', updated)
+  })
+  test('schedules a restart only after the host response is sent', async () => {
+    const scheduleCoreDshRestart = vi.fn()
+    const completions: Array<() => void | Promise<void>> = []
+    const { router } = createIsolatedClipboardRouter(true, {
+      openPopoutTaskInMain: vi.fn(),
+      scheduleCoreDshRestart,
+      setPopoutMode: vi.fn(),
+    })
+
+    await expect(
+      router.invoke(
+        WEWORK_APP_PRINCIPAL,
+        'runtime.restartCoreDsh',
+        {},
+        {
+          onResponseSent: completion => completions.push(completion),
+        }
+      )
+    ).resolves.toEqual({ scheduled: true })
+
+    expect(scheduleCoreDshRestart).not.toHaveBeenCalled()
+    expect(completions).toHaveLength(1)
+    await completions[0]()
+    expect(scheduleCoreDshRestart).toHaveBeenCalledOnce()
+  })
+})
+
+describe('Popout Window sizing capabilities', () => {
+  test('reveals the main workbench through the host', async () => {
+    const showMain = vi.fn().mockResolvedValue(undefined)
+    const { router } = createIsolatedClipboardRouter(true, { showMain })
+    await router.invoke(WEWORK_APP_PRINCIPAL, 'window.showMain', {})
+    expect(showMain).toHaveBeenCalledOnce()
+  })
+
+  test('closes the explicitly named workspace window', async () => {
+    const closeWorkspace = vi.fn()
+    const { router } = createIsolatedClipboardRouter(true, { closeWorkspace })
+    await router.invoke(WEWORK_APP_PRINCIPAL, 'window.closeWorkspace', { label: 'workspace-task' })
+    expect(closeWorkspace).toHaveBeenCalledWith('workspace-task')
+  })
+  test('forwards validated conversation and menu states to the native window', async () => {
+    const popoutHost = {
+      openPopoutTaskInMain: vi.fn(),
+      setPopoutMode: vi.fn(),
+    }
+    const { router } = createIsolatedClipboardRouter(true, popoutHost)
+
+    await router.invoke(WEWORK_APP_PRINCIPAL, 'window.setPopoutMode', { mode: 'menu' })
+    await router.invoke(WEWORK_APP_PRINCIPAL, 'window.openPopoutTaskInMain', {
+      taskAddressId: 'local-device:task-1',
+    })
+
+    expect(popoutHost.openPopoutTaskInMain).toHaveBeenCalledWith('local-device:task-1')
+    expect(popoutHost.setPopoutMode).toHaveBeenCalledWith('menu')
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'window.setPopoutMode', { mode: 'invalid' })
+    ).rejects.toMatchObject({ code: 'invalid_params' })
+  })
+})
+
+describe('captureWebContentsDataUrl', () => {
+  test('uses Electron native capturePage for the visible composed surface', async () => {
+    const { capturePage, contents, debuggerSession } = createWebContents({
+      captureDataUrl: 'data:image/png;base64,native-capture',
+    })
+    const rect = { x: 10, y: 20, width: 30, height: 40 }
+
+    await expect(captureWebContentsDataUrl(contents, { rect })).resolves.toBe(
+      'data:image/png;base64,native-capture'
+    )
+    expect(capturePage).toHaveBeenCalledWith(rect)
+    expect(debuggerSession.attach).not.toHaveBeenCalled()
+    expect(debuggerSession.sendCommand).not.toHaveBeenCalled()
+  })
+
+  test('can prefer debugger view capture without blocking on Electron capturePage', async () => {
+    const { capturePage, contents, debuggerSession } = createWebContents({
+      captureDataUrl: 'data:image/png;base64,native-capture',
+      debuggerData: 'debugger-capture',
+    })
+
+    await expect(captureWebContentsDataUrl(contents, { preferDebugger: true })).resolves.toBe(
+      'data:image/png;base64,debugger-capture'
+    )
+    expect(debuggerSession.attach).toHaveBeenCalledOnce()
+    expect(debuggerSession.sendCommand).toHaveBeenCalledWith('Page.captureScreenshot', {
+      captureBeyondViewport: false,
+      format: 'png',
+      fromSurface: false,
+    })
+    expect(debuggerSession.detach).toHaveBeenCalledOnce()
+    expect(capturePage).not.toHaveBeenCalled()
+  })
+
+  test('can prefer debugger surface capture for composed owner content', async () => {
+    const { capturePage, contents, debuggerSession } = createWebContents({
+      captureDataUrl: 'data:image/png;base64,native-capture',
+      debuggerData: 'debugger-surface-capture',
+    })
+    const rect = { x: 10, y: 20, width: 30, height: 40 }
+
+    await expect(
+      captureWebContentsDataUrl(contents, {
+        rect,
+        preferDebugger: true,
+        debuggerFromSurface: true,
+      })
+    ).resolves.toBe('data:image/png;base64,debugger-surface-capture')
+    expect(debuggerSession.sendCommand).toHaveBeenCalledWith('Page.captureScreenshot', {
+      captureBeyondViewport: false,
+      format: 'png',
+      fromSurface: true,
+      clip: { ...rect, scale: 1 },
+    })
+    expect(capturePage).not.toHaveBeenCalled()
+  })
+
+  test('falls back to native capture when preferred debugger capture times out', async () => {
+    vi.useFakeTimers()
+    try {
+      const { capturePage, contents, debuggerSession } = createWebContents({
+        captureDataUrl: 'data:image/png;base64,native-after-debugger-timeout',
+        debuggerPending: true,
+      })
+
+      const capture = captureWebContentsDataUrl(contents, { preferDebugger: true })
+      await vi.advanceTimersByTimeAsync(10_000)
+
+      await expect(capture).resolves.toBe('data:image/png;base64,native-after-debugger-timeout')
+      expect(debuggerSession.detach).toHaveBeenCalledOnce()
+      expect(capturePage).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('reports both capture failures', async () => {
+    const { contents, debuggerSession } = createWebContents({
+      captureError: new Error('UnknownVizError'),
+      debuggerError: new Error('DebuggerCaptureError'),
+    })
+    const rect = { x: 10, y: 20, width: 30, height: 40 }
+
+    await expect(captureWebContentsDataUrl(contents, { rect })).rejects.toThrow(
+      'Electron capturePage failed: UnknownVizError; CDP Page.captureScreenshot failed: DebuggerCaptureError'
+    )
+    expect(debuggerSession.sendCommand).toHaveBeenCalledWith('Page.captureScreenshot', {
+      captureBeyondViewport: false,
+      format: 'png',
+      fromSurface: true,
+      clip: { ...rect, scale: 1 },
+    })
+  })
+
+  test('falls back to the debugger when Electron native capture hangs', async () => {
+    vi.useFakeTimers()
+    try {
+      const { contents, debuggerSession } = createWebContents({
+        capturePending: true,
+        debuggerData: 'debugger-after-native-timeout',
+      })
+
+      const capture = captureWebContentsDataUrl(contents)
+      await vi.advanceTimersByTimeAsync(10_000)
+
+      await expect(capture).resolves.toBe('data:image/png;base64,debugger-after-native-timeout')
+      expect(debuggerSession.sendCommand).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('fails within a bounded time when both screenshot backends hang', async () => {
+    vi.useFakeTimers()
+    try {
+      const { contents, debuggerSession } = createWebContents({
+        capturePending: true,
+        debuggerPending: true,
+      })
+
+      const capture = captureWebContentsDataUrl(contents)
+      const rejection = expect(capture).rejects.toThrow(
+        'Electron capturePage failed: Electron capturePage timed out after 10000ms; ' +
+          'CDP Page.captureScreenshot failed: CDP Page.captureScreenshot timed out after 10000ms'
+      )
+      await vi.advanceTimersByTimeAsync(20_000)
+
+      await rejection
+      expect(debuggerSession.detach).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('registerBrowserHistoryCapabilities', () => {
+  test('registers search and remove with the Electron history manager', async () => {
+    const handlers = new Map<HostCapability, HostCapabilityHandler>()
+    const router = {
+      register: vi.fn((capability: HostCapability, handler: HostCapabilityHandler) => {
+        handlers.set(capability, handler)
+      }),
+    } as unknown as HostCapabilityRouter
+    const browser = {
+      removeHistory: vi.fn(async () => 2),
+      searchHistory: vi.fn(async () => []),
+    } as unknown as EmbeddedBrowserManager
+
+    registerBrowserHistoryCapabilities(router, browser)
+
+    await handlers.get('browser.historySearch')?.(
+      { text: 'docs', endTimeMs: 2_001, offset: 3, maxResults: 25 },
+      { principal: 'test' }
+    )
+    await handlers.get('browser.historyRemove')?.({ ids: ['one', 'two'] }, { principal: 'test' })
+    expect(browser.searchHistory).toHaveBeenCalledWith({
+      text: 'docs',
+      endTimeMs: 2_001,
+      offset: 3,
+      maxResults: 25,
+    })
+    expect(browser.removeHistory).toHaveBeenCalledWith(['one', 'two'])
+  })
+})
+
+describe('registerAppUpdateCapabilities', () => {
+  test('validates channels and forwards the updater lifecycle', async () => {
+    const handlers = new Map<HostCapability, HostCapabilityHandler>()
+    const router = {
+      register: vi.fn((capability: HostCapability, handler: HostCapabilityHandler) => {
+        handlers.set(capability, handler)
+      }),
+    } as unknown as HostCapabilityRouter
+    const appUpdates = {
+      check: vi.fn(async () => ({ currentVersion: '0.2.6', version: '0.2.7' })),
+      download: vi.fn(async () => undefined),
+      downloadProgress: vi.fn(() => ({ downloadedBytes: 25, totalBytes: 100 })),
+      createInstallAction: vi.fn(() => vi.fn(async () => undefined)),
+    } as unknown as AppUpdateService
+    const installCompletions: Array<() => void | Promise<void>> = []
+    const context = {
+      principal: 'test',
+      deferUntilResponseSent: (completion: () => void | Promise<void>) =>
+        installCompletions.push(completion),
+    }
+
+    registerAppUpdateCapabilities(router, appUpdates)
+
+    await expect(
+      handlers.get('appUpdate.check')?.({ channel: 'stable' }, context)
+    ).resolves.toEqual({
+      currentVersion: '0.2.6',
+      version: '0.2.7',
+    })
+    await handlers.get('appUpdate.download')?.({}, context)
+    expect(await handlers.get('appUpdate.downloadProgress')?.({}, context)).toEqual({
+      downloadedBytes: 25,
+      totalBytes: 100,
+    })
+    await handlers.get('appUpdate.install')?.({}, context)
+
+    expect(appUpdates.check).toHaveBeenCalledWith('stable')
+    expect(appUpdates.download).toHaveBeenCalledOnce()
+    expect(appUpdates.downloadProgress).toHaveBeenCalledOnce()
+    expect(appUpdates.createInstallAction).toHaveBeenCalledOnce()
+    expect(installCompletions).toHaveLength(1)
+    await installCompletions[0]()
+    expect(() => handlers.get('appUpdate.check')?.({ channel: 'nightly' }, context)).toThrow(
+      'channel is invalid'
+    )
+  })
+
+  test('reports update capabilities as unavailable without an updater service', () => {
+    const handlers = new Map<HostCapability, HostCapabilityHandler>()
+    const router = {
+      register: vi.fn((capability: HostCapability, handler: HostCapabilityHandler) => {
+        handlers.set(capability, handler)
+      }),
+    } as unknown as HostCapabilityRouter
+
+    registerAppUpdateCapabilities(router, undefined)
+
+    expect(() =>
+      handlers.get('appUpdate.download')?.(
+        {},
+        { principal: 'test', deferUntilResponseSent: vi.fn() }
+      )
+    ).toThrow('App updates are unavailable')
+  })
+
+  test('does not hold the host request open for the whole download', async () => {
+    const handlers = new Map<HostCapability, HostCapabilityHandler>()
+    const router = {
+      register: vi.fn((capability: HostCapability, handler: HostCapabilityHandler) => {
+        handlers.set(capability, handler)
+      }),
+    } as unknown as HostCapabilityRouter
+    const appUpdates = {
+      download: vi.fn(() => new Promise<void>(() => undefined)),
+    } as unknown as AppUpdateService
+
+    registerAppUpdateCapabilities(router, appUpdates)
+
+    expect(
+      handlers.get('appUpdate.download')?.(
+        {},
+        { principal: 'test', deferUntilResponseSent: vi.fn() }
+      )
+    ).toBeNull()
+    expect(appUpdates.download).toHaveBeenCalledOnce()
+  })
+})
+
+describe('registerRendererStorageCapabilities', () => {
+  test('validates and forwards renderer storage initialization and updates', async () => {
+    const handlers = new Map<HostCapability, HostCapabilityHandler>()
+    const router = {
+      register: vi.fn((capability: HostCapability, handler: HostCapabilityHandler) => {
+        handlers.set(capability, handler)
+      }),
+    } as unknown as HostCapabilityRouter
+    const rendererStorage = {
+      initialize: vi.fn(async entries => entries),
+      update: vi.fn(async () => undefined),
+    } as unknown as RendererStorageStore
+
+    registerRendererStorageCapabilities(router, rendererStorage)
+
+    await expect(
+      handlers.get('rendererStorage.initialize')?.(
+        { entries: { appearance: 'dark' } },
+        { principal: 'test' }
+      )
+    ).resolves.toEqual({ appearance: 'dark' })
+    await expect(
+      handlers.get('rendererStorage.update')?.(
+        {
+          clear: false,
+          changes: { appearance: 'light', removed: null },
+        },
+        { principal: 'test' }
+      )
+    ).resolves.toEqual({ persisted: true })
+    expect(rendererStorage.update).toHaveBeenCalledWith({
+      clear: false,
+      changes: { appearance: 'light', removed: null },
+    })
+    await expect(
+      handlers.get('rendererStorage.update')?.(
+        { clear: 'false', changes: {} },
+        { principal: 'test' }
+      )
+    ).rejects.toThrow('clear is invalid')
+  })
+})
+
+describe('registerDesktopServiceCapabilities', () => {
+  test.each([
+    {
+      label: 'supplied',
+      diagnostics: {
+        schemaVersion: 1,
+        events: [{ name: 'anchor-lost', details: { scrollerId: 1, rowIndex: 4 } }],
+      },
+    },
+    { label: 'null', diagnostics: null },
+    { label: 'omitted', diagnostics: undefined },
+  ])(
+    'forwards $label conversation diagnostics through feedback request parsing',
+    async ({ diagnostics }) => {
+      const handlers = new Map<HostCapability, HostCapabilityHandler>()
+      const router = {
+        register: vi.fn((capability: HostCapability, handler: HostCapabilityHandler) => {
+          handlers.set(capability, handler)
+        }),
+      } as unknown as HostCapabilityRouter
+      const preview = vi.fn(async () => ({ stagingId: 'stage-1' }))
+      registerDesktopServiceCapabilities(
+        router,
+        { feedback: { preview } } as unknown as Parameters<
+          typeof registerDesktopServiceCapabilities
+        >[1],
+        { openLogDirectory: vi.fn(), openDevTools: vi.fn() }
+      )
+      const request = {
+        includeRuntimeLogs: true,
+        includeTaskInfo: false,
+        includeScreenshot: false,
+        includeSystemInfo: false,
+        note: 'Conversation flickers during upward scrolling',
+        taskContext: null,
+        screenshotDataUrl: null,
+        composerDiagnostics: null,
+        attachments: [],
+        ...(diagnostics === undefined ? {} : { conversationDiagnostics: diagnostics }),
+      }
+
+      await handlers.get('feedback.previewBundle')?.({ request }, { principal: 'test' })
+
+      expect(preview).toHaveBeenCalledWith({
+        ...request,
+        conversationDiagnostics: diagnostics ?? null,
+      })
+    }
+  )
+
+  test('allowlists and forwards all migrated desktop capability contracts', async () => {
+    const handlers = new Map<HostCapability, HostCapabilityHandler>()
+    const router = {
+      register: vi.fn((capability: HostCapability, handler: HostCapabilityHandler) => {
+        handlers.set(capability, handler)
+      }),
+    } as unknown as HostCapabilityRouter
+    const feedback = {
+      confirm: vi.fn(async () => ({ reportId: 'WF-1', path: '/downloads/report.zip' })),
+      discard: vi.fn(async () => undefined),
+      preview: vi.fn(async () => ({ stagingId: 'stage-1' })),
+    } as unknown as FeedbackBundleManager
+    const coreDshPlugins = {
+      listCoreDshPlugins: vi.fn(async () => []),
+      installCoreDshPlugin: vi.fn(async () => []),
+      updateCoreDshPlugin: vi.fn(async () => []),
+      setCoreDshPluginEnabled: vi.fn(async () => []),
+      uninstallCoreDshPlugin: vi.fn(async () => []),
+    }
+    const developer = {
+      openDevTools: vi.fn(),
+      openLogDirectory: vi.fn(async () => undefined),
+    }
+    const cleanupStaleTemporaryImages = vi.fn(async () => undefined)
+    const expectedCapabilities = [
+      'feedback.previewBundle',
+      'feedback.confirmBundle',
+      'feedback.discardBundle',
+      'developer.openLogDirectory',
+      'developer.openDevTools',
+      'maintenance.cleanupTemporaryImages',
+      'maintenance.getSystemPressure',
+    ] as const
+
+    registerDesktopServiceCapabilities(
+      router,
+      { cleanupStaleTemporaryImages, coreDshPlugins: () => coreDshPlugins, feedback },
+      developer
+    )
+
+    expect(HOST_CAPABILITIES).toEqual(expect.arrayContaining(expectedCapabilities))
+    expect([...handlers.keys()]).toEqual(expect.arrayContaining(expectedCapabilities))
+    await handlers.get('feedback.previewBundle')?.(
+      {
+        request: {
+          includeRuntimeLogs: true,
+          includeTaskInfo: false,
+          includeScreenshot: false,
+          includeSystemInfo: true,
+          note: 'note',
+          taskContext: null,
+          screenshotDataUrl: null,
+          composerDiagnostics: null,
+          attachments: [],
+        },
+      },
+      { principal: 'test' }
+    )
+    await handlers.get('feedback.confirmBundle')?.(
+      { decision: { stagingId: 'stage-1' } },
+      { principal: 'test' }
+    )
+    await handlers.get('feedback.discardBundle')?.(
+      { decision: { stagingId: 'stage-1' } },
+      { principal: 'test' }
+    )
+    await handlers.get('maintenance.cleanupTemporaryImages')?.({}, { principal: 'test' })
+    await handlers.get('developer.openLogDirectory')?.({}, { principal: 'test' })
+    await handlers.get('developer.openDevTools')?.({}, { principal: 'test' })
+
+    expect(feedback.preview).toHaveBeenCalledWith(
+      expect.objectContaining({ includeRuntimeLogs: true, includeSystemInfo: true })
+    )
+    expect(feedback.confirm).toHaveBeenCalledWith('stage-1')
+    expect(feedback.discard).toHaveBeenCalledWith('stage-1')
+    expect(cleanupStaleTemporaryImages).toHaveBeenCalledOnce()
+    expect(developer.openLogDirectory).toHaveBeenCalledOnce()
+    expect(developer.openDevTools).toHaveBeenCalledOnce()
+  })
+
+  test('forwards the application menu language reported by the renderer', async () => {
+    const handlers = new Map<HostCapability, HostCapabilityHandler>()
+    const router = {
+      register: vi.fn((capability: HostCapability, handler: HostCapabilityHandler) => {
+        handlers.set(capability, handler)
+      }),
+    } as unknown as HostCapabilityRouter
+    const updateApplicationMenuCapabilities = vi.fn()
+    const updateApplicationMenuLanguage = vi.fn()
+    registerDesktopServiceCapabilities(
+      router,
+      {
+        applicationMenu: () => null,
+        updateApplicationMenuCapabilities,
+        updateApplicationMenuLanguage,
+      } as unknown as ElectronDesktopServices,
+      { openDevTools: vi.fn(), openLogDirectory: vi.fn() }
+    )
+
+    await handlers.get('applicationMenu.setLanguage')?.(
+      { language: 'zh-CN' },
+      { principal: 'test' }
+    )
+    expect(updateApplicationMenuLanguage).toHaveBeenCalledWith('zh-CN')
+
+    await handlers.get('applicationMenu.setCapabilities')?.(
+      { windowLabel: 'main', capabilities: { taskSurface: true, canCloseTab: false } },
+      { principal: 'test' }
+    )
+    expect(updateApplicationMenuCapabilities).toHaveBeenCalledWith('main', {
+      taskSurface: true,
+      canCloseTab: false,
+    })
+
+    expect(() =>
+      handlers.get('applicationMenu.setCapabilities')?.(
+        { windowLabel: 'main', capabilities: { taskSurface: 'yes' } },
+        { principal: 'test' }
+      )
+    ).toThrow()
+  })
+})
+
+describe('isolated surface clipboard capabilities', () => {
+  test('inspects supplied workspace paths when the native clipboard is unavailable', async () => {
+    const { router } = createIsolatedClipboardRouter()
+    electronMocks.clipboardRead.mockRejectedValueOnce(new Error('Clipboard unavailable'))
+
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'clipboard.readWorkspacePaths', {
+        fallbackPaths: [resolve(import.meta.dirname, 'electron-capabilities.test.ts')],
+      })
+    ).resolves.toMatchObject([
+      { path: resolve(import.meta.dirname, 'electron-capabilities.test.ts'), isDirectory: false },
+    ])
+  })
+
+  beforeEach(() => {
+    electronMocks.clipboardReadText.mockClear()
+    electronMocks.clipboardWriteText.mockClear()
+  })
+
+  test('propagates asynchronous clipboard write failures', async () => {
+    const { router } = createIsolatedClipboardRouter()
+    await router.invoke(WEWORK_APP_PRINCIPAL, 'isolatedClipboard.activate', { leaseId: 'lease-1' })
+    electronMocks.clipboardWriteText.mockRejectedValueOnce(new Error('Clipboard unavailable'))
+
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'isolatedClipboard.writeText', {
+        leaseId: 'lease-1',
+        text: 'pending write',
+      })
+    ).rejects.toThrow('Clipboard unavailable')
+  })
+
+  test('read and write require a focused window with the active lease', async () => {
+    const { router } = createIsolatedClipboardRouter()
+
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'isolatedClipboard.readText', { leaseId: 'lease-1' })
+    ).rejects.toMatchObject({ code: 'isolated_clipboard_inactive' })
+
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'isolatedClipboard.activate', { leaseId: 'lease-1' })
+    ).resolves.toEqual({ active: true })
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'isolatedClipboard.readText', { leaseId: 'lease-1' })
+    ).resolves.toBe('native text')
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'isolatedClipboard.writeText', {
+        leaseId: 'lease-1',
+        text: '  remote text\n',
+      })
+    ).resolves.toEqual({ written: true })
+
+    expect(clipboard.readText).toHaveBeenCalledOnce()
+    expect(clipboard.writeText).toHaveBeenCalledWith('  remote text\n')
+
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'isolatedClipboard.readText', { leaseId: 'lease-2' })
+    ).rejects.toMatchObject({ code: 'isolated_clipboard_inactive' })
+  })
+
+  test('rejects clipboard activation and access when the Wework window is unfocused', async () => {
+    const { router } = createIsolatedClipboardRouter(false)
+
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'isolatedClipboard.activate', { leaseId: 'lease-1' })
+    ).rejects.toMatchObject({ code: 'window_not_focused' })
+    await expect(
+      router.invoke(WEWORK_APP_PRINCIPAL, 'isolatedClipboard.writeText', {
+        leaseId: 'lease-1',
+        text: 'remote text',
+      })
+    ).rejects.toMatchObject({ code: 'isolated_clipboard_inactive' })
+
+    expect(clipboard.writeText).not.toHaveBeenCalled()
+  })
+})
+
+describe('registerCoreDshPluginCapabilities', () => {
+  test('forwards the explicit Core DSH plugin operations', async () => {
+    const handlers = new Map<HostCapability, HostCapabilityHandler>()
+    const router = {
+      register: vi.fn((capability: HostCapability, handler: HostCapabilityHandler) => {
+        handlers.set(capability, handler)
+      }),
+    } as unknown as HostCapabilityRouter
+    const coreDshPlugins = {
+      listCoreDshPlugins: vi.fn(async () => []),
+      installCoreDshPlugin: vi.fn(async () => []),
+      updateCoreDshPlugin: vi.fn(async () => []),
+      setCoreDshPluginEnabled: vi.fn(async () => []),
+      uninstallCoreDshPlugin: vi.fn(async () => []),
+    }
+    const services = {
+      cleanupStaleTemporaryImages: vi.fn(async () => undefined),
+      coreDshPlugins: () => coreDshPlugins,
+      feedback: {} as FeedbackBundleManager,
+    }
+
+    registerCoreDshPluginCapabilities(router, services)
+    await handlers.get('runtime.listCoreDshPlugins')?.({}, { principal: 'test' })
+    await handlers.get('runtime.installCoreDshPlugin')?.(
+      { spec: 'github:owner/plugin' },
+      { principal: 'test' }
+    )
+    await handlers.get('runtime.updateCoreDshPlugin')?.(
+      { name: 'dsh-example' },
+      { principal: 'test' }
+    )
+    await handlers.get('runtime.setCoreDshPluginEnabled')?.(
+      { name: 'dsh-example', enabled: false },
+      { principal: 'test' }
+    )
+    await handlers.get('runtime.uninstallCoreDshPlugin')?.(
+      { name: 'dsh-example' },
+      { principal: 'test' }
+    )
+
+    expect(coreDshPlugins.listCoreDshPlugins).toHaveBeenCalledOnce()
+    expect(coreDshPlugins.installCoreDshPlugin).toHaveBeenCalledWith('github:owner/plugin')
+    expect(coreDshPlugins.updateCoreDshPlugin).toHaveBeenCalledWith('dsh-example')
+    expect(coreDshPlugins.setCoreDshPluginEnabled).toHaveBeenCalledWith('dsh-example', false)
+    expect(coreDshPlugins.uninstallCoreDshPlugin).toHaveBeenCalledWith('dsh-example')
+  })
+})
+
+describe('registerPluginDevelopmentCapabilities', () => {
+  test('forwards isolated Wework lifecycle operations', async () => {
+    const handlers = new Map<HostCapability, HostCapabilityHandler>()
+    const router = {
+      register: vi.fn((capability: HostCapability, handler: HostCapabilityHandler) => {
+        handlers.set(capability, handler)
+      }),
+    } as unknown as HostCapabilityRouter
+    const pluginDevelopment = {
+      deleteData: vi.fn(async () => undefined),
+      focus: vi.fn(async () => undefined),
+      list: vi.fn(async () => []),
+      openDevTools: vi.fn(async () => undefined),
+      openLogDirectory: vi.fn(async () => undefined),
+      restartCoreDsh: vi.fn(async () => undefined),
+      start: vi.fn(async () => ({})),
+      stop: vi.fn(async () => undefined),
+      validate: vi.fn(async () => ({})),
+    }
+    const services = {
+      pluginDevelopment: () => pluginDevelopment,
+    }
+
+    registerPluginDevelopmentCapabilities(router, services)
+    await handlers.get('pluginDevelopment.list')?.({}, { principal: 'test' })
+    await handlers.get('pluginDevelopment.validate')?.(
+      { sourceRoot: '/workspace/plugin' },
+      { principal: 'test' }
+    )
+    await handlers.get('pluginDevelopment.start')?.(
+      { sourceRoot: '/workspace/plugin' },
+      { principal: 'test' }
+    )
+    await handlers.get('pluginDevelopment.focus')?.({}, { principal: 'test' })
+    await handlers.get('pluginDevelopment.restartCoreDsh')?.({}, { principal: 'test' })
+    await handlers.get('pluginDevelopment.openDevTools')?.({}, { principal: 'test' })
+    await handlers.get('pluginDevelopment.openLogDirectory')?.({}, { principal: 'test' })
+    await handlers.get('pluginDevelopment.stop')?.({}, { principal: 'test' })
+    await handlers.get('pluginDevelopment.deleteData')?.({}, { principal: 'test' })
+
+    expect(pluginDevelopment.validate).toHaveBeenCalledWith('/workspace/plugin')
+    expect(pluginDevelopment.start).toHaveBeenCalledWith('/workspace/plugin')
+    expect(pluginDevelopment.focus).toHaveBeenCalledOnce()
+    expect(pluginDevelopment.restartCoreDsh).toHaveBeenCalledOnce()
+    expect(pluginDevelopment.openDevTools).toHaveBeenCalledOnce()
+    expect(pluginDevelopment.openLogDirectory).toHaveBeenCalledOnce()
+    expect(pluginDevelopment.stop).toHaveBeenCalledOnce()
+    expect(pluginDevelopment.deleteData).toHaveBeenCalledOnce()
+  })
+})
+
+describe('createWorkbenchCapabilityRouter', () => {
+  test('captures a rectangle from the scoped owner without accepting a caller-supplied label', async () => {
+    const browser = {
+      has: vi.fn((label: string) => label === 'smart-app:test'),
+      state: vi.fn(() => ({ visible: true })),
+      capture: vi.fn(async () => 'data:image/png;base64,owner-rect'),
+    }
+    const router = createWorkbenchCapabilityRouter(browser as never, 'smart-app:test')
+
+    expect(router.describe(WEWORK_WORKBENCH_PRINCIPAL)).toContain('dshCapture.ownerRect')
+    await expect(
+      router.invoke(WEWORK_WORKBENCH_PRINCIPAL, 'dshCapture.ownerRect', {
+        x: 12.4,
+        y: 24.2,
+        width: 320.1,
+        height: 180.8,
+        label: 'smart-app:another',
+      })
+    ).resolves.toEqual({ dataUrl: 'data:image/png;base64,owner-rect' })
+    expect(browser.capture).toHaveBeenCalledWith(
+      'smart-app:test',
+      {
+        x: 12,
+        y: 24,
+        width: 321,
+        height: 181,
+      },
+      {
+        preferDebugger: true,
+        debuggerFromSurface: true,
+      }
+    )
+  })
+
+  test('rejects invalid rectangles before reaching the scoped owner', async () => {
+    const browser = {
+      has: vi.fn(() => true),
+      state: vi.fn(() => ({ visible: true })),
+      capture: vi.fn(),
+    }
+    const router = createWorkbenchCapabilityRouter(browser as never, 'smart-app:test')
+
+    await expect(
+      router.invoke(WEWORK_WORKBENCH_PRINCIPAL, 'dshCapture.ownerRect', {
+        x: -1,
+        y: 0,
+        width: 320,
+        height: 180,
+      })
+    ).rejects.toMatchObject({ code: 'invalid_params' })
+    await expect(
+      router.invoke(WEWORK_WORKBENCH_PRINCIPAL, 'dshCapture.ownerRect', {
+        x: 0,
+        y: 0,
+        width: 7681,
+        height: 180,
+      })
+    ).rejects.toMatchObject({ code: 'invalid_params' })
+    expect(browser.capture).not.toHaveBeenCalled()
+  })
+
+  test('rejects capture while the scoped owner is hidden', async () => {
+    const browser = {
+      has: vi.fn(() => true),
+      state: vi.fn(() => ({ visible: false })),
+      capture: vi.fn(),
+    }
+    const router = createWorkbenchCapabilityRouter(browser as never, 'smart-app:test')
+
+    await expect(
+      router.invoke(WEWORK_WORKBENCH_PRINCIPAL, 'dshCapture.ownerRect', {
+        x: 0,
+        y: 0,
+        width: 320,
+        height: 180,
+      })
+    ).rejects.toMatchObject({ code: 'owner_view_hidden' })
+    expect(browser.capture).not.toHaveBeenCalled()
+  })
+
+  test('grants owner-view capture and read-only device diagnostics to the workbench principal', async () => {
+    const router = createWorkbenchCapabilityRouter(null, null)
+    const granted = router.describe(WEWORK_WORKBENCH_PRINCIPAL)
+    expect(granted).toEqual([
+      'dshCapture.capabilities',
+      'dshCapture.ownerRect',
+      'deviceDiagnostics.microphone',
+    ])
+    expect(granted).not.toContain('browser.open')
+    expect(granted).not.toContain('filesystem.stat')
+    expect(granted).not.toContain('executor.*')
+  })
+
+  test('denies capabilities for the core principal', async () => {
+    const router = createWorkbenchCapabilityRouter(null, null)
+    expect(router.describe(WEWORK_APP_PRINCIPAL)).toEqual([])
+  })
+
+  test('denies unknown capabilities for the workbench principal', async () => {
+    const router = createWorkbenchCapabilityRouter(null, null)
+    await expect(
+      router.invoke(WEWORK_WORKBENCH_PRINCIPAL, 'browser.open', {})
+    ).rejects.toMatchObject({ code: 'capability_denied' })
+  })
+
+  test('keeps owner-view capture out of the core principal grant', () => {
+    const granted = coreGrantedCapabilities()
+    expect(granted).not.toContain('dshCapture.capabilities')
+    expect(granted).not.toContain('dshCapture.ownerRect')
+    expect(granted).toContain('browser.open')
+    expect(granted).toContain('deviceDiagnostics.microphone')
+  })
+
+  test('grants app.relaunch to the core principal', () => {
+    const granted = coreGrantedCapabilities()
+    expect(granted).toContain('app.relaunch')
+    expect(granted).toContain('app.quit')
+  })
+
+  test('reports capability available only while the scoped owner is visible', async () => {
+    const hidden = createWorkbenchCapabilityRouter(
+      {
+        has: vi.fn(() => true),
+        state: vi.fn(() => ({ visible: false })),
+      } as never,
+      'smart-app:test'
+    )
+    await expect(
+      hidden.invoke(WEWORK_WORKBENCH_PRINCIPAL, 'dshCapture.capabilities', {})
+    ).resolves.toEqual({ available: false })
+
+    const visible = createWorkbenchCapabilityRouter(
+      {
+        has: vi.fn(() => true),
+        state: vi.fn(() => ({ visible: true })),
+      } as never,
+      'smart-app:test'
+    )
+    await expect(
+      visible.invoke(WEWORK_WORKBENCH_PRINCIPAL, 'dshCapture.capabilities', {})
+    ).resolves.toEqual({ available: true })
+  })
+})

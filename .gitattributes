@@ -1,0 +1,11 @@
+# Windows batch scripts rely on CRLF line endings for reliable cmd.exe
+# label parsing; convert on checkout regardless of the committing platform.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Keep shebang scripts executable and valid under native module transforms.
+*.sh text eol=lf
+*.mjs text eol=lf
+
+# SDK inventories hash source bytes, including when checked out on Windows.
+sdk/** text eol=lf

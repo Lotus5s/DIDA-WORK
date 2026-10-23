@@ -1,0 +1,537 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import sys
+from contextlib import contextmanager
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+
+chat_shell_module = ModuleType("chat_shell")
+chat_shell_models_module = ModuleType("chat_shell.models")
+chat_shell_models_module.LangChainModelFactory = object
+chat_shell_module.models = chat_shell_models_module
+sys.modules.setdefault("chat_shell", chat_shell_module)
+sys.modules.setdefault("chat_shell.models", chat_shell_models_module)
+chat_config_module = ModuleType("app.services.chat.config")
+chat_config_module.get_team_first_bot_shell_type = Mock()
+sys.modules.setdefault("app.services.chat.config", chat_config_module)
+
+import app.stores.tasks as task_stores
+from app.api.ws import chat_namespace
+from app.api.ws.chat_namespace import ChatNamespace
+
+
+def test_retry_restores_image_generation_size() -> None:
+    user_subtask = SimpleNamespace(
+        result={"image_config": {"model": "gpt-image", "size": "1512x648"}}
+    )
+
+    params = chat_namespace._get_retry_generate_params(user_subtask)
+
+    assert params is not None
+    assert params.size == "1512x648"
+
+
+def test_retry_restores_workflow_video_model_without_text_model_override() -> None:
+    user_subtask = SimpleNamespace(
+        result={
+            "video_config": {
+                "model": "seedance-2",
+                "model_display_name": "Seedance 2",
+            }
+        }
+    )
+
+    params = chat_namespace._get_retry_generate_params(user_subtask)
+
+    assert params is not None
+    assert params.model == "seedance-2"
+    assert params.model_display_name == "Seedance 2"
+
+
+class _RetryDbMock:
+    """Mock DB that records whether the retry session was released."""
+
+    def __init__(self, user):
+        self.closed = False
+        self.rolled_back = False
+        self.commit = Mock()
+        self.refresh = Mock()
+        self.query = Mock()
+        self.query.return_value.filter.return_value.first.return_value = user
+
+    def close(self):
+        self.closed = True
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+def test_get_device_info_for_close_session_uses_task_owner_for_member(monkeypatch):
+    db = Mock()
+    task = SimpleNamespace(id=100, user_id=7)
+    subtask = SimpleNamespace(executor_name="device-local-1")
+    get_task = Mock(return_value=task)
+    is_member = Mock(return_value=True)
+    get_subtask = Mock(return_value=subtask)
+
+    @contextmanager
+    def fake_db_session():
+        yield db
+
+    monkeypatch.setattr(chat_namespace, "get_db_session", fake_db_session)
+    monkeypatch.setattr(task_stores.task_store, "get_regular_active_task", get_task)
+    monkeypatch.setattr(task_stores.task_access_store, "is_member", is_member)
+    monkeypatch.setattr(
+        task_stores.subtask_store,
+        "get_latest_device_executor_for_task",
+        get_subtask,
+    )
+
+    result = chat_namespace._get_device_info_for_close_session(
+        task_id=100,
+        user_id=9,
+    )
+
+    assert result == {"device_id": "local-1", "user_id": 7}
+    get_task.assert_called_once_with(db, task_id=100)
+    is_member.assert_called_once_with(db, task_id=100, user_id=9)
+    get_subtask.assert_called_once_with(db, task_id=100, owner_user_id=7)
+
+
+@pytest.mark.asyncio
+async def test_chat_retry_default_model_clears_stale_override_labels_without_name_error():
+    """Retrying with the bot default model should clear stale labels and succeed."""
+
+    namespace = ChatNamespace()
+    namespace.get_session = AsyncMock(return_value={"user_id": 1})
+    namespace._check_token_expiry = AsyncMock(return_value=False)
+
+    task = SimpleNamespace(
+        id=100,
+        json={
+            "metadata": {
+                "labels": {
+                    "modelId": "old-model",
+                    "forceOverrideBotModel": "true",
+                    "forceOverrideBotModelType": "public",
+                }
+            }
+        },
+    )
+    failed_ai_subtask = SimpleNamespace(
+        id=42,
+        team_id=10,
+        message_id=7,
+        parent_id=41,
+        status=SimpleNamespace(value="FAILED"),
+    )
+    team = SimpleNamespace(id=10)
+    user_subtask = SimpleNamespace(id=41, prompt="Hello", contexts=[])
+    user = SimpleNamespace(id=1)
+
+    db = Mock()
+    db.query.return_value.filter.return_value.first.return_value = user
+
+    with (
+        patch("app.api.ws.chat_namespace.SessionLocal", return_value=db),
+        patch(
+            "app.api.ws.chat_namespace.can_access_task", AsyncMock(return_value=True)
+        ),
+        patch(
+            "app.api.ws.chat_namespace.fetch_retry_context",
+            return_value=(failed_ai_subtask, task, team, user_subtask),
+        ),
+        patch("app.api.ws.chat_namespace.reset_subtask_for_retry"),
+        patch("app.api.ws.chat_namespace.extract_display_prompt", return_value="Hello"),
+        patch("app.api.ws.chat_namespace.get_device_id", return_value=None),
+        patch(
+            "app.api.ws.chat_namespace.trigger_ai_response_unified",
+            AsyncMock(),
+        ) as mock_trigger,
+        patch("app.stores.tasks.task_store") as mock_task_store,
+    ):
+        result = await namespace.on_chat_retry(
+            "sid-123",
+            {
+                "task_id": 100,
+                "subtask_id": 42,
+                "force_override_bot_model": None,
+                "force_override_bot_model_type": None,
+                "use_model_override": True,
+            },
+        )
+
+    assert result == {"success": True}
+    assert task.json["metadata"]["labels"] == {}
+    mock_task_store.update_json.assert_called_once_with(
+        db, task=task, payload=task.json
+    )
+    assert db.commit.called
+    assert mock_trigger.await_count == 1
+    assert mock_trigger.await_args.kwargs["payload"].force_override_bot_model is None
+
+
+@pytest.mark.asyncio
+async def test_chat_retry_closes_session_before_triggering_sse_dispatch():
+    namespace = ChatNamespace()
+    namespace.get_session = AsyncMock(return_value={"user_id": 1})
+    namespace._check_token_expiry = AsyncMock(return_value=False)
+
+    task = SimpleNamespace(id=100, json={"metadata": {"labels": {}}})
+    failed_ai_subtask = SimpleNamespace(
+        id=42,
+        team_id=10,
+        message_id=7,
+        parent_id=41,
+        status=SimpleNamespace(value="FAILED"),
+    )
+    team = SimpleNamespace(id=10)
+    user_subtask = SimpleNamespace(id=41, prompt="Hello", contexts=[])
+    user = SimpleNamespace(id=1)
+    db = _RetryDbMock(user=user)
+
+    async def assert_session_closed_before_dispatch(**kwargs):
+        assert db.rolled_back is True
+        assert db.closed is True
+
+    with (
+        patch("app.api.ws.chat_namespace.SessionLocal", return_value=db),
+        patch(
+            "app.api.ws.chat_namespace.can_access_task", AsyncMock(return_value=True)
+        ),
+        patch(
+            "app.api.ws.chat_namespace.fetch_retry_context",
+            return_value=(failed_ai_subtask, task, team, user_subtask),
+        ),
+        patch("app.api.ws.chat_namespace.reset_subtask_for_retry"),
+        patch("app.api.ws.chat_namespace.extract_display_prompt", return_value="Hello"),
+        patch("app.api.ws.chat_namespace.get_device_id", return_value=None),
+        patch(
+            "app.api.ws.chat_namespace.trigger_ai_response_unified",
+            AsyncMock(side_effect=assert_session_closed_before_dispatch),
+        ) as mock_trigger,
+    ):
+        result = await namespace.on_chat_retry(
+            "sid-123",
+            {
+                "task_id": 100,
+                "subtask_id": 42,
+                "force_override_bot_model": None,
+                "force_override_bot_model_type": None,
+                "use_model_override": False,
+            },
+        )
+
+    assert result == {"success": True}
+    mock_trigger.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_retry_persists_failed_state_when_dispatch_raises():
+    namespace = ChatNamespace()
+    namespace.get_session = AsyncMock(return_value={"user_id": 1})
+    namespace._check_token_expiry = AsyncMock(return_value=False)
+
+    db = _RetryDbMock(user=SimpleNamespace(id=1))
+    assistant_subtask = SimpleNamespace(id=42)
+    dispatch_args = {
+        "task": SimpleNamespace(id=100),
+        "assistant_subtask": assistant_subtask,
+    }
+    dispatch_error = RuntimeError("video attachment preprocessing failed")
+
+    with (
+        patch("app.api.ws.chat_namespace.SessionLocal", return_value=db),
+        patch(
+            "app.api.ws.chat_namespace.can_access_task", AsyncMock(return_value=True)
+        ),
+        patch(
+            "app.api.ws.chat_namespace._prepare_chat_retry_dispatch",
+            return_value=dispatch_args,
+        ),
+        patch(
+            "app.api.ws.chat_namespace.trigger_ai_response_unified",
+            AsyncMock(side_effect=dispatch_error),
+        ),
+        patch(
+            "app.api.ws.chat_namespace._finalize_failed_ai_trigger",
+            AsyncMock(),
+        ) as mock_finalize,
+    ):
+        result = await namespace.on_chat_retry(
+            "sid-123",
+            {
+                "task_id": 100,
+                "subtask_id": 42,
+                "force_override_bot_model": None,
+                "force_override_bot_model_type": None,
+                "use_model_override": False,
+            },
+        )
+
+    assert result == {
+        "error": "Internal server error: video attachment preprocessing failed"
+    }
+    mock_finalize.assert_awaited_once()
+    assert mock_finalize.await_args.kwargs["task_id"] == 100
+    assert mock_finalize.await_args.kwargs["assistant_subtask_id"] == 42
+    assert mock_finalize.await_args.kwargs["error_message"]
+    assert mock_finalize.await_args.kwargs["error_code"]
+
+
+@pytest.mark.asyncio
+async def test_chat_retry_rejects_a_code_wiki_task_before_resetting_it() -> None:
+    namespace = ChatNamespace()
+    namespace.get_session = AsyncMock(return_value={"user_id": 1})
+    namespace._check_token_expiry = AsyncMock(return_value=False)
+
+    task = SimpleNamespace(
+        id=100,
+        json={"metadata": {"labels": {"source": "code_wiki"}}},
+    )
+    failed_ai_subtask = SimpleNamespace(
+        id=42,
+        team_id=10,
+        message_id=7,
+        parent_id=41,
+        status=SimpleNamespace(value="FAILED"),
+    )
+    team = SimpleNamespace(id=10)
+    user_subtask = SimpleNamespace(id=41, prompt="Generate a wiki", contexts=[])
+
+    with (
+        patch("app.api.ws.chat_namespace.SessionLocal", return_value=Mock()),
+        patch(
+            "app.api.ws.chat_namespace.can_access_task", AsyncMock(return_value=True)
+        ),
+        patch(
+            "app.api.ws.chat_namespace.fetch_retry_context",
+            return_value=(failed_ai_subtask, task, team, user_subtask),
+        ),
+        patch("app.api.ws.chat_namespace.reset_subtask_for_retry") as reset,
+        patch(
+            "app.api.ws.chat_namespace.trigger_ai_response_unified", AsyncMock()
+        ) as trigger,
+    ):
+        result = await namespace.on_chat_retry(
+            "sid-123",
+            {
+                "task_id": 100,
+                "subtask_id": 42,
+                "force_override_bot_model": None,
+                "force_override_bot_model_type": None,
+                "use_model_override": False,
+            },
+        )
+
+    assert result == {
+        "error": "Code Wiki task retry is not supported. Start a new Code Wiki generation."
+    }
+    reset.assert_not_called()
+    trigger.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chat_retry_restores_persisted_video_generation_params():
+    namespace = ChatNamespace()
+    namespace.get_session = AsyncMock(return_value={"user_id": 1})
+    namespace._check_token_expiry = AsyncMock(return_value=False)
+
+    task = SimpleNamespace(id=100, json={"metadata": {"labels": {}}})
+    failed_ai_subtask = SimpleNamespace(
+        id=42,
+        team_id=10,
+        message_id=7,
+        parent_id=41,
+        status=SimpleNamespace(value="FAILED"),
+    )
+    team = SimpleNamespace(id=10)
+    user_subtask = SimpleNamespace(
+        id=41,
+        prompt="Generate a video",
+        contexts=[],
+        result={
+            "video_config": {
+                "resolution": "1080p",
+                "ratio": "16:9",
+                "duration": 5,
+                "generation_mode_id": "text-to-video",
+            }
+        },
+    )
+    user = SimpleNamespace(id=1)
+    db = _RetryDbMock(user=user)
+
+    with (
+        patch("app.api.ws.chat_namespace.SessionLocal", return_value=db),
+        patch(
+            "app.api.ws.chat_namespace.can_access_task", AsyncMock(return_value=True)
+        ),
+        patch(
+            "app.api.ws.chat_namespace.fetch_retry_context",
+            return_value=(failed_ai_subtask, task, team, user_subtask),
+        ),
+        patch("app.api.ws.chat_namespace.reset_subtask_for_retry"),
+        patch(
+            "app.api.ws.chat_namespace.extract_display_prompt",
+            return_value="Generate a video",
+        ),
+        patch("app.api.ws.chat_namespace.get_device_id", return_value=None),
+        patch(
+            "app.api.ws.chat_namespace.trigger_ai_response_unified",
+            AsyncMock(),
+        ) as mock_trigger,
+        patch("app.stores.tasks.task_store"),
+    ):
+        result = await namespace.on_chat_retry(
+            "sid-123",
+            {
+                "task_id": 100,
+                "subtask_id": 42,
+                "force_override_bot_model": "video-model",
+                "force_override_bot_model_type": "public",
+                "use_model_override": True,
+            },
+        )
+
+    assert result == {"success": True}
+    generate_params = mock_trigger.await_args.kwargs["payload"].generate_params
+    assert generate_params.resolution == "1080p"
+    assert generate_params.ratio == "16:9"
+    assert generate_params.duration == 5
+    assert generate_params.generation_mode_id == "text-to-video"
+
+
+@pytest.mark.asyncio
+async def test_chat_retry_new_model_without_type_clears_stale_override_model_type():
+    """Retrying with a new model should drop a stale override type when none is provided."""
+
+    namespace = ChatNamespace()
+    namespace.get_session = AsyncMock(return_value={"user_id": 1})
+    namespace._check_token_expiry = AsyncMock(return_value=False)
+
+    task = SimpleNamespace(
+        id=100,
+        json={
+            "metadata": {
+                "labels": {
+                    "modelId": "old-model",
+                    "forceOverrideBotModel": "true",
+                    "forceOverrideBotModelType": "public",
+                }
+            }
+        },
+    )
+    failed_ai_subtask = SimpleNamespace(
+        id=42,
+        team_id=10,
+        message_id=7,
+        parent_id=41,
+        status=SimpleNamespace(value="FAILED"),
+    )
+    team = SimpleNamespace(id=10)
+    user_subtask = SimpleNamespace(id=41, prompt="Hello", contexts=[])
+    user = SimpleNamespace(id=1)
+
+    db = Mock()
+    db.query.return_value.filter.return_value.first.return_value = user
+
+    with (
+        patch("app.api.ws.chat_namespace.SessionLocal", return_value=db),
+        patch(
+            "app.api.ws.chat_namespace.can_access_task", AsyncMock(return_value=True)
+        ),
+        patch(
+            "app.api.ws.chat_namespace.fetch_retry_context",
+            return_value=(failed_ai_subtask, task, team, user_subtask),
+        ),
+        patch("app.api.ws.chat_namespace.reset_subtask_for_retry"),
+        patch("app.api.ws.chat_namespace.extract_display_prompt", return_value="Hello"),
+        patch("app.api.ws.chat_namespace.get_device_id", return_value=None),
+        patch(
+            "app.api.ws.chat_namespace.trigger_ai_response_unified",
+            AsyncMock(),
+        ) as mock_trigger,
+        patch("app.stores.tasks.task_store") as mock_task_store,
+    ):
+        result = await namespace.on_chat_retry(
+            "sid-123",
+            {
+                "task_id": 100,
+                "subtask_id": 42,
+                "force_override_bot_model": "new-model",
+                "force_override_bot_model_type": None,
+                "use_model_override": True,
+            },
+        )
+
+    assert result == {"success": True}
+    assert task.json["metadata"]["labels"] == {
+        "modelId": "new-model",
+        "forceOverrideBotModel": "true",
+    }
+    mock_task_store.update_json.assert_called_once_with(
+        db, task=task, payload=task.json
+    )
+    assert db.commit.called
+    assert mock_trigger.await_count == 1
+    assert (
+        mock_trigger.await_args.kwargs["payload"].force_override_bot_model
+        == "new-model"
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_retry_rejects_running_subtask_without_dispatching():
+    """Retry should not re-dispatch a subtask that is still marked RUNNING."""
+
+    namespace = ChatNamespace()
+    namespace.get_session = AsyncMock(return_value={"user_id": 1})
+    namespace._check_token_expiry = AsyncMock(return_value=False)
+
+    task = SimpleNamespace(id=100, json={"metadata": {"labels": {}}})
+    running_ai_subtask = SimpleNamespace(
+        id=42,
+        team_id=10,
+        message_id=7,
+        parent_id=41,
+        status=SimpleNamespace(value="RUNNING"),
+    )
+    team = SimpleNamespace(id=10)
+    user_subtask = SimpleNamespace(id=41, prompt="Hello", contexts=[])
+
+    db = Mock()
+
+    with (
+        patch("app.api.ws.chat_namespace.SessionLocal", return_value=db),
+        patch(
+            "app.api.ws.chat_namespace.can_access_task", AsyncMock(return_value=True)
+        ),
+        patch(
+            "app.api.ws.chat_namespace.fetch_retry_context",
+            return_value=(running_ai_subtask, task, team, user_subtask),
+        ),
+        patch("app.api.ws.chat_namespace.reset_subtask_for_retry") as mock_reset,
+        patch(
+            "app.api.ws.chat_namespace.trigger_ai_response_unified",
+            AsyncMock(),
+        ) as mock_trigger,
+    ):
+        result = await namespace.on_chat_retry(
+            "sid-123",
+            {
+                "task_id": 100,
+                "subtask_id": 42,
+                "force_override_bot_model": None,
+                "force_override_bot_model_type": None,
+                "use_model_override": False,
+            },
+        )
+
+    assert result == {"error": "Cannot retry subtask in RUNNING state"}
+    mock_reset.assert_not_called()
+    mock_trigger.assert_not_awaited()

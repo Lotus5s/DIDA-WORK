@@ -1,0 +1,277 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import { apiClient } from './client'
+import { getToken } from './user'
+import { fetchAllPages } from '@wegent/chat-core'
+import type { TeamBot, Team, PaginationParams, TaskType, TeamInputPlaceholder } from '@/types/api'
+import type { CheckRunningTasksResponse } from './common'
+
+// Team Request/Response Types
+export interface CreateTeamRequest {
+  name: string
+  displayName?: string | null
+  description?: string
+  bots?: TeamBot[]
+  workflow?: Record<string, unknown>
+  bind_mode?: TaskType[]
+  mode_spec?: Team['mode_spec']
+  is_active?: boolean
+  namespace?: string // Group namespace, defaults to 'default' for personal teams
+  icon?: string // Icon ID from preset icon library
+  inputPlaceholder?: TeamInputPlaceholder | null
+  quick_phrases?: string[]
+  requires_workspace?: boolean // Whether this team requires a workspace/repository (null = auto-infer from shell)
+}
+
+export interface TeamIdentityConfirmation {
+  forceIdentityChange: true
+  confirmName: string
+}
+
+export interface TeamListResponse {
+  total: number
+  items: Team[]
+}
+
+export interface TeamListParams extends PaginationParams {
+  groupNames?: string[]
+  sourceFilter?: 'all' | 'mine' | 'personal' | 'group' | 'system'
+  mode?: 'all' | 'chat' | 'code' | 'task' | 'knowledge' | 'video' | 'image'
+}
+
+export interface GetTeamsOptions {
+  signal?: AbortSignal
+}
+
+// Team Share Response Type
+export interface TeamShareResponse {
+  share_url: string
+  share_token: string
+}
+
+// Team Share Info Response Type
+export interface TeamShareInfoResponse {
+  user_id: number
+  user_name: string
+  team_id: number
+  team_name: string
+  bind_mode?: string[]
+}
+
+// Team Share Join Request Type
+export interface TeamShareJoinRequest {
+  share_token: string
+}
+
+// Team Input Parameters Response Type
+export interface TeamInputParametersResponse {
+  has_parameters: boolean
+  parameters: Array<{
+    variable: string
+    label: string | Record<string, string>
+    required: boolean
+    type: string
+    options?: string[]
+    max_length?: number
+    placeholder?: string
+    default?: string
+    hint?: string
+  }>
+  app_mode?: string // Dify app mode: 'chat', 'chatflow', 'workflow', 'completion', 'agent'
+}
+
+// Team Skills Response Type
+export interface TeamSkillsResponse {
+  team_id: number
+  team_namespace: string
+  skills: string[] // All bot skills (deduplicated)
+  preload_skills: string[] // Skills to preload
+}
+
+export interface TeamResourceMember {
+  id: number
+  resource_type: string
+  resource_id: number
+  user_id: number | null
+  display_name: string | null
+  user_email: string | null
+  role: string
+  status: string
+  entity_type?: string | null
+  entity_id?: string | null
+  source_type?: string | null
+  invited_by_user_id: number
+  invited_by_user_name: string | null
+  reviewed_by_user_id: number | null
+  reviewed_by_user_name: string | null
+  reviewed_at: string | null
+  copied_resource_id: number | null
+  requested_at: string
+  created_at: string
+  updated_at: string
+}
+
+export interface TeamMemberListResponse {
+  members: TeamResourceMember[]
+  total: number
+}
+
+// Team Copy Preflight Response Type
+export interface CopyPreflightResponse {
+  personal_skills: Array<{ id: number; name: string; description: string }>
+}
+
+const pendingTeamCatalogs = new Map<string, Promise<TeamListResponse>>()
+
+export const teamApis = {
+  async getTeam(id: number): Promise<Team> {
+    return apiClient.get(`/teams/${id}`)
+  },
+  getDefaultTeam(
+    mode: 'chat' | 'code' | 'knowledge' | 'task',
+    signal?: AbortSignal
+  ): Promise<Team | null> {
+    return apiClient.get(`/teams/default?mode=${mode}`, { signal })
+  },
+  /** Get the complete catalog for lists and selectors that filter teams locally. */
+  async getAllTeams(
+    scope?: 'personal' | 'group' | 'all',
+    groupName?: string,
+    refresh = false,
+    options?: GetTeamsOptions
+  ): Promise<TeamListResponse> {
+    // Cancellable requests own their pagination so aborts cannot affect other consumers.
+    if (options?.signal) {
+      return fetchAllPages((page, limit) =>
+        teamApis.getTeams({ page, limit }, scope, groupName, options)
+      )
+    }
+    const key = JSON.stringify([getToken(), scope || 'all', groupName || null])
+    const pending = pendingTeamCatalogs.get(key)
+    if (!refresh && pending) return pending
+
+    // Share the entire pagination chain; completed results are never cached here.
+    const request = fetchAllPages((page, limit) =>
+      teamApis.getTeams({ page, limit }, scope, groupName)
+    ).finally(() => {
+      if (pendingTeamCatalogs.get(key) === request) pendingTeamCatalogs.delete(key)
+    })
+    pendingTeamCatalogs.set(key, request)
+    return request
+  },
+  /**
+   * Get teams list
+   * @param params - Pagination parameters
+   * @param scope - Resource scope: 'personal', 'group', or 'all'
+   * @param groupName - Optional group name. When omitted with group scope, all accessible groups are returned.
+   */
+  async getTeams(
+    params?: TeamListParams,
+    scope?: 'personal' | 'group' | 'all',
+    groupName?: string,
+    options?: GetTeamsOptions
+  ): Promise<TeamListResponse> {
+    const p = params ? params : { page: 1, limit: 100 }
+    const queryParams = new URLSearchParams()
+    queryParams.append('page', String(p.page || 1))
+    queryParams.append('limit', String(p.limit || 100))
+    if (scope) {
+      queryParams.append('scope', scope)
+    }
+    if (groupName) {
+      queryParams.append('group_name', groupName)
+    }
+    p.groupNames?.forEach(name => queryParams.append('group_names', name))
+    if (p.sourceFilter) queryParams.append('source_filter', p.sourceFilter)
+    if (p.mode) queryParams.append('mode', p.mode)
+    return apiClient.get(`/teams?${queryParams.toString()}`, { signal: options?.signal })
+  },
+  /**
+   * Create a new team
+   * @param data - Team creation data (includes namespace field)
+   */
+  async createTeam(data: CreateTeamRequest): Promise<Team> {
+    return apiClient.post('/teams', data)
+  },
+  async copyPreflight(id: number, targetNamespace: string): Promise<CopyPreflightResponse> {
+    return apiClient.get(
+      `/teams/${id}/copy-preflight?target_namespace=${encodeURIComponent(targetNamespace)}`
+    )
+  },
+  async copyTeam(id: number, targetNamespace?: string, copySkills?: boolean): Promise<Team> {
+    const params = new URLSearchParams()
+    if (targetNamespace) params.append('target_namespace', targetNamespace)
+    if (copySkills !== undefined) params.append('copy_skills', String(copySkills))
+    const query = params.toString() ? `?${params.toString()}` : ''
+    return apiClient.post(`/teams/${id}/copy${query}`)
+  },
+  async deleteTeam(id: number, confirmName?: string): Promise<void> {
+    const params = new URLSearchParams()
+    if (confirmName !== undefined) {
+      params.set('force', 'true')
+      params.set('confirm_name', confirmName)
+    }
+    const query = params.toString() ? `?${params.toString()}` : ''
+    await apiClient.delete(`/teams/${id}${query}`)
+  },
+  async updateTeam(
+    id: number,
+    data: CreateTeamRequest,
+    identityConfirmation?: TeamIdentityConfirmation
+  ): Promise<Team> {
+    const params = new URLSearchParams()
+    if (identityConfirmation) {
+      params.set('force_identity_change', 'true')
+      params.set('confirm_name', identityConfirmation.confirmName)
+    }
+    const query = params.toString() ? `?${params.toString()}` : ''
+    return apiClient.put(`/teams/${id}${query}`, data)
+  },
+  async shareTeam(id: number): Promise<TeamShareResponse> {
+    return apiClient.post(`/teams/${id}/share`)
+  },
+  async getTeamShareInfo(shareToken: string): Promise<TeamShareInfoResponse> {
+    return apiClient.get(`/teams/share/info?share_token=${shareToken}`)
+  },
+  async joinSharedTeam(data: TeamShareJoinRequest): Promise<void> {
+    return apiClient.post('/teams/share/join', data)
+  },
+  async getTeamInputParameters(teamId: number): Promise<TeamInputParametersResponse> {
+    return apiClient.get(`/teams/${teamId}/input-parameters`)
+  },
+  async listTeamMembers(teamId: number): Promise<TeamMemberListResponse> {
+    return apiClient.get(`/share/Team/${teamId}/members`)
+  },
+  async addTeamNamespaceAuthorization(
+    teamId: number,
+    namespaceId: number
+  ): Promise<TeamResourceMember> {
+    return apiClient.post(`/share/Team/${teamId}/members`, {
+      user_id: 0,
+      role: 'Reporter',
+      entity_type: 'namespace',
+      entity_id: String(namespaceId),
+    })
+  },
+  async removeTeamMember(teamId: number, memberId: number): Promise<void> {
+    await apiClient.delete(`/share/Team/${teamId}/members/${memberId}`)
+  },
+  async checkRunningTasks(id: number): Promise<CheckRunningTasksResponse> {
+    return apiClient.get(`/teams/${id}/running-tasks`)
+  },
+  /**
+   * Get all skills associated with a team
+   * @param teamId - Team ID
+   * @returns TeamSkillsResponse with skills and preload_skills lists
+   */
+  async getTeamSkills(teamId: number): Promise<TeamSkillsResponse> {
+    return apiClient.get(`/teams/${teamId}/skills`)
+  },
+}
+
+/**
+ * Fetch team skills - convenience export for useSkillSelector
+ */
+export const fetchTeamSkills = teamApis.getTeamSkills

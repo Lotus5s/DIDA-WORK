@@ -1,0 +1,491 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::{
+    collections::VecDeque,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use serde_json::{json, Value};
+use tokio::sync::{broadcast, Notify};
+use wegent_executor::{
+    config::device::{ConnectionConfig, DeviceConfig, UpdateConfig},
+    local::app_ipc::{AppIpcError, RuntimeWorkHandler},
+    local::backend::{
+        local_backend_connection_failure_log_line, local_backend_registered_log_line,
+        local_backend_starting_log_line, EventHandler, LocalBackendClient, LocalBackendConfig,
+        LocalBackendRunner, LocalBackendTransport,
+    },
+};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn local_backend_config_uses_heartbeat_call_timeout_env() {
+    let _env = EnvGuard::set("LOCAL_HEARTBEAT_CALL_TIMEOUT", "12");
+
+    let config = LocalBackendConfig::from_device_config(DeviceConfig {
+        device_id: "device-1".to_owned(),
+        device_name: "Device One".to_owned(),
+        device_type: "local".to_owned(),
+        bind_shell: "claudecode".to_owned(),
+        connection: ConnectionConfig {
+            backend_url: "http://localhost:8000".to_owned(),
+            socket_url: String::new(),
+            auth_token: "wg-token".to_owned(),
+            runtime_auth_token: "runtime-wg-token".to_owned(),
+        },
+        ..DeviceConfig::default()
+    });
+
+    assert_eq!(config.heartbeat_timeout, Duration::from_secs(12));
+}
+
+#[tokio::test]
+async fn send_heartbeat_propagates_timeout_error_and_passes_configured_timeout() {
+    let transport =
+        ScriptedTransport::with_call_results(vec![Err("device:heartbeat timed out".to_owned())]);
+    let mut config = local_backend_config();
+    config.heartbeat_timeout = Duration::from_secs(12);
+    let client = LocalBackendClient::new(config.clone(), transport.clone());
+
+    let error = client
+        .send_heartbeat(config.heartbeat_timeout)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, "device:heartbeat timed out");
+    let calls = transport.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].event, "device:heartbeat");
+    assert_eq!(calls[0].timeout, Duration::from_secs(12));
+}
+
+#[tokio::test]
+async fn send_heartbeat_propagates_transport_error() {
+    let transport = ScriptedTransport::with_call_results(vec![Err("socket closed".to_owned())]);
+    let client = LocalBackendClient::new(local_backend_config(), transport);
+
+    let error = client
+        .send_heartbeat(Duration::from_secs(2))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, "socket closed");
+}
+
+#[test]
+fn local_backend_connection_failure_log_line_includes_backend_url() {
+    let line = local_backend_connection_failure_log_line(
+        "http://localhost:8000",
+        "device:register timed out",
+    );
+
+    assert_log_timestamp(&line);
+    assert!(
+        line.ends_with(
+            " local backend connection failed backend_url=http://localhost:8000 error=\"device:register timed out\""
+        )
+    );
+}
+
+#[test]
+fn local_backend_starting_log_line_includes_backend_url_and_device() {
+    let line = local_backend_starting_log_line("http://localhost:8000", "device-1");
+
+    assert_log_timestamp(&line);
+    assert!(line.ends_with(
+        " local backend runner starting backend_url=http://localhost:8000 device_id=device-1"
+    ));
+}
+
+#[test]
+fn local_backend_registered_log_line_includes_backend_url_and_device() {
+    let line = local_backend_registered_log_line("http://localhost:8000", "device-1");
+
+    assert_log_timestamp(&line);
+    assert!(line.ends_with(
+        " local backend registered backend_url=http://localhost:8000 device_id=device-1"
+    ));
+}
+
+fn assert_log_timestamp(line: &str) {
+    let timestamp = &line[..19];
+    assert_eq!(timestamp.as_bytes()[4], b'-');
+    assert_eq!(timestamp.as_bytes()[7], b'-');
+    assert_eq!(timestamp.as_bytes()[10], b' ');
+    assert_eq!(timestamp.as_bytes()[13], b':');
+    assert_eq!(timestamp.as_bytes()[16], b':');
+}
+
+#[tokio::test]
+async fn runner_reconnects_after_two_consecutive_heartbeat_failures_to_preserve_online_ttl() {
+    let transport = ScriptedTransport::with_call_results(vec![
+        Ok(json!({"success": true})),
+        Ok(json!({"success": true})),
+    ])
+    .with_failure_after_initial_liveness();
+    let mut config = local_backend_config();
+    config.heartbeat_interval = Duration::from_millis(80);
+    config.heartbeat_timeout = Duration::from_millis(10);
+    config.reconnect_delay = Duration::from_millis(1);
+    config.reconnect_delay_max = Duration::from_millis(1);
+    let runner = LocalBackendRunner::new(config, transport.clone()).without_session_gateway();
+
+    let task = tokio::spawn(runner.run_forever());
+
+    transport.wait_for_connects(2).await;
+    task.abort();
+    let _ = task.await;
+
+    assert!(transport.connects() >= 2);
+    assert!(transport.disconnects() >= 1);
+    let failures: Vec<_> = transport
+        .emits_for_event("device:heartbeat")
+        .into_iter()
+        .filter(|emit| emit.failed)
+        .collect();
+    assert!(failures.len() >= 2);
+    let retry_gap = failures[failures.len() - 1]
+        .recorded_at
+        .duration_since(failures[failures.len() - 2].recorded_at);
+    assert!(
+        retry_gap < Duration::from_millis(40),
+        "expected retry gap to be shorter than the regular heartbeat interval, got {retry_gap:?}"
+    );
+}
+
+#[tokio::test]
+async fn runner_backs_off_when_connection_drops_before_a_stable_heartbeat() {
+    let transport = ScriptedTransport::with_call_results(vec![
+        Ok(json!({"success": true})),
+        Ok(json!({"success": true})),
+    ])
+    .with_failure_after_initial_liveness();
+    let mut config = local_backend_config();
+    config.heartbeat_interval = Duration::from_millis(5);
+    config.heartbeat_timeout = Duration::from_millis(1);
+    config.reconnect_delay = Duration::from_millis(40);
+    config.reconnect_delay_max = Duration::from_millis(80);
+    let runner = LocalBackendRunner::new(config, transport.clone()).without_session_gateway();
+    let task = tokio::spawn(runner.run_forever());
+
+    transport.wait_for_connects(1).await;
+    let first_connection_observed_at = Instant::now();
+    transport.wait_for_connects(2).await;
+    let reconnect_elapsed = first_connection_observed_at.elapsed();
+    task.abort();
+    let _ = task.await;
+
+    assert!(
+        reconnect_elapsed >= Duration::from_millis(35),
+        "expected unstable reconnect backoff, got {reconnect_elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn large_runtime_rpc_does_not_pause_device_heartbeats() {
+    let transport = ScriptedTransport::default();
+    let mut config = local_backend_config();
+    config.heartbeat_interval = Duration::from_millis(40);
+    config.heartbeat_timeout = Duration::from_millis(20);
+    config.reconnect_delay = Duration::from_millis(1);
+    config.reconnect_delay_max = Duration::from_millis(1);
+    let handler = Arc::new(BlockingTranscriptHandler::default());
+    let (event_tx, event_rx) = broadcast::channel(8);
+    let runner = LocalBackendRunner::new_for_app_sidecar_with_shared_runtime_work_handler(
+        config,
+        transport.clone(),
+        handler.clone(),
+        event_rx,
+    );
+    drop(event_tx);
+
+    let runner_task = tokio::spawn(runner.run_forever());
+    transport.wait_for_connects(1).await;
+    let runtime_handler = transport.handler("runtime:rpc").expect("runtime handler");
+    let rpc_task = tokio::spawn(async move {
+        runtime_handler(json!({
+            "method": "runtime.tasks.transcript",
+            "payload": {"localTaskId": "large-1"}
+        }))
+        .await
+        .expect("runtime ACK")
+    });
+    handler.started.notified().await;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if transport.emits_for_event("device:heartbeat").len() >= 3 {
+                return;
+            }
+            transport.notify.notified().await;
+        }
+    })
+    .await
+    .expect("heartbeats should continue while transcript is loading");
+
+    handler.release.notify_one();
+    let ack = rpc_task.await.unwrap();
+    runner_task.abort();
+    let _ = runner_task.await;
+
+    assert_eq!(ack["__runtimeRpcEncoding"], "gzip+base64+json");
+    assert_eq!(transport.connects(), 1);
+    assert_eq!(transport.disconnects(), 0);
+}
+
+#[derive(Clone, Debug)]
+struct RecordedCall {
+    event: String,
+    timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct RecordedEmit {
+    event: String,
+    recorded_at: Instant,
+    failed: bool,
+}
+
+#[derive(Clone, Default)]
+struct ScriptedTransport {
+    calls: Arc<Mutex<Vec<RecordedCall>>>,
+    call_results: Arc<Mutex<VecDeque<Result<Value, String>>>>,
+    emits: Arc<Mutex<Vec<RecordedEmit>>>,
+    heartbeat_failure: Arc<Mutex<bool>>,
+    fail_after_initial_liveness: bool,
+    handlers: Arc<Mutex<Vec<(String, EventHandler)>>>,
+    connects: Arc<Mutex<usize>>,
+    disconnects: Arc<Mutex<usize>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl ScriptedTransport {
+    fn with_call_results(results: Vec<Result<Value, String>>) -> Self {
+        Self {
+            call_results: Arc::new(Mutex::new(results.into())),
+            ..Self::default()
+        }
+    }
+
+    fn with_failure_after_initial_liveness(mut self) -> Self {
+        self.fail_after_initial_liveness = true;
+        self
+    }
+
+    fn calls(&self) -> Vec<RecordedCall> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn connects(&self) -> usize {
+        *self.connects.lock().unwrap()
+    }
+
+    fn disconnects(&self) -> usize {
+        *self.disconnects.lock().unwrap()
+    }
+
+    fn emits_for_event(&self, event: &str) -> Vec<RecordedEmit> {
+        self.emits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|emit| emit.event == event)
+            .cloned()
+            .collect()
+    }
+
+    fn handler(&self, event: &str) -> Option<EventHandler> {
+        self.handlers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name == event)
+            .map(|(_, handler)| Arc::clone(handler))
+    }
+
+    async fn wait_for_connects(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if self.connects() >= count {
+                    return;
+                }
+                self.notify.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+impl LocalBackendTransport for ScriptedTransport {
+    fn connect<'a>(
+        &'a self,
+        _config: &'a LocalBackendConfig,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            *self.heartbeat_failure.lock().unwrap() = false;
+            *self.connects.lock().unwrap() += 1;
+            self.notify.notify_waiters();
+            Ok(())
+        })
+    }
+
+    fn disconnect<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            *self.disconnects.lock().unwrap() += 1;
+            self.notify.notify_waiters();
+            Ok(())
+        })
+    }
+
+    fn call<'a>(
+        &'a self,
+        event: &'a str,
+        _payload: Value,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(RecordedCall {
+                event: event.to_owned(),
+                timeout,
+            });
+            self.notify.notify_waiters();
+            self.call_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(json!({"success": true})))
+        })
+    }
+
+    fn emit<'a>(
+        &'a self,
+        event: &'a str,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let failed = event == "device:heartbeat" && *self.heartbeat_failure.lock().unwrap();
+            // Registration succeeds, then the connection remains broken until
+            // reconnect. Capacity heartbeats cannot consume or clear the fault.
+            if event == "device:heartbeat"
+                && self.fail_after_initial_liveness
+                && self.connects() == 1
+            {
+                *self.heartbeat_failure.lock().unwrap() = true;
+            }
+            self.emits.lock().unwrap().push(RecordedEmit {
+                event: event.to_owned(),
+                recorded_at: Instant::now(),
+                failed,
+            });
+            self.notify.notify_waiters();
+            if failed {
+                Err("heartbeat transport failed".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn on(&self, event: &str, handler: EventHandler) {
+        self.handlers
+            .lock()
+            .unwrap()
+            .push((event.to_owned(), handler));
+    }
+
+    fn on_close(&self, _: wegent_executor::local::backend::ConnectionClosedHandler) {}
+}
+
+#[derive(Default)]
+struct BlockingTranscriptHandler {
+    started: Notify,
+    release: Notify,
+}
+
+impl RuntimeWorkHandler for BlockingTranscriptHandler {
+    fn handle_runtime_rpc<'a>(
+        &'a self,
+        data: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, AppIpcError>> + Send + 'a>> {
+        Box::pin(async move {
+            if data.get("method").and_then(Value::as_str) == Some("runtime.tasks.transcript") {
+                self.started.notify_one();
+                self.release.notified().await;
+                return Ok(json!({
+                    "success": true,
+                    "messages": [{
+                        "id": "message-1",
+                        "content": "large transcript ".repeat(80_000),
+                    }],
+                }));
+            }
+            Ok(json!({"success": true, "available": true}))
+        })
+    }
+}
+
+fn local_backend_config() -> LocalBackendConfig {
+    LocalBackendConfig {
+        backend_url: "http://localhost:8000".to_owned(),
+        socket_url: "http://localhost:8000".to_owned(),
+        auth_token: "wg-token".to_owned(),
+        runtime_auth_token: "runtime-wg-token".to_owned(),
+        device_id: "device-1".to_owned(),
+        runtime_instance_id: "runtime-1".to_owned(),
+        device_name: "Device One".to_owned(),
+        device_type: "local".to_owned(),
+        app_device_id: String::new(),
+        bind_shell: "claudecode".to_owned(),
+        executor_version: "test-version".to_owned(),
+        client_ip: "192.0.2.10".to_owned(),
+        runtime_transfer_host: "192.0.2.10".to_owned(),
+        heartbeat_interval: Duration::from_secs(30),
+        heartbeat_timeout: Duration::from_secs(10),
+        runtime_work_poll_interval: Duration::from_secs(2),
+        registration_timeout: Duration::from_secs(10),
+        reconnect_delay: Duration::from_secs(1),
+        reconnect_delay_max: Duration::from_secs(30),
+        configured_capabilities: Vec::new(),
+        local_workspace_root: std::env::temp_dir().join(format!(
+            "wegent-resilience-workspace-{}",
+            std::process::id()
+        )),
+        update: UpdateConfig::default(),
+    }
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self {
+            key,
+            previous,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}

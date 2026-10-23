@@ -1,0 +1,858 @@
+---
+sidebar_position: 26
+---
+
+# Complete Collaboration Execution E2E Test Plan
+
+Audit date: 2026-09-12
+
+## Goals
+
+This plan verifies the complete collaboration path from resource creation through real execution completion. It does not merely verify that a page is visible, configuration is saved, or a model returns text claiming that work is complete.
+
+The suite must prove that:
+
+1. Users can create or use collaboration resources from both Wegent Web and Wework.
+2. A real Executor can register, report capabilities, be scheduled, and execute work.
+3. Relationships among Workspace, Project, Issue, members, agents, and execution environments are persisted.
+4. After an Issue is assigned to a Wegent Chat agent, its Skill and MCP are loaded, invoked, and produce a verifiable result.
+5. After an Issue is assigned to a Wegent ClaudeCode agent, its Skill and MCP are loaded, invoked, and produce a verifiable result.
+6. After an Issue is assigned to a Codex agent, its Skill, MCP, and Plugin are loaded, invoked, and produce a verifiable result.
+7. After an Issue is assigned to a person, Wework receives a notification, the user creates a private local Task from the Issue, a real runtime executes it, and shared Issue changes happen only through explicit actions.
+8. Execution failures, Executor outages, page refreshes, process restarts, and duplicate events neither fabricate success nor break eventual consistency.
+9. Every critical step has structured assertions, backend evidence, and screenshot evidence.
+
+## Audited Runtime Models
+
+Wegent Shells and Wework project agents use different configuration models. E2E fixtures must identify the runtime chain under test.
+
+### Wegent Chat, ClaudeCode, and Codex
+
+Chat, ClaudeCode, and Codex use the Wegent CRD resource chain:
+
+```text
+Team
+  -> Bot
+    -> Ghost
+      -> Skill references
+      -> MCP servers
+    -> Shell: Chat | ClaudeCode | Codex
+    -> optional Model
+```
+
+- `Ghost` stores the prompt, Skill references, and MCP configuration.
+- `Bot` combines a Ghost, a Shell, and an optional model.
+- `Team` combines one or more Bots and defines their collaboration mode.
+- After Task creation, the backend resolves Team, Bot, Ghost, Skill, and MCP data to build the real execution request.
+- Chat Shell enters Chat Runtime.
+- ClaudeCode Shell is scheduled through Executor Manager to a real Executor that starts Claude Code CLI.
+- The public Codex Shell is also scheduled through Executor Manager to a real Executor that starts Codex app-server.
+
+### Wework Codex project agents
+
+In addition to the public Shell, Codex supports the Wework project-agent and local-runtime chain. E2E-06 in this plan verifies this chain:
+
+```text
+ProjectChatAgent
+  -> Wework Runtime
+    -> Codex app-server / Codex CLI
+      -> Skill
+      -> MCP
+      -> Codex Plugin
+```
+
+- A project agent is represented by `ProjectChatAgent`.
+- Codex Skills, MCPs, and Plugins are materialized into an isolated Codex Home.
+- A Plugin may provide a Skill, MCP, and other Codex extensions.
+- E2E must verify the Wegent Codex Shell chain and the Wework Codex project-agent chain separately. Evidence from one chain cannot substitute for the other.
+
+### Human
+
+Assignment to a person does not immediately start an AI runtime:
+
+```text
+Issue assignment
+  -> Wework notification
+    -> User opens Issue
+      -> User creates private local Task
+        -> Local Wework Runtime starts
+          -> Issue moves to in progress
+            -> Runtime completes without advancing Issue again
+```
+
+Assignment to a person first creates a notification and collaboration context. The user may enter the Issue from that notification, or proactively enter an unassigned Issue and create a Task. Private Task conversation and terminal state are not automatically written to the shared Issue. Comments, deliveries, and subsequent status changes require a manual user action or an explicit instruction for AI to use project-space tools.
+
+## Test Boundary and Authenticity Rules
+
+### Components that must be real
+
+- Real Backend, database, and Redis.
+- Real Wegent Web pages.
+- Real Wework Electron application.
+- Real Executor registration and heartbeat.
+- Real Chat Shell, Claude Code CLI, and Codex Runtime.
+- Real Workspace, Project, Issue, Task, message, activity, notification, and status projection data.
+- Real Skill resolution, MCP tool calls, tool-output round trips, and Plugin materialization.
+
+### Deterministic substitutes allowed at external boundaries
+
+The upstream model and third-party MCP services may use deterministic test servers, but substitution must stop at the system boundary:
+
+- The model server must record every request round and return real tool calls as required by the scenario.
+- The MCP test server must record tool names, arguments, call order, and return values.
+- Tests must not bypass Chat Shell, Claude Code CLI, Codex Runtime, Executor, or the backend state machine.
+- Tests must not write directly to the database to manufacture execution success.
+- Tests must not intercept frontend requests and fabricate successful responses.
+- Tests must not pass solely because model text contains “completed.”
+
+### Every checkpoint is self-contained
+
+Each checkpoint must establish its own minimal prerequisites and support:
+
+- isolated checkpoint execution;
+- execution starting from that checkpoint;
+- full-suite execution;
+- isolated reproduction after failure.
+
+A checkpoint must not depend on data created only by an earlier checkpoint that may be skipped.
+
+## Test Resource Model
+
+Every run uses a unique namespace or name suffix to prevent parallel shards from contaminating each other:
+
+```text
+Workspace: collaboration-e2e-<run-id>
+Project: execution-project-<run-id>
+Chat Team: chat-agent-<run-id>
+Claude Team: claude-agent-<run-id>
+Codex ProjectChatAgent: codex-agent-<run-id>
+Executor: collaboration-executor-<run-id>
+Issues:
+  - CHAT-<run-id>
+  - CLAUDE-<run-id>
+  - CODEX-<run-id>
+  - HUMAN-<run-id>
+```
+
+Each runtime uses distinct probe values so a result from one runtime cannot accidentally satisfy another runtime's assertions:
+
+| Agent      | Skill probe             | MCP probe             | Plugin probe            |
+| ---------- | ----------------------- | --------------------- | ----------------------- |
+| Chat       | `CHAT_SKILL_<run-id>`   | `CHAT_MCP_<run-id>`   | Not applicable          |
+| ClaudeCode | `CLAUDE_SKILL_<run-id>` | `CLAUDE_MCP_<run-id>` | Not applicable          |
+| Codex      | `CODEX_SKILL_<run-id>`  | `CODEX_MCP_<run-id>`  | `CODEX_PLUGIN_<run-id>` |
+
+The final artifact must contain the correct probe values and be proven through a file, backend activity, MCP call record, or delivery API.
+
+## Agent Model and Session Regressions
+
+Cover the agent execution flow in the `project-automation`,
+`collaboration-local-agent-dispatch`, and `collaboration-remote-agent-dispatch`
+checkpoints. Report local and remote-process evidence separately; passing an
+isolated remote Executor does not verify the user's cloud device.
+
+| Scenario                       | Required result                                                                                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Automatic tag assignment       | Adding `auto` in the UI creates one execution; the actual model request uses the assigned agent's model, and completion moves the Issue to review |
+| Team model inheritance         | Without a model override, submit `wegentTeamId` instead of the workbench default model; the compiled Team determines the execution Shell          |
+| V2 request boundary            | The materialize response omits top-level `modelConfig: null`; materialized configuration exists only in the compiled execution request            |
+| Replies after manual execution | TaskBinding persists the Team ID; a reply continues the original task with `newSession=false` and uses the same actual model                      |
+| Manual execution capabilities  | The executor role reads its bound Issue through a real Code Mode tool call without exposing assignment or management tools                        |
+| Complete result persistence    | A final event saves full content after an outcome-only history snapshot; a previous turn's final event cannot complete a newer continuation       |
+| App device event projection    | The owned device's `app-record-*` and installation ID match the same activity; completion and failure both update its terminal state              |
+| Failure authorization          | Only the initiating user can fail a manually started response without a trigger message; unrelated users and senders cannot bypass authorization  |
+
+Assert the agent message content and terminal state; a user's prompt containing
+the probe text is not proof of model execution. Retain Electron screenshots,
+task IDs, model routing logs, and backend terminal states without logging
+authentication tokens or model secrets.
+
+## Complete Scenario Matrix
+
+### Remote collaboration group manager planning details
+
+The `collaboration-remote-group-planning-details` checkpoint uses isolated Electron, a real backend, MySQL, Redis, and a remote Executor. Only the upstream model is replaced.
+
+1. Create a project, collaboration rules, a manager, members, and an Issue, then assign the group through the UI.
+2. Wait for the manager's real model request, hold its response, and click execution details on the planning activity.
+3. Assert that the conversation shows this round's collaboration rules and the pause button, with no failed-conversation retry entry.
+4. Close and reopen details, then assert that the transcript remains visible.
+5. Release the manager response and continue validating two planning rounds, three member executions, and the final Issue state.
+
+The collaboration dispatch retains its execution lifecycle identity; TaskBinding and the manager activity address the actual `-manager-initial` conversation. This scenario prevents using the dispatch task as a transcript address, which causes backend validation failure and `Failed to fetch` in the UI. CI runs it in the `core18` shard. Failure and success evidence stays in test artifacts; cleanup releases held responses and stops isolated processes.
+
+### E2E-01: Create collaboration resources in Wegent
+
+Goal: prove that Wegent Web can create collaboration-domain resources and that they are persisted.
+
+Steps:
+
+1. Sign in to Wegent Web.
+2. Open Collaboration.
+3. Create a Workspace.
+4. Create a Project in the Workspace.
+5. Create or import a Chat Team:
+   - select `Chat` as the Bot Shell;
+   - configure a Skill on the Ghost;
+   - configure MCP on the Ghost.
+6. Create or import a ClaudeCode Team:
+   - select `ClaudeCode` as the Bot Shell;
+   - configure a Skill on the Ghost;
+   - configure MCP on the Ghost.
+7. Add both Teams to the available agent scope of the Workspace or Project.
+8. Refresh and re-enter the pages to verify the resources remain present.
+9. Read the Workspace, Project, Team, Bot, and Ghost through APIs and compare the persisted data.
+
+Core assertions:
+
+- Kind resources are read using the complete `namespace + name + user_id` identity.
+- Each Bot references the expected Ghost and Shell.
+- Each Team references the expected Bot.
+- Each Ghost contains the expected Skill references and MCP configuration.
+- The Workspace-to-Project relationship exists and both resources are active.
+- UI state after refresh matches API state.
+
+### E2E-02: Create and browse collaboration resources in Wework
+
+Goal: prove that Wework creates and browses collaboration resources through Collaboration rather than the legacy My Tasks page or local mock data.
+
+Steps:
+
+1. Start an isolated Wework Electron application.
+2. Sign in with the same test account.
+3. Open the Collaboration tab.
+4. Create a Workspace from All Workspaces.
+5. Enter the Workspace and create a Project.
+6. Browse members, agents, and execution environments on the Workspace resource page.
+7. Open the Issue table and board in the Project.
+8. Refresh the Wework page or restart its renderer.
+9. Open the same Workspace and Project in Wegent Web.
+
+Core assertions:
+
+- Resources created in Wework are readable in Wegent Web.
+- Resources created in Wegent are readable in Wework.
+- Both hosts show the same resource IDs, names, statuses, and membership relationships.
+- The Wework Collaboration tab mounts Collaboration; My Tasks remains a task view in the Tasks module.
+
+### E2E-03: Register and recover a real Executor
+
+Goal: prove that an execution environment is not static configuration but a schedulable, real Executor.
+
+Steps:
+
+1. Create an execution environment or generate a deployment command from the product UI.
+2. Start a real Executor using the one-time registration credential from the command.
+3. Wait for the Executor to register with the backend.
+4. Verify heartbeat, version, platform, and capability reporting.
+5. Add the execution environment to the test Workspace's available scope.
+6. Stop the Executor and verify that it becomes offline.
+7. Restart it with the same valid identity.
+8. Verify that it returns online with consistent capability information.
+
+Core assertions:
+
+- The Executor ID matches the backend registration record.
+- Online status comes from a real heartbeat, not local frontend state.
+- Reported capabilities include those required by the target Shell or Runtime.
+- An offline Executor must not receive new executions.
+- The recovered Executor can receive subsequent work.
+
+Daily CI may use registration data from the deployment command to launch the repository's real Executor binary directly. Container-image and full Docker-command validation may run as a lower-frequency deployment smoke test, but an in-memory fake Executor must never replace the execution chain.
+
+### E2E-04: Assign an Issue to a Wegent Chat agent
+
+Goal: prove that a Chat agent executes from Issue assignment through completion and actually loads its Skill and invokes its MCP.
+
+Steps:
+
+1. Create a Chat Issue in the Project.
+2. Require the Issue to:
+   - read a specified Skill;
+   - call a specified MCP tool;
+   - write the MCP result and Skill probe into its result.
+3. Assign the work to the Chat Team from Issue activity.
+4. Verify that the assignment event is persisted.
+5. Wait for the backend Task and execution record.
+6. Start a real execution through Chat Shell.
+7. Have the deterministic model request the MCP tool.
+8. Have MCP return `CHAT_MCP_<run-id>`.
+9. Have the model apply the Skill instruction to produce the final result.
+10. Wait for the Task, execution record, project message, and Issue AI state to become terminal.
+
+Required proof:
+
+- Scheduling uses the expected Team, Bot, Ghost, and Chat Shell.
+- The initial model request contains the expected Skill content or locator.
+- The model emits the expected MCP tool call.
+- The MCP service receives the correct tool name and arguments.
+- Non-empty tool output is included in the next model request.
+- The final result contains `CHAT_SKILL_<run-id>` and `CHAT_MCP_<run-id>`.
+- The backend Task is `COMPLETED`.
+- Issue activity contains a completion message and AI state is completed.
+
+### E2E-05: Assign an Issue to a Wegent ClaudeCode agent
+
+Goal: prove that the ClaudeCode agent is scheduled to a real Executor and that Claude Code CLI loads a Skill, invokes MCP, and produces a file artifact.
+
+Steps:
+
+1. Create a Claude Issue in the Project.
+2. Require the Issue to read a Skill, call MCP, and generate a result file in the workspace.
+3. Assign the Issue to the ClaudeCode Team.
+4. Verify that the backend selects an online Executor with ClaudeCode capability.
+5. Start the real Claude Code CLI.
+6. Have Claude Code read the Skill.
+7. Have Claude Code invoke the MCP tool.
+8. Have MCP return `CLAUDE_MCP_<run-id>`.
+9. Have Claude Code write `claude-result.txt`.
+10. Wait for Task, Runtime, and Issue projections to become terminal.
+
+Required proof:
+
+- Scheduling identity contains the expected Team, Bot, Ghost, Executor, and runtime task.
+- Executor logs prove that a real Claude Code process started.
+- Skill content enters the execution context.
+- MCP tool call, input, output, and subsequent model context form a complete chain.
+- `claude-result.txt` exists and contains both
+  `CLAUDE_SKILL_<run-id>` and `CLAUDE_MCP_<run-id>`.
+- Task and Runtime are completed.
+- Issue status becomes in review or completed and does not remain running.
+
+### E2E-06: Assign an Issue to a Codex project agent
+
+Goal: prove that Codex loads a Skill, MCP, and Plugin through ProjectChatAgent and Wework Runtime.
+
+Steps:
+
+1. Create a Codex ProjectChatAgent in the current Workspace.
+2. Create an isolated Codex Plugin containing:
+   - `.codex-plugin/plugin.json`;
+   - a Plugin Skill;
+   - Plugin MCP configuration;
+   - a unique Plugin probe.
+3. Install or bind the Plugin to the isolated Codex Home used by that ProjectChatAgent.
+4. Configure an additional Skill and MCP for the Codex agent.
+5. Create a Codex Issue in the Project.
+6. Assign the Issue to the Codex ProjectChatAgent.
+7. Start a real Codex app-server or Codex CLI through Wework Runtime.
+8. Have Codex discover the Plugin.
+9. Have Codex read the Skill supplied by the Plugin.
+10. Have Codex discover the Plugin MCP through the actual advertised-tool path: receive the namespaced tool directly below the deferred-loading threshold, or use tool search when tools are deferred.
+11. Have Codex invoke the Plugin MCP and use its output in subsequent reasoning.
+12. Have Codex generate `codex-result.txt` or an equivalent delivery.
+13. Wait for the runtime Task and Issue status to become terminal.
+
+Required proof:
+
+- The scheduled object in this scenario is a ProjectChatAgent; the Wegent `Codex` Shell requires separate verification.
+- The target Plugin files are materialized in Codex Home.
+- The correct Skill locator appears in an initial request or tool output.
+- Codex actually reads the target `SKILL.md`.
+- Codex tool discovery matches the advertised-tool mode used by the run; corresponding E2E coverage exists for both direct advertisement and tool search.
+- Codex invokes the namespaced Plugin MCP tool.
+- MCP output appears in a subsequent model request.
+- The artifact contains `CODEX_SKILL_<run-id>`,
+  `CODEX_MCP_<run-id>`, and `CODEX_PLUGIN_<run-id>`.
+- The Wework Task completes and Issue activity and status projections complete.
+
+### E2E-07: Assign an Issue to a person and execute it in Wework
+
+Goal: prove that an assignee can create a private local Task from a shared Issue
+and use AI as a personal tool while preserving the boundary between private
+execution and shared collaboration state.
+
+Steps:
+
+1. Have an assigner assign the Human Issue to the target user.
+2. Verify creation of the backend notification and inbox record.
+3. Verify that Wework shows a system notification and in-app unread indicator.
+4. Click the notification and deep-link to the correct Workspace, Project, and Issue.
+5. Click Create Task in the Issue.
+6. Verify that the new Task is visible only to the current user and retains
+   Workspace, Project, and Issue context.
+7. Verify that the composer shows the current Issue as a native chip rather than
+   plain text or an incorrect status label.
+8. Submit execution instructions. When the local Runtime starts, move an inbox
+   or pending Issue to in progress.
+9. Verify that the Runtime can use `wework_space` to read the current Issue and
+   changes the Issue, adds comments, or submits deliveries only when explicitly requested.
+10. Generate `human-result.txt` or an equivalent local artifact and complete the Task.
+11. Verify that Task completion, failure, stop, or delivery does not automatically
+    move the Issue to in review or completed.
+12. Change Issue status manually, or explicitly instruct AI to change it through
+    `wework_space`.
+
+Required proof:
+
+- Notification recipient, assignment event, and Issue ID are correct.
+- Duplicate assignment events do not create duplicate notifications.
+- Clicking the notification opens the exact Issue, not just the Collaboration home page.
+- The new Task is bound to the correct Workspace, Project, Issue, user, and local device.
+- The sent Issue reference remains a native chip and is not polluted by text such
+  as `[blocked]`.
+- A real local Runtime completes the execution and has project-space tools.
+- Runtime start automatically marks an eligible Issue in progress.
+- Runtime terminal state, stop, and delivery do not further change Issue status
+  or assignee.
+- Ordinary private-task conversation is not automatically published as a shared
+  Issue comment.
+- When the user explicitly asks AI to update the Issue, the tool call uses the
+  explicit current project and Issue IDs.
+
+Additional scenario:
+
+- A user who is not assigned may still proactively enter an Issue and create a Task.
+- Proactive participation must not fabricate an “assigned to me” notification or assignment event.
+- Starting a private Task may move an Issue from in review to in progress;
+  completed Issues retain their completed status.
+- Users with edit permission start, complete, and reopen Issues directly through
+  the status selector or board drag without a result form. Comments and attachments
+  carry work communication.
+- `project-assignment-notification` covers creating a Task directly from pending,
+  binding the complete current assignment identity, projecting progress from real
+  Task delivery, reassignment after completion, direct status changes, and comments.
+
+#### Current-computer regression for human AI assistance
+
+CI checkpoint: `collaboration-issue-task-discovery`.
+
+Prerequisites: isolated Electron, real Backend, MySQL, Redis, Codex, and two online
+APP executors; replace only the model upstream. Create two projects with initialized
+environments on the current computer and the other APP respectively. Assign an Issue
+in each project to the current user and set it to in progress through an ordinary
+status update. Require `human_task_binding.assignmentId` to match the assignment.
+
+Steps and assertions:
+
+1. Open project execution settings and wait for the real device catalog and ready environment.
+2. Open the Issue, click Create Task, and send a request containing the original Issue reference.
+3. Wait for a model reply through real Codex; a binding or visible composer does not prove execution.
+4. Require exactly one task binding on the current computer, independent of the other APP environment.
+5. Require the Issue to remain in progress; finishing a private task must not change its shared status.
+6. Repeat for both environments, then close the conversation and Issue.
+
+Boundary: the other executor is online, its environment is initialized, and the catalog
+has loaded, excluding incomplete discovery as an explanation. Retain failures in the
+runner's `failure.txt`, `ui-snapshot.json`, model requests, and runtime logs. The shared
+runner stops isolated Electron, generated executors, and the backend, and removes
+temporary data and credentials.
+
+### E2E-08: Cross-host consistency
+
+Steps:
+
+1. Create a Workspace, Project, and Issue in Wegent.
+2. Open the same Issue in Wework and perform assignment.
+3. Observe running status and activity in Wegent.
+4. Let the agent or person complete the Task.
+5. Refresh both hosts and read the final state.
+
+Required proof:
+
+- Resource IDs do not change.
+- Activity ordering is consistent.
+- Task, execution record, and Issue status agree.
+- Either host can recover the current state after refresh or restart.
+- A single completion event is not projected twice.
+
+## Failure and Recovery Scenarios
+
+### Executor offline
+
+- Offline before assignment: the Task remains in an explainable waiting state and is never marked completed.
+- Offline during execution: the execution record becomes failed, disconnected, or recoverable and preserves diagnostic information.
+- Executor recovery: only eligible execution is resumed; two valid executions must not be created for the same work.
+
+### Skill loading failure
+
+- If the Skill is missing, its hash does not match, or its content is unreadable, execution must fail with an accurate reason.
+- The runtime must not silently ignore the Skill and report success.
+
+### MCP failure
+
+- Verify unreachable MCP, missing tool, invalid arguments, and timeout separately.
+- A tool-call failure must enter the model or Runtime error chain.
+- Without valid tool output, the runtime must not produce an artifact that satisfies passing assertions.
+
+### Plugin failure
+
+- If the Plugin is not installed, its manifest is invalid, its Skill is missing, or its MCP is not registered, the Codex scenario must fail.
+- After repair and reinstall, verify recovery with a new runtime Task.
+- Do not reuse artifacts left by the failed run.
+
+### UI and process recovery
+
+- Wegent page refresh restores the Issue and execution state.
+- Wework renderer reload restores the tab, Issue, and Task binding.
+- Wework application restart restores unfinished Tasks without reviving stale runtime state as a new execution.
+- Duplicate notifications, webhooks, or polling results remain idempotent.
+
+### Permissions and isolation
+
+- Non-Workspace members cannot read the Workspace.
+- Non-Project members cannot perform restricted Project operations.
+- One user's assignment notification cannot appear in another user's Wework.
+- Plugin, Skill, MCP, and Codex Home data from one run cannot contaminate another run.
+
+## Unified Execution Evidence
+
+Every agent execution scenario must collect the following four layers of evidence.
+
+### 1. Scheduling identity
+
+Record and assert all applicable fields:
+
+```text
+workspaceId
+projectId
+issueId
+assignmentId or assignment event id
+teamId
+botId
+ghostId
+projectChatAgentId
+backendTaskId
+runtimeTaskId
+executorId
+executorType
+runtimeDeviceId
+```
+
+Identity fields must come from backend APIs, execution records, or Runtime logs, not be inferred from UI text.
+
+### 2. Backend and runtime terminal states
+
+For scenarios where an agent directly owns the Issue, assert at least:
+
+```text
+Task status == COMPLETED
+Runtime execution status == completed
+Project message status == completed
+Project message metadata.run_status == completed
+Issue ai_state.status == completed
+Issue status == in_review | completed
+```
+
+For a human assignee's private local Task, assert separately that the Task and
+Runtime are complete while the Issue remains `in_progress` after runtime start,
+until the user changes it manually or explicitly instructs AI to use
+project-space tools.
+
+If a runtime does not have one of these fields, document the mapping and assert that runtime's authoritative terminal field.
+
+### 3. Tool call and output
+
+The complete chain must be present:
+
+```text
+Skill locator or content enters runtime
+  -> model emits expected tool_call
+    -> MCP receives expected tool name and input
+      -> MCP returns non-empty tool_output
+        -> next model request contains the tool_output
+```
+
+Seeing only a tool inventory, a button, saved MCP configuration, or model text that mentions a tool is not sufficient.
+
+### 4. Non-forgeable side effect
+
+Every execution must verify at least one side effect that cannot be fabricated by model text:
+
+- a real file in the workspace with exact content;
+- an exact call record received by the MCP test server;
+- persisted Issue activity, comment, or delivery in the backend;
+- persisted Wework Task binding and completion state;
+- a notification-service record for the target user.
+
+Verifying both a file and a backend record is recommended to avoid a single-source false positive.
+
+## Screenshot Evidence Chain
+
+Screenshots are saved under test-result directories or CI artifacts and are never committed to the repository. Filenames must include sequence, host, scenario, and state.
+
+### Shared resources and Executor
+
+1. `01-wegent-workspace-created.png`: newly created Workspace in Wegent.
+2. `02-wegent-project-created.png`: newly created Project in Wegent.
+3. `03-wegent-agents-configured.png`: Chat and ClaudeCode agents with configuration summaries.
+4. `04-wework-workspace-visible.png`: the same Workspace visible in Wework.
+5. `05-wework-project-visible.png`: the same Project visible in Wework.
+6. `06-executor-deploy-command.png`: execution-environment deployment entry and generated command, with credentials redacted.
+7. `07-executor-online.png`: real Executor online with reported capabilities.
+
+### Chat execution
+
+8. `08-chat-issue-created.png`: Chat Issue detail.
+9. `09-chat-assigned.png`: Chat assignment event in Issue activity.
+10. `10-chat-running.png`: Chat execution in progress.
+11. `11-chat-completed.png`: completion activity, probe result, and Issue terminal state.
+
+### ClaudeCode execution
+
+12. `12-claude-issue-created.png`: Claude Issue detail.
+13. `13-claude-assigned.png`: ClaudeCode assignment event.
+14. `14-claude-running.png`: ClaudeCode running on the Executor.
+15. `15-claude-artifact.png`: real file artifact preview.
+16. `16-claude-completed.png`: Issue terminal state.
+
+### Codex execution
+
+17. `17-codex-agent-plugin.png`: ProjectChatAgent, Skill, MCP, and Plugin configuration.
+18. `18-codex-issue-created.png`: Codex Issue detail.
+19. `19-codex-assigned.png`: Codex assignment event.
+20. `20-codex-plugin-loaded.png`: Plugin, Skill, and MCP loading evidence in runtime detail.
+21. `21-codex-artifact.png`: real artifact containing all three probes.
+22. `22-codex-completed.png`: Task and Issue terminal states.
+
+### Human execution
+
+23. `23-human-assignment-notification.png`: assignment notification received in Wework.
+24. `24-human-notification-center.png`: target Issue in Notification Center.
+25. `25-human-issue-opened.png`: correct Issue opened after clicking the notification.
+26. `26-human-task-created.png`: Task created and bound from the Issue.
+27. `27-human-task-running.png`: real Runtime executing the Task.
+28. `28-human-artifact.png`: local artifact generated.
+29. `29-human-task-completed.png`: Task completed while the Issue remains in progress.
+
+### Recovery and cross-host state
+
+30. `30-executor-offline.png`: Executor offline state.
+31. `31-executor-recovered.png`: Executor restored online.
+32. `32-wegent-final-state.png`: final state in Wegent.
+33. `33-wework-final-state.png`: final state in Wework.
+
+Screenshot review must verify:
+
+- The sequence is continuous and no later screenshot substitutes for an earlier step.
+- Workspace, Project, and Issue names or IDs connect the images into one chain.
+- No credentials, tokens, private user data, or sensitive local paths are visible.
+- Screenshot states agree with structured logs.
+- Static demos, legacy pages, and stub pages are not used as product evidence.
+
+## Execution Environment Deployment Evidence Chain
+
+Collaboration does not introduce a parallel Executor deployment flow. Workspace
+execution environments reuse the remote execution environment onboarding in Wework
+connection settings, with two existing checkpoints providing real evidence.
+
+### `remote-device-onboarding`
+
+This checkpoint must continuously prove:
+
+1. The Wework UI opens the add-remote-execution-environment dialog.
+2. The UI generates a deployment command containing the Backend, WebSocket, device ID,
+   device name, and one-time authorization information.
+3. The copy action writes exactly the runnable command displayed by the UI.
+4. The test process starts the real Executor binary with the device identity and
+   authorization information from that command, without pre-seeding a Backend device record.
+5. The Backend reports `online` with a non-empty Runtime identity, and Wework shows the
+   device card as online.
+6. A remote project is created through that device, and the Runtime Task `deviceId` in the
+   debug snapshot must equal the newly deployed device.
+7. A real Codex tool loop creates `wework-cloud-e2e-result.txt` in that device's project
+   directory with `CODEX_EXECUTED_REAL_CLOUD_TOOL`, and the task then settles normally.
+
+Evidence screenshots:
+
+- `cloud-00-remote-docker-command.png`
+- `cloud-00-generated-remote-device-online.png`
+- `cloud-00-disabled-session-settings.png`
+- `cloud-00-disabled-session-project.png`
+- `cloud-00-generated-remote-task-running.png`
+- `cloud-00-generated-remote-task-completed.png`
+
+The disabled terminal/IDE checks are capability-reporting boundary coverage, not a substitute
+for task execution coverage.
+
+### `collaboration-agent-automation-chain`
+
+This checkpoint must also cover the record-scoped routing regression for creating a Project
+execution environment on a Wework device:
+
+1. Start the real Executor bundled with the desktop App, then start a second real Executor with
+   the same logical App device ID and a different Runtime identity.
+2. The Backend must persist two independent device records and return different
+   `app-record-{id}` execution routes for them. The test must not pre-seed devices by writing
+   directly to the database.
+3. Add the Wework device associated with the desktop App from Project settings, enter a valid
+   repository and setup step, and click Create Environment.
+4. The environment preparation command must target the selected device record's
+   `app-record-{id}` route, reach `ready`, and persist its state under that route in the
+   execution environment's `devices` map.
+5. After removing that Wework device, initialize the real cloud Executor and complete the
+   existing two-agent automation chain, proving that record-scoped routing does not break
+   subsequent scheduling.
+
+Environment preparation clones repositories with the Git credentials configured on the device,
+matching how tasks dispatched to a device behave: the Backend sends no task-scoped token because
+one execution environment may hold repositories from several domains. A private repository
+therefore requires the Git accounts to be synchronized to that device first, otherwise the clone
+fails for missing credentials.
+
+### `cloud-device-lifecycle`
+
+This checkpoint reuses the real cloud Executor started by CI and verifies:
+
+1. The initial Backend state is `online`, with an Executor version and Runtime identity.
+2. Wework shows the upgrade action, current version, target version, and temporary-offline warning.
+3. In a managed cloud environment, restart targets the Sandbox identity and disables device
+   actions while restart is pending.
+4. The test really stops the Executor process, waits for Backend `offline`, and starts the same
+   Executor again.
+5. The Backend returns to `online`, Runtime identity stays stable, and Wework reports recovery
+   and re-enables actions.
+6. The public-Backend branch without managed recovery must show an explicit restart failure and
+   must not mislabel the still-online device as offline.
+
+Evidence screenshots:
+
+- `cloud-device-01-online.png`
+- `cloud-device-upgrade-confirmation.png`
+- `cloud-device-restart-pending.png`
+- `cloud-device-restart-recovered.png`
+- `cloud-device-restart-unavailable.png` (public-Backend rejection branch only)
+
+## CI Checkpoint Mapping
+
+Prefer extending and reusing existing checkpoints instead of duplicating deployment, Plugin, or runtime frameworks.
+
+| Capability                                 | Existing checkpoint / suite                      | Target change                                                                                                         |
+| ------------------------------------------ | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| Wegent collaboration resource creation     | Frontend collaboration Playwright                | Add Workspace, Project, Chat/Claude resource creation and cross-host persistence assertions                           |
+| Wework collaboration creation and browsing | `collaboration-shared-core`                      | Cover Wework resource creation, cross-host reads, and the shared collaboration primary flow                           |
+| Executor registration and executability    | `remote-device-onboarding`                       | UI deployment command, real process startup, online registration, capability report, targeted execution, and artifact |
+| Executor lifecycle                         | `cloud-device-lifecycle`                         | Authoritative online state, offline, recovery, upgrade, stable Runtime identity, and reconnect assertions             |
+| Chat Issue assignment and execution        | `project-automation` + provider-native Chat E2E  | Extract shared fixtures and close the loop from Ghost Skill/MCP configuration through project assignment completion   |
+| ClaudeCode Skill/MCP execution             | provider-native ClaudeCode E2E                   | Connect Workspace/Project/Issue assignment while preserving real CLI and file-artifact assertions                     |
+| Codex Skill/MCP/Plugin                     | Wework Plugin E2E + project automation           | Connect ProjectChatAgent assignment and reuse real Plugin materialization and multi-turn tool-call evidence           |
+| Human assignment and notification          | `project-assignment-notification`                | Extend through notification deep link, Task creation, real execution, artifact, and Issue terminal state              |
+| Wework Task and Issue status sync          | `task-status-sync` + `collaboration-shared-core` | Reuse Task binding and status-projection assertions                                                                   |
+| Wework Claude Runtime regression           | `claude-runtime`                                 | Keep as an independent real local/cloud Claude CLI regression; it does not replace the project-assignment scenario    |
+
+CI requirements:
+
+- Every new scenario must be invoked by an existing GitHub CI suite or checkpoint.
+- A local-only debug command without CI registration is not acceptable.
+- Long desktop flows must expose checkpoints through the shared runner.
+- The classifier must map collaboration, assignment, ProjectChatAgent, Plugin, Skill, MCP, Executor, and status-sync changes to the corresponding shards.
+- Changes to Workspace execution-environment authorization, Project Agent environment binding,
+  and shared Workspace API mapping must trigger `collaboration-shared-core`,
+  `remote-device-onboarding`, and `cloud-device-lifecycle` together.
+- Default retry count is zero. Intermittent failures are defects and must not be hidden by reruns.
+- Screenshots, structured logs, model requests, MCP calls, and Runtime logs are uploaded together as diagnostic artifacts.
+
+## Fixture and Reuse Rules
+
+Before adding tests, extract and reuse the following capabilities so that existing monolithic scenarios do not keep growing:
+
+```text
+createWorkspace
+createProject
+createTeamBotGhost
+createProjectChatAgent
+registerRealExecutor
+createIssue
+assignIssue
+waitForBackendTask
+waitForRuntimeExecution
+assertSkillLoaded
+assertMcpRoundTrip
+assertPluginLoaded
+assertExecutionIdentity
+assertExecutionTerminalState
+assertArtifact
+archiveProjectAndWorkspace
+```
+
+Fixtures only establish prerequisites. The critical user action under test must still be performed through the relevant product UI.
+
+Runtime chains may share execution-evidence assertion interfaces, but fixtures must create the corresponding real resources:
+
+- Wegent Chat, ClaudeCode, and Codex Shell fixtures create Team, Bot, and Ghost resources.
+- Wework Codex project-agent fixtures create ProjectChatAgent and an isolated Codex Runtime.
+- The shared layer describes execution evidence only and does not erase the different runtime models.
+
+## Cleanup Order
+
+Run idempotent cleanup on both success and failure:
+
+1. Cancel all still-running Tasks and runtime tasks.
+2. Wait for execution to become terminal so background processes stop writing data.
+3. Stop Executors started by the current run.
+4. Delete isolated Codex Homes, Plugin caches, and temporary workspaces.
+5. Delete or archive test Issues and their deliveries.
+6. Enumerate and archive every active Project in the Workspace.
+7. Archive the Workspace.
+8. Delete test Teams, Bots, Ghosts, ProjectChatAgents, models, and MCP configurations.
+9. Stop Electron, Backend, Redis, model server, and MCP test server.
+10. Preserve failure logs and screenshot artifacts without committing them to Git.
+
+All active Projects must be archived before the Workspace is archived. Authorization relationships from historically archived Projects should not block Workspace cleanup.
+
+## Passing Criteria
+
+The complete collaboration execution E2E suite passes only when all criteria below are satisfied.
+
+### Resources
+
+- Workspace, Project, and Issue resources created in Wegent and Wework are mutually readable.
+- Team, Bot, Ghost, ProjectChatAgent, and Executor relationships follow their actual respective models.
+- Resources persist after page refresh and application restart.
+
+### Executor
+
+- At least one real Executor completes registration, capability reporting, task execution, offline transition, and recovery.
+- Runtime logs correlate to concrete backend and runtime Task IDs.
+
+### Chat
+
+- The Chat Team's Ghost Skill is loaded.
+- The Chat Team's MCP is actually invoked.
+- Tool output enters the next model request.
+- Task, project message, and Issue status complete.
+- A non-forgeable side effect exists.
+
+### ClaudeCode
+
+- The ClaudeCode Team's Ghost Skill is loaded.
+- MCP is invoked by a real Claude Code CLI.
+- A real Executor generates the exact file artifact.
+- Task, Runtime, and Issue status complete.
+
+### Wegent Codex Shell
+
+- The execution target is a Team/Bot/Ghost using the Codex Shell through the standard Executor.
+- The Ghost Skill is loaded, MCP is invoked by a real Codex app-server, and its output enters the next request.
+- A real Executor generates the exact file artifact, and Task, project message, and Issue status complete.
+- Preserve this path's scheduling identity, runtime logs, and artifact evidence; Wework Runtime results cannot substitute for it.
+
+### Wework Codex Project Agent
+
+- The execution target is ProjectChatAgent/Wework Runtime.
+- Skill, MCP, and Plugin are all loaded by a real Codex Runtime.
+- Plugin MCP is actually invoked and its output enters the next request.
+- A real artifact contains all three independent probes.
+- Task and Issue status complete.
+- Preserve independent runtime evidence for this path; Wegent Codex Shell results cannot substitute for it.
+
+### Human
+
+- Wework receives a real assignment notification for the target user.
+- Clicking the notification opens the correct Issue.
+- The private Task created from the Issue preserves complete collaboration context
+  and a native Issue chip.
+- A real local Runtime has `wework_space` tools and completes the Task.
+- Runtime start moves the Issue to in progress; Task terminal state does not
+  automatically advance the Issue.
+- Issue comments, deliveries, and subsequent status changes are triggered only
+  by manual user actions or explicit instructions.
+
+### Evidence
+
+- Every scenario contains scheduling identity, authoritative terminal state, tool call/output, and a non-forgeable side effect.
+- The core-flow screenshot chain is complete and passes manual review.
+- Screenshots and diagnostic files are retained only as local or CI artifacts and never enter the repository.
+- Every scenario is invoked by GitHub CI and passes with zero retries.
+
+Any scenario that proves only “configuration exists,” “page is visible,” “the model says it completed,” or “the test passed without a real side effect” is considered not passed.

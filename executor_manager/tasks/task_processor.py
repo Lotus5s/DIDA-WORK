@@ -1,0 +1,231 @@
+#!/usr/bin/env python
+
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# -*- coding: utf-8 -*-
+
+"""
+Task processing module, handles tasks from queue.
+
+Supports both OpenAI Responses API format and legacy ExecutionRequest dict format.
+Uses get_metadata_field() helper for transparent field access across both formats.
+"""
+
+from typing import Any, Dict, List, Union
+
+from executor_manager.config import config
+from executor_manager.executors.dispatcher import ExecutorDispatcher
+from executor_manager.github.github_app import get_github_app
+from shared.logger import setup_logger
+from shared.models.execution import ExecutionRequest
+from shared.models.openai_converter import get_metadata_field
+from shared.telemetry.decorators import set_span_attribute, trace_sync
+
+logger = setup_logger(__name__)
+
+
+def _extract_task_attributes(self, task: Union[Dict[str, Any], ExecutionRequest]):
+    """Extract trace attributes from task data.
+
+    Args:
+        task: Task data as dict or ExecutionRequest
+    """
+    # Handle both dict and ExecutionRequest
+    if isinstance(task, ExecutionRequest):
+        task_dict = task.to_dict()
+    else:
+        task_dict = task
+
+    attrs = {
+        "task.id": str(get_metadata_field(task_dict, "task_id", -1)),
+        "task.subtask_id": str(get_metadata_field(task_dict, "subtask_id", -1)),
+        "task.title": get_metadata_field(task_dict, "task_title", ""),
+        "task.type": get_metadata_field(task_dict, "type", "online"),
+    }
+    # Extract user info if available
+    user_data = get_metadata_field(task_dict, "user", {})
+    if user_data:
+        if user_data.get("id"):
+            attrs["user.id"] = str(user_data.get("id"))
+        if user_data.get("name"):
+            attrs["user.name"] = user_data.get("name")
+    return attrs
+
+
+class TaskProcessor:
+    """Task processor class, handles different types of tasks.
+
+    Supports both OpenAI Responses API format and legacy ExecutionRequest dict format.
+    """
+
+    def __init__(self):
+        """Initialize TaskProcessor"""
+        self.github_app = None
+        if config.GITHUB_APP_ID and config.GITHUB_PRIVATE_KEY_PATH:
+            self.github_app = get_github_app()
+
+    def process_tasks(
+        self, tasks: List[Union[Dict[str, Any], ExecutionRequest]]
+    ) -> Dict[int, Any]:
+        """
+        Process fetched tasks with distributed tracing support.
+
+        Args:
+            tasks: List of tasks as dicts (OpenAI or legacy format) or ExecutionRequest objects
+
+        Returns:
+            dict: Task processing results keyed by task_id
+        """
+        if not tasks:
+            logger.info("No tasks to process")
+            return {}
+
+        task_result = {}
+        total_count = len(tasks)
+        success_count = 0
+
+        for task in tasks:
+            # Convert to dict if ExecutionRequest
+            if isinstance(task, ExecutionRequest):
+                task_dict = task.to_dict()
+            else:
+                task_dict = task
+
+            task_id = get_metadata_field(task_dict, "task_id", -1)
+            result, success = self._process_single_task(task_dict)
+            task_result[task_id] = result
+            if success:
+                success_count += 1
+
+        logger.info(
+            f"Task processing completed: {success_count}/{total_count} succeeded"
+        )
+        return task_result
+
+    @trace_sync(
+        span_name="process_task",
+        tracer_name="executor_manager.tasks",
+        extract_attributes=_extract_task_attributes,
+    )
+    def _process_single_task(
+        self, task: Union[Dict[str, Any], ExecutionRequest]
+    ) -> tuple:
+        """
+        Process a single task with tracing support.
+
+        Args:
+            task: Task data as dict (OpenAI or legacy format) or ExecutionRequest
+
+        Returns:
+            tuple: (result dict, success bool)
+        """
+        # Convert to dict if ExecutionRequest
+        if isinstance(task, ExecutionRequest):
+            task_dict = task.to_dict()
+        else:
+            task_dict = task
+
+        task_id = get_metadata_field(task_dict, "task_id", -1)
+        subtask_id = get_metadata_field(task_dict, "subtask_id", -1)
+        bot_config = get_metadata_field(task_dict, "bot", [])
+        attachments = get_metadata_field(task_dict, "attachments", []) or []
+
+        # Set request context for log correlation
+        from shared.telemetry.context import init_request_context
+
+        init_request_context()
+
+        try:
+            executor_type = (
+                get_metadata_field(task_dict, "executor_type")
+                or config.EXECUTOR_DISPATCHER_MODE
+            )
+            logger.info(
+                "Processing task: ID=%s, subtask_id=%s, executor_type=%s, "
+                "attachments=%d, attachment_ids=%s, has_auth_token=%s, "
+                "backend_url_present=%s",
+                task_id,
+                subtask_id,
+                executor_type,
+                len(attachments) if isinstance(attachments, list) else 0,
+                (
+                    [
+                        attachment.get("id")
+                        for attachment in attachments
+                        if isinstance(attachment, dict)
+                    ]
+                    if isinstance(attachments, list)
+                    else []
+                ),
+                bool(get_metadata_field(task_dict, "auth_token")),
+                bool(get_metadata_field(task_dict, "backend_url")),
+            )
+
+            set_span_attribute("executor.type", executor_type)
+
+            executor = ExecutorDispatcher.get_executor(executor_type)
+
+            # Handle GitHub App token injection for MCP servers
+            if (
+                self.github_app is not None
+                and bot_config
+                and isinstance(bot_config, dict)
+                and "mcp_servers" in bot_config
+                and bot_config.get("mcp_servers") is not None
+            ):
+                mcp_servers = bot_config.get("mcp_servers", {})
+
+                if "github" in mcp_servers:
+                    if "env" not in mcp_servers["github"]:
+                        mcp_servers["github"]["env"] = {}
+
+                    git_repo = get_metadata_field(task_dict, "git_repo")
+                    github_app_access_token = self.github_app.get_repository_token(
+                        git_repo
+                    )
+                    if github_app_access_token.get("token"):
+                        mcp_servers["github"]["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"] = (
+                            github_app_access_token.get("token")
+                        )
+                        logger.info("Set GITHUB_PERSONAL_ACCESS_TOKEN in github mcp")
+
+            # Submit task to executor (pass dict for executor compatibility)
+            # Note: callback is not used in push mode, status updates are handled via HTTP callback
+            result = executor.submit_executor(
+                task_dict,
+                callback=None,
+            )
+
+            if (
+                result
+                and result.get("status") == "success"
+                and result.get("executor_name")
+            ):
+                logger.info(
+                    f"Task processed successfully: ID={task_id}, executor_type={executor_type}"
+                )
+                set_span_attribute("executor.name", result.get("executor_name"))
+                set_span_attribute("task.submit_success", True)
+                return result, True
+            else:
+                error_msg = (
+                    result.get("error_msg", "Unknown error")
+                    if result
+                    else "No result returned"
+                )
+                logger.error(
+                    f"Failed to process task: ID={task_id}, executor_type={executor_type}, error={error_msg}"
+                )
+                set_span_attribute("error", True)
+                set_span_attribute("error.message", error_msg)
+                set_span_attribute("task.submit_success", False)
+                return result, False
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error processing task {task_id}: {error_msg}")
+            set_span_attribute("error", True)
+            set_span_attribute("error.message", error_msg)
+            return {"status": "failed", "error_msg": error_msg}, False

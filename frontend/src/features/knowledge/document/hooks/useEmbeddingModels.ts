@@ -1,0 +1,65 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import { useEffect, useState, useCallback } from 'react'
+import { modelApis, UnifiedModel } from '@/apis/models'
+
+/**
+ * Hook to fetch embedding models with scope support.
+ *
+ * @param scope - Resource scope: 'personal', 'group', 'organization', or 'all'
+ * @param groupName - Group name (required when scope is 'group')
+ */
+export function useEmbeddingModels(
+  scope?: 'personal' | 'group' | 'organization' | 'all',
+  groupName?: string,
+  publicOnly = false
+) {
+  const [models, setModels] = useState<UnifiedModel[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<Error | null>(null)
+
+  const fetchModels = useCallback(async () => {
+    try {
+      setLoading(true)
+      // For organization scope, use 'personal' to get user's models + public models
+      // For group scope, pass 'group' directly to get group's models + public models
+      const apiScope = scope === 'organization' ? 'personal' : scope || 'all'
+      // Use modelApis.getUnifiedModels with scope support and filter by embedding type
+      const response = await modelApis.getUnifiedModels(
+        undefined, // shellType
+        false, // includeConfig
+        apiScope, // scope - default to 'all' to include personal + group + public models
+        groupName, // groupName
+        'embedding' // modelCategoryType - filter by embedding models
+      )
+      const data = (response?.data || []).filter(model => !publicOnly || model.type === 'public')
+      // Sort by type priority based on scope, then by name
+      // - Personal scope: user > public
+      // - Group scope: group > public
+      // - Organization scope: user > public (same as personal)
+      const typePriority: Record<string, number> =
+        scope === 'group' ? { group: 0, public: 1 } : { user: 0, public: 1 }
+      data.sort((a, b) => {
+        const priorityA = typePriority[a.type] ?? 1
+        const priorityB = typePriority[b.type] ?? 1
+        if (priorityA !== priorityB) {
+          return priorityA - priorityB
+        }
+        return (a.name || '').localeCompare(b.name || '')
+      })
+      setModels(data)
+    } catch (err) {
+      setError(err as Error)
+    } finally {
+      setLoading(false)
+    }
+  }, [scope, groupName, publicOnly])
+
+  useEffect(() => {
+    fetchModels()
+  }, [fetchModels])
+
+  return { models, loading, error, refetch: fetchModels }
+}

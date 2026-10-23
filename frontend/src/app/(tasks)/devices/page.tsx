@@ -1,0 +1,325 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { useEffect, useState, useMemo, useCallback } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
+import TopNavigation from '@/features/layout/TopNavigation'
+import {
+  TaskSidebar,
+  ResizableSidebar,
+  CollapsedSidebarButtons,
+} from '@/features/tasks/components/sidebar'
+import '@/app/tasks/tasks.css'
+import '@/features/common/scrollbar.css'
+import { GithubStarButton } from '@/features/layout/GithubStarButton'
+import { ThemeToggle } from '@/features/theme/ThemeToggle'
+import { useTranslation } from '@/hooks/useTranslation'
+import { saveLastTab } from '@/utils/userPreferences'
+import { useIsMobile } from '@/features/layout/hooks/useMediaQuery'
+import { useTaskSession } from '@/features/tasks/session/TaskSession'
+import { paths } from '@/config/paths'
+import { useDevices } from '@/contexts/DeviceContext'
+import { DeviceInfo } from '@/apis/devices'
+import { getToken } from '@/apis/user'
+import { Monitor, Loader2, Cloud, Server } from 'lucide-react'
+import { getSocketUrl } from '@/lib/runtime-config'
+import {
+  DeviceCard,
+  DevicesPageHeader,
+  DeviceSection,
+  DeviceSetupGuide,
+  EditDeviceAliasDialog,
+} from '@/features/devices/components'
+import { useDeviceHandlers } from '@/features/devices/hooks'
+import { useAdvancedDeviceMode } from '@/features/devices/hooks/useAdvancedDeviceMode'
+import { isOpenClawDevice } from '@/features/devices/utils/device-status'
+import { filterDevicesByAdvancedMode } from '@/features/devices/utils/device-visibility'
+
+// Helper function to sort devices by priority
+function sortDevices(devices: DeviceInfo[]): DeviceInfo[] {
+  return [...devices].sort((a, b) => {
+    // Priority 1: Online devices first (online > busy > offline)
+    const statusOrder: Record<string, number> = { online: 0, busy: 1, offline: 2 }
+    const statusDiff = (statusOrder[a.status] ?? 2) - (statusOrder[b.status] ?? 2)
+    if (statusDiff !== 0) return statusDiff
+
+    // Priority 2: Default device first
+    if (a.is_default && !b.is_default) return -1
+    if (!a.is_default && b.is_default) return 1
+
+    // Priority 3: Alphabetically by name
+    return a.name.localeCompare(b.name)
+  })
+}
+
+export default function DevicesPage() {
+  const { t } = useTranslation('devices')
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const { selectTask } = useTaskSession()
+  const isMobile = useIsMobile()
+
+  // Environment variables for device setup
+  const guideUrl = process.env.NEXT_PUBLIC_DEVICE_GUIDE_URL || ''
+
+  // Generate dynamic backend URL from runtime config
+  const backendUrl = useMemo(() => getSocketUrl(), [])
+
+  // Get auth token
+  const authToken = useMemo(() => getToken() || '<YOUR_AUTH_TOKEN>', [])
+
+  const { devices, isLoading, error, refreshDevices, isDeviceUpgrading, getUpgradeStatus } =
+    useDevices()
+
+  // Device action handlers (consolidated in custom hook)
+  const handlers = useDeviceHandlers()
+  const { showAdvancedDevices, setShowAdvancedDevices } = useAdvancedDeviceMode()
+
+  // Sort and group devices
+  const sortedDevices = useMemo(() => sortDevices(devices), [devices])
+  const visibleDevices = useMemo(
+    () => filterDevicesByAdvancedMode(sortedDevices, showAdvancedDevices),
+    [showAdvancedDevices, sortedDevices]
+  )
+  const hasAdvancedDevices = useMemo(() => sortedDevices.some(isOpenClawDevice), [sortedDevices])
+  const requestedDeviceId = searchParams.get('deviceId')
+  const requestedDevice = useMemo(() => {
+    if (!requestedDeviceId) return null
+    return (
+      sortedDevices.find(device =>
+        [
+          String(device.id),
+          device.device_id,
+          device.registered_device_id,
+          device.execution_target_id,
+          device.socket_device_id,
+        ].includes(requestedDeviceId)
+      ) ?? null
+    )
+  }, [requestedDeviceId, sortedDevices])
+  const displayedDevices = useMemo(() => {
+    if (!requestedDevice || visibleDevices.some(device => device.id === requestedDevice.id)) {
+      return visibleDevices
+    }
+    return sortDevices([...visibleDevices, requestedDevice])
+  }, [requestedDevice, visibleDevices])
+  const highlightedDeviceId = requestedDevice?.id ?? null
+
+  // Mobile sidebar state
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false)
+
+  // Collapsed sidebar state
+  const [isCollapsed, setIsCollapsed] = useState(false)
+
+  // Guide visibility state
+  const [showSetupGuide, setShowSetupGuide] = useState(searchParams.get('register') === '1')
+
+  // Edit alias dialog state
+  const [editAliasDevice, setEditAliasDevice] = useState<DeviceInfo | null>(null)
+  const [isEditAliasDialogOpen, setIsEditAliasDialogOpen] = useState(false)
+
+  // Handle opening edit alias dialog
+  const handleOpenEditAliasDialog = useCallback((device: DeviceInfo) => {
+    setEditAliasDevice(device)
+    setIsEditAliasDialogOpen(true)
+  }, [])
+
+  // Load collapsed state from localStorage
+  useEffect(() => {
+    const savedCollapsed = localStorage.getItem('task-sidebar-collapsed')
+    if (savedCollapsed === 'true') {
+      setIsCollapsed(true)
+    }
+  }, [])
+
+  useEffect(() => {
+    saveLastTab('devices')
+  }, [])
+
+  useEffect(() => {
+    if (searchParams.get('register') === '1') setShowSetupGuide(true)
+  }, [searchParams])
+
+  useEffect(() => {
+    if (highlightedDeviceId === null) return
+    document
+      .querySelector(`[data-testid="device-record-${highlightedDeviceId}"]`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }, [highlightedDeviceId])
+
+  const handleToggleCollapsed = useCallback(() => {
+    setIsCollapsed(prev => {
+      const newValue = !prev
+      localStorage.setItem('task-sidebar-collapsed', String(newValue))
+      return newValue
+    })
+  }, [])
+
+  // Handle new task from collapsed sidebar button
+  const handleNewTask = useCallback(() => {
+    selectTask(null)
+    router.replace(paths.chat.getHref())
+  }, [selectTask, router])
+
+  return (
+    <div className="flex smart-h-screen bg-base text-text-primary box-border">
+      {/* Collapsed sidebar floating buttons */}
+      {isCollapsed && !isMobile && (
+        <CollapsedSidebarButtons onExpand={handleToggleCollapsed} onNewTask={handleNewTask} />
+      )}
+
+      {/* Responsive resizable sidebar */}
+      <ResizableSidebar isCollapsed={isCollapsed} onToggleCollapsed={handleToggleCollapsed}>
+        <TaskSidebar
+          isMobileSidebarOpen={isMobileSidebarOpen}
+          setIsMobileSidebarOpen={setIsMobileSidebarOpen}
+          pageType="devices"
+          isCollapsed={isCollapsed}
+          onToggleCollapsed={handleToggleCollapsed}
+        />
+      </ResizableSidebar>
+
+      {/* Main content area */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Top navigation */}
+        <TopNavigation
+          activePage="devices"
+          variant="with-sidebar"
+          title={t('title')}
+          onMobileSidebarToggle={() => setIsMobileSidebarOpen(true)}
+          isSidebarCollapsed={isCollapsed}
+        >
+          {isMobile ? <ThemeToggle /> : <GithubStarButton />}
+        </TopNavigation>
+
+        {/* Content area */}
+        <div className="flex-1 overflow-auto p-6">
+          <div className="max-w-4xl mx-auto">
+            {/* Header with refresh button */}
+            <DevicesPageHeader
+              isLoading={isLoading}
+              hasDevices={sortedDevices.length > 0}
+              onRefresh={refreshDevices}
+              onAddDevice={() => setShowSetupGuide(true)}
+              hasAdvancedDevices={hasAdvancedDevices}
+              showAdvancedDevices={showAdvancedDevices}
+              onShowAdvancedDevicesChange={setShowAdvancedDevices}
+            />
+
+            {/* Error message */}
+            {error && (
+              <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-6">
+                {error}
+              </div>
+            )}
+
+            {/* Loading state */}
+            {isLoading && devices.length === 0 && (
+              <div className="flex items-center justify-center py-12">
+                <Loader2 className="w-8 h-8 animate-spin text-text-muted" />
+              </div>
+            )}
+
+            {/* Device setup guide - shown when no devices or when user clicks Add Device */}
+            {(devices.length === 0 || showSetupGuide) && !isLoading && (
+              <div className="mb-6">
+                <DeviceSetupGuide
+                  backendUrl={backendUrl}
+                  authToken={authToken}
+                  guideUrl={guideUrl}
+                />
+              </div>
+            )}
+
+            {/* Device sections - hide when showing setup guide */}
+            {sortedDevices.length > 0 && !showSetupGuide && (
+              <div className="space-y-6">
+                {/* Local Devices, including Wework app devices */}
+                <DeviceSection
+                  title={t('local_devices_section')}
+                  icon={Monitor}
+                  devices={displayedDevices}
+                  type={['local', 'app']}
+                  emptyMessage={t('no_local_devices')}
+                >
+                  {device => (
+                    <DeviceCard
+                      device={device}
+                      highlighted={device.id === highlightedDeviceId}
+                      onStartTask={handlers.handleStartTask}
+                      onSetDefault={handlers.handleSetDefault}
+                      onDelete={handlers.handleDeleteDevice}
+                      onCancelTask={handlers.handleCancelTask}
+                      onUpgrade={handlers.handleUpgradeDevice}
+                      onEditAlias={handleOpenEditAliasDialog}
+                      isUpgrading={isDeviceUpgrading(device.device_id)}
+                      upgradeStatus={getUpgradeStatus(device.device_id)}
+                    />
+                  )}
+                </DeviceSection>
+
+                <DeviceSection
+                  title={t('remote_devices_section')}
+                  icon={Server}
+                  devices={displayedDevices}
+                  type="remote"
+                  emptyMessage={t('no_remote_devices')}
+                >
+                  {device => (
+                    <DeviceCard
+                      device={device}
+                      highlighted={device.id === highlightedDeviceId}
+                      onStartTask={handlers.handleStartTask}
+                      onSetDefault={handlers.handleSetDefault}
+                      onDelete={handlers.handleDeleteDevice}
+                      onCancelTask={handlers.handleCancelTask}
+                      onUpgrade={handlers.handleUpgradeDevice}
+                      onEditAlias={handleOpenEditAliasDialog}
+                      isUpgrading={isDeviceUpgrading(device.device_id)}
+                      upgradeStatus={getUpgradeStatus(device.device_id)}
+                    />
+                  )}
+                </DeviceSection>
+
+                {/* Cloud Devices */}
+                <DeviceSection
+                  title={t('cloud_devices_section')}
+                  icon={Cloud}
+                  devices={displayedDevices}
+                  type="cloud"
+                  emptyMessage={t('cloud_devices_coming_soon')}
+                >
+                  {device => (
+                    <DeviceCard
+                      device={device}
+                      highlighted={device.id === highlightedDeviceId}
+                      onStartTask={handlers.handleStartTask}
+                      onSetDefault={handlers.handleSetDefault}
+                      onDelete={handlers.handleDeleteDevice}
+                      onCancelTask={handlers.handleCancelTask}
+                      onUpgrade={handlers.handleUpgradeDevice}
+                      onEditAlias={handleOpenEditAliasDialog}
+                      isUpgrading={isDeviceUpgrading(device.device_id)}
+                      upgradeStatus={getUpgradeStatus(device.device_id)}
+                    />
+                  )}
+                </DeviceSection>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Edit Device Alias Dialog */}
+      <EditDeviceAliasDialog
+        device={editAliasDevice}
+        open={isEditAliasDialogOpen}
+        onOpenChange={setIsEditAliasDialogOpen}
+        onSave={handlers.handleEditAlias}
+      />
+    </div>
+  )
+}

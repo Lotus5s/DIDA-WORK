@@ -1,0 +1,892 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react'
+import { useTranslation } from '@/hooks/useTranslation'
+import { useIsMobile } from '@/features/layout/hooks/useMediaQuery'
+import { useUser } from '@/features/common/UserContext'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { Maximize2, Minimize2 } from 'lucide-react'
+import type { ChatTipItem, Team, TaskType } from '@/types/api'
+import type { UnifiedSkill } from '@/apis/skills'
+import MentionAutocomplete from '../chat/MentionAutocomplete'
+import SkillAutocomplete, { SkillFlyAnimationTrigger } from '../chat/SkillAutocomplete'
+import SkillFlyAnimation from '../chat/SkillFlyAnimation'
+import { useToast } from '@/hooks/use-toast'
+
+type PlaceholderLanguage = 'zh' | 'en'
+
+export function resolveTeamInputPlaceholder(
+  team: Team | null,
+  language: PlaceholderLanguage,
+  isMobile: boolean
+): string | null {
+  const inputPlaceholder = team?.inputPlaceholder
+  if (!inputPlaceholder) return null
+
+  const languageOrder: PlaceholderLanguage[] = language === 'zh' ? ['zh', 'en'] : ['en', 'zh']
+  const devicePlaceholder = isMobile ? inputPlaceholder.mobile : inputPlaceholder.desktop
+
+  for (const source of [devicePlaceholder, inputPlaceholder]) {
+    for (const locale of languageOrder) {
+      const value = source?.[locale]?.trim()
+      if (value) return value
+    }
+  }
+
+  return null
+}
+
+interface ChatInputProps {
+  message: string
+  setMessage: (message: string) => void
+  handleSendMessage: () => void
+  isLoading: boolean
+  disabled?: boolean
+  taskType?: TaskType
+  autoFocus?: boolean
+  // Controls whether the message can be submitted (e.g., model selection required)
+  canSubmit?: boolean
+  submitBlockedReason?: string | null
+  tipText?: ChatTipItem | null
+  // Optional badge element to render inline with text
+  badge?: React.ReactNode
+  // Group chat support
+  isGroupChat?: boolean
+  team?: Team | null
+  // Callback when file(s) are pasted (e.g., images from clipboard)
+  onPasteFile?: (files: File | File[]) => void
+  // Whether there are no available teams (shows disabled state with special placeholder)
+  hasNoTeams?: boolean
+  // Custom reason for disabled state (e.g., "Device offline"). Shows as placeholder.
+  disabledReason?: string
+
+  // Skill selector support
+  showSkillSelector?: boolean
+  availableSkills?: UnifiedSkill[]
+  teamSkillNames?: string[]
+  preloadedSkillNames?: string[]
+  selectedSkillIds?: number[]
+  onSkillSelect?: (skill: UnifiedSkill) => void
+  isChatShell?: boolean
+  /** Whether skill selector is read-only (can view but not modify via / command) */
+  skillSelectorReadOnly?: boolean
+  /** Ref to the skill button element for fly animation target */
+  skillButtonRef?: React.RefObject<HTMLElement | null>
+
+  // Expand/collapse control for input height
+  /** Whether the input is currently expanded (2x height) */
+  isExpanded?: boolean
+  /** Callback when expand/collapse button is clicked */
+  onExpandToggle?: () => void
+  /** Use tighter vertical spacing for prefilled queue-message state */
+  compactSpacing?: boolean
+  /** Increment to focus the editor and move the cursor to the end after external fills. */
+  focusAtEndSignal?: number
+}
+
+export default function ChatInput({
+  message,
+  setMessage,
+  handleSendMessage,
+  disabled = false,
+  taskType: _taskType = 'code',
+  autoFocus = false,
+  canSubmit = true,
+  submitBlockedReason,
+  tipText,
+  badge,
+  isGroupChat = false,
+  team = null,
+  onPasteFile,
+  hasNoTeams = false,
+  disabledReason,
+  showSkillSelector = false,
+  availableSkills = [],
+  teamSkillNames = [],
+  preloadedSkillNames = [],
+  selectedSkillIds,
+  onSkillSelect,
+  isChatShell = false,
+  skillSelectorReadOnly = false,
+  skillButtonRef,
+  isExpanded = false,
+  onExpandToggle,
+  compactSpacing = false,
+  focusAtEndSignal,
+}: ChatInputProps) {
+  const { toast } = useToast()
+  const { t, i18n } = useTranslation()
+  const isMobile = useIsMobile()
+
+  // Get current language for tip text
+  const currentLang = i18n.language?.startsWith('zh') ? 'zh' : 'en'
+
+  // Use tip text as placeholder if available, otherwise use default
+  // If hasNoTeams is true, show the special placeholder
+  // If disabledReason is provided, show that as placeholder
+  const placeholder = useMemo(() => {
+    if (disabledReason) {
+      return disabledReason
+    }
+    if (hasNoTeams) {
+      return t('chat:input.no_team_placeholder')
+    }
+    const teamPlaceholder = resolveTeamInputPlaceholder(team, currentLang, isMobile)
+    if (teamPlaceholder) {
+      return teamPlaceholder
+    }
+    if (tipText) {
+      return tipText[currentLang] || tipText.en || t('chat:placeholder.input')
+    }
+    // For group chat, show mention instruction
+    if (isGroupChat && team?.name) {
+      return t('chat:groupChat.mentionToTrigger', { teamName: team.name })
+    }
+    return t('chat:placeholder.input')
+  }, [disabledReason, tipText, currentLang, t, isGroupChat, team, hasNoTeams, isMobile])
+
+  // Combine disabled, hasNoTeams and disabledReason for input disabled state
+  const isInputDisabled = disabled || hasNoTeams || !!disabledReason
+
+  const [isComposing, setIsComposing] = useState(false)
+  // Track if composition just ended (for Safari where compositionend fires before keydown)
+  const compositionJustEndedRef = useRef(false)
+  const { user } = useUser()
+  const editableRef = useRef<HTMLDivElement>(null)
+  const badgeRef = useRef<HTMLSpanElement>(null)
+  const lastFocusAtEndSignalRef = useRef(focusAtEndSignal)
+  const [badgeWidth, setBadgeWidth] = useState(0)
+
+  // Track if we should show placeholder
+  const [showPlaceholder, setShowPlaceholder] = useState(!message)
+
+  // Mention autocomplete state
+  const [showMentionMenu, setShowMentionMenu] = useState(false)
+  const [mentionMenuPosition, setMentionMenuPosition] = useState({ top: 0, left: 0 })
+  const [mentionQuery, setMentionQuery] = useState('')
+
+  // Skill autocomplete state
+  const [showSkillMenu, setShowSkillMenu] = useState(false)
+  const [skillMenuPosition, setSkillMenuPosition] = useState({ top: 0, left: 0 })
+  const [skillQuery, setSkillQuery] = useState('')
+
+  // Skill fly animation state (managed here so animation persists after autocomplete closes)
+  const [flyAnimation, setFlyAnimation] = useState<{
+    skillName: string | null
+    startPosition: { x: number; y: number } | null
+    endPosition: { x: number; y: number } | null
+  }>({
+    skillName: null,
+    startPosition: null,
+    endPosition: null,
+  })
+
+  // Handle fly animation trigger from SkillAutocomplete
+  const handleTriggerFlyAnimation = useCallback((data: SkillFlyAnimationTrigger) => {
+    setFlyAnimation({
+      skillName: data.skillName,
+      startPosition: data.startPosition,
+      endPosition: data.endPosition,
+    })
+  }, [])
+
+  // Update placeholder visibility when message changes externally
+  useEffect(() => {
+    setShowPlaceholder(!message)
+  }, [message])
+
+  // Measure badge width for text-indent
+  useEffect(() => {
+    const nextBadgeWidth = badgeRef.current && badge ? badgeRef.current.offsetWidth + 8 : 0
+    // The parent recreates the badge while typing; only dispatch real layout changes.
+    if (nextBadgeWidth !== badgeWidth) {
+      setBadgeWidth(nextBadgeWidth)
+    }
+  }, [badge, badgeWidth])
+
+  // Helper function to extract text with preserved newlines from contentEditable
+  const getTextWithNewlines = useCallback((element: HTMLElement): string => {
+    let text = ''
+    const childNodes = element.childNodes
+
+    for (let i = 0; i < childNodes.length; i++) {
+      const node = childNodes[i]
+
+      if (node.nodeType === Node.TEXT_NODE) {
+        text += node.textContent || ''
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node as HTMLElement
+        const tagName = el.tagName.toLowerCase()
+
+        // Handle <br> as newline
+        if (tagName === 'br') {
+          text += '\n'
+        } else if (tagName === 'div' || tagName === 'p') {
+          // Handle block elements (div, p) - add newline before if not first and has content
+          if (text && !text.endsWith('\n')) {
+            text += '\n'
+          }
+          text += getTextWithNewlines(el)
+        } else {
+          // For other elements, recursively get text
+          text += getTextWithNewlines(el)
+        }
+      }
+    }
+
+    return text
+  }, [])
+
+  // Helper function to set innerHTML with newlines converted to <br> tags
+  const setContentWithNewlines = useCallback((element: HTMLElement, text: string) => {
+    // Convert newlines to <br> tags for proper display in contentEditable
+    // Use innerHTML to properly render the <br> tags
+    const htmlContent = text
+      .split('\n')
+      .map(line => {
+        // Escape HTML entities to prevent XSS
+        const escaped = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        return escaped
+      })
+      .join('<br>')
+    element.innerHTML = htmlContent
+  }, [])
+
+  const collapseRangeAtContentEnd = useCallback((range: Range, element: HTMLElement) => {
+    const lastChild = element.lastChild
+    if (lastChild?.nodeType === Node.TEXT_NODE) {
+      range.setStart(lastChild, lastChild.textContent?.length ?? 0)
+      range.collapse(true)
+      return
+    }
+
+    range.selectNodeContents(element)
+    range.collapse(false)
+  }, [])
+
+  // Sync contenteditable content with message prop
+  useEffect(() => {
+    if (editableRef.current) {
+      // Get current content with newlines preserved
+      const currentContent = getTextWithNewlines(editableRef.current)
+      if (currentContent !== message) {
+        // Only update if different to avoid cursor jumping
+        const selection = window.getSelection()
+        const hadFocus = document.activeElement === editableRef.current
+
+        setContentWithNewlines(editableRef.current, message)
+
+        // Restore cursor to end if had focus
+        if (hadFocus && selection && message) {
+          const range = document.createRange()
+          collapseRangeAtContentEnd(range, editableRef.current)
+          selection.removeAllRanges()
+          selection.addRange(range)
+        }
+      }
+    }
+  }, [message, getTextWithNewlines, setContentWithNewlines, collapseRangeAtContentEnd])
+
+  // Auto focus the input when autoFocus is true and not disabled
+  useEffect(() => {
+    if (autoFocus && !isInputDisabled && editableRef.current) {
+      // Use setTimeout to ensure the DOM is fully rendered
+      const timer = setTimeout(() => {
+        const activeElement = document.activeElement
+        const canTakeFocus =
+          !activeElement ||
+          activeElement === document.body ||
+          activeElement === document.documentElement
+
+        // Do not steal focus after the user or an overlay has focused another control.
+        if (canTakeFocus) {
+          editableRef.current?.focus()
+        }
+      }, 100)
+      return () => clearTimeout(timer)
+    }
+  }, [autoFocus, isInputDisabled])
+
+  // Get user's send key preference (default to 'enter')
+  const sendKey = user?.preferences?.send_key || 'enter'
+
+  const handleCompositionStart = () => {
+    setIsComposing(true)
+    compositionJustEndedRef.current = false
+  }
+
+  const handleCompositionEnd = () => {
+    setIsComposing(false)
+    // Set flag to indicate composition just ended
+    // This handles Safari where compositionend fires before keydown
+    compositionJustEndedRef.current = true
+    // Clear the flag after a short delay to allow normal Enter key behavior
+    setTimeout(() => {
+      compositionJustEndedRef.current = false
+    }, 100)
+  }
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Check multiple conditions for IME compatibility:
+    // 1. isComposing state - tracks composition via React state
+    // 2. nativeEvent.isComposing - native browser flag (more reliable in some browsers)
+    // 3. compositionJustEndedRef - handles Safari where compositionend fires before keydown
+    //    This prevents the Enter key that confirms IME selection from also sending the message
+    if (
+      isInputDisabled ||
+      isComposing ||
+      e.nativeEvent.isComposing ||
+      compositionJustEndedRef.current
+    )
+      return
+
+    // On mobile, Enter always creates new line (no easy Shift+Enter on mobile keyboards)
+    // Users can tap the send button to send messages
+
+    if (sendKey === 'cmd_enter') {
+      // Cmd/Ctrl+Enter sends message, Enter creates new line
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault()
+        // Check if submission is allowed (e.g., model is selected when required)
+        if (canSubmit) {
+          handleSendMessage()
+        } else if (submitBlockedReason) {
+          toast({ variant: 'destructive', title: submitBlockedReason })
+        }
+      } else if (e.key === 'Enter' && !e.metaKey && !e.ctrlKey) {
+        // Enter without modifier creates new line
+        // Prevent default to avoid creating <div> elements, insert <br> instead
+        e.preventDefault()
+        document.execCommand('insertLineBreak')
+      }
+    } else {
+      if (isMobile) {
+        return
+      } else if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault()
+        // Check if submission is allowed (e.g., model is selected when required)
+        if (canSubmit) {
+          handleSendMessage()
+        } else if (submitBlockedReason) {
+          toast({ variant: 'destructive', title: submitBlockedReason })
+        }
+      } else if (e.key === 'Enter' && e.shiftKey) {
+        // Shift+Enter creates new line
+        // Prevent default to avoid creating <div> elements, insert <br> instead
+        e.preventDefault()
+        document.execCommand('insertLineBreak')
+      }
+    }
+  }
+
+  const handleInput = useCallback(
+    (e: React.FormEvent<HTMLDivElement>) => {
+      if (isInputDisabled) return
+      const text = getTextWithNewlines(e.currentTarget)
+      setMessage(text)
+      setShowPlaceholder(!text)
+
+      // Helper function to get cursor position for autocomplete menus
+      const getCursorPosition = () => {
+        const selection = window.getSelection()
+        if (selection && selection.rangeCount > 0) {
+          const range = selection.getRangeAt(0)
+          const rect = range.getBoundingClientRect()
+          const containerRect = editableRef.current?.getBoundingClientRect()
+          if (containerRect) {
+            return {
+              top: rect.top - containerRect.top - 8,
+              left: rect.left - containerRect.left,
+            }
+          }
+        }
+        return null
+      }
+
+      // Check for @ trigger in group chat mode
+      if (isGroupChat && team) {
+        const lastChar = text[text.length - 1]
+        if (lastChar === '@') {
+          const position = getCursorPosition()
+          if (position) {
+            setMentionMenuPosition(position)
+            setShowMentionMenu(true)
+            setMentionQuery('')
+          }
+        } else if (showMentionMenu) {
+          // Update query or close menu if user continues typing after @
+          const words = text.split(/\s/)
+          const lastWord = words[words.length - 1]
+          if (lastWord.startsWith('@')) {
+            // Extract query after @
+            const query = lastWord.substring(1)
+            setMentionQuery(query)
+          } else {
+            setShowMentionMenu(false)
+            setMentionQuery('')
+          }
+        }
+      }
+
+      // Check for / trigger for skill selector
+      if (showSkillSelector && availableSkills.length > 0) {
+        const lastChar = text[text.length - 1]
+        // Only trigger at start of input or after whitespace
+        const charBeforeLast = text.length > 1 ? text[text.length - 2] : ''
+        const isValidTrigger = lastChar === '/' && (text.length === 1 || /\s/.test(charBeforeLast))
+
+        if (isValidTrigger) {
+          const position = getCursorPosition()
+          if (position) {
+            setSkillMenuPosition(position)
+            setShowSkillMenu(true)
+            setSkillQuery('')
+          }
+        } else if (showSkillMenu) {
+          // Update query or close menu if user continues typing after /
+          const words = text.split(/\s/)
+          const lastWord = words[words.length - 1]
+          if (lastWord.startsWith('/')) {
+            // Extract query after /
+            const query = lastWord.substring(1)
+            setSkillQuery(query)
+          } else {
+            setShowSkillMenu(false)
+            setSkillQuery('')
+          }
+        }
+      }
+    },
+    [
+      isInputDisabled,
+      setMessage,
+      getTextWithNewlines,
+      isGroupChat,
+      team,
+      showMentionMenu,
+      showSkillSelector,
+      availableSkills.length,
+      showSkillMenu,
+    ]
+  )
+
+  // Handle mention selection
+  const handleMentionSelect = useCallback(
+    (mention: string) => {
+      if (editableRef.current) {
+        const currentText = getTextWithNewlines(editableRef.current)
+        // Replace the last @word (including partial @query) with the selected mention
+        // Find the last @ symbol and replace everything from there to the end of that word
+        const lastAtIndex = currentText.lastIndexOf('@')
+        if (lastAtIndex !== -1) {
+          // Get text before the @
+          const textBefore = currentText.substring(0, lastAtIndex)
+          // Get text after the @ and find where the current word ends
+          const textAfterAt = currentText.substring(lastAtIndex + 1)
+          // Find the end of the current word (first whitespace after @)
+          const wordEndMatch = textAfterAt.match(/^\S*/)
+          const currentWord = wordEndMatch ? wordEndMatch[0] : ''
+          const textAfterWord = textAfterAt.substring(currentWord.length)
+          // Build new text: text before @ + mention + space + remaining text
+          const newText = textBefore + mention + ' ' + textAfterWord.trimStart()
+          setMessage(newText)
+          setContentWithNewlines(editableRef.current, newText)
+        }
+
+        // Move cursor to end
+        const selection = window.getSelection()
+        if (selection && editableRef.current) {
+          const range = document.createRange()
+          range.selectNodeContents(editableRef.current)
+          range.collapse(false)
+          selection.removeAllRanges()
+          selection.addRange(range)
+        }
+
+        // Focus back to input
+        editableRef.current.focus()
+        setShowMentionMenu(false)
+        setMentionQuery('')
+      }
+    },
+    [getTextWithNewlines, setMessage, setContentWithNewlines]
+  )
+
+  // Handle skill selection from autocomplete
+  const handleSkillSelect = useCallback(
+    (skill: UnifiedSkill) => {
+      if (editableRef.current && onSkillSelect) {
+        const currentText = getTextWithNewlines(editableRef.current)
+        // Remove the /query from the text
+        const lastSlashIndex = currentText.lastIndexOf('/')
+        if (lastSlashIndex !== -1) {
+          // Find the position of / that triggered the menu
+          // Get text before the /
+          const textBefore = currentText.substring(0, lastSlashIndex)
+          // Get text after the / and find where the current word ends
+          const textAfterSlash = currentText.substring(lastSlashIndex + 1)
+          // Find the end of the current word (first whitespace after /)
+          const wordEndMatch = textAfterSlash.match(/^\S*/)
+          const currentWord = wordEndMatch ? wordEndMatch[0] : ''
+          const textAfterWord = textAfterSlash.substring(currentWord.length)
+          // Build new text: text before / + remaining text (remove the /query)
+          const newText = textBefore + textAfterWord.trimStart()
+          setMessage(newText)
+          setContentWithNewlines(editableRef.current, newText)
+        }
+
+        // Call the skill selection callback
+        onSkillSelect(skill)
+
+        // Move cursor to end
+        const selection = window.getSelection()
+        if (selection && editableRef.current) {
+          const range = document.createRange()
+          range.selectNodeContents(editableRef.current)
+          range.collapse(false)
+          selection.removeAllRanges()
+          selection.addRange(range)
+        }
+
+        // Focus back to input
+        editableRef.current.focus()
+        setShowSkillMenu(false)
+        setSkillQuery('')
+      }
+    },
+    [getTextWithNewlines, setMessage, setContentWithNewlines, onSkillSelect]
+  )
+
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent<HTMLDivElement>) => {
+      if (isInputDisabled) return
+
+      const clipboardData = e.clipboardData
+
+      // Get plain text from clipboard
+      let pastedText = clipboardData.getData('text/plain')
+
+      // Remove invisible/control characters that can break layout
+      // This includes: zero-width spaces, zero-width joiners, direction marks, etc.
+      // Keep normal whitespace (space, tab, newline) but remove problematic Unicode characters
+      if (pastedText) {
+        pastedText = pastedText.replace(/[\u200B-\u200D\u2028\u2029\uFEFF\u00A0\u2060\u180E]/g, '')
+      }
+
+      const hasText = pastedText && pastedText.trim().length > 0
+
+      // Check if clipboard contains HTML data (indicates rich text from Word, PPT, web pages, etc.)
+      // When copying styled text, applications often include both text/html and image data
+      // The image is just a rendered preview of the text, not a real image the user wants to upload
+      const hasHtml = clipboardData.getData('text/html').length > 0
+
+      // Collect all files from clipboard (from both files and items)
+      // Support all file types, not just images (PDF, Word, etc.)
+      const pastedFiles: File[] = []
+
+      // Only collect files if there's no HTML data (to avoid uploading text preview images)
+      // OR if there's no text (pure file paste like screenshots or copied files)
+      if (!hasHtml || !hasText) {
+        // Check clipboard files first (for direct file paste)
+        if (clipboardData.files && clipboardData.files.length > 0) {
+          for (let i = 0; i < clipboardData.files.length; i++) {
+            const file = clipboardData.files[i]
+            // Accept all file types, not just images
+            pastedFiles.push(file)
+          }
+        }
+
+        // Check clipboard items for screenshots and other file data
+        const items = clipboardData.items
+        if (items) {
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i]
+            // Accept all file types from clipboard items
+            if (item.kind === 'file') {
+              const file = item.getAsFile()
+              // Avoid duplicate files (same file might appear in both files and items)
+              if (file && !pastedFiles.some(f => f.name === file.name && f.size === file.size)) {
+                pastedFiles.push(file)
+              }
+            }
+          }
+        }
+      }
+
+      const hasFiles = pastedFiles.length > 0
+
+      // Handle different paste scenarios:
+      // 1. Files only (e.g., pure screenshot or copied files) -> upload files
+      // 2. Text only (e.g., plain text copy) -> insert text
+      // 3. Rich text with HTML (e.g., from Word/PPT/web) -> insert text only (ignore preview images)
+      // 4. Real files with text (rare case) -> handled by the hasHtml check above
+
+      // Prevent default behavior to handle paste manually
+      e.preventDefault()
+
+      // Handle file upload if there are files (and not just preview images from rich text)
+      if (hasFiles && onPasteFile) {
+        onPasteFile(pastedFiles)
+      }
+
+      // Handle text insertion if there is text content
+      if (hasText && editableRef.current) {
+        // Get current selection
+        let selection = window.getSelection()
+
+        // Fallback: if no selection exists (edge case), focus the input and create a selection at the end
+        if (!selection || selection.rangeCount === 0) {
+          editableRef.current.focus()
+          selection = window.getSelection()
+
+          // If still no selection after focus, create one at the end of the input
+          if (selection) {
+            const range = document.createRange()
+            collapseRangeAtContentEnd(range, editableRef.current)
+            selection.removeAllRanges()
+            selection.addRange(range)
+          }
+        }
+
+        // Proceed with text insertion if we have a valid selection
+        if (selection && selection.rangeCount > 0) {
+          const range = selection.getRangeAt(0)
+          range.deleteContents()
+
+          // Insert plain text node
+          const textNode = document.createTextNode(pastedText)
+          range.insertNode(textNode)
+
+          // Move cursor to end of inserted text
+          range.setStartAfter(textNode)
+          range.setEndAfter(textNode)
+          selection.removeAllRanges()
+          selection.addRange(range)
+        }
+
+        // Update message state - use getTextWithNewlines to preserve newlines
+        const newText = getTextWithNewlines(editableRef.current)
+        setMessage(newText)
+        setShowPlaceholder(!newText)
+      }
+    },
+    [isInputDisabled, setMessage, getTextWithNewlines, onPasteFile, collapseRangeAtContentEnd]
+  )
+
+  const focusEditableAtEnd = useCallback(() => {
+    if (editableRef.current) {
+      editableRef.current.focus()
+      const selection = window.getSelection()
+      if (selection) {
+        const range = document.createRange()
+        collapseRangeAtContentEnd(range, editableRef.current)
+        selection.removeAllRanges()
+        selection.addRange(range)
+      }
+    }
+  }, [collapseRangeAtContentEnd])
+
+  const handleFocus = useCallback(() => {
+    // Move cursor to end on focus
+    focusEditableAtEnd()
+  }, [focusEditableAtEnd])
+
+  useEffect(() => {
+    if (focusAtEndSignal === undefined || lastFocusAtEndSignalRef.current === focusAtEndSignal) {
+      return
+    }
+
+    lastFocusAtEndSignalRef.current = focusAtEndSignal
+    focusEditableAtEnd()
+  }, [focusAtEndSignal, focusEditableAtEnd])
+
+  // Calculate min height based on device
+  // Figma design shows input card ~140px total, text area takes most of it
+  // Text area should be ~60-70px minimum (about 2-3 lines with 26px line-height)
+  const baseMinHeight = compactSpacing
+    ? isMobile
+      ? '3rem'
+      : '3.25rem'
+    : isMobile
+      ? '3.5rem'
+      : '4rem'
+  // When expanded, increase min height to show the expanded state visually
+  const expandedMinHeight = isMobile ? '9rem' : '10rem'
+  const minHeight = !isMobile && isExpanded ? expandedMinHeight : baseMinHeight
+  // When expanded, double the max height for easier editing of large text
+  // Only apply expansion on desktop - mobile has no toggle button to collapse
+  const baseMaxHeight = isMobile ? '9rem' : '10rem'
+  const expandedMaxHeight = isMobile ? '18rem' : '20rem'
+  const maxHeight = !isMobile && isExpanded ? expandedMaxHeight : baseMaxHeight
+
+  // Get tooltip text based on send key preference and platform
+  const tooltipText = useMemo(() => {
+    if (sendKey === 'cmd_enter') {
+      // Detect if Mac or Windows
+      const isMac =
+        typeof navigator !== 'undefined' && /Mac|iPod|iPhone|iPad/.test(navigator.platform)
+      return isMac ? t('chat:send_shortcut_cmd_enter_mac') : t('chat:send_shortcut_cmd_enter_win')
+    }
+    return t('chat:send_shortcut')
+  }, [sendKey, t])
+
+  return (
+    <div className="w-full relative" data-tour="task-input">
+      {/* Placeholder - shown when empty */}
+      {showPlaceholder && (
+        <div
+          className="absolute pointer-events-none text-text-muted text-base leading-[26px]"
+          style={{
+            top: compactSpacing ? '0' : '0.25rem',
+            left: badge ? `${badgeWidth}px` : '0',
+          }}
+        >
+          {placeholder}
+        </div>
+      )}
+
+      {/* Mention autocomplete menu */}
+      {showMentionMenu && isGroupChat && team && (
+        <MentionAutocomplete
+          team={team}
+          query={mentionQuery}
+          onSelect={handleMentionSelect}
+          onClose={() => {
+            setShowMentionMenu(false)
+            setMentionQuery('')
+          }}
+          position={mentionMenuPosition}
+        />
+      )}
+
+      {/* Skill autocomplete menu */}
+      {showSkillMenu && showSkillSelector && availableSkills.length > 0 && (
+        <SkillAutocomplete
+          skills={availableSkills}
+          teamSkillNames={teamSkillNames}
+          preloadedSkillNames={preloadedSkillNames}
+          query={skillQuery}
+          selectedSkillIds={selectedSkillIds}
+          onSelect={handleSkillSelect}
+          onClose={() => {
+            setShowSkillMenu(false)
+            setSkillQuery('')
+          }}
+          position={skillMenuPosition}
+          isChatShell={isChatShell}
+          readOnly={skillSelectorReadOnly}
+          skillButtonRef={skillButtonRef}
+          onTriggerFlyAnimation={handleTriggerFlyAnimation}
+        />
+      )}
+
+      {/* Skill fly animation - rendered here so it persists after autocomplete closes */}
+      <SkillFlyAnimation
+        skillName={flyAnimation.skillName}
+        startPosition={flyAnimation.startPosition}
+        endPosition={flyAnimation.endPosition}
+        onAnimationComplete={() =>
+          setFlyAnimation({ skillName: null, startPosition: null, endPosition: null })
+        }
+      />
+      {/* Scrollable container that includes both badge and editable content */}
+      <div className="relative">
+        <div
+          className="w-full custom-scrollbar transition-all duration-300 ease-in-out"
+          style={{
+            minHeight,
+            maxHeight,
+            overflowY: 'auto',
+          }}
+        >
+          {/* Inner content wrapper with badge and text */}
+          <div className="relative">
+            {/* Badge - positioned absolutely so it doesn't affect text flow */}
+            {badge && (
+              <span
+                ref={badgeRef}
+                className={`absolute left-0 pointer-events-auto z-10 ${
+                  compactSpacing ? 'top-0' : 'top-0.5'
+                }`}
+                style={{ userSelect: 'none' }}
+              >
+                {badge}
+              </span>
+            )}
+
+            {/* Editable content area - wrapped in Tooltip for send shortcut hint */}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div
+                    ref={editableRef}
+                    contentEditable={!isInputDisabled}
+                    onInput={handleInput}
+                    onKeyDown={handleKeyDown}
+                    onPaste={handlePaste}
+                    onCompositionStart={handleCompositionStart}
+                    onCompositionEnd={handleCompositionEnd}
+                    onFocus={handleFocus}
+                    data-testid="message-input"
+                    data-team-id={team?.id}
+                    data-roleid="message-input"
+                    className={`w-full ${
+                      compactSpacing ? 'pt-0.5 pb-1' : 'pt-1 pb-2'
+                    } bg-transparent text-text-primary text-base leading-[26px] focus:outline-none transition-all duration-300 ease-in-out ${
+                      isInputDisabled ? 'opacity-50 cursor-not-allowed' : ''
+                    }`}
+                    style={{
+                      minHeight,
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                      // Use text-indent for first line only to leave space for badge
+                      // By using insertLineBreak in keydown handler, we ensure Shift+Enter
+                      // only inserts <br> tags (not new <div> blocks), so text-indent
+                      // correctly affects only the first line and subsequent lines start from left edge
+                      textIndent: badge ? `${badgeWidth}px` : 0,
+                      // Add padding at top right to prevent text overlapping with expand button
+                      paddingRight: onExpandToggle && !isMobile ? '2rem' : undefined,
+                    }}
+                    suppressContentEditableWarning
+                  />
+                </TooltipTrigger>
+                <TooltipContent side="top" className="hidden text-xs md:block">
+                  <p>{tooltipText}</p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </div>
+        </div>
+
+        {/* Expand/Collapse button - positioned at top-right corner */}
+        {onExpandToggle && !isMobile && (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={onExpandToggle}
+                  className="absolute top-1 right-0 p-1 rounded hover:bg-surface-hover text-text-muted hover:text-text-secondary transition-colors z-10"
+                  aria-label={isExpanded ? t('chat:input.collapse') : t('chat:input.expand')}
+                >
+                  {isExpanded ? (
+                    <Minimize2 className="h-4 w-4" />
+                  ) : (
+                    <Maximize2 className="h-4 w-4" />
+                  )}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="text-xs">
+                <p>{isExpanded ? t('chat:input.collapse') : t('chat:input.expand')}</p>
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
+      </div>
+    </div>
+  )
+}

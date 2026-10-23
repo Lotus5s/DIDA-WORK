@@ -1,0 +1,490 @@
+import { APIRequestContext, expect, Page, request as playwrightRequest } from '@playwright/test'
+import { ADMIN_USER } from '../config/test-users'
+import {
+  createProviderNativeKnowledgeFixture,
+  deleteProviderNativeKnowledgeFixture,
+  ProviderNativeKnowledgeFixture,
+} from '../fixtures/provider-native-knowledge'
+import { ApiClient, createApiClient, createBackendRequestHeaders } from './api-client'
+import { modelToolDefinitions } from './model-tool-discovery'
+
+export const PROVIDER_NATIVE_API_URL = process.env.E2E_API_URL || 'http://localhost:8000'
+export const PROVIDER_NATIVE_MOCK_URL = process.env.MOCK_MODEL_SERVER_URL || 'http://localhost:9999'
+const PROVIDER_NATIVE_MCP_URL =
+  process.env.E2E_PROVIDER_MCP_URL ||
+  process.env.E2E_CLAUDE_MODEL_SERVER_URL ||
+  PROVIDER_NATIVE_MOCK_URL
+
+export interface ProviderNativeResources {
+  token: string
+  prefix: string
+  modelName: string
+  botName: string
+  botId: number
+  teamName: string
+  teamId: number
+  fixture: ProviderNativeKnowledgeFixture
+}
+
+export interface ProviderNativeSkillRef {
+  skill_id: number
+  namespace: string
+  is_public: boolean
+  content_hash?: string
+}
+
+export interface RecordedProviderCall {
+  timestamp: string
+  name: string
+  arguments: Record<string, unknown>
+  result: unknown
+  isError: boolean
+}
+
+export interface RecordedTaskToolCall {
+  id: string
+  name: string
+  input: Record<string, unknown>
+  output: unknown
+}
+
+export interface ToolScenarioStep {
+  toolCalls?: Array<{ toolName: string; arguments: Record<string, unknown> }>
+  responseContent?: string
+  doneDelayMs?: number
+}
+
+export interface ToolScenarioOptions {
+  matchHeaders?: Record<string, string | null>
+}
+
+export async function createProviderNativeResources(
+  request: APIRequestContext,
+  prefix: string
+): Promise<ProviderNativeResources> {
+  const apiClient: ApiClient = createApiClient(request)
+  const login = await apiClient.login(ADMIN_USER.username, ADMIN_USER.password)
+  const token = login.data?.access_token || ''
+  expect(token).toBeTruthy()
+  const fixture = await createProviderNativeKnowledgeFixture(request, {
+    apiBaseUrl: PROVIDER_NATIVE_API_URL,
+    token,
+    nameSuffix: prefix,
+  })
+  const modelName = `${prefix}-model`
+  const botName = `${prefix}-bot`
+  const teamName = `${prefix}-team`
+  const modelResponse = await request.post(
+    `${PROVIDER_NATIVE_API_URL}/api/v1/namespaces/default/models`,
+    {
+      headers: authHeaders(token),
+      data: {
+        apiVersion: 'agent.wecode.io/v1',
+        kind: 'Model',
+        metadata: { name: modelName, namespace: 'default' },
+        spec: {
+          modelConfig: {
+            env: {
+              model: 'openai',
+              model_id: 'mock-provider-native-model',
+              api_key: 'mock-api-key',
+              base_url: `${PROVIDER_NATIVE_MOCK_URL}/v1`,
+            },
+          },
+        },
+      },
+    }
+  )
+  expect([200, 201]).toContain(modelResponse.status())
+  const botResponse = await request.post(`${PROVIDER_NATIVE_API_URL}/api/bots`, {
+    headers: authHeaders(token),
+    data: {
+      name: botName,
+      shell_name: 'Chat',
+      agent_config: { bind_model: modelName, bind_model_type: 'user' },
+      system_prompt: 'Use only explicitly selected provider-native knowledge.',
+      namespace: 'default',
+      is_active: true,
+    },
+  })
+  expect([200, 201]).toContain(botResponse.status())
+  const botId = ((await botResponse.json()) as { id?: number }).id
+  expect(botId).toBeTruthy()
+  const teamResponse = await request.post(`${PROVIDER_NATIVE_API_URL}/api/teams`, {
+    headers: authHeaders(token),
+    data: {
+      name: teamName,
+      description: 'Provider-native extended E2E team',
+      bots: [{ bot_id: botId, bot_prompt: '', role: 'worker' }],
+      bind_mode: ['chat'],
+      namespace: 'default',
+      is_active: true,
+    },
+  })
+  expect([200, 201]).toContain(teamResponse.status())
+  const teamId = ((await teamResponse.json()) as { id?: number }).id
+  expect(teamId).toBeTruthy()
+  await configureDingTalkService(request, token, 'docs', true)
+  await configureDingTalkService(request, token, 'wikispace', true)
+  await resetMockMcp(request)
+  for (const endpoint of ['dingtalk-docs/sync', 'dingtalk-wikispace/sync']) {
+    const response = await request.post(`${PROVIDER_NATIVE_API_URL}/api/${endpoint}`, {
+      headers: authHeaders(token),
+      timeout: 30_000,
+    })
+    expect(response.status(), await response.text()).toBe(200)
+  }
+  await resetMockMcp(request)
+  return {
+    token,
+    prefix,
+    modelName,
+    botName,
+    botId: botId!,
+    teamName,
+    teamId: teamId!,
+    fixture,
+  }
+}
+
+export async function deleteProviderNativeResources(
+  request: APIRequestContext,
+  resources: ProviderNativeResources
+): Promise<void> {
+  const cleanupErrors: unknown[] = []
+  const attemptCleanup = async (cleanup: () => Promise<unknown>) => {
+    try {
+      await cleanup()
+    } catch (error) {
+      cleanupErrors.push(error)
+    }
+  }
+
+  await configureDingTalkService(request, resources.token, 'docs', false).catch(() => null)
+  await configureDingTalkService(request, resources.token, 'wikispace', false).catch(() => null)
+  await configureDingTalkService(request, resources.token, 'ai_table', false).catch(() => null)
+  await attemptCleanup(() =>
+    deleteProviderNativeKnowledgeFixture(
+      request,
+      PROVIDER_NATIVE_API_URL,
+      resources.token,
+      resources.fixture.knowledgeBase.id,
+      [
+        resources.fixture.documents.a1.id,
+        resources.fixture.documents.a2.id,
+        resources.fixture.documents.a3.id,
+      ]
+    )
+  )
+  await attemptCleanup(() =>
+    deleteProviderNativeKnowledgeFixture(
+      request,
+      PROVIDER_NATIVE_API_URL,
+      resources.token,
+      resources.fixture.otherKnowledgeBase.id,
+      [resources.fixture.documents.b1.id]
+    )
+  )
+  await request
+    .delete(`${PROVIDER_NATIVE_API_URL}/api/v1/namespaces/default/teams/${resources.teamName}`, {
+      headers: authHeaders(resources.token),
+    })
+    .catch(() => null)
+  await request
+    .delete(`${PROVIDER_NATIVE_API_URL}/api/v1/namespaces/default/bots/${resources.botName}`, {
+      headers: authHeaders(resources.token),
+    })
+    .catch(() => null)
+  await request
+    .delete(`${PROVIDER_NATIVE_API_URL}/api/v1/namespaces/default/models/${resources.modelName}`, {
+      headers: authHeaders(resources.token),
+    })
+    .catch(() => null)
+  await resetMockMcp(request).catch(() => null)
+
+  if (cleanupErrors.length > 0) throw cleanupErrors[0]
+}
+
+export async function configureDingTalkService(
+  request: APIRequestContext,
+  token: string,
+  serviceId: 'docs' | 'wikispace' | 'ai_table' | 'table',
+  enabled: boolean
+): Promise<void> {
+  const response = await request.put(
+    `${PROVIDER_NATIVE_API_URL}/api/users/me/mcps/providers/dingtalk/services/${serviceId}`,
+    {
+      headers: authHeaders(token),
+      data: {
+        enabled,
+        url: enabled ? `${PROVIDER_NATIVE_MCP_URL}/mcp?service=${serviceId}` : '',
+      },
+    }
+  )
+  expect(response.status(), await response.text()).toBe(200)
+}
+
+export async function openProviderNativeChat(
+  page: Page,
+  resources: ProviderNativeResources
+): Promise<void> {
+  await page.addInitScript(selectedTeamId => {
+    localStorage.setItem('user_onboarding_completed', 'true')
+    localStorage.setItem('wegent_last_team_id', String(selectedTeamId))
+    localStorage.setItem('wegent_last_team_id_chat', String(selectedTeamId))
+  }, resources.teamId)
+  await page.goto(`/chat?teamId=${resources.teamId}`, { waitUntil: 'domcontentloaded' })
+  const input = page.getByTestId('message-input')
+  if (!(await input.isVisible({ timeout: 5_000 }).catch(() => false))) {
+    const selector = page
+      .locator('[data-testid="agent-skill-selector-button"], [data-testid="team-selector"]')
+      .first()
+    await selector.click({ force: true })
+    await page
+      .locator(
+        `[data-testid="team-option-${resources.teamName}"], [role="button"]:has-text("${resources.teamName}"), [role="option"]:has-text("${resources.teamName}")`
+      )
+      .first()
+      .click({ force: true })
+  }
+  await expect(input).toBeVisible()
+}
+
+export async function configureToolScenario(
+  request: APIRequestContext,
+  matchText: string,
+  steps: ToolScenarioStep[],
+  options: ToolScenarioOptions = {}
+): Promise<void> {
+  const response = await request.post(`${PROVIDER_NATIVE_MOCK_URL}/tool-scenarios`, {
+    data: { matchText, matchHeaders: options.matchHeaders, steps },
+  })
+  expect(response.status(), await response.text()).toBe(200)
+}
+
+export async function clearToolScenario(
+  request: APIRequestContext,
+  matchText: string
+): Promise<void> {
+  await request.delete(
+    `${PROVIDER_NATIVE_MOCK_URL}/tool-scenarios?matchText=${encodeURIComponent(matchText)}`
+  )
+}
+
+export async function resetMockMcp(request: APIRequestContext): Promise<void> {
+  const response = await request.post(`${PROVIDER_NATIVE_MOCK_URL}/mcp-control/reset`)
+  expect(response.status(), await response.text()).toBe(200)
+}
+
+export function providerNativeMcpServer(
+  service: 'docs' | 'wikispace' | 'ai_table' = 'docs'
+): Record<string, unknown> {
+  return {
+    type: 'streamable-http',
+    url: `${PROVIDER_NATIVE_MCP_URL}/mcp?service=${service}`,
+  }
+}
+
+export async function resolveProviderNativeSkillRef(
+  request: APIRequestContext,
+  token: string,
+  skillName: string
+): Promise<ProviderNativeSkillRef> {
+  const response = await request.get(
+    `${PROVIDER_NATIVE_API_URL}/api/v1/kinds/skills?name=${encodeURIComponent(
+      skillName
+    )}&namespace=default&exact_match=false`,
+    { headers: authHeaders(token) }
+  )
+  expect(response.status(), await response.text()).toBe(200)
+  const body = (await response.json()) as {
+    items?: Array<{
+      metadata?: {
+        namespace?: string
+        labels?: Record<string, string>
+      }
+      status?: {
+        fileHash?: string
+      }
+    }>
+  }
+  const skill =
+    body.items?.find(item => item.metadata?.labels?.name === skillName) ?? body.items?.[0]
+  const skillId = Number(skill?.metadata?.labels?.id)
+  expect(skillId, `Skill ${skillName} should expose metadata.labels.id`).toBeGreaterThan(0)
+  const fileHash = skill?.status?.fileHash
+  return {
+    skill_id: skillId,
+    namespace: skill?.metadata?.namespace || 'default',
+    is_public: skill?.metadata?.labels?.user_id === '0',
+    content_hash: fileHash ? `sha256:${fileHash}` : undefined,
+  }
+}
+
+export async function configureMockMcp(
+  request: APIRequestContext,
+  config: { deniedNodeIds?: string[]; documentNames?: Record<string, string> }
+): Promise<void> {
+  const response = await request.post(`${PROVIDER_NATIVE_MOCK_URL}/mcp-control/config`, {
+    data: config,
+  })
+  expect(response.status(), await response.text()).toBe(200)
+}
+
+export async function getMcpCalls(request: APIRequestContext): Promise<RecordedProviderCall[]> {
+  const response = await request.get(`${PROVIDER_NATIVE_MOCK_URL}/mcp-control/calls`)
+  expect(response.status(), await response.text()).toBe(200)
+  return (await response.json()) as RecordedProviderCall[]
+}
+
+export async function waitForTaskTerminal(
+  token: string,
+  taskId: number,
+  expected: RegExp = /^COMPLETED/
+): Promise<string> {
+  const runtimeRequest = await playwrightRequest.newContext({
+    extraHTTPHeaders: authHeaders(token),
+  })
+  let finalStatus = ''
+  try {
+    await expect
+      .poll(
+        async () => {
+          let response
+          try {
+            response = await runtimeRequest.get(
+              `${PROVIDER_NATIVE_API_URL}/api/tasks/${taskId}/runtime-check`
+            )
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            if (!/socket hang up|ECONNRESET/i.test(message)) throw error
+            return `TRANSPORT_ERROR_${message}`
+          }
+          if (response.status() !== 200) return `HTTP_${response.status()}`
+          const body = (await response.json()) as { task_status: string }
+          finalStatus = body.task_status.toUpperCase()
+          return finalStatus
+        },
+        { timeout: 60_000, message: `Task ${taskId} should reach ${expected}` }
+      )
+      .toMatch(expected)
+    return finalStatus
+  } finally {
+    await runtimeRequest.dispose()
+  }
+}
+
+export async function getTask(request: APIRequestContext, token: string, taskId: number) {
+  const response = await request.get(`${PROVIDER_NATIVE_API_URL}/api/tasks/${taskId}`, {
+    headers: authHeaders(token),
+  })
+  expect(response.status(), await response.text()).toBe(200)
+  return (await response.json()) as unknown
+}
+
+export function collectTaskToolCalls(value: unknown): RecordedTaskToolCall[] {
+  const calls = new Map<string, RecordedTaskToolCall>()
+  const visit = (current: unknown) => {
+    if (Array.isArray(current)) {
+      current.forEach(visit)
+      return
+    }
+    if (!current || typeof current !== 'object') return
+    const item = current as Record<string, unknown>
+    if (
+      typeof item.tool_name === 'string' &&
+      item.tool_input &&
+      typeof item.tool_input === 'object'
+    ) {
+      const id = String(
+        item.tool_use_id || item.id || `${item.tool_name}:${JSON.stringify(item.tool_input)}`
+      )
+      const previous = calls.get(id)
+      calls.set(id, {
+        id,
+        name: item.tool_name,
+        input: item.tool_input as Record<string, unknown>,
+        output: item.tool_output ?? previous?.output,
+      })
+    }
+    Object.values(item).forEach(visit)
+  }
+  visit(value)
+  return [...calls.values()]
+}
+
+export function extractTaskAnswer(task: unknown): string {
+  if (!task || typeof task !== 'object') return ''
+  const subtasks = (task as { subtasks?: unknown[] }).subtasks
+  if (!Array.isArray(subtasks)) return ''
+  for (const subtask of [...subtasks].reverse()) {
+    if (!subtask || typeof subtask !== 'object') continue
+    const result = (subtask as { result?: { value?: unknown } }).result
+    if (typeof result?.value === 'string' && result.value.trim()) return result.value.trim()
+  }
+  return ''
+}
+
+export function extractExternalKnowledgeRefs(task: unknown): Record<string, unknown>[] {
+  if (!task || typeof task !== 'object') return []
+  const refs = (task as { external_knowledge_refs?: unknown }).external_knowledge_refs
+  return Array.isArray(refs)
+    ? refs.filter((ref): ref is Record<string, unknown> => Boolean(ref) && typeof ref === 'object')
+    : []
+}
+
+export async function getScenarioModelBodies(
+  request: APIRequestContext,
+  prompt: string
+): Promise<Record<string, unknown>[]> {
+  const response = await request.get(
+    `${PROVIDER_NATIVE_MOCK_URL}/tool-scenarios?matchText=${encodeURIComponent(prompt)}`
+  )
+  expect(response.status(), await response.text()).toBe(200)
+  const body = (await response.json()) as { capturedRequests: Record<string, unknown>[] }
+  return body.capturedRequests.filter(item => JSON.stringify(item).includes(prompt))
+}
+
+export async function getScenarioRequestHeaders(
+  request: APIRequestContext,
+  prompt: string
+): Promise<Array<Record<string, string | string[] | undefined>>> {
+  const response = await request.get(
+    `${PROVIDER_NATIVE_MOCK_URL}/tool-scenarios?matchText=${encodeURIComponent(prompt)}`
+  )
+  expect(response.status(), await response.text()).toBe(200)
+  const body = (await response.json()) as {
+    capturedHeaders?: Array<Record<string, string | string[] | undefined>>
+  }
+  return body.capturedHeaders ?? []
+}
+
+export async function getToolScenarioState(
+  request: APIRequestContext,
+  prompt: string
+): Promise<{ nextStep: number; capturedRequestCount: number }> {
+  const response = await request.get(
+    `${PROVIDER_NATIVE_MOCK_URL}/tool-scenarios?matchText=${encodeURIComponent(prompt)}`
+  )
+  expect(response.status(), await response.text()).toBe(200)
+  const body = (await response.json()) as {
+    nextStep?: number
+    capturedRequests?: unknown[]
+  }
+  return {
+    nextStep: body.nextStep ?? 0,
+    capturedRequestCount: body.capturedRequests?.length ?? 0,
+  }
+}
+
+export function modelRequestText(bodies: unknown[]): string {
+  return JSON.stringify(bodies).replace(/\\\"/g, '"')
+}
+
+export function modelToolNames(bodies: Record<string, unknown>[]): string[] {
+  return bodies.flatMap(body => modelToolDefinitions(body).map(tool => tool.name))
+}
+
+export function authHeaders(token: string): Record<string, string> {
+  return createBackendRequestHeaders(token)
+}

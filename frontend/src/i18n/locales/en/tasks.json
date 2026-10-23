@@ -1,0 +1,239 @@
+{
+  "access_denied_title": "Access Denied",
+  "access_denied_description": "You don't have permission to access this task. It may have been deleted or you don't have the necessary permissions.",
+  "access_denied_go_home": "Go Home",
+  "attachment": {
+    "characters": "characters"
+  },
+  "remote_workspace": {
+    "button": "View the task files",
+    "unavailable": "Remote session unavailable",
+    "reason_loading": "Checking remote workspace status...",
+    "reason_status_check_failed": "Failed to check remote workspace status",
+    "reason_not_connected": "Remote session is not connected yet",
+    "reason_sandbox_not_running": "Remote sandbox is not running",
+    "reason_booting": "Remote workspace is booting",
+    "reason_warming": "Remote workspace is warming up",
+    "reason_starting": "Remote workspace is starting",
+    "chat_shell_disabled": "File management is not available in standard chat mode",
+    "title": "Remote Workspace",
+    "root": "Workspace",
+    "parent": "Parent",
+    "parent_entry": "Parent folder",
+    "parent_entry_hint": "Go back one level",
+    "search_placeholder": "Search for the current file list",
+    "sort": {
+      "label": "Sort",
+      "options": {
+        "name_asc": "Name (A-Z)",
+        "name_desc": "Name (Z-A)",
+        "size_desc": "Size (Large first)",
+        "modified_desc": "Recently modified"
+      }
+    },
+    "actions": {
+      "cancel": "Cancel",
+      "close": "Close",
+      "download": "Download",
+      "exit_fullscreen": "Exit fullscreen",
+      "fullscreen": "Fullscreen preview",
+      "go": "Go",
+      "preview": "Preview",
+      "refresh": "Refresh"
+    },
+    "download_confirm": {
+      "title": "Download selected files?",
+      "description": "This will download {{count}} selected files. Your browser may show multiple download prompts."
+    },
+    "columns": {
+      "select_all": "Select all files",
+      "name": "Name",
+      "size": "Size",
+      "modified": "Modified",
+      "type": "Type"
+    },
+    "status": {
+      "path": "Path",
+      "selected": "selected",
+      "items": "items",
+      "has_files": "Files"
+    },
+    "path": {
+      "edit": "Edit path",
+      "invalid": "Path is outside workspace"
+    },
+    "types": {
+      "folder": "Folder",
+      "file": "File",
+      "text": "Text",
+      "image": "Image",
+      "pdf": "PDF"
+    },
+    "detail": {
+      "title": "Details",
+      "no_file_selected": "Select one file to view details",
+      "multiple_selected": "Multiple items selected",
+      "metadata": "Metadata",
+      "metadata_path": "Path",
+      "metadata_size": "Size",
+      "metadata_modified": "Modified",
+      "metadata_type": "Type"
+    },
+    "mobile": {
+      "tabs": {
+        "files": "Files",
+        "preview": "Preview"
+      }
+    },
+    "tree": {
+      "title": "Directory Tree",
+      "expand": "Expand",
+      "collapse": "Collapse",
+      "open_directory": "Open directory",
+      "loading": "Loading...",
+      "loading_children": "Loading children...",
+      "empty": "No files found",
+      "load_failed": "Failed to load workspace tree",
+      "load_children_failed": "Failed to load child directories",
+      "retry": "Retry"
+    },
+    "preview": {
+      "title": "Preview",
+      "hint": "Double-click the file name to open preview",
+      "empty": "Select a file to preview",
+      "loading": "Loading preview...",
+      "load_failed": "Failed to load preview",
+      "unsupported": "This file type is not supported for preview. Please download."
+    }
+  },
+  "workbench": {
+    "overview": "Overview",
+    "files_changed": "Files Changed",
+    "close_panel": "Close panel",
+    "open_main_menu": "Open main menu",
+    "waiting_result": "Waiting for task execution result...",
+    "loading_states": [
+      "Loading task data...",
+      "Fetching code changes...",
+      "Analyzing execution results..."
+    ],
+    "tips": [
+      "💡 Summary and change list will be generated automatically after completion",
+      "⚡ Click on commit records to view detailed changes",
+      "🔍 Switch to \"Files Changed\" tab to view full code diff",
+      "📋 Click commit ID to quickly copy to clipboard",
+      "🎯 Workbench displays task execution progress and status in real-time",
+      "✨ Expand \"Original Prompt\" to review initial task requirements"
+    ],
+    "status": {
+      "completed": "Completed",
+      "failed": "Failed",
+      "pending_confirmation": "Awaiting confirmation",
+      "running": "Running"
+    },
+    "summary": "Summary",
+    "commits": "commits",
+    "last_updated": "Last updated",
+    "copy_commit_id": "Copy full commit ID",
+    "files": "files",
+    "original_prompt": "Original prompt",
+    "no_file_changes": "No file changes detected",
+    "no_changes_found": "No changes found",
+    "file_status": {
+      "new": "New",
+      "deleted": "Deleted",
+      "renamed": "Renamed",
+      "modified": "Modified",
+      "added": "Added",
+      "removed": "Removed"
+    },
+    "loading_diff": "Loading code diff...",
+    "diff_load_failed": "Failed to load diff data",
+    "view_error_details": "View error details",
+    "error_details": "Error Details",
+    "retry": "Retry",
+    "diff_error": {
+      "title": "Unable to load code diff",
+      "branch_not_found": "The branch was not found in the repository. It may have been deleted or renamed.",
+      "access_denied": "Access denied. Please check your repository permissions.",
+      "server_error": "The Git server is temporarily unavailable. Please try again later.",
+      "network_error": "Network error. Please check your connection and try again.",
+      "unknown_error": "An unexpected error occurred while loading the diff.",
+      "hint_file_list": "You can still see the list of changed files below."
+    },
+    "additions": "Additions",
+    "deletions": "Deletions",
+    "expand_all": "Expand All",
+    "collapse_all": "Collapse All",
+    "changes": "Changes",
+    "loading_diff_message": "Loading diff...",
+    "no_changes_between_branches": "No changes found between branches",
+    "execution_timeline": "Execution Timeline",
+    "no_repository": "This task is not associated with a code repository"
+  },
+  "thinking": {
+    "execution_completed": "Execution Completed",
+    "execution_failed": "Execution Failed",
+    "execution_cancelled": "Execution Cancelled",
+    "tool_actions": {
+      "Read": "Read Files",
+      "Edit": "Edit Files",
+      "Write": "Write Files",
+      "Bash": "Execute Commands",
+      "Grep": "Search Code",
+      "Glob": "Find Files",
+      "Task": "Execute Task",
+      "WebFetch": "Fetch Web Content",
+      "WebSearch": "Search Web"
+    }
+  },
+  "urlPreview": {
+    "loading": "Loading link preview...",
+    "loadFailed": "Failed to load link preview",
+    "openInNewTab": "Open in new tab",
+    "imageLoadFailed": "Failed to load image",
+    "zoomIn": "Zoom in",
+    "zoomOut": "Zoom out",
+    "rotate": "Rotate",
+    "download": "Download",
+    "close": "Close"
+  },
+  "streaming_wait": {
+    "thinking": "Thinking",
+    "analyzing": "Analyzing in depth",
+    "generating_response": "Please wait, generating response",
+    "longer_than_usual": "Response is taking longer than usual"
+  },
+  "preserve_executor": {
+    "preserve": "Preserve",
+    "preserved": "Preserved",
+    "enabled_title": "Executor Preserved",
+    "enabled_desc": "This task's executor pod will not be cleaned up after completion.",
+    "disabled_title": "Executor Cleanup Enabled",
+    "disabled_desc": "This task's executor pod will be cleaned up normally.",
+    "error_title": "Failed to Update",
+    "error_desc": "Could not update executor preservation setting.",
+    "tooltip_preserved": "Executor is preserved and will not be cleaned up",
+    "tooltip_not_preserved": "Click to preserve executor from cleanup"
+  },
+  "preview": {
+    "title": "Subscription Preview",
+    "task_name": "Task Name",
+    "trigger": "Trigger",
+    "prompt": "Prompt",
+    "preserve_history": "Preserve History",
+    "retry": "Retry",
+    "timeout": "Timeout",
+    "cancel": "Cancel",
+    "confirm": "Confirm Create",
+    "create_success": "Subscription created successfully",
+    "create_error": "Failed to create subscription",
+    "cancelled": "Cancelled",
+    "confirmed_title": "Created Successfully",
+    "confirmed_desc": "The subscription has been created and will execute automatically.",
+    "cancelled_title": "Cancelled",
+    "cancelled_desc": "Subscription creation has been cancelled.",
+    "expired_title": "Preview Expired",
+    "expired_desc": "This preview has expired. Please generate a new preview."
+  }
+}

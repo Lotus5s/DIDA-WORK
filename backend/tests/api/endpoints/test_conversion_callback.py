@@ -1,0 +1,406 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for the conversion completion callback endpoint.
+
+Covers the staleness race fixed in this change: a late callback from a
+superseded generation must not create an orphan Markdown attachment nor point
+converted_attachment_id at stale content (which DocumentReadService would then
+prefer over the original).
+"""
+
+import base64
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from app.api.endpoints.internal.conversion_callback import (
+    conversion_completed_callback,
+    conversion_status_callback,
+)
+from app.models.kind import Kind
+from app.models.knowledge import DocumentIndexStatus, KnowledgeDocument
+from app.models.subtask_context import ContextStatus, ContextType, SubtaskContext
+from app.models.user import User
+from app.schemas.conversion_callback import (
+    ConversionCompletedRequest,
+    ConversionStatusRequest,
+)
+
+
+def _make_request(
+    *,
+    document_id: int = 1,
+    generation: int = 5,
+    attachment_id: int = 20,
+    markdown: bytes = b"# Converted title",
+) -> ConversionCompletedRequest:
+    """Build a valid ConversionCompletedRequest for tests."""
+    return ConversionCompletedRequest(
+        document_id=document_id,
+        generation=generation,
+        converted_name="doc.md",
+        converted_extension="md",
+        file_size=100,
+        markdown_bytes=base64.b64encode(markdown).decode(),
+        index_dispatch_payload={
+            "attachment_id": attachment_id,
+            "knowledge_base_id": 10,
+            "document_id": document_id,
+        },
+    )
+
+
+def _build_db_chain(*query_results: MagicMock) -> MagicMock:
+    """Wire up a mock db whose successive db.query(...) calls return each result."""
+    db = MagicMock()
+    db.query.side_effect = list(query_results)
+    return db
+
+
+def _query_first(value) -> MagicMock:
+    q = MagicMock()
+    q.filter.return_value.first.return_value = value
+    return q
+
+
+def _stored_attempt(*, generation: int, status: str = "converting") -> tuple:
+    """The (index_generation, index_status) row the pre-check reads."""
+    return generation, status
+
+
+@pytest.mark.unit
+def test_conversion_failed_callback_forwards_structured_error() -> None:
+    doc = SimpleNamespace(id=1)
+    db = _build_db_chain(_query_first(doc))
+    request = ConversionStatusRequest(
+        action="conversion_failed",
+        document_id=1,
+        generation=5,
+        error_message="private provider detail",
+        error_code="model_quota_exhausted",
+        user_message="The selected model quota has been exhausted.",
+        retryable=False,
+        provider="gemini",
+        model="gemini-3.5-flash",
+    )
+
+    with patch(
+        "app.api.endpoints.internal.conversion_callback.mark_document_index_failed",
+        return_value=True,
+    ) as mark_failed:
+        response = conversion_status_callback(request=request, db=db)
+
+    assert response.ok is True
+    error = mark_failed.call_args.kwargs["error"]
+    assert error.code == "model_quota_exhausted"
+    assert error.retryable is False
+    assert error.provider == "gemini"
+    assert error.model == "gemini-3.5-flash"
+
+
+@pytest.mark.unit
+class TestConversionCompletedCallback:
+    def test_creates_converted_attachment_and_dispatches_index(self) -> None:
+        """Happy path: pre-check passes -> create attachment -> dispatch indexing."""
+        doc = SimpleNamespace(
+            id=1,
+            attachment_id=20,
+            kind_id=10,
+            converted_attachment_id=None,
+            user_id=42,
+        )
+        original_attachment = SimpleNamespace(id=20, user_id=42)
+        converted_context = SimpleNamespace(id=30)
+
+        db = _build_db_chain(
+            _query_first(doc),
+            _query_first(original_attachment),
+            _query_first(_stored_attempt(generation=5)),  # pre-check: current
+        )
+        request = _make_request()
+
+        with (
+            patch(
+                "app.api.endpoints.internal.conversion_callback.context_service"
+            ) as mock_ctx,
+            patch(
+                "app.api.endpoints.internal.conversion_callback.mark_document_conversion_succeeded",
+                return_value=True,
+            ) as mock_succeeded,
+            patch(
+                "app.api.endpoints.internal.conversion_callback.index_document_task"
+            ) as mock_task,
+        ):
+            mock_ctx.upload_attachment.return_value = (converted_context, None)
+            mock_task.delay.return_value = SimpleNamespace(id="celery-task-1")
+
+            response = conversion_completed_callback(request=request, db=db)
+
+        assert response.ok is True
+        assert response.skipped is False
+        assert response.index_task_id == "celery-task-1"
+        # converted_attachment_id now points at the new attachment
+        assert doc.converted_attachment_id == 30
+        # indexing dispatched with the converted attachment id, not the original
+        mock_task.delay.assert_called_once()
+        assert mock_task.delay.call_args.kwargs["attachment_id"] == 30
+        mock_ctx.upload_attachment.assert_called_once()
+        mock_succeeded.assert_called_once()
+
+    def test_stale_precheck_skips_without_side_effects(self) -> None:
+        """A superseded generation must create no attachment and dispatch nothing."""
+        doc = SimpleNamespace(
+            id=1,
+            attachment_id=20,
+            kind_id=10,
+            converted_attachment_id=None,
+            user_id=42,
+        )
+        original_attachment = SimpleNamespace(id=20, user_id=42)
+
+        db = _build_db_chain(
+            _query_first(doc),
+            _query_first(original_attachment),
+            # pre-check: the stored row is a newer generation
+            _query_first(_stored_attempt(generation=5)),
+        )
+        request = _make_request(generation=3)  # older generation
+
+        with (
+            patch(
+                "app.api.endpoints.internal.conversion_callback.context_service"
+            ) as mock_ctx,
+            patch(
+                "app.api.endpoints.internal.conversion_callback.mark_document_conversion_succeeded"
+            ) as mock_succeeded,
+            patch(
+                "app.api.endpoints.internal.conversion_callback.index_document_task"
+            ) as mock_task,
+        ):
+            response = conversion_completed_callback(request=request, db=db)
+
+        assert response.ok is True
+        assert response.skipped is True
+        assert response.skip_reason == "stale_conversion"
+        # No mutation happened at all
+        assert doc.converted_attachment_id is None
+        mock_ctx.upload_attachment.assert_not_called()
+        mock_ctx.delete_context.assert_not_called()
+        mock_task.delay.assert_not_called()
+        mock_succeeded.assert_not_called()
+
+    def test_stale_race_window_rolls_back_attachment(self) -> None:
+        """Staleness detected only at the transition must roll back the attachment."""
+        doc = SimpleNamespace(
+            id=1,
+            attachment_id=20,
+            kind_id=10,
+            converted_attachment_id=999,  # previous reference, must be restored
+            user_id=42,
+        )
+        original_attachment = SimpleNamespace(id=20, user_id=42)
+        converted_context = SimpleNamespace(id=30)
+
+        db = _build_db_chain(
+            _query_first(doc),
+            _query_first(original_attachment),
+            # pre-check passes: the callback's generation is still current...
+            _query_first(_stored_attempt(generation=3)),
+        )
+        request = _make_request(generation=3)
+
+        with (
+            patch(
+                "app.api.endpoints.internal.conversion_callback.context_service"
+            ) as mock_ctx,
+            patch(
+                "app.api.endpoints.internal.conversion_callback.mark_document_conversion_succeeded",
+                return_value=False,  # ...but a newer generation won the race
+            ) as mock_succeeded,
+            patch(
+                "app.api.endpoints.internal.conversion_callback.index_document_task"
+            ) as mock_task,
+        ):
+            mock_ctx.upload_attachment.return_value = (converted_context, None)
+
+            response = conversion_completed_callback(request=request, db=db)
+
+        assert response.skipped is True
+        assert response.skip_reason == "stale_conversion"
+        # Rollback: orphan attachment deleted, reference restored to previous value
+        mock_ctx.delete_context.assert_called_once_with(
+            db=db, context_id=30, user_id=42
+        )
+        assert doc.converted_attachment_id == 999
+        mock_task.delay.assert_not_called()
+        mock_succeeded.assert_called_once()
+
+    def test_attachment_id_mismatch_returns_400(self) -> None:
+        """Payload attachment_id must match the document's attachment_id."""
+        doc = SimpleNamespace(id=1, attachment_id=20, kind_id=10, user_id=42)
+        db = _build_db_chain(_query_first(doc))
+        request = _make_request(attachment_id=999)  # mismatch
+
+        with pytest.raises(HTTPException) as exc:
+            conversion_completed_callback(request=request, db=db)
+
+        assert exc.value.status_code == 400
+
+    def test_invalid_base64_returns_400(self) -> None:
+        """Malformed base64 must fail before any DB mutation."""
+        db = MagicMock()
+        request = ConversionCompletedRequest(
+            document_id=1,
+            generation=5,
+            converted_name="doc.md",
+            converted_extension="md",
+            file_size=100,
+            markdown_bytes="@@@not-base64@@@",
+            index_dispatch_payload={"attachment_id": 20},
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            conversion_completed_callback(request=request, db=db)
+
+        assert exc.value.status_code == 400
+        db.query.assert_not_called()
+
+    def test_missing_document_returns_400(self) -> None:
+        """Unknown document_id is rejected before any mutation."""
+        db = _build_db_chain(_query_first(None))
+        request = _make_request()
+
+        with pytest.raises(HTTPException) as exc:
+            conversion_completed_callback(request=request, db=db)
+
+        assert exc.value.status_code == 400
+
+
+def _create_kind(test_db: Session, test_user: User) -> Kind:
+    knowledge_base = Kind(
+        user_id=test_user.id,
+        kind="KnowledgeBase",
+        name="kb-cached-precheck",
+        namespace="default",
+        json={
+            "apiVersion": "agent.wecode.io/v1",
+            "kind": "KnowledgeBase",
+            "metadata": {"name": "kb-cached-precheck", "namespace": "default"},
+            "spec": {"name": "Cached pre-check KB"},
+            "status": {"state": "Available"},
+        },
+    )
+    test_db.add(knowledge_base)
+    test_db.commit()
+    test_db.refresh(knowledge_base)
+    return knowledge_base
+
+
+def _create_attachment(test_db: Session, test_user: User) -> SubtaskContext:
+    attachment = SubtaskContext(
+        subtask_id=0,
+        user_id=test_user.id,
+        context_type=ContextType.ATTACHMENT.value,
+        name="converted-source.pdf",
+        status=ContextStatus.READY.value,
+        type_data={
+            "original_filename": "converted-source.pdf",
+            "file_extension": ".pdf",
+            "file_size": 64,
+            "storage_backend": "mysql",
+            "storage_key": "attachments/converted-source.pdf",
+        },
+    )
+    test_db.add(attachment)
+    test_db.commit()
+    test_db.refresh(attachment)
+    return attachment
+
+
+@pytest.mark.unit
+def test_precheck_reads_persisted_state_not_a_cached_document(
+    test_db: Session, test_user: User
+) -> None:
+    """A Session that cached the old attempt must not mask a newer stored one.
+
+    The endpoint may have loaded the document earlier in the same Session. An
+    entity query then returns the identity-mapped object with its old
+    generation and status, so the staleness pre-check has to read the stored
+    column values instead.
+    """
+    knowledge_base = _create_kind(test_db, test_user)
+    attachment = _create_attachment(test_db, test_user)
+    document = KnowledgeDocument(
+        kind_id=knowledge_base.id,
+        attachment_id=attachment.id,
+        name="converted-source.pdf",
+        file_extension="pdf",
+        file_size=64,
+        user_id=test_user.id,
+        is_active=True,
+        status="enabled",
+        source_type="file",
+        index_status=DocumentIndexStatus.CONVERTING,
+        index_generation=3,
+    )
+    test_db.add(document)
+    test_db.commit()
+    test_db.refresh(document)
+
+    # The Session now caches this attempt, then the stored row advances.
+    cached = (
+        test_db.query(KnowledgeDocument)
+        .filter(KnowledgeDocument.id == document.id)
+        .first()
+    )
+    test_db.query(KnowledgeDocument).filter(KnowledgeDocument.id == document.id).update(
+        {
+            KnowledgeDocument.index_generation: 4,
+            KnowledgeDocument.index_status: DocumentIndexStatus.SUCCESS,
+        },
+        synchronize_session=False,
+    )
+    test_db.commit()
+    assert cached is not None
+    assert int(cached.index_generation) == 3
+    assert cached.index_status == DocumentIndexStatus.CONVERTING
+
+    request = ConversionCompletedRequest(
+        document_id=document.id,
+        generation=3,
+        converted_name="converted-source.pdf.md",
+        converted_extension="md",
+        file_size=8,
+        markdown_bytes=base64.b64encode(b"# stale").decode(),
+        index_dispatch_payload={
+            "attachment_id": attachment.id,
+            "knowledge_base_id": knowledge_base.id,
+            "document_id": document.id,
+        },
+    )
+
+    with (
+        patch(
+            "app.api.endpoints.internal.conversion_callback.context_service"
+        ) as mock_ctx,
+        patch(
+            "app.api.endpoints.internal.conversion_callback.mark_document_conversion_succeeded"
+        ) as mock_succeeded,
+        patch(
+            "app.api.endpoints.internal.conversion_callback.index_document_task"
+        ) as mock_task,
+    ):
+        response = conversion_completed_callback(request=request, db=test_db)
+
+    assert response.ok is True
+    assert response.skipped is True
+    assert response.skip_reason == "stale_conversion"
+    mock_ctx.upload_attachment.assert_not_called()
+    mock_ctx.delete_context.assert_not_called()
+    mock_task.delay.assert_not_called()
+    mock_succeeded.assert_not_called()

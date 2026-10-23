@@ -1,0 +1,1449 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import React, { memo, useState } from 'react'
+import type {
+  TaskDetail,
+  Team,
+  GitRepoInfo,
+  GitBranch,
+  Attachment,
+  SubtaskContextBrief,
+  TaskType,
+  InteractiveFormAnswerPayload,
+} from '@/types/api'
+import {
+  Bot,
+  Download,
+  AlertCircle,
+  Loader2,
+  Clock,
+  CheckCircle2,
+  XCircle,
+  Ban,
+  User,
+} from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import EnhancedMarkdown from '@/components/common/EnhancedMarkdown'
+import { ReasoningDisplay } from './thinking'
+import MixedContentView from './thinking/MixedContentView'
+import ThinkingDisplay from './thinking/ThinkingDisplay'
+import FinalPromptMessage from './FinalPromptMessage'
+import { parseMarkdownFinalPrompt } from './finalPromptParser'
+import ClarificationAnswerSummary from '../clarification/ClarificationAnswerSummary'
+import ContextBadgeList from './ContextBadgeList'
+import StreamingWaitIndicator from './StreamingWaitIndicator'
+import BubbleTools, { CopyButton, EditButton } from './BubbleTools'
+import InlineMessageEdit from './InlineMessageEdit'
+import { SourceReferences } from '../chat/SourceReferences'
+import { GeminiAnnotations } from '../chat/GeminiAnnotations'
+import CollapsibleMessage from './CollapsibleMessage'
+import { processCitePatterns } from '../../utils/processCitePatterns'
+import RegenerateModelPopover from './RegenerateModelPopover'
+import { getMessageBubbleClassNames } from './messageBubbleStyles'
+import type { ClarificationAnswer } from '@/types/api'
+import type { SourceReference, GeminiAnnotation, RetrievalSummaryPayload } from '@/types/socket'
+import type { Model } from '../../hooks/useModelSelection'
+import type { UnifiedModel } from '@/apis/models'
+import { isTextBlock, isThinkingBlock } from './thinking/types'
+import type { MessageBlock, ThinkingBlock, ThinkingStep } from './thinking/types'
+import { useTraceAction } from '@/hooks/useTraceAction'
+import { useMessageFeedback } from '@/hooks/useMessageFeedback'
+import { ShareTokenProvider } from '@/contexts/ShareTokenContext'
+import { SmartLink, SmartImage, SmartTextLine } from '@/components/common/SmartUrlRenderer'
+import { formatDateTime } from '@/utils/dateTime'
+import { getTeamDisplayName } from '@/utils/team'
+import { ErrorCard } from './ErrorCard'
+export interface Message {
+  type: 'user' | 'ai'
+  content: string
+  timestamp: number
+  botName?: string
+  subtaskStatus?: string
+  subtaskId?: number
+  thinking?: ThinkingStep[] | null
+  /** Full result data from backend (for code executor with workbench, or chat with shell_type) */
+  result?: {
+    value?: string
+    thinking?: unknown[]
+    workbench?: Record<string, unknown>
+    shell_type?: string // Shell type (Chat, ClaudeCode, Agno, etc.)
+    sources?: SourceReference[] // RAG knowledge base sources
+    retrieval_summary?: RetrievalSummaryPayload
+    reasoning_content?: string // Reasoning content from DeepSeek R1 etc.
+    blocks?: MessageBlock[] // Message blocks for mixed rendering (new format)
+    annotations?: GeminiAnnotation[] // Gemini Deep Research grounding annotations
+    /** Video generation progress (0-100) */
+    progress?: number
+    /** Video generation result */
+    video?: {
+      attachment_id?: number | null
+      video_url: string
+      thumbnail?: string | null // Base64 encoded thumbnail
+      duration?: number | null // Video duration in seconds
+      is_placeholder?: boolean // True when video is still being generated
+    }
+    /** Video generation config (stored in user message subtask for display) */
+    video_config?: {
+      model?: string
+      model_display_name?: string
+      resolution?: string
+      ratio?: string
+      duration?: number
+    }
+  }
+  /** @deprecated Use contexts instead */
+  attachments?: Attachment[]
+  /** Unified contexts (attachments, knowledge bases, etc.) */
+  contexts?: SubtaskContextBrief[]
+  /** Recovered content from Redis/DB when user refreshes during streaming */
+  recoveredContent?: string
+  /** Flag indicating this message has recovered content */
+  isRecovered?: boolean
+  /** Flag indicating the content is incomplete (client disconnected) */
+  isIncomplete?: boolean
+  /** Flag indicating this message is waiting for first character (streaming but no content yet) */
+  isWaiting?: boolean
+  /** Group chat: sender user name (for USER type messages) */
+  senderUserName?: string
+  /** Group chat: sender user ID (for determining message alignment) */
+  senderUserId?: number
+  /** Whether this is a group chat or chat agent type (to show sender names) */
+  shouldShowSender?: boolean
+  /** Message status: pending, streaming, completed, error */
+  status?: 'pending' | 'streaming' | 'completed' | 'error'
+  /** Error message if status is 'error' */
+  error?: string
+  /** Classified error type from backend (e.g., 'context_length_exceeded') */
+  errorType?: string
+  /** RAG knowledge base sources (top-level for backward compatibility) */
+  sources?: SourceReference[]
+  /** Reasoning/thinking content from DeepSeek R1 and similar models */
+  reasoningContent?: string
+  /** Whether reasoning content is actively streaming */
+  isReasoningStreaming?: boolean
+}
+
+/** Configuration for paragraph-level action button */
+export interface ParagraphAction {
+  /** Icon to display on hover */
+  icon: React.ReactNode
+  /** Tooltip text for the action button */
+  tooltip?: string
+  /** Callback when action is triggered - receives paragraph text and optional click event */
+  onAction: (paragraphText: string, event?: React.MouseEvent) => void
+  /** Optional: Render a popover content instead of just calling onAction */
+  renderPopover?: (props: { paragraphText: string; onClose: () => void }) => React.ReactNode
+}
+
+export interface MessageBubbleProps {
+  msg: Message
+  index: number
+  selectedTaskDetail: TaskDetail | null
+  selectedTeam?: Team | null
+  selectedRepo?: GitRepoInfo | null
+  selectedBranch?: GitBranch | null
+  theme: 'light' | 'dark'
+  t: (key: string) => string
+  /** Whether to show waiting indicator (streaming but no content yet) */
+  isWaiting?: boolean
+  /** Optional override for the in-message waiting indicator text */
+  waitingMessage?: string
+  /** Generic callback when a component inside the message bubble wants to send a message. */
+  onSendMessage?: (
+    content: string,
+    options?: { interactiveFormAnswer?: InteractiveFormAnswerPayload }
+  ) => void
+  /** Callback when user submits an ask_user_question form - sends the pre-formatted answer as a new conversation message */
+  onAskUserSubmit?: (
+    toolUseId: string,
+    formattedMessage: string,
+    answer: InteractiveFormAnswerPayload
+  ) => void
+  /** Callback when user selects text in AI message (optional) - receives selected text */
+  onTextSelect?: (selectedText: string) => void
+  /** Paragraph-level action configuration - shows action button on hover for each paragraph in AI messages */
+  paragraphAction?: ParagraphAction
+  /**
+   * Whether this message is from the current user (for group chat alignment).
+   * In group chat, only current user's messages should be right-aligned.
+   * Other users' messages should be left-aligned like AI messages.
+   * If not provided, defaults to true for user messages (backward compatible).
+   */
+  isCurrentUserMessage?: boolean
+  /** Callback when user clicks retry button for failed messages */
+  onRetry?: (message: Message) => boolean | void | Promise<boolean | void>
+  /** Callback when user clicks a recommended model button on error card */
+  onRetryWithModel?: (
+    message: Message,
+    model: UnifiedModel
+  ) => boolean | void | Promise<boolean | void>
+  /** Message type for feedback storage key differentiation */
+  feedbackMessageType?: 'original' | 'correction'
+  /** Whether this is a group chat (for enabling message collapsing) */
+  isGroupChat?: boolean
+  /**
+   * Whether the current pipeline stage is pending confirmation.
+   * This is the single source of truth from pipeline_stage_info.is_pending_confirmation.
+   */
+  isPendingConfirmation?: boolean
+  /** Callback when pipeline stage is confirmed (for FinalPromptMessage) */
+  onPipelineStageConfirmed?: () => void
+  /** Whether this message is currently in edit mode */
+  isEditing?: boolean
+  /** Callback when user clicks the edit button */
+  onEdit?: (msg: Message) => void
+  /** Callback when user saves edited message */
+  onEditSave?: (content: string) => Promise<void>
+  /** Callback when user cancels editing */
+  onEditCancel?: () => void
+  /** Whether this is the last AI message */
+  isLastAiMessage?: boolean
+  /** Handler for regenerate action - receives the message and selected model */
+  onRegenerate?: (msg: Message, model: Model) => void
+  /** Whether regenerate is in progress */
+  isRegenerating?: boolean
+  /** Callback when user wants to use a generated image as reference for follow-up generation */
+  onUseAsReference?: (item: import('./ImageGallery').ImageItem) => void
+  /** Callback when user clicks re-edit button - restores original user input to input box */
+  onReEdit?: (msg: Message) => void
+  /** Share token for public access to attachments (no login required) */
+  shareToken?: string
+  /** Current task type to determine which model category to show in regenerate popover */
+  taskType?: TaskType
+  /** Callback when user clicks forward button - receives the subtaskId of the message to forward */
+  onForwardClick?: (subtaskId: number) => void
+  /** Callback when user saves the displayed AI Markdown to a knowledge base. */
+  onSaveToKnowledge?: (content: string) => void
+}
+
+// Component for rendering a paragraph with hover action button
+const ParagraphWithAction = ({
+  children,
+  paragraphText,
+  action,
+}: {
+  children: React.ReactNode
+  paragraphText: string
+  action: ParagraphAction
+}) => {
+  const [isHovered, setIsHovered] = useState(false)
+  const [isPopoverOpen, setIsPopoverOpen] = useState(false)
+
+  const handleAction = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    // If renderPopover is provided, the Popover will handle the action
+    // Otherwise, call onAction directly with the event for positioning
+    if (!action.renderPopover) {
+      action.onAction(paragraphText, e)
+    }
+  }
+
+  const handleClosePopover = () => {
+    setIsPopoverOpen(false)
+  }
+
+  // Render the action button
+  const renderActionButton = () => {
+    const button = (
+      <Button
+        variant="ghost"
+        size="icon"
+        onClick={handleAction}
+        className="h-7 w-7 hover:bg-primary/10 hover:text-primary"
+        title={action.tooltip}
+      >
+        {action.icon}
+      </Button>
+    )
+
+    // If renderPopover is provided, wrap button in Popover
+    if (action.renderPopover) {
+      return (
+        <Popover open={isPopoverOpen} onOpenChange={setIsPopoverOpen}>
+          <PopoverTrigger asChild>{button}</PopoverTrigger>
+          <PopoverContent
+            side="right"
+            align="start"
+            className="w-80 p-0 bg-surface border-border"
+            onInteractOutside={() => setIsPopoverOpen(false)}
+          >
+            {action.renderPopover({
+              paragraphText,
+              onClose: handleClosePopover,
+            })}
+          </PopoverContent>
+        </Popover>
+      )
+    }
+
+    // Otherwise, just show tooltip if provided
+    if (action.tooltip) {
+      return (
+        <Tooltip>
+          <TooltipTrigger asChild>{button}</TooltipTrigger>
+          <TooltipContent side="right">{action.tooltip}</TooltipContent>
+        </Tooltip>
+      )
+    }
+
+    return button
+  }
+
+  return (
+    <div
+      className="relative group/paragraph"
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+    >
+      {children}
+      {/* Action button - appears on hover at the right side */}
+      <div
+        className={`absolute -right-8 top-0 transition-opacity duration-200 ${
+          isHovered || isPopoverOpen ? 'opacity-100' : 'opacity-0'
+        }`}
+      >
+        {renderActionButton()}
+      </div>
+    </div>
+  )
+}
+
+/** Determine whether the Re-edit button should be shown for an AI message. */
+function canShowReEdit(
+  msg: Message,
+  isGroupChat: boolean | undefined,
+  onReEdit: ((msg: Message) => void) | undefined
+): boolean {
+  if (!onReEdit || isGroupChat) return false
+  // Must have a valid subtaskId to support re-edit
+  if (!msg.subtaskId) return false
+  const isCompleted =
+    msg.subtaskStatus === 'COMPLETED' ||
+    msg.subtaskStatus === 'CANCELLED' ||
+    msg.status === 'completed'
+  const isNotRunning =
+    msg.subtaskStatus !== 'RUNNING' &&
+    msg.subtaskStatus !== 'PENDING' &&
+    msg.subtaskStatus !== 'PROCESSING' &&
+    msg.status !== 'streaming' &&
+    msg.status !== 'pending'
+  return isCompleted && isNotRunning
+}
+
+function canSaveToKnowledge(
+  msg: Message,
+  onSaveToKnowledge: ((content: string) => void) | undefined,
+  content: string
+): boolean {
+  const isComplete =
+    msg.status === 'completed' ||
+    msg.subtaskStatus === 'COMPLETED' ||
+    msg.subtaskStatus === 'CANCELLED'
+  return Boolean(onSaveToKnowledge) && !msg.isIncomplete && isComplete && content.trim().length > 0
+}
+
+/**
+ * Extract copyable text content from message blocks.
+ * When a message uses the blocks-based rendering (MixedContentView),
+ * msg.content only holds the last streamed text block's content.
+ * The full content is stored across all TextBlock entries in msg.result.blocks.
+ */
+function getCopyableContentFromBlocks(blocks: MessageBlock[]): string {
+  return blocks
+    .filter(isTextBlock)
+    .map(b => b.content)
+    .join('\n\n')
+    .trim()
+}
+
+function getSaveableMarkdown(
+  markdown: string,
+  annotations: GeminiAnnotation[] | undefined
+): string {
+  return processCitePatterns(markdown, annotations)
+}
+
+function getBlockRenderHash(blocks: MessageBlock[] | undefined): string {
+  return (
+    blocks
+      ?.map(block => {
+        const contentLength =
+          'content' in block && typeof block.content === 'string' ? block.content.length : 0
+        const outputLength =
+          block.type === 'tool'
+            ? typeof block.tool_output === 'string'
+              ? block.tool_output.length
+              : block.tool_output
+                ? JSON.stringify(block.tool_output).length
+                : 0
+            : block.type === 'subagent'
+              ? `${block.output?.length || 0}:${block.summary?.length || 0}:${getBlockRenderHash(block.children)}`
+              : 0
+
+        return `${block.id}:${block.status}:${block.type}:${contentLength}:${outputLength}`
+      })
+      .join('|') || ''
+  )
+}
+
+const MessageBubble = memo(
+  function MessageBubble({
+    msg,
+    index,
+    selectedTaskDetail,
+    selectedTeam,
+    selectedRepo,
+    selectedBranch,
+    theme,
+    t,
+    isWaiting,
+    waitingMessage,
+    onSendMessage,
+    onAskUserSubmit,
+    onTextSelect,
+    paragraphAction,
+    isCurrentUserMessage,
+    onRetry,
+    onRetryWithModel,
+    feedbackMessageType,
+    isGroupChat,
+    isPendingConfirmation,
+    onPipelineStageConfirmed,
+    isEditing,
+    onEdit,
+    onEditSave,
+    onEditCancel,
+    isLastAiMessage,
+    onRegenerate,
+    isRegenerating,
+    onUseAsReference,
+    onReEdit,
+    shareToken,
+    taskType,
+    onForwardClick,
+    onSaveToKnowledge,
+  }: MessageBubbleProps) {
+    // Use trace hook for telemetry (auto-includes user and task context)
+    const { trace } = useTraceAction()
+
+    // State for regenerate model popover
+    const [isRegeneratePopoverOpen, setIsRegeneratePopoverOpen] = useState(false)
+
+    // Use feedback hook for managing like/dislike state with localStorage persistence
+    const { feedback, handleLike, handleDislike } = useMessageFeedback({
+      subtaskId: msg.subtaskId,
+      timestamp: msg.timestamp,
+      messageType: feedbackMessageType,
+      onFeedbackChange: fb =>
+        trace.event('message-feedback', {
+          'feedback.type': fb ?? 'cancelled',
+          'feedback.message_type': msg.type,
+          'feedback.category': feedbackMessageType || 'original',
+          ...(msg.subtaskId && { 'subtask.id': msg.subtaskId }),
+        }),
+    })
+
+    // Determine if this is a user-type message (for styling purposes)
+    const isUserTypeMessage = msg.type === 'user'
+
+    // Determine if this message should be right-aligned (current user's message)
+    // For group chat: only current user's messages are right-aligned
+    // For non-group chat (backward compatible): all user messages are right-aligned
+    // Default to true for user messages if isCurrentUserMessage is not provided
+    const shouldAlignRight = isUserTypeMessage && (isCurrentUserMessage ?? true)
+
+    const { baseClasses: defaultBubbleBaseClasses, typeClasses: defaultBubbleTypeClasses } =
+      getMessageBubbleClassNames(isUserTypeMessage)
+    const bubbleBaseClasses = isEditing
+      ? 'relative w-full overflow-visible text-text-primary'
+      : defaultBubbleBaseClasses
+    const bubbleTypeClasses = isEditing ? '' : defaultBubbleTypeClasses
+
+    const formatTimestamp = (timestamp: number | undefined) => {
+      return formatDateTime(timestamp)
+    }
+
+    const timestampLabel = formatTimestamp(msg.timestamp)
+    const correctionResultTitle = t('chat:correction.result_title')
+    const isCorrectionResultMessage = !isUserTypeMessage && msg.botName === correctionResultTitle
+    const agentDisplayName = selectedTeam ? getTeamDisplayName(selectedTeam) : undefined
+    const botDisplayName = msg.botName?.trim()
+    const selectedTeamBotCount = selectedTeam?.bots?.length ?? 0
+    const shouldShowBotName =
+      selectedTeamBotCount > 1 && Boolean(botDisplayName) && botDisplayName !== agentDisplayName
+    const messageHeaderLabel =
+      shouldShowBotName && agentDisplayName
+        ? `${agentDisplayName} · ${botDisplayName}`
+        : agentDisplayName || botDisplayName || t('messages.bot') || 'Bot'
+    const headerIcon = isUserTypeMessage ? null : isCorrectionResultMessage ? (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width="24"
+        height="24"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className="lucide lucide-circle-check-big h-4 w-4 text-primary"
+        aria-hidden="true"
+      >
+        <path d="M21.801 10A10 10 0 1 1 17 3.335"></path>
+        <path d="m9 11 3 3L22 4"></path>
+      </svg>
+    ) : (
+      <Bot className="w-4 h-4" data-testid="ai-message-icon" />
+    )
+    const headerLabel = isUserTypeMessage
+      ? ''
+      : isCorrectionResultMessage
+        ? msg.botName || correctionResultTitle
+        : messageHeaderLabel
+
+    // Determine if message is currently streaming (to disable URL metadata fetching)
+    // During streaming, we show simple links to avoid excessive API calls
+    const isStreaming =
+      msg.subtaskStatus === 'RUNNING' ||
+      msg.subtaskStatus === 'PENDING' ||
+      msg.subtaskStatus === 'PROCESSING' ||
+      isWaiting ||
+      msg.isWaiting
+
+    const inlineThinkingBlocks = React.useMemo(
+      () =>
+        msg.result?.blocks?.filter(
+          (block): block is ThinkingBlock => isThinkingBlock(block) && Boolean(block.content.trim())
+        ) ?? [],
+      [msg.result?.blocks]
+    )
+    const inlineThinkingContent = React.useMemo(
+      () => inlineThinkingBlocks.map(block => block.content.trim()).join('\n\n'),
+      [inlineThinkingBlocks]
+    )
+    const mixedContentBlocks = React.useMemo(
+      () => msg.result?.blocks?.filter(block => block.type !== 'thinking') ?? [],
+      [msg.result?.blocks]
+    )
+    const finalPromptData = React.useMemo(() => {
+      if (isUserTypeMessage) return null
+
+      const blockContent = getCopyableContentFromBlocks(msg.result?.blocks ?? [])
+      const content = blockContent || msg.recoveredContent || msg.content || ''
+      const contentToParse = content.includes('${$$}$') ? content.split('${$$}$')[1] || '' : content
+      return parseMarkdownFinalPrompt(contentToParse)
+    }, [isUserTypeMessage, msg.content, msg.recoveredContent, msg.result?.blocks])
+    const blockSaveableMarkdown = React.useMemo(
+      () =>
+        getSaveableMarkdown(
+          getCopyableContentFromBlocks(msg.result?.blocks ?? []),
+          msg.result?.annotations
+        ),
+      [msg.result?.annotations, msg.result?.blocks]
+    )
+    const hasToolBlocks = React.useMemo(
+      () => msg.result?.blocks?.some(block => block.type === 'tool') ?? false,
+      [msg.result?.blocks]
+    )
+    const hasThinkingToolSteps = React.useMemo(
+      () =>
+        msg.thinking?.some(
+          step => step.details?.type === 'tool_use' || step.details?.type === 'tool_result'
+        ) ?? false,
+      [msg.thinking]
+    )
+    const explicitReasoningContent =
+      msg.reasoningContent || msg.result?.reasoning_content || inlineThinkingContent
+    const waitingReasoningContent =
+      !explicitReasoningContent && !isUserTypeMessage && (isWaiting || msg.isWaiting)
+        ? waitingMessage || t('tasks:streaming_wait.thinking') || '正在思考'
+        : ''
+    const displayReasoningContent = explicitReasoningContent || waitingReasoningContent
+    const isUsingReasoningWaitDisplay = Boolean(waitingReasoningContent)
+    const isDisplayReasoningStreaming =
+      Boolean(msg.isReasoningStreaming) ||
+      inlineThinkingBlocks.some(block => block.status === 'streaming') ||
+      isUsingReasoningWaitDisplay
+
+    const renderProgressBar = (status: string, progress: number) => {
+      const normalizedStatus = (status ?? '').toUpperCase()
+      const isActiveStatus = ['RUNNING', 'PENDING', 'PROCESSING'].includes(normalizedStatus)
+      const safeProgress = Number.isFinite(progress) ? Math.min(Math.max(progress, 0), 100) : 0
+
+      // Get status configuration (icon, label key, colors)
+      const getStatusConfig = (statusKey: string) => {
+        switch (statusKey) {
+          case 'RUNNING':
+            return {
+              icon: <Loader2 className="h-3.5 w-3.5 animate-spin" />,
+              labelKey: 'messages.status_running',
+              bgClass: 'bg-primary/10',
+              textClass: 'text-primary',
+              dotClass: 'bg-primary',
+            }
+          case 'PENDING':
+            return {
+              icon: <Clock className="h-3.5 w-3.5" />,
+              labelKey: 'messages.status_pending',
+              bgClass: 'bg-amber-500/10',
+              textClass: 'text-amber-600 dark:text-amber-400',
+              dotClass: 'bg-amber-500',
+            }
+          case 'PROCESSING':
+            return {
+              icon: <Loader2 className="h-3.5 w-3.5 animate-spin" />,
+              labelKey: 'messages.status_processing',
+              bgClass: 'bg-blue-500/10',
+              textClass: 'text-blue-600 dark:text-blue-400',
+              dotClass: 'bg-blue-500',
+            }
+          case 'COMPLETED':
+            return {
+              icon: <CheckCircle2 className="h-3.5 w-3.5" />,
+              labelKey: 'messages.status_completed',
+              bgClass: 'bg-green-500/10',
+              textClass: 'text-green-600 dark:text-green-400',
+              dotClass: 'bg-green-500',
+            }
+          case 'FAILED':
+            return {
+              icon: <XCircle className="h-3.5 w-3.5" />,
+              labelKey: 'messages.status_failed',
+              bgClass: 'bg-red-500/10',
+              textClass: 'text-red-600 dark:text-red-400',
+              dotClass: 'bg-red-500',
+            }
+          case 'CANCELLED':
+            return {
+              icon: <Ban className="h-3.5 w-3.5" />,
+              labelKey: 'messages.status_cancelled',
+              bgClass: 'bg-gray-500/10',
+              textClass: 'text-gray-600 dark:text-gray-400',
+              dotClass: 'bg-gray-500',
+            }
+          case 'CANCELLING':
+            return {
+              icon: <Loader2 className="h-3.5 w-3.5 animate-spin" />,
+              labelKey: 'messages.status_cancelling',
+              bgClass: 'bg-orange-500/10',
+              textClass: 'text-orange-600 dark:text-orange-400',
+              dotClass: 'bg-orange-500',
+            }
+          default:
+            return {
+              icon: <Loader2 className="h-3.5 w-3.5" />,
+              labelKey: 'messages.status_running',
+              bgClass: 'bg-primary/10',
+              textClass: 'text-primary',
+              dotClass: 'bg-primary',
+            }
+        }
+      }
+
+      const config = getStatusConfig(normalizedStatus)
+
+      return (
+        <div className="mt-3 space-y-2">
+          {/* Status Badge */}
+          <div className="flex items-center gap-2">
+            <span
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${config.bgClass} ${config.textClass}`}
+            >
+              {config.icon}
+              <span>{t(config.labelKey) || status}</span>
+            </span>
+          </div>
+
+          {/* Minimal Progress Bar - only show for active statuses */}
+          {isActiveStatus && (
+            <div className="w-full bg-border/40 rounded-full h-1 overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-500 ease-out ${config.dotClass} ${isActiveStatus ? 'progress-bar-shimmer' : ''}`}
+                style={{ width: `${Math.max(safeProgress, 3)}%` }}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={safeProgress}
+                role="progressbar"
+              />
+            </div>
+          )}
+        </div>
+      )
+    }
+
+    const renderMarkdownResult = (rawResult: string, promptPart?: string) => {
+      const trimmed = (rawResult ?? '').trim()
+      const fencedMatch = trimmed.match(/^```(?:\s*(?:markdown|md))?\s*\n([\s\S]*?)\n```$/)
+      const rawMarkdownResult = fencedMatch ? fencedMatch[1] : trimmed
+
+      // Process [cite: X, Y, Z] patterns to clickable markdown links
+      // Only process when annotations are available from Gemini Deep Research
+      const annotations = msg.result?.annotations
+      const normalizedResult = getSaveableMarkdown(rawMarkdownResult, annotations)
+      const saveableMarkdown = `${promptPart ? promptPart + '\n\n' : ''}${normalizedResult}`
+
+      const progressMatch = normalizedResult.match(/^__PROGRESS_BAR__:(.*?):(\d+)$/)
+      if (progressMatch) {
+        const status = progressMatch[1]
+        const progress = parseInt(progressMatch[2], 10) || 0
+        return renderProgressBar(status, progress)
+      }
+
+      // Helper to extract text content from React children
+      const extractText = (node: React.ReactNode): string => {
+        if (typeof node === 'string') return node
+        if (typeof node === 'number') return String(node)
+        if (Array.isArray(node)) return node.map(extractText).join('')
+        if (React.isValidElement(node)) {
+          const props = node.props as { children?: React.ReactNode }
+          if (props.children) {
+            return extractText(props.children)
+          }
+        }
+        return ''
+      }
+
+      // Helper to wrap content with paragraph action
+      const wrapWithAction = (element: React.ReactNode, text: string) => {
+        if (!paragraphAction || !text.trim()) return element
+        return (
+          <ParagraphWithAction paragraphText={text} action={paragraphAction}>
+            {element}
+          </ParagraphWithAction>
+        )
+      }
+
+      // Check if message should be collapsible (only for completed AI messages in group chat, not streaming)
+      // Only enable collapsing for group chat messages
+      const shouldEnableCollapse = !isStreaming && msg.subtaskStatus !== 'RUNNING' && isGroupChat
+
+      const markdownContent = (
+        <EnhancedMarkdown
+          source={normalizedResult}
+          theme={theme}
+          components={
+            paragraphAction
+              ? {
+                  a: ({ href, children }) => {
+                    if (!href) {
+                      return <span>{children}</span>
+                    }
+                    return (
+                      <SmartLink href={href} disabled={isStreaming}>
+                        {children}
+                      </SmartLink>
+                    )
+                  },
+                  img: ({ src, alt }) => {
+                    if (!src || typeof src !== 'string') return null
+                    return <SmartImage src={src} alt={alt} />
+                  },
+                  p: ({ children }) => {
+                    const text = extractText(children)
+                    return wrapWithAction(<p>{children}</p>, text)
+                  },
+                  h1: ({ children }) => {
+                    const text = extractText(children)
+                    return wrapWithAction(<h1>{children}</h1>, text)
+                  },
+                  h2: ({ children }) => {
+                    const text = extractText(children)
+                    return wrapWithAction(<h2>{children}</h2>, text)
+                  },
+                  h3: ({ children }) => {
+                    const text = extractText(children)
+                    return wrapWithAction(<h3>{children}</h3>, text)
+                  },
+                  h4: ({ children }) => {
+                    const text = extractText(children)
+                    return wrapWithAction(<h4>{children}</h4>, text)
+                  },
+                  h5: ({ children }) => {
+                    const text = extractText(children)
+                    return wrapWithAction(<h5>{children}</h5>, text)
+                  },
+                  h6: ({ children }) => {
+                    const text = extractText(children)
+                    return wrapWithAction(<h6>{children}</h6>, text)
+                  },
+                  li: ({ children }) => {
+                    const text = extractText(children)
+                    return wrapWithAction(<li>{children}</li>, text)
+                  },
+                  blockquote: ({ children }) => {
+                    const text = extractText(children)
+                    return wrapWithAction(<blockquote>{children}</blockquote>, text)
+                  },
+                }
+              : {
+                  a: ({ href, children }) => {
+                    if (!href) {
+                      return <span>{children}</span>
+                    }
+                    return (
+                      <SmartLink href={href} disabled={isStreaming}>
+                        {children}
+                      </SmartLink>
+                    )
+                  },
+                  img: ({ src, alt }) => {
+                    if (!src || typeof src !== 'string') return null
+                    return <SmartImage src={src} alt={alt} />
+                  },
+                }
+          }
+        />
+      )
+
+      return (
+        <>
+          <CollapsibleMessage content={normalizedResult} enabled={shouldEnableCollapse}>
+            {markdownContent}
+          </CollapsibleMessage>
+          <SourceReferences
+            sources={msg.sources || msg.result?.sources || []}
+            retrievalSummary={msg.result?.retrieval_summary}
+          />
+          <GeminiAnnotations annotations={msg.result?.annotations || []} />
+          {/* Hide BubbleTools during streaming */}
+          {!isStreaming && (
+            <BubbleTools
+              contentToCopy={saveableMarkdown}
+              onCopySuccess={() => trace.copy(msg.type, msg.subtaskId)}
+              showSaveToKnowledge={canSaveToKnowledge(msg, onSaveToKnowledge, saveableMarkdown)}
+              onSaveToKnowledge={onSaveToKnowledge}
+              tools={[
+                {
+                  key: 'download',
+                  title: t('messages.download') || 'Download',
+                  icon: <Download className="h-4 w-4 text-text-muted" />,
+                  onClick: () => {
+                    const blob = new Blob([saveableMarkdown], {
+                      type: 'text/plain;charset=utf-8',
+                    })
+                    const url = URL.createObjectURL(blob)
+                    const a = document.createElement('a')
+                    a.href = url
+                    a.download = 'message.md'
+                    a.click()
+                    URL.revokeObjectURL(url)
+                    trace.download(msg.type, msg.subtaskId)
+                  },
+                },
+              ]}
+              feedback={feedback}
+              onLike={handleLike}
+              onDislike={handleDislike}
+              feedbackLabels={{
+                like: t('chat:messages.like') || 'Like',
+                dislike: t('chat:messages.dislike') || 'Dislike',
+              }}
+              showRegenerate={(() => {
+                const hasOnRegenerate = Boolean(onRegenerate)
+                const isCompleted =
+                  msg.subtaskStatus === 'COMPLETED' ||
+                  msg.subtaskStatus === 'CANCELLED' ||
+                  msg.status === 'completed'
+                const isNotRunning =
+                  msg.subtaskStatus !== 'RUNNING' &&
+                  msg.subtaskStatus !== 'PENDING' &&
+                  msg.subtaskStatus !== 'PROCESSING' &&
+                  msg.status !== 'streaming' &&
+                  msg.status !== 'pending'
+                return (
+                  hasOnRegenerate && !isGroupChat && isLastAiMessage && isCompleted && isNotRunning
+                )
+              })()}
+              onRegenerateClick={() => setIsRegeneratePopoverOpen(true)}
+              isRegenerating={isRegenerating}
+              renderRegenerateButton={(defaultButton, tooltipText) => (
+                <RegenerateModelPopover
+                  open={isRegeneratePopoverOpen}
+                  onOpenChange={setIsRegeneratePopoverOpen}
+                  selectedTeam={selectedTeam ?? null}
+                  onSelectModel={model => {
+                    onRegenerate?.(msg, model)
+                  }}
+                  isLoading={isRegenerating}
+                  trigger={defaultButton}
+                  tooltipText={tooltipText}
+                  taskType={taskType}
+                />
+              )}
+              showReEdit={canShowReEdit(msg, isGroupChat, onReEdit)}
+              onReEditClick={onReEdit ? () => onReEdit(msg) : undefined}
+              showForward={!!selectedTaskDetail?.id && !!msg.subtaskId && !!onForwardClick}
+              onForwardClick={() => msg.subtaskId && onForwardClick?.(msg.subtaskId)}
+            />
+          )}
+        </>
+      )
+    }
+
+    const renderPlainMessage = (message: Message) => {
+      // Check if this is an external API params message
+      if (message.type === 'user' && message.content.includes('[EXTERNAL_API_PARAMS]')) {
+        const paramsMatch = message.content.match(
+          /\[EXTERNAL_API_PARAMS\]([\s\S]*?)\[\/EXTERNAL_API_PARAMS\]/
+        )
+        if (paramsMatch) {
+          try {
+            const params = JSON.parse(paramsMatch[1])
+            const remainingContent = message.content
+              .replace(/\[EXTERNAL_API_PARAMS\][\s\S]*?\[\/EXTERNAL_API_PARAMS\]\n?/, '')
+              .trim()
+
+            return (
+              <div className="space-y-3">
+                <div className="bg-base-secondary rounded-lg p-3 border border-border">
+                  <div className="text-xs font-semibold text-text-muted mb-2">
+                    📋 {t('messages.application_parameters') || '应用参数'}
+                  </div>
+                  <div className="space-y-2">
+                    {Object.entries(params).map(([key, value]) => (
+                      <div key={key} className="flex items-start gap-2">
+                        <span className="text-xs font-medium text-text-secondary min-w-[80px]">
+                          {key}:
+                        </span>
+                        <span className="text-xs text-text-primary flex-1 break-all">
+                          {String(value)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                {remainingContent && (
+                  <div className="chat-message-prompt text-sm break-all">{remainingContent}</div>
+                )}
+              </div>
+            )
+          } catch (e) {
+            console.error('Failed to parse EXTERNAL_API_PARAMS:', e)
+          }
+        }
+      }
+
+      // Check if this is a Markdown clarification answer (user message)
+      if (message.type === 'user' && message.content.includes('## 📝 我的回答')) {
+        const answerPayload: ClarificationAnswer[] = []
+        const questionRegex = /### ([A-Z_\d]+): (.*?)\n\*\*Answer\*\*: ([\s\S]*?)(?=\n###|$)/g
+        let match
+
+        while ((match = questionRegex.exec(message.content)) !== null) {
+          const questionId = match[1].toLowerCase()
+          const questionText = match[2].trim()
+          const answerContent = match[3].trim()
+
+          if (answerContent.startsWith('-')) {
+            const optionRegex = /- `([^`]+)` - (.*?)(?=\n-|$)/g
+            const values: string[] = []
+            const labels: string[] = []
+            let optMatch
+
+            while ((optMatch = optionRegex.exec(answerContent)) !== null) {
+              values.push(optMatch[1])
+              labels.push(optMatch[2].trim())
+            }
+
+            answerPayload.push({
+              question_id: questionId,
+              question_text: questionText,
+              answer_type: 'choice',
+              value: values,
+              selected_labels: labels,
+            })
+          } else if (answerContent.startsWith('`')) {
+            const singleMatch = answerContent.match(/`([^`]+)` - (.*)/)
+            if (singleMatch) {
+              answerPayload.push({
+                question_id: questionId,
+                question_text: questionText,
+                answer_type: 'choice',
+                value: singleMatch[1],
+                selected_labels: singleMatch[2].trim(),
+              })
+            }
+          } else {
+            answerPayload.push({
+              question_id: questionId,
+              question_text: questionText,
+              answer_type: 'custom',
+              value: answerContent,
+            })
+          }
+        }
+
+        if (answerPayload.length > 0) {
+          return (
+            <ClarificationAnswerSummary
+              data={{ type: 'clarification_answer', answers: answerPayload }}
+              rawContent={message.content}
+            />
+          )
+        }
+      }
+
+      // Build content elements
+      const contentElements = (message.content?.split('\n') || []).map((line, idx) => {
+        if (line.startsWith('__PROMPT_TRUNCATED__:')) {
+          const lineMatch = line.match(/^__PROMPT_TRUNCATED__:(.*)::(.*)$/)
+          if (lineMatch) {
+            const shortPrompt = lineMatch[1]
+            const fullPrompt = lineMatch[2]
+            return (
+              <span
+                key={idx}
+                className="text-sm font-bold cursor-pointer underline decoration-dotted block"
+                title={fullPrompt}
+              >
+                {shortPrompt}
+              </span>
+            )
+          }
+        }
+
+        const progressMatch = line.match(/__PROGRESS_BAR__:(.*?):(\d+)/)
+        if (progressMatch) {
+          const status = progressMatch[1]
+          const progress = parseInt(progressMatch[2], 10) || 0
+          return <React.Fragment key={idx}>{renderProgressBar(status, progress)}</React.Fragment>
+        }
+
+        // Use SmartTextLine to detect and render URLs (images and links) in plain text
+        // Pass disabled={isStreaming} to avoid metadata fetching during streaming
+        return <SmartTextLine key={idx} text={line} disabled={isStreaming} />
+      })
+
+      return contentElements
+    }
+    const renderAiMessage = (message: Message) => {
+      const content = message.content ?? ''
+
+      // Video rendering is now handled by MixedContentView via video blocks
+      // The old result.video and result.progress logic has been removed
+      // in favor of the unified block-based rendering system
+
+      if (finalPromptData) {
+        return (
+          <FinalPromptMessage
+            data={finalPromptData}
+            selectedTeam={selectedTeam}
+            selectedRepo={selectedRepo}
+            selectedBranch={selectedBranch}
+            taskId={selectedTaskDetail?.id}
+            subtaskId={msg.subtaskId}
+            isPendingConfirmation={isPendingConfirmation}
+            onStageConfirmed={onPipelineStageConfirmed}
+            onForwardClick={onForwardClick}
+            isMessageStreaming={isStreaming || message.status === 'streaming'}
+          />
+        )
+      }
+
+      if (!content.includes('${$$}$')) {
+        // Render AI message as markdown by default
+        return renderMarkdownResult(content)
+      }
+
+      const [prompt, result] = content.split('${$$}$')
+      return (
+        <>
+          {prompt && (
+            <div className="chat-message-prompt text-sm whitespace-pre-line mb-2">{prompt}</div>
+          )}
+          {result && renderMarkdownResult(result, prompt)}
+        </>
+      )
+    }
+
+    const renderMessageBody = (message: Message) =>
+      message.type === 'ai' ? renderAiMessage(message) : renderPlainMessage(message)
+
+    // Render recovered content notice
+    const renderRecoveryNotice = () => {
+      if (!msg.isRecovered) return null
+
+      return (
+        <div className="bg-muted border-l-4 border-primary p-3 mt-2 rounded-r-lg">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-text-primary">
+                {msg.isIncomplete
+                  ? t('messages.content_incomplete') || '回答未完成'
+                  : t('messages.content_recovered') || '已恢复内容'}
+              </p>
+              <p className="text-xs text-text-muted mt-1">
+                {msg.isIncomplete
+                  ? t('messages.content_incomplete_desc') || '连接已断开，这是生成的部分内容'
+                  : t('messages.content_recovered_desc') || '页面刷新后已恢复之前的内容'}
+              </p>
+            </div>
+          </div>
+        </div>
+      )
+    }
+
+    // Handle text selection in AI messages
+    const handleTextSelection = () => {
+      if (!onTextSelect || isUserTypeMessage) return
+
+      const selection = window.getSelection()
+      if (selection && selection.toString().trim()) {
+        const selectedText = selection.toString().trim()
+        onTextSelect(selectedText)
+      }
+    }
+
+    // When editing, expand to full width for better editing experience
+    const containerWidthClass = isEditing
+      ? 'w-full'
+      : shouldAlignRight
+        ? 'max-w-[75%] w-auto'
+        : isUserTypeMessage
+          ? 'max-w-[75%] w-auto'
+          : 'w-full'
+
+    return (
+      <ShareTokenProvider shareToken={shareToken}>
+        <div
+          className={`flex ${isEditing ? 'justify-start' : shouldAlignRight ? 'justify-end' : 'justify-start'}`}
+          translate="no"
+        >
+          <div
+            className={`flex ${containerWidthClass} flex-col ${isEditing ? 'items-start' : shouldAlignRight ? 'items-end' : 'items-start'}`}
+          >
+            <div
+              className={`${bubbleBaseClasses} ${bubbleTypeClasses}`}
+              onMouseUp={handleTextSelection}
+              data-message-content="true"
+            >
+              {/* Show header for AI messages */}
+              {!isUserTypeMessage && (
+                <div className="flex items-center gap-2 mb-2 text-xs opacity-80">
+                  {headerIcon}
+                  <span className="font-semibold">{headerLabel}</span>
+                  {timestampLabel && <span>{timestampLabel}</span>}
+                  {msg.isRecovered && (
+                    <span className="text-primary text-xs">
+                      ({t('messages.recovered') || '已恢复'})
+                    </span>
+                  )}
+                </div>
+              )}
+              {/* Show reasoning display for DeepSeek R1 and similar models */}
+              {!isUserTypeMessage && displayReasoningContent && (
+                <ReasoningDisplay
+                  reasoningContent={displayReasoningContent}
+                  isStreaming={isDisplayReasoningStreaming}
+                />
+              )}
+              {/* Show tool blocks from thinking unless block rendering already includes tools */}
+              {!isUserTypeMessage &&
+                msg.thinking &&
+                msg.thinking.length > 0 &&
+                (!msg.result?.blocks || msg.result.blocks.length === 0 || hasThinkingToolSteps) &&
+                !hasToolBlocks && (
+                  <ThinkingDisplay
+                    thinking={msg.thinking}
+                    taskStatus={msg.subtaskStatus}
+                    shellType={msg.result?.shell_type}
+                  />
+                )}
+              {/* Show header for other users' messages in group chat (left-aligned user messages) */}
+              {isUserTypeMessage && !shouldAlignRight && msg.shouldShowSender && (
+                <div className="flex items-center gap-2 mb-2 text-xs opacity-80">
+                  <User className="w-4 h-4" />
+                  <span className="font-semibold">{msg.senderUserName || 'Unknown User'}</span>
+                  {timestampLabel && <span>{timestampLabel}</span>}
+                </div>
+              )}
+              {/* Show contexts (attachments, knowledge bases, etc.) for both user and AI messages */}
+              {/* For AI messages with image/video blocks, filter out attachments to avoid duplicate display */}
+              <ContextBadgeList
+                contexts={(() => {
+                  if (!msg.contexts) return undefined
+                  // For AI messages, check if there are image/video blocks in result.blocks
+                  // If so, filter out attachments that are already displayed in ImageGallery/VideoPlayer
+                  if (!isUserTypeMessage && msg.result?.blocks) {
+                    // Get all attachment IDs from image and video blocks
+                    const attachmentIdsInBlocks = new Set<number>()
+                    for (const block of msg.result.blocks) {
+                      // Handle image blocks
+                      if (block.type === 'image' && block.image_attachment_ids) {
+                        for (const id of block.image_attachment_ids) {
+                          if (id) attachmentIdsInBlocks.add(id)
+                        }
+                      }
+                      // Handle video blocks
+                      if (block.type === 'video' && block.video_attachment_id) {
+                        attachmentIdsInBlocks.add(block.video_attachment_id)
+                      }
+                    }
+                    // If there are attachment IDs in blocks, filter them out from contexts
+                    if (attachmentIdsInBlocks.size > 0) {
+                      const filteredContexts = msg.contexts.filter(
+                        ctx => !attachmentIdsInBlocks.has(ctx.id)
+                      )
+                      return filteredContexts.length > 0 ? filteredContexts : undefined
+                    }
+                  }
+                  return msg.contexts
+                })()}
+                shareToken={shareToken}
+                displayGeneratedMedia={!isUserTypeMessage}
+              />
+              {/* Show waiting indicator when streaming but no content yet */}
+              {isWaiting || msg.isWaiting ? (
+                isUsingReasoningWaitDisplay ? null : (
+                  <StreamingWaitIndicator isWaiting={true} message={waitingMessage} />
+                )
+              ) : isEditing && isUserTypeMessage && onEditSave && onEditCancel ? (
+                /* Show inline edit component when editing a user message */
+                <InlineMessageEdit
+                  initialContent={msg.content}
+                  onSave={onEditSave}
+                  onCancel={onEditCancel}
+                />
+              ) : (
+                <>
+                  {/* A strict final-prompt heading takes precedence over generic text blocks. */}
+                  {!isUserTypeMessage && finalPromptData ? (
+                    <>{renderMessageBody(msg)}</>
+                  ) : !isUserTypeMessage && msg.result?.blocks && mixedContentBlocks.length > 0 ? (
+                    <>
+                      <MixedContentView
+                        thinking={msg.thinking ?? null}
+                        content={msg.recoveredContent || msg.content || ''}
+                        taskStatus={msg.subtaskStatus}
+                        theme={theme}
+                        blocks={mixedContentBlocks}
+                        annotations={msg.result?.annotations}
+                        processingMessage={waitingMessage}
+                        onUseAsReference={onUseAsReference}
+                        taskId={selectedTaskDetail?.id}
+                        subtaskId={msg.subtaskId}
+                        currentMessageIndex={index}
+                        onAskUserSubmit={onAskUserSubmit}
+                        onCardChatButtonClick={onSendMessage}
+                      />
+                      <SourceReferences
+                        sources={msg.sources || msg.result?.sources || []}
+                        retrievalSummary={msg.result?.retrieval_summary}
+                      />
+                      <GeminiAnnotations annotations={msg.result?.annotations || []} />
+                      {/* Hide BubbleTools during streaming */}
+                      {!isStreaming && (
+                        <BubbleTools
+                          contentToCopy={blockSaveableMarkdown}
+                          onCopySuccess={() => trace.copy(msg.type, msg.subtaskId)}
+                          showSaveToKnowledge={canSaveToKnowledge(
+                            msg,
+                            onSaveToKnowledge,
+                            blockSaveableMarkdown
+                          )}
+                          onSaveToKnowledge={onSaveToKnowledge}
+                          tools={[
+                            {
+                              key: 'download',
+                              title: t('messages.download') || 'Download',
+                              icon: <Download className="h-4 w-4 text-text-muted" />,
+                              onClick: () => {
+                                const blob = new Blob([blockSaveableMarkdown], {
+                                  type: 'text/plain;charset=utf-8',
+                                })
+                                const url = URL.createObjectURL(blob)
+                                const a = document.createElement('a')
+                                a.href = url
+                                a.download = 'message.md'
+                                a.click()
+                                URL.revokeObjectURL(url)
+                                trace.download(msg.type, msg.subtaskId)
+                              },
+                            },
+                          ]}
+                          feedback={feedback}
+                          onLike={handleLike}
+                          onDislike={handleDislike}
+                          feedbackLabels={{
+                            like: t('chat:messages.like') || 'Like',
+                            dislike: t('chat:messages.dislike') || 'Dislike',
+                          }}
+                          showRegenerate={(() => {
+                            const hasOnRegenerate = Boolean(onRegenerate)
+                            const isCompleted =
+                              msg.subtaskStatus === 'COMPLETED' ||
+                              msg.subtaskStatus === 'CANCELLED' ||
+                              msg.status === 'completed'
+                            const isNotRunning =
+                              msg.subtaskStatus !== 'RUNNING' &&
+                              msg.subtaskStatus !== 'PENDING' &&
+                              msg.subtaskStatus !== 'PROCESSING' &&
+                              msg.status !== 'streaming' &&
+                              msg.status !== 'pending'
+                            return (
+                              hasOnRegenerate &&
+                              !isGroupChat &&
+                              isLastAiMessage &&
+                              isCompleted &&
+                              isNotRunning
+                            )
+                          })()}
+                          onRegenerateClick={() => setIsRegeneratePopoverOpen(true)}
+                          isRegenerating={isRegenerating}
+                          renderRegenerateButton={(defaultButton, tooltipText) => (
+                            <RegenerateModelPopover
+                              open={isRegeneratePopoverOpen}
+                              onOpenChange={setIsRegeneratePopoverOpen}
+                              selectedTeam={selectedTeam ?? null}
+                              onSelectModel={model => {
+                                onRegenerate?.(msg, model)
+                              }}
+                              isLoading={isRegenerating}
+                              trigger={defaultButton}
+                              tooltipText={tooltipText}
+                              taskType={taskType}
+                            />
+                          )}
+                          showReEdit={canShowReEdit(msg, isGroupChat, onReEdit)}
+                          onReEditClick={onReEdit ? () => onReEdit(msg) : undefined}
+                          showForward={
+                            !!selectedTaskDetail?.id && !!msg.subtaskId && !!onForwardClick
+                          }
+                          onForwardClick={() => msg.subtaskId && onForwardClick?.(msg.subtaskId)}
+                        />
+                      )}
+                    </>
+                  ) : (
+                    <>{renderMessageBody(msg)}</>
+                  )}
+                </>
+              )}
+              {/* Show incomplete notice for completed but incomplete messages */}
+              {msg.isIncomplete && msg.subtaskStatus !== 'RUNNING' && renderRecoveryNotice()}
+
+              {/* Show error card for failed messages */}
+              {!isUserTypeMessage && msg.status === 'error' && msg.error && (
+                <div className="mt-4">
+                  <ErrorCard
+                    error={msg.error}
+                    errorType={msg.errorType}
+                    subtaskId={msg.subtaskId}
+                    taskId={selectedTaskDetail?.id}
+                    timestamp={msg.timestamp || Date.now()}
+                    message={msg}
+                    selectedTeam={selectedTeam}
+                    isLastErrorMessage={isLastAiMessage ?? false}
+                    onRetry={onRetry}
+                    onRetryWithModel={onRetryWithModel}
+                  />
+                </div>
+              )}
+
+              {/* Show copy button for user messages - visible on hover */}
+              {isUserTypeMessage && !isEditing && (
+                <div className="absolute -bottom-8 left-2 flex items-center gap-1 z-10 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                  <CopyButton
+                    content={msg.content}
+                    className="h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec"
+                    tooltip={t('chat:actions.copy') || 'Copy'}
+                    onCopySuccess={() => trace.copy(msg.type, msg.subtaskId)}
+                  />
+                  {/* Edit button - only show for non-group chat and when not streaming */}
+                  {!isGroupChat && !isStreaming && onEdit && (
+                    <EditButton
+                      onEdit={() => onEdit(msg)}
+                      className="h-[30px] w-[30px] !rounded-full bg-fill-tert hover:!bg-fill-sec"
+                      tooltip={t('chat:actions.edit') || 'Edit'}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </ShareTokenProvider>
+    )
+  },
+  (prevProps, nextProps) => {
+    // Custom comparison function for memo
+    // Only re-render if the message content or status changes
+    // Note: Compare thinking array length to detect updates (for executor tasks)
+    const prevThinkingLen = Array.isArray(prevProps.msg.thinking)
+      ? prevProps.msg.thinking.length
+      : 0
+    const nextThinkingLen = Array.isArray(nextProps.msg.thinking)
+      ? nextProps.msg.thinking.length
+      : 0
+
+    const prevSourcesLen =
+      prevProps.msg.sources?.length || prevProps.msg.result?.sources?.length || 0
+    const nextSourcesLen =
+      nextProps.msg.sources?.length || nextProps.msg.result?.sources?.length || 0
+
+    // Compare reasoning content length for streaming updates
+    const prevReasoningLen =
+      prevProps.msg.reasoningContent?.length || prevProps.msg.result?.reasoning_content?.length || 0
+    const nextReasoningLen =
+      nextProps.msg.reasoningContent?.length || nextProps.msg.result?.reasoning_content?.length || 0
+
+    // Compare blocks array length for mixed content rendering
+    const prevBlocksLen = prevProps.msg.result?.blocks?.length || 0
+    const nextBlocksLen = nextProps.msg.result?.blocks?.length || 0
+
+    // CRITICAL FIX: Compare blocks content hash (id + status + has_output)
+    // Comparing only length is not enough - we need to detect when block status/content changes
+    const prevBlocksHash = getBlockRenderHash(prevProps.msg.result?.blocks)
+    const nextBlocksHash = getBlockRenderHash(nextProps.msg.result?.blocks)
+
+    const shouldSkipRender =
+      prevProps.msg.content === nextProps.msg.content &&
+      prevProps.msg.botName === nextProps.msg.botName &&
+      prevProps.msg.subtaskStatus === nextProps.msg.subtaskStatus &&
+      prevProps.msg.subtaskId === nextProps.msg.subtaskId &&
+      prevProps.msg.timestamp === nextProps.msg.timestamp &&
+      prevProps.msg.recoveredContent === nextProps.msg.recoveredContent &&
+      prevProps.msg.isRecovered === nextProps.msg.isRecovered &&
+      prevProps.msg.isIncomplete === nextProps.msg.isIncomplete &&
+      prevProps.msg.isWaiting === nextProps.msg.isWaiting &&
+      prevProps.msg.result === nextProps.msg.result &&
+      prevProps.isWaiting === nextProps.isWaiting &&
+      prevProps.waitingMessage === nextProps.waitingMessage &&
+      prevProps.theme === nextProps.theme &&
+      prevProps.onTextSelect === nextProps.onTextSelect &&
+      prevProps.onAskUserSubmit === nextProps.onAskUserSubmit &&
+      prevProps.paragraphAction === nextProps.paragraphAction &&
+      prevProps.isCurrentUserMessage === nextProps.isCurrentUserMessage &&
+      prevProps.onRetry === nextProps.onRetry &&
+      prevThinkingLen === nextThinkingLen &&
+      prevSourcesLen === nextSourcesLen &&
+      prevReasoningLen === nextReasoningLen &&
+      prevBlocksLen === nextBlocksLen &&
+      prevBlocksHash === nextBlocksHash && // CRITICAL: Compare block content changes
+      prevProps.msg.status === nextProps.msg.status &&
+      prevProps.msg.error === nextProps.msg.error &&
+      prevProps.msg.errorType === nextProps.msg.errorType &&
+      prevProps.isPendingConfirmation === nextProps.isPendingConfirmation &&
+      prevProps.isEditing === nextProps.isEditing &&
+      prevProps.isLastAiMessage === nextProps.isLastAiMessage &&
+      prevProps.isRegenerating === nextProps.isRegenerating &&
+      prevProps.onUseAsReference === nextProps.onUseAsReference &&
+      prevProps.onRetryWithModel === nextProps.onRetryWithModel &&
+      prevProps.onReEdit === nextProps.onReEdit &&
+      Boolean(prevProps.onSaveToKnowledge) === Boolean(nextProps.onSaveToKnowledge) &&
+      prevProps.taskType === nextProps.taskType &&
+      prevProps.selectedTeam?.name === nextProps.selectedTeam?.name &&
+      prevProps.selectedTeam?.displayName === nextProps.selectedTeam?.displayName &&
+      (prevProps.selectedTeam?.bots?.length ?? 0) === (nextProps.selectedTeam?.bots?.length ?? 0)
+
+    return shouldSkipRender
+  }
+)
+
+export default MessageBubble

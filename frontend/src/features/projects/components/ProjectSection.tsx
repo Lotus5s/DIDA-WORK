@@ -1,0 +1,544 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { useState, useCallback, useEffect } from 'react'
+import { useRouter } from 'next/navigation'
+import {
+  ChevronDown,
+  ChevronUp,
+  ChevronRight,
+  FolderPlus,
+  MoreHorizontal,
+  Pencil,
+  Trash2,
+  FolderOpen,
+  Folder,
+  FolderKanban,
+  SquarePen,
+  Search,
+} from 'lucide-react'
+import { useTranslation } from '@/hooks/useTranslation'
+import { useProjectContext } from '../contexts/projectContext'
+import { ProjectCreateDialog } from './ProjectCreateDialog'
+import { ProjectEditDialog } from './ProjectEditDialog'
+import { ProjectDeleteDialog } from './ProjectDeleteDialog'
+import { DroppableProject } from './DroppableProject'
+import { DraggableProjectTask } from './DraggableProjectTask'
+import { ProjectTaskMenu } from './ProjectTaskMenu'
+import { ProjectWithTasks, ProjectTask } from '@/types/api'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown'
+import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
+import { paths } from '@/config/paths'
+import { useTaskSession } from '@/features/tasks/session/TaskSession'
+import SearchDialog from '@/features/tasks/components/sidebar/SearchDialog'
+import { TaskInlineRename } from '@/components/common/TaskInlineRename'
+import { taskApis } from '@/apis/tasks'
+import { canImportOrdinaryTaskToProject, isWorkspaceProject } from '../utils/projectClassification'
+
+interface ProjectSectionProps {
+  onTaskSelect?: () => void
+}
+
+export function ProjectSection({ onTaskSelect }: ProjectSectionProps) {
+  const { t } = useTranslation('projects')
+  const router = useRouter()
+  const {
+    projects,
+    isLoading,
+    expandedProjects,
+    toggleProjectExpanded,
+    selectedProjectTaskId,
+    selectedProjectTask,
+    setSelectedProjectTaskId,
+    refreshProjects,
+    isProjectSectionCollapsed,
+    setProjectSectionCollapsed,
+    projectTaskPages,
+    loadProjectTasks,
+  } = useProjectContext()
+  const { selectTask } = useTaskSession()
+
+  useEffect(() => {
+    if (isProjectSectionCollapsed || isLoading) return
+    for (const project of projects) {
+      const page = projectTaskPages[project.id]
+      if (expandedProjects.has(project.id) && !page?.loaded && !page?.loading && !page?.error) {
+        void loadProjectTasks(project.id)
+      }
+    }
+  }, [
+    projects,
+    expandedProjects,
+    projectTaskPages,
+    loadProjectTasks,
+    isProjectSectionCollapsed,
+    isLoading,
+  ])
+
+  const handleNewConversation = useCallback(
+    (project: ProjectWithTasks) => {
+      setSelectedProjectTaskId(null)
+      selectTask(null)
+
+      const params = new URLSearchParams()
+      if (isWorkspaceProject(project)) {
+        params.set('projectId', String(project.id))
+        const deviceId = project.config?.execution?.deviceId
+        if (deviceId) {
+          params.set('deviceId', deviceId)
+        }
+        router.push(`/devices/chat?${params.toString()}`)
+      } else {
+        params.set('conversationGroupId', String(project.id))
+        router.push(`${paths.chat.getHref()}?${params.toString()}`)
+      }
+      onTaskSelect?.()
+    },
+    [setSelectedProjectTaskId, selectTask, router, onTaskSelect]
+  )
+  // Dialog states
+  const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [createDialogMode, setCreateDialogMode] = useState<'group' | 'workspace'>('workspace')
+  const [editDialogOpen, setEditDialogOpen] = useState(false)
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
+  const [selectedProject, setSelectedProject] = useState<ProjectWithTasks | null>(null)
+  const [searchProjectId, setSearchProjectId] = useState<number | null>(null)
+  const searchProject = projects.find(project => project.id === searchProjectId)
+  const loadSearchProjectTasks = useCallback(
+    (loadMore: boolean = false) =>
+      searchProjectId === null ? Promise.resolve() : loadProjectTasks(searchProjectId, loadMore),
+    [searchProjectId, loadProjectTasks]
+  )
+
+  const sectionTitle = t('workspaceSection.title')
+
+  const handleOpenCreateDialog = (mode: 'group' | 'workspace') => {
+    setCreateDialogMode(mode)
+    setCreateDialogOpen(true)
+  }
+
+  const handleEditProject = (project: ProjectWithTasks) => {
+    setSelectedProject(project)
+    setEditDialogOpen(true)
+  }
+
+  const handleDeleteProject = (project: ProjectWithTasks) => {
+    setSelectedProject(project)
+    setDeleteDialogOpen(true)
+  }
+
+  // Handle task click - navigate to the task
+  const handleTaskClick = (projectTask: ProjectTask, project: ProjectWithTasks) => {
+    // Set project task as selected (for project section highlight)
+    setSelectedProjectTaskId(projectTask.task_id)
+
+    const params = new URLSearchParams()
+    params.set('taskId', String(projectTask.task_id))
+
+    if (isWorkspaceProject(project)) {
+      // Workspace tasks go directly to /devices/chat with projectId + deviceId
+      params.set('projectId', String(project.id))
+      const deviceId = project.config?.execution?.deviceId
+      if (deviceId) {
+        params.set('deviceId', deviceId)
+      }
+      router.push(`/devices/chat?${params.toString()}`)
+    } else if (projectTask.device_id) {
+      // Grouped device conversations must stay on the device chat page.
+      router.push(`/devices/chat?${params.toString()}`)
+    } else {
+      router.push(`${paths.chat.getHref()}?${params.toString()}`)
+    }
+
+    onTaskSelect?.()
+  }
+
+  return (
+    <div className="mb-0">
+      {/* Section Header */}
+      <div
+        className="group flex h-6 items-center justify-between rounded-md px-1 text-xs font-medium text-text-muted hover:bg-[rgb(238,238,238)] hover:text-text-primary dark:hover:bg-white/10 transition-colors"
+        data-testid="project-section-header"
+      >
+        <button
+          type="button"
+          data-testid="project-section-toggle"
+          onClick={() => setProjectSectionCollapsed(previous => !previous)}
+          aria-expanded={!isProjectSectionCollapsed}
+          className="flex h-full min-w-0 flex-1 items-center justify-between"
+        >
+          <span className="truncate">{sectionTitle}</span>
+          {isProjectSectionCollapsed ? (
+            <ChevronDown className="h-3.5 w-3.5 flex-shrink-0" />
+          ) : (
+            <ChevronUp className="h-3.5 w-3.5 flex-shrink-0" />
+          )}
+        </button>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              data-testid="create-workspace-project-button"
+              variant="ghost"
+              size="sm"
+              className="ml-1 h-5 w-5 p-0 text-text-muted hover:text-text-primary transition-colors rounded"
+              title={t('createMenu.title')}
+              aria-label={t('createMenu.title')}
+            >
+              <FolderPlus className="w-3.5 h-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-36">
+            <DropdownMenuItem
+              data-testid="create-group-button"
+              onClick={() => handleOpenCreateDialog('group')}
+            >
+              <Folder className="w-3.5 h-3.5 mr-2" />
+              {t('create.title')}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              data-testid="create-workspace-project-menu-item"
+              onClick={() => handleOpenCreateDialog('workspace')}
+            >
+              <FolderPlus className="w-3.5 h-3.5 mr-2" />
+              {t('workspaceCreate.title')}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+
+      {/* Project List */}
+      {!isProjectSectionCollapsed && (
+        <div className="mt-1 space-y-0.5" data-testid="project-section-list">
+          {isLoading ? (
+            <div className="px-4 py-2 text-xs text-text-muted">{t('common:loading')}</div>
+          ) : projects.length === 0 ? (
+            <div className="px-4 py-2 text-xs text-text-muted">{t('workspaceSection.empty')}</div>
+          ) : (
+            projects.map(project => (
+              <DroppableProject
+                key={project.id}
+                projectId={project.id}
+                disabled={!canImportOrdinaryTaskToProject(project)}
+              >
+                <ProjectItem
+                  project={project}
+                  isExpanded={expandedProjects.has(project.id)}
+                  onToggleExpand={() => toggleProjectExpanded(project.id)}
+                  onEdit={() => handleEditProject(project)}
+                  onDelete={() => handleDeleteProject(project)}
+                  onSearch={() => setSearchProjectId(project.id)}
+                  onTaskClick={handleTaskClick}
+                  selectedProjectTaskId={selectedProjectTaskId}
+                  selectedTask={
+                    selectedProjectTask?.project_id === project.id ? selectedProjectTask : null
+                  }
+                  onRefreshProjects={refreshProjects}
+                  isWorkspace={isWorkspaceProject(project)}
+                  onNewConversation={handleNewConversation}
+                  taskPage={projectTaskPages[project.id]}
+                  onLoadTasks={() => {
+                    void loadProjectTasks(project.id, Boolean(projectTaskPages[project.id]?.loaded))
+                  }}
+                />
+              </DroppableProject>
+            ))
+          )}
+        </div>
+      )}
+
+      {/* Dialogs */}
+      <ProjectCreateDialog
+        open={createDialogOpen}
+        onOpenChange={setCreateDialogOpen}
+        mode={createDialogMode}
+      />
+      <ProjectEditDialog
+        open={editDialogOpen}
+        onOpenChange={setEditDialogOpen}
+        project={selectedProject}
+      />
+      <ProjectDeleteDialog
+        open={deleteDialogOpen}
+        onOpenChange={setDeleteDialogOpen}
+        project={selectedProject}
+      />
+      {searchProject && (
+        <SearchDialog
+          open
+          onOpenChange={open => {
+            if (!open) setSearchProjectId(null)
+          }}
+          projectId={searchProject.id}
+          projectName={searchProject.name}
+          projectTaskList={{
+            tasks: searchProject.tasks,
+            page: projectTaskPages[searchProject.id],
+            loadTasks: loadSearchProjectTasks,
+          }}
+          onProjectTaskSelect={task => handleTaskClick(task, searchProject)}
+        />
+      )}
+    </div>
+  )
+}
+
+interface ProjectItemProps {
+  project: ProjectWithTasks
+  isExpanded: boolean
+  onToggleExpand: () => void
+  onEdit: () => void
+  onDelete: () => void
+  onSearch: () => void
+  onTaskClick: (projectTask: ProjectTask, project: ProjectWithTasks) => void
+  selectedProjectTaskId: number | null
+  selectedTask: ProjectTask | null
+  onRefreshProjects: () => Promise<void>
+  isWorkspace?: boolean
+  onNewConversation?: (project: ProjectWithTasks) => void
+  taskPage?: { loading: boolean; loaded: boolean; hasMore: boolean; error?: string }
+  onLoadTasks: () => void
+}
+
+function ProjectItem({
+  project,
+  isExpanded,
+  onToggleExpand,
+  onEdit,
+  onDelete,
+  onSearch,
+  onTaskClick,
+  selectedProjectTaskId,
+  selectedTask,
+  onRefreshProjects,
+  isWorkspace,
+  onNewConversation,
+  taskPage,
+  onLoadTasks,
+}: ProjectItemProps) {
+  const { t } = useTranslation('projects')
+  const taskCount = project.task_count
+  const visibleTasks =
+    selectedTask && !project.tasks.some(task => task.task_id === selectedTask.task_id)
+      ? [selectedTask, ...project.tasks]
+      : project.tasks
+
+  // Track which task is being renamed
+  const [editingTaskId, setEditingTaskId] = useState<number | null>(null)
+
+  // Handle double-click to start renaming
+  const handleDoubleClick = useCallback((e: React.MouseEvent, taskId: number) => {
+    e.stopPropagation()
+    e.preventDefault()
+    setEditingTaskId(taskId)
+  }, [])
+
+  // Handle rename save
+  const handleRenameSave = useCallback(
+    async (taskId: number, newTitle: string) => {
+      await taskApis.updateTask(taskId, { title: newTitle })
+      // Refresh projects to update task_title
+      await onRefreshProjects()
+    },
+    [onRefreshProjects]
+  )
+
+  return (
+    <div className="group">
+      {/* Project Header */}
+      <div
+        className={cn(
+          'flex items-center gap-1 px-2 py-1.5 rounded-md cursor-pointer',
+          'hover:bg-surface transition-colors'
+        )}
+      >
+        {/* Expand/Collapse Button */}
+        <button
+          onClick={onToggleExpand}
+          className="flex items-center justify-center w-5 h-5 text-text-secondary hover:text-text-primary"
+          data-testid={`project-item-toggle-${project.id}`}
+          aria-label={project.name}
+        >
+          {isExpanded ? (
+            <ChevronDown className="w-3.5 h-3.5" />
+          ) : (
+            <ChevronRight className="w-3.5 h-3.5" />
+          )}
+        </button>
+
+        {/* Project/group icon */}
+        <div
+          className="flex items-center justify-center w-5 h-5"
+          style={{ color: project.color || 'var(--color-text-secondary)' }}
+        >
+          {isWorkspace ? (
+            <FolderKanban className="w-4 h-4" data-testid="workspace-project-icon" />
+          ) : isExpanded ? (
+            <FolderOpen className="w-4 h-4" data-testid="conversation-group-icon" />
+          ) : (
+            <Folder className="w-4 h-4" data-testid="conversation-group-icon" />
+          )}
+        </div>
+
+        {/* Project Name */}
+        <span className="flex-1 text-sm text-text-primary truncate" onClick={onToggleExpand}>
+          {project.name}
+        </span>
+
+        {/* Actions Menu */}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 w-5 p-0 opacity-0 group-hover:opacity-100 transition-opacity text-text-muted hover:text-text-primary"
+              data-testid={`project-actions-menu-btn-${project.id}`}
+              aria-label={t('actions.menu')}
+            >
+              <MoreHorizontal className="w-3.5 h-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-32">
+            <DropdownMenuItem
+              data-testid={`project-search-tasks-${project.id}`}
+              onClick={onSearch}
+              className="min-h-11 lg:min-h-8"
+            >
+              <Search className="w-3.5 h-3.5 mr-2" />
+              {t('actions.searchTasks')}
+            </DropdownMenuItem>
+            {onNewConversation && (
+              <DropdownMenuItem
+                data-testid="project-menu-new-conversation-btn"
+                onClick={() => onNewConversation(project)}
+              >
+                <SquarePen className="w-3.5 h-3.5 mr-2" />
+                {t('workspace.newConversation')}
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem onClick={onEdit}>
+              <Pencil className="w-3.5 h-3.5 mr-2" />
+              {t('actions.edit')}
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={onDelete} className="text-destructive">
+              <Trash2 className="w-3.5 h-3.5 mr-2" />
+              {t('actions.delete')}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        {/* New conversation button (on hover) */}
+        {onNewConversation && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className={cn(
+              'h-5 w-5 p-0 transition-opacity text-text-muted hover:text-text-primary',
+              isExpanded || taskCount === 0 ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+            )}
+            onClick={e => {
+              e.stopPropagation()
+              onNewConversation(project)
+            }}
+            title={t('workspace.newConversation')}
+            aria-label={t('workspace.newConversation')}
+            data-testid="project-new-conversation-btn"
+          >
+            <SquarePen className="w-3.5 h-3.5" />
+          </Button>
+        )}
+      </div>
+
+      {/* Task List (when expanded) */}
+      {isExpanded && (
+        <div className="ml-6 space-y-0.5">
+          {visibleTasks.map(projectTask => {
+            const isSelected = selectedProjectTaskId === projectTask.task_id
+            const isEditing = editingTaskId === projectTask.task_id
+            return (
+              <DraggableProjectTask
+                key={projectTask.task_id}
+                projectId={project.id}
+                projectTask={projectTask}
+              >
+                <div
+                  onClick={() => {
+                    // Don't navigate when editing
+                    if (!isEditing) {
+                      onTaskClick(projectTask, project)
+                    }
+                  }}
+                  className={cn(
+                    'group/task flex items-center gap-2 px-2 py-1 rounded-md cursor-pointer',
+                    'text-sm transition-colors',
+                    isSelected
+                      ? 'bg-primary/10 text-text-primary'
+                      : 'text-text-secondary hover:text-text-primary hover:bg-surface'
+                  )}
+                >
+                  {isEditing ? (
+                    <TaskInlineRename
+                      taskId={projectTask.task_id}
+                      initialTitle={projectTask.task_title || `Task #${projectTask.task_id}`}
+                      isEditing={true}
+                      onEditEnd={() => setEditingTaskId(null)}
+                      onSave={async (newTitle: string) => {
+                        await handleRenameSave(projectTask.task_id, newTitle)
+                      }}
+                    />
+                  ) : (
+                    <span
+                      className="flex-1 truncate"
+                      onDoubleClick={e => handleDoubleClick(e, projectTask.task_id)}
+                    >
+                      {projectTask.task_title || `Task #${projectTask.task_id}`}
+                    </span>
+                  )}
+                  <div className="opacity-0 group-hover/task:opacity-100 transition-opacity">
+                    <ProjectTaskMenu
+                      taskId={projectTask.task_id}
+                      projectId={project.id}
+                      onRename={() => setEditingTaskId(projectTask.task_id)}
+                      isWorkspace={isWorkspace}
+                    />
+                  </div>
+                </div>
+              </DraggableProjectTask>
+            )
+          })}
+          {(taskPage?.loading || taskPage?.error || taskPage?.hasMore) && (
+            <button
+              type="button"
+              data-testid={`project-tasks-load-more-${project.id}`}
+              onClick={onLoadTasks}
+              disabled={taskPage.loading}
+              className="flex h-11 min-w-[44px] w-full items-center gap-1 rounded-md px-2 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text-primary disabled:cursor-wait disabled:opacity-60 lg:h-8"
+            >
+              <ChevronDown className="h-3.5 w-3.5" />
+              {taskPage.loading
+                ? t('common:loading')
+                : taskPage.error
+                  ? t('section.retryTasks')
+                  : t('section.loadMore')}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Empty State (when expanded but no tasks) */}
+      {isExpanded && taskCount === 0 && !taskPage?.loading && !taskPage?.error && (
+        <div className="ml-6 px-2 py-1">
+          <span className="text-xs text-text-muted">{t('section.noTasks')}</span>
+        </div>
+      )}
+    </div>
+  )
+}

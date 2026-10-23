@@ -1,0 +1,141 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+from app.schemas.kind import KnowledgeBaseDefaultRef, SkillRefMeta
+from app.schemas.runner_routing import ExecutionPolicy, ModelPolicy, RunnerSelection
+from app.schemas.user import UserInDB
+
+
+class BotCreate(BaseModel):
+    """Bot creation model - request schema"""
+
+    name: str
+    shell_name: str  # Shell name (e.g., 'ClaudeCode', 'Agno', 'my-custom-shell')
+    agent_config: dict[str, Any]
+    system_prompt: Optional[str] = None
+    mcp_servers: Optional[dict[str, Any]] = None
+    plugins: Optional[List[dict[str, Any]]] = None
+    capability_mode: Optional[str] = None
+    execution_policy: ExecutionPolicy | None = None
+    model_policy: ModelPolicy | None = None
+    inherit_base_capabilities: bool = False
+    default_knowledge_base_refs: Optional[List[KnowledgeBaseDefaultRef]] = None
+    skills: Optional[List[str]] = None
+    skill_refs: Optional[Dict[str, SkillRefMeta]] = None
+    preload_skills: Optional[List[str]] = None  # Skills to preload into system prompt
+    preload_skill_refs: Optional[Dict[str, SkillRefMeta]] = None
+    target_group_names: List[str] = Field(default_factory=list, max_length=100)
+    namespace: Optional[str] = (
+        "default"  # Namespace for the bot (group name or 'default')
+    )
+    is_active: bool = True
+    secondary_model_name: Optional[str] = None
+    secondary_model_namespace: Optional[str] = "default"
+
+
+class BotUpdate(BaseModel):
+    """Bot update model - request schema"""
+
+    name: Optional[str] = None
+    shell_name: Optional[str] = (
+        None  # Shell name (e.g., 'ClaudeCode', 'Agno', 'my-custom-shell')
+    )
+    agent_config: Optional[dict[str, Any]] = None
+    system_prompt: Optional[str] = None
+    mcp_servers: Optional[dict[str, Any]] = None
+    plugins: Optional[List[dict[str, Any]]] = None
+    capability_mode: Optional[str] = None
+    execution_policy: ExecutionPolicy | None = None
+    model_policy: ModelPolicy | None = None
+    inherit_base_capabilities: Optional[bool] = None
+    default_knowledge_base_refs: Optional[List[KnowledgeBaseDefaultRef]] = None
+    skills: Optional[List[str]] = None
+    skill_refs: Optional[Dict[str, SkillRefMeta]] = None
+    preload_skills: Optional[List[str]] = None  # Skills to preload into system prompt
+    preload_skill_refs: Optional[Dict[str, SkillRefMeta]] = None
+    target_group_names: Optional[List[str]] = Field(default=None, max_length=100)
+    namespace: Optional[str] = None  # Namespace for the bot (group name or 'default')
+    is_active: Optional[bool] = None
+    secondary_model_name: Optional[str] = None
+    secondary_model_namespace: Optional[str] = None
+
+
+class BotInDB(BaseModel):
+    """Database bot model - response schema"""
+
+    id: int
+    user_id: int
+    name: str
+    namespace: Optional[str] = (
+        "default"  # Namespace for group bots (default: 'default')
+    )
+    shell_name: str  # Shell name (the name user selected, e.g., 'ClaudeCode', 'my-custom-shell')
+    shell_type: str  # Actual agent type (e.g., 'ClaudeCode', 'Agno', 'Dify')
+    agent_config: dict[str, Any]
+    system_prompt: Optional[str] = None
+    mcp_servers: Optional[dict[str, Any]] = None
+    plugins: Optional[List[dict[str, Any]]] = None
+    capability_mode: str = "manual"
+    execution_policy: ExecutionPolicy | None = None
+    model_policy: ModelPolicy | None = None
+    inherit_base_capabilities: bool = False
+    default_knowledge_base_refs: Optional[List[KnowledgeBaseDefaultRef]] = None
+    skills: Optional[List[str]] = None
+    skill_refs: Optional[Dict[str, SkillRefMeta]] = None
+    preload_skills: Optional[List[str]] = None  # Skills to preload into system prompt
+    preload_skill_refs: Optional[Dict[str, SkillRefMeta]] = None
+    is_active: bool = True
+    created_at: datetime
+    updated_at: datetime
+    secondary_model_name: Optional[str] = None
+    secondary_model_namespace: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class BotDetail(BaseModel):
+    """Detailed bot model with related entities"""
+
+    id: int
+    name: str
+    namespace: Optional[str] = (
+        "default"  # Namespace for group bots (default: 'default')
+    )
+    shell_name: str  # Shell name (the name user selected, e.g., 'ClaudeCode', 'my-custom-shell')
+    shell_type: str  # Actual agent type (e.g., 'ClaudeCode', 'Agno', 'Dify')
+    agent_config: dict[str, Any]
+    system_prompt: Optional[str] = None
+    mcp_servers: Optional[dict[str, Any]] = None
+    plugins: Optional[List[dict[str, Any]]] = None
+    capability_mode: str = "manual"
+    execution_policy: ExecutionPolicy | None = None
+    model_policy: ModelPolicy | None = None
+    inherit_base_capabilities: bool = False
+    default_knowledge_base_refs: Optional[List[KnowledgeBaseDefaultRef]] = None
+    skills: Optional[List[str]] = None
+    skill_refs: Optional[Dict[str, SkillRefMeta]] = None
+    preload_skills: Optional[List[str]] = None  # Skills to preload into system prompt
+    preload_skill_refs: Optional[Dict[str, SkillRefMeta]] = None
+    is_active: bool = True
+    created_at: datetime
+    updated_at: datetime
+    user: Optional[UserInDB] = None
+    secondary_model_name: Optional[str] = None
+    secondary_model_namespace: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class BotListResponse(BaseModel):
+    """Bot paginated response model"""
+
+    total: int
+    items: list[BotInDB]

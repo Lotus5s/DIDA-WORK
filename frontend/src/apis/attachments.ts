@@ -1,0 +1,846 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Attachment API client for file upload and management.
+ */
+
+import { getToken } from './user'
+import type { TruncationInfo } from '@/types/api'
+
+// API base URL - use relative path for browser compatibility
+const API_BASE_URL = ''
+
+/**
+ * Attachment status enum
+ */
+export type AttachmentStatus = 'uploading' | 'parsing' | 'ready' | 'failed'
+
+/**
+ * Attachment response from API
+ */
+export interface AttachmentResponse {
+  id: number
+  filename: string
+  file_size: number
+  mime_type: string
+  status: AttachmentStatus
+  text_length?: number | null
+  error_message?: string | null
+  error_code?: string | null
+  truncation_info?: TruncationInfo | null
+}
+
+/**
+ * Detailed attachment response
+ */
+export interface AttachmentDetailResponse extends AttachmentResponse {
+  subtask_id?: number | null
+  file_extension: string
+  created_at: string
+}
+
+/**
+ * Attachment preview response with extracted text snippet
+ */
+export interface AttachmentPreviewResponse extends AttachmentDetailResponse {
+  preview_type: 'text' | 'image' | 'html' | 'none'
+  preview_text?: string | null
+  download_url: string
+}
+
+export interface AttachmentPlaybackResponse {
+  playback_url: string
+  cover_url?: string | null
+}
+
+/**
+ * Public share link response
+ */
+export interface PublicShareLinkResponse {
+  share_url: string
+  expires_at: string
+}
+
+/**
+ * Error code to i18n key mapping
+ */
+const ERROR_CODE_MAPPING: Record<
+  string,
+  { titleKey: string; hintKey: string; hintParams?: Record<string, string | number> }
+> = {
+  unsupported_type: {
+    titleKey: 'attachment.errors.unsupported_type',
+    hintKey: 'attachment.errors.unsupported_type_hint',
+  },
+  unrecognized_type: {
+    titleKey: 'attachment.errors.unrecognized_type',
+    hintKey: 'attachment.errors.unrecognized_type_hint',
+  },
+  file_too_large: {
+    titleKey: 'attachment.errors.file_too_large',
+    hintKey: 'attachment.errors.file_too_large_hint',
+    hintParams: { size: 100 },
+  },
+  parse_failed: {
+    titleKey: 'attachment.errors.parse_failed',
+    hintKey: 'attachment.errors.parse_failed_hint',
+  },
+  encrypted_pdf: {
+    titleKey: 'attachment.errors.encrypted_pdf',
+    hintKey: 'attachment.errors.encrypted_pdf_hint',
+  },
+  legacy_doc: {
+    titleKey: 'attachment.errors.legacy_doc',
+    hintKey: 'attachment.errors.legacy_doc_hint',
+  },
+  legacy_ppt: {
+    titleKey: 'attachment.errors.legacy_ppt',
+    hintKey: 'attachment.errors.legacy_ppt_hint',
+  },
+  legacy_xls: {
+    titleKey: 'attachment.errors.legacy_xls',
+    hintKey: 'attachment.errors.legacy_xls_hint',
+  },
+}
+
+/**
+ * Get localized error message from error code
+ * @param errorCode - Backend error code
+ * @param t - i18n translation function
+ * @returns Localized error message or undefined
+ */
+export function getErrorMessageFromCode(
+  errorCode: string | null | undefined,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  t: (key: string, params?: Record<string, any>) => string
+): string | undefined {
+  if (!errorCode) return undefined
+
+  const mapping = ERROR_CODE_MAPPING[errorCode]
+  if (!mapping) return undefined
+
+  const title = t(mapping.titleKey)
+  const hint = t(mapping.hintKey, mapping.hintParams || { types: t('attachment.supported_types') })
+  return `${title}: ${hint}`
+}
+
+/**
+ * Known supported file extensions (for display purposes)
+ * Note: The backend also supports any text-based files via MIME detection
+ */
+export const SUPPORTED_EXTENSIONS = [
+  '.pdf',
+  '.doc',
+  '.docx',
+  '.ppt',
+  '.pptx',
+  '.xls',
+  '.xlsx',
+  '.csv',
+  '.xmind',
+  '.txt',
+  '.md',
+  '.html',
+  '.htm',
+  '.html5',
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.gif',
+  '.bmp',
+  '.webp',
+  '.tif',
+  '.tiff',
+  '.mp4',
+  '.mov',
+  '.avi',
+  '.webm',
+  '.mkv',
+  '.m4v',
+  '.mp3',
+  '.wav',
+  '.m4a',
+  '.aac',
+  '.ogg',
+  '.flac',
+]
+
+/**
+ * Common code file extensions (for icon display)
+ */
+export const CODE_FILE_EXTENSIONS = [
+  '.py',
+  '.js',
+  '.ts',
+  '.jsx',
+  '.tsx',
+  '.java',
+  '.c',
+  '.cpp',
+  '.h',
+  '.hpp',
+  '.cs',
+  '.go',
+  '.rs',
+  '.rb',
+  '.php',
+  '.swift',
+  '.kt',
+  '.scala',
+  '.lua',
+  '.r',
+  '.sql',
+  '.sh',
+  '.bash',
+  '.zsh',
+  '.ps1',
+  '.vue',
+  '.svelte',
+]
+
+/**
+ * Common config file extensions (for icon display)
+ */
+export const CONFIG_FILE_EXTENSIONS = [
+  '.json',
+  '.yaml',
+  '.yml',
+  '.xml',
+  '.toml',
+  '.ini',
+  '.conf',
+  '.cfg',
+  '.env',
+  '.properties',
+  '.dockerfile',
+  '.gitignore',
+  '.editorconfig',
+  '.eslintrc',
+  '.prettierrc',
+]
+
+/**
+ * Supported MIME types
+ */
+export const SUPPORTED_MIME_TYPES = [
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'text/csv',
+  'application/vnd.xmind.workbook',
+  'text/plain',
+  'text/markdown',
+  'text/html',
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/bmp',
+  'image/webp',
+]
+
+/**
+ * Maximum file size (100 MB).
+ *
+ * KB video uploads do NOT use this generic path — they go through the
+ * two-phase video-upload contract (VideoUploadProvider), whose size limit is
+ * governed by the configured object-storage provider. This cap only applies
+ * to generic attachment uploads (text/image/chat).
+ */
+export const MAX_FILE_SIZE = 100 * 1024 * 1024
+
+/**
+ * Check if a file extension is supported
+ * Note: Returns true for all extensions - backend will use MIME detection for unknown types
+ */
+export function isSupportedExtension(_filename: string): boolean {
+  // Allow all file types - the backend will validate using MIME detection
+  // for unknown extensions and return appropriate error messages
+  return true
+}
+
+/**
+ * Check if file size is within the generic 100 MB limit. KB video uploads
+ * bypass this (routed to the VideoUploadProvider contract).
+ */
+export function isValidFileSize(size: number): boolean {
+  return size <= MAX_FILE_SIZE
+}
+
+/**
+ * Get file extension from filename
+ */
+export function getFileExtension(filename: string): string {
+  return filename.toLowerCase().substring(filename.lastIndexOf('.'))
+}
+
+/**
+ * Format file size for display
+ */
+export function formatFileSize(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`
+  } else if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`
+  } else {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  }
+}
+
+/**
+ * Get file icon based on extension
+ */
+export function getFileIcon(extension: string): string {
+  const ext = extension.toLowerCase()
+  switch (ext) {
+    case '.pdf':
+      return '📄'
+    case '.doc':
+    case '.docx':
+      return '📝'
+    case '.ppt':
+    case '.pptx':
+      return '📊'
+    case '.xls':
+    case '.xlsx':
+    case '.csv':
+    case '.xmind':
+      return '📈'
+    case '.txt':
+    case '.md':
+      return '📃'
+    case '.jpg':
+    case '.jpeg':
+    case '.png':
+    case '.gif':
+    case '.bmp':
+    case '.webp':
+      return '🖼️'
+    case '.html':
+    case '.htm':
+    case '.html5':
+      return '🌐'
+    default:
+      // Check for code files
+      if (CODE_FILE_EXTENSIONS.includes(ext)) {
+        return '💻'
+      }
+      // Check for config files
+      if (CONFIG_FILE_EXTENSIONS.includes(ext)) {
+        return '⚙️'
+      }
+      // Default icon for other text files
+      return '📄'
+  }
+}
+
+/**
+ * Image file extensions
+ */
+export const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tif', '.tiff']
+
+/**
+ * Video file extensions supported for attachments / media analysis.
+ * Kept in sync with the backend ``_MULTIMODAL_VIDEO_EXTENSIONS`` so that
+ * isVideoFileName / upload gating / reanalyze all agree with the pipeline.
+ */
+export const VIDEO_EXTENSIONS = ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.webm', '.m4v']
+
+export const AUDIO_EXTENSIONS = ['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac']
+
+/**
+ * HTML file extensions
+ */
+export const HTML_EXTENSIONS = ['.html', '.htm', '.html5']
+
+/**
+ * Check if a file extension is an image type
+ */
+export function isImageExtension(extension: string): boolean {
+  const ext = extension.toLowerCase()
+  return IMAGE_EXTENSIONS.includes(ext)
+}
+
+/**
+ * Check if a file extension is a video type
+ */
+export function isVideoExtension(extension: string): boolean {
+  const ext = extension.startsWith('.') ? extension.toLowerCase() : `.${extension.toLowerCase()}`
+  return VIDEO_EXTENSIONS.includes(ext)
+}
+
+/**
+ * Check if a filename is a supported video file.
+ */
+export function isVideoFileName(filename: string): boolean {
+  const dotIndex = filename.lastIndexOf('.')
+  if (dotIndex < 0) return false
+  return isVideoExtension(filename.slice(dotIndex))
+}
+
+export function isAudioExtension(extension: string): boolean {
+  const ext = extension.startsWith('.') ? extension.toLowerCase() : `.${extension.toLowerCase()}`
+  return AUDIO_EXTENSIONS.includes(ext)
+}
+
+const FORMAT_TO_MIME: Record<string, string> = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  bmp: 'image/bmp',
+  webp: 'image/webp',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
+  mp4: 'video/mp4',
+  mov: 'video/quicktime',
+  avi: 'video/x-msvideo',
+  webm: 'video/webm',
+  mkv: 'video/x-matroska',
+  m4v: 'video/x-m4v',
+  flv: 'video/x-flv',
+  wmv: 'video/x-ms-wmv',
+  wav: 'audio/wav',
+  mp3: 'audio/mpeg',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  ogg: 'audio/ogg',
+  flac: 'audio/flac',
+}
+
+export function formatsToAcceptString(formats: string[] | undefined, fallback: string): string {
+  if (!formats?.length) return fallback
+  const acceptedTypes = formats.map(format => {
+    const normalized = format.toLowerCase().replace(/^\./, '')
+    return FORMAT_TO_MIME[normalized] ?? `.${normalized}`
+  })
+  return Array.from(new Set(acceptedTypes)).join(',')
+}
+
+/**
+ * Check if a file extension is an HTML type
+ */
+export function isHtmlExtension(extension: string): boolean {
+  const ext = extension.toLowerCase()
+  return HTML_EXTENSIONS.includes(ext)
+}
+
+/**
+ * Get image preview URL for an attachment
+ *
+ * @param attachmentId - Attachment ID
+ * @param shareToken - Optional share token for public access
+ * @returns Preview URL
+ */
+export function getAttachmentPreviewUrl(attachmentId: number, shareToken?: string): string {
+  const baseUrl = `${API_BASE_URL}/api/attachments/${attachmentId}/download`
+  if (shareToken) {
+    return `${baseUrl}?share_token=${encodeURIComponent(shareToken)}`
+  }
+  return baseUrl
+}
+
+/**
+ * Upload a file attachment
+ *
+ * @param file - File to upload
+ * @param onProgress - Optional progress callback (0-100)
+ * @returns Attachment response
+ */
+export async function uploadAttachment(
+  file: File,
+  onProgress?: (progress: number) => void,
+  storagePurpose: 'default' | 'video_reference' = 'default'
+): Promise<AttachmentResponse> {
+  const token = getToken()
+
+  // Validate file size before upload (generic 100 MB cap; KB video uploads
+  // go through the separate VideoUploadProvider contract, not this path).
+  if (!isValidFileSize(file.size)) {
+    throw new Error(`文件大小超过 ${MAX_FILE_SIZE / (1024 * 1024)} MB 限制`)
+  }
+
+  const formData = new FormData()
+  formData.append('file', file)
+
+  // Use XMLHttpRequest for progress tracking
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+
+    xhr.upload.addEventListener('progress', event => {
+      if (event.lengthComputable && onProgress) {
+        const progress = Math.round((event.loaded / event.total) * 100)
+        onProgress(progress)
+      }
+    })
+
+    xhr.addEventListener('load', () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const response = JSON.parse(xhr.responseText)
+          resolve(response)
+        } catch {
+          reject(new Error('Failed to parse response'))
+        }
+      } else {
+        try {
+          const error = JSON.parse(xhr.responseText)
+          // Handle error.detail that could be a string or an object
+          let errorMessage = 'Upload failed'
+          if (error.detail) {
+            if (typeof error.detail === 'string') {
+              errorMessage = error.detail
+            } else if (typeof error.detail === 'object' && error.detail.message) {
+              errorMessage = error.detail.message
+            }
+          }
+          reject(new Error(errorMessage))
+        } catch {
+          reject(new Error(`Upload failed: ${xhr.status}`))
+        }
+      }
+    })
+
+    xhr.addEventListener('error', () => {
+      reject(new Error('Network error during upload'))
+    })
+
+    xhr.addEventListener('abort', () => {
+      reject(new Error('Upload cancelled'))
+    })
+
+    const query = new URLSearchParams({ storage_purpose: storagePurpose })
+    xhr.open('POST', `${API_BASE_URL}/api/attachments/upload?${query.toString()}`)
+    if (token) {
+      xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    }
+    xhr.send(formData)
+  })
+}
+
+/**
+ * Get attachment details by ID
+ *
+ * @param attachmentId - Attachment ID
+ * @param shareToken - Optional share token for public access (no login required)
+ * @returns Attachment details
+ */
+export async function getAttachment(
+  attachmentId: number,
+  shareToken?: string
+): Promise<AttachmentDetailResponse> {
+  const token = getToken()
+  let url = `${API_BASE_URL}/api/attachments/${attachmentId}`
+
+  // Add share_token as query parameter if provided
+  if (shareToken) {
+    url += `?share_token=${encodeURIComponent(shareToken)}`
+  }
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      // Only include Authorization header if we have a token and no shareToken
+      // shareToken-based access doesn't require JWT authentication
+      ...(!shareToken && token && { Authorization: `Bearer ${token}` }),
+    },
+  })
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(error.detail || 'Failed to get attachment')
+  }
+
+  return response.json()
+}
+
+/**
+ * Get attachment preview by ID
+ *
+ * @param attachmentId - Attachment ID
+ * @param shareToken - Optional share token for public access (no login required)
+ * @returns Attachment preview details
+ */
+export async function getAttachmentPreview(
+  attachmentId: number,
+  shareToken?: string
+): Promise<AttachmentPreviewResponse> {
+  const token = getToken()
+  let url = `${API_BASE_URL}/api/attachments/${attachmentId}/preview`
+
+  // Add share_token as query parameter if provided
+  if (shareToken) {
+    url += `?share_token=${encodeURIComponent(shareToken)}`
+  }
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      // Only include Authorization header if we have a token and no shareToken
+      // shareToken-based access doesn't require JWT authentication
+      ...(!shareToken && token && { Authorization: `Bearer ${token}` }),
+    },
+  })
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(error.detail || 'Failed to get attachment preview')
+  }
+
+  return response.json()
+}
+
+/**
+ * Get attachment download URL
+ *
+ * @param attachmentId - Attachment ID
+ * @param shareToken - Optional share token for public access
+ * @returns Download URL
+ */
+export function getAttachmentDownloadUrl(attachmentId: number, shareToken?: string): string {
+  const baseUrl = `${API_BASE_URL}/api/attachments/${attachmentId}/download`
+  if (shareToken) {
+    return `${baseUrl}?share_token=${encodeURIComponent(shareToken)}`
+  }
+  return baseUrl
+}
+
+export async function createAttachmentDownloadUrl(attachmentId: number): Promise<string> {
+  const token = getToken()
+  if (!token) {
+    throw new Error('Authentication required')
+  }
+
+  const response = await fetch(`${API_BASE_URL}/api/attachments/${attachmentId}/download-token`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!response.ok) {
+    throw new Error(`Failed to create attachment download token (${response.status})`)
+  }
+
+  const data = await response.json()
+  if (!data.download_token || typeof data.download_token !== 'string') {
+    throw new Error('Invalid attachment download token response')
+  }
+  return `${getAttachmentDownloadUrl(attachmentId)}?download_token=${encodeURIComponent(data.download_token)}`
+}
+
+export async function getAttachmentPlayback(
+  attachmentId: number,
+  shareToken?: string
+): Promise<AttachmentPlaybackResponse> {
+  const token = getToken()
+  const query = shareToken ? `?share_token=${encodeURIComponent(shareToken)}` : ''
+  const response = await fetch(`${API_BASE_URL}/api/attachments/${attachmentId}/playback${query}`, {
+    method: 'GET',
+    headers: {
+      ...(!shareToken && token && { Authorization: `Bearer ${token}` }),
+    },
+  })
+  if (!response.ok) {
+    throw new Error(`Failed to resolve attachment playback (${response.status})`)
+  }
+
+  const data = await response.json()
+  if (!data.playback_url || typeof data.playback_url !== 'string') {
+    throw new Error('Invalid attachment playback response')
+  }
+  return data
+}
+
+interface FetchAttachmentFileOptions {
+  filename?: string
+  shareToken?: string
+  signal?: AbortSignal
+}
+
+function getAttachmentFilename(
+  response: Response,
+  attachmentId: number,
+  providedFilename?: string
+): string {
+  if (providedFilename) return providedFilename
+
+  const contentDisposition = response.headers.get('Content-Disposition')
+  if (contentDisposition) {
+    const rfc5987Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i)
+    if (rfc5987Match?.[1]) {
+      try {
+        return decodeURIComponent(rfc5987Match[1])
+      } catch {
+        return rfc5987Match[1]
+      }
+    }
+
+    const standardMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/i)
+    if (standardMatch?.[1]) {
+      return standardMatch[1].replace(/['"]/g, '')
+    }
+  }
+
+  return `attachment-${attachmentId}.file`
+}
+
+/**
+ * Fetch an attachment as a named File without triggering a browser download.
+ */
+export async function fetchAttachmentFile(
+  attachmentId: number,
+  options: FetchAttachmentFileOptions = {}
+): Promise<File> {
+  const token = getToken()
+  const response = await fetch(getAttachmentDownloadUrl(attachmentId, options.shareToken), {
+    method: 'GET',
+    headers: {
+      ...(!options.shareToken && token && { Authorization: `Bearer ${token}` }),
+    },
+    signal: options.signal,
+  })
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch attachment (${response.status})`)
+  }
+
+  const filename = getAttachmentFilename(response, attachmentId, options.filename)
+  const blob = await response.blob()
+  return new File([blob], filename, {
+    type: blob.type || response.headers.get('Content-Type') || 'application/octet-stream',
+  })
+}
+
+/**
+ * Download attachment file
+ *
+ * @param attachmentId - Attachment ID
+ * @param filename - Optional filename for download. If not provided, will be extracted from Content-Disposition header
+ * @param shareToken - Optional share token for public access (no login required)
+ */
+export async function downloadAttachment(
+  attachmentId: number,
+  filename?: string,
+  shareToken?: string
+): Promise<void> {
+  let downloadUrl = getAttachmentDownloadUrl(attachmentId, shareToken)
+
+  if (!shareToken) {
+    downloadUrl = await createAttachmentDownloadUrl(attachmentId)
+  }
+
+  const link = document.createElement('a')
+  link.href = downloadUrl
+  if (filename) {
+    link.download = filename
+  }
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+}
+
+/**
+ * Delete an attachment
+ *
+ * @param attachmentId - Attachment ID
+ */
+export async function deleteAttachment(attachmentId: number): Promise<void> {
+  const token = getToken()
+
+  const response = await fetch(`${API_BASE_URL}/api/attachments/${attachmentId}`, {
+    method: 'DELETE',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token && { Authorization: `Bearer ${token}` }),
+    },
+  })
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(error.detail || 'Failed to delete attachment')
+  }
+}
+
+/**
+ * Get attachment by subtask ID
+ *
+ * @param subtaskId - Subtask ID
+ * @returns Attachment details or null
+ */
+export async function getAttachmentBySubtask(
+  subtaskId: number
+): Promise<AttachmentDetailResponse | null> {
+  const token = getToken()
+
+  const response = await fetch(`${API_BASE_URL}/api/attachments/subtask/${subtaskId}`, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token && { Authorization: `Bearer ${token}` }),
+    },
+  })
+
+  if (!response.ok) {
+    if (response.status === 404) {
+      return null
+    }
+    const error = await response.json().catch(() => ({}))
+    throw new Error(error.detail || 'Failed to get attachment')
+  }
+
+  const data = await response.json()
+  return data || null
+}
+
+/**
+ * Create public share link for attachment
+ *
+ * @param attachmentId - Attachment ID
+ * @param expiresInDays - Link expiration time in days (1-30, default: 7)
+ * @returns Share URL and expiration time
+ */
+export async function createAttachmentShareLink(
+  attachmentId: number,
+  expiresInDays: number = 7
+): Promise<PublicShareLinkResponse> {
+  const token = getToken()
+
+  const response = await fetch(
+    `${API_BASE_URL}/api/attachments/${attachmentId}/public-share?expires_in_days=${expiresInDays}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token && { Authorization: `Bearer ${token}` }),
+      },
+    }
+  )
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(error.detail || 'Failed to create share link')
+  }
+
+  return response.json()
+}
+
+/**
+ * Attachment API exports
+ */
+export const attachmentApis = {
+  uploadAttachment,
+  getAttachment,
+  getAttachmentPreview,
+  getAttachmentDownloadUrl,
+  createAttachmentDownloadUrl,
+  getAttachmentPlayback,
+  downloadAttachment,
+  deleteAttachment,
+  getAttachmentBySubtask,
+  createAttachmentShareLink,
+}

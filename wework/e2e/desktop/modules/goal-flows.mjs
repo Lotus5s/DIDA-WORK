@@ -1,0 +1,1337 @@
+import { waitForNewTaskRow, waitForSnapshot } from './conversation-layout.mjs'
+
+import {
+  assertConversationTextNotDuplicated,
+  assertConversationTextOccurrences,
+  ensurePlanMode,
+  sendPrompt,
+} from './conversation-navigation.mjs'
+
+import { waitForBlankConversation } from './memory-tool-flows.mjs'
+
+import { ensureExperimentalFeaturesEnabled } from './preferences-automation-flows.mjs'
+
+import { snapshotHasAssistantActivity } from './response-protocol.mjs'
+
+import {
+  COMPOSER_READY_STABILITY_MS,
+  ACTIVE_WORKBENCH_SELECTOR,
+  CLOUD_PUBLIC_MODEL_NAME,
+  DEFAULT_MODEL_ID,
+  DEFAULT_MODEL_LABEL,
+  DEFAULT_STEP_TIMEOUT_MS,
+  GOAL_BUSY_COMPLETION_TEXT,
+  GOAL_BUSY_OBJECTIVE,
+  GOAL_BUSY_PLAN_PROMPT,
+  GOAL_BUSY_PLAN_TEXT,
+  GOAL_IDLE_COMPLETION_TEXT,
+  GOAL_IDLE_FOLLOW_UP_PROMPT,
+  GOAL_IDLE_FOLLOW_UP_TEXT,
+  GOAL_IDLE_INITIAL_TEXT,
+  GOAL_IDLE_CONTINUATION_TEXT,
+  GOAL_IDLE_PROMPT,
+  GOAL_SNAPSHOT_RECONCILIATION_PROMPT,
+  GOAL_SNAPSHOT_RECONCILIATION_TEXT,
+  GOAL_RESTART_COMPLETION_TEXT,
+  GOAL_RESTART_BLOCKER_COMPLETION_TEXT,
+  GOAL_RESTART_BLOCKER_INITIAL_TEXT,
+  GOAL_RESTART_BLOCKER_PROMPT,
+  GOAL_RESTART_INITIAL_TEXT,
+  GOAL_RESTART_PROMPT,
+  SUPERVISOR_COMPLETION_TEXT,
+  SUPERVISOR_CORRECTION,
+  SUPERVISOR_CORRECTION_COMPLETION_TEXT,
+  SUPERVISOR_PRINCIPLES,
+  SUPERVISOR_PROMPT,
+  WORKBENCH_READY_TIMEOUT_MS,
+  assert,
+  ensureModelOptionVisible,
+  processIsAlive,
+  readFile,
+  selectE2EModel,
+  sendPromptUntilScenarioRequest,
+  waitForExecutorRuntimeEvidence,
+  waitForLogPattern,
+  withTimeout,
+} from './shared.mjs'
+
+import { captureVerificationScreenshot, waitForWorkbenchDebugState } from './workspace-flows.mjs'
+
+const SUPERVISOR_MODEL_KEY = `public:${CLOUD_PUBLIC_MODEL_NAME}:default:0`
+
+async function verifyMissingGoalSnapshotReconciliation({ composerSelector, control }) {
+  control.setScenario('goal_snapshot_reconciliation')
+  const taskRowsBeforeGoal = new Set(
+    JSON.parse(await control.command('snapshot', 'body')).testIds.filter(testId =>
+      testId.startsWith('runtime-local-task-row-')
+    )
+  )
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  await selectE2EModel(control)
+  await control.command('click', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="add-context-button"]`)
+  await control.command('click', '[data-testid="set-goal-button"]')
+  await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    GOAL_SNAPSHOT_RECONCILIATION_PROMPT,
+    'goal_snapshot_reconciliation'
+  )
+  const goalTaskRowTestId = await waitForNewTaskRow(
+    control,
+    taskRowsBeforeGoal,
+    'WEWORK_DESKTOP_E2E_GOAL_SNAPSHOT_RECONCILIATION'
+  )
+  const goalTaskId = goalTaskRowTestId.replace('runtime-local-task-row-', '')
+  const goalDotTestId = `runtime-local-task-goal-dot-${goalTaskId}`
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes('goal-status-bar') &&
+      snapshot.testIds.includes(goalDotTestId) &&
+      snapshot.testIds.includes('pause-response-button'),
+    'The Goal snapshot reconciliation fixture did not become active'
+  )
+  const activeDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot =>
+      snapshot.workbench?.currentRuntimeTask?.taskId === goalTaskId &&
+      snapshot.pane?.goal?.status === 'active' &&
+      snapshot.pane.goal.threadId !== 'pending',
+    'The Goal snapshot reconciliation fixture did not expose a confirmed active Goal'
+  )
+  const address = activeDebugSnapshot.workbench.currentRuntimeTask
+  await control.command('dropNextRuntimeEvent', 'body', {
+    value: 'runtime.goal.cleared',
+  })
+  const clearResponse = JSON.parse(
+    await control.command('clearRuntimeGoalDirectly', 'body', {
+      value: JSON.stringify({ address }),
+    })
+  )
+  assert.equal(clearResponse.accepted, true, 'The executor rejected the direct Goal clear')
+  const staleSnapshot = JSON.parse(await control.command('snapshot', 'body'))
+  assert.equal(
+    staleSnapshot.testIds.includes('goal-status-bar'),
+    true,
+    'The dropped Goal clear event did not preserve the stale Goal bar fixture'
+  )
+  assert.equal(
+    staleSnapshot.testIds.includes(goalDotTestId),
+    true,
+    'The dropped Goal clear event did not preserve the stale sidebar Goal fixture'
+  )
+
+  await control.command('dispatchRuntimeEventLagged', 'body')
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      !snapshot.testIds.includes('goal-status-bar') && !snapshot.testIds.includes(goalDotTestId),
+    'The authoritative Goal snapshot did not clear the stale Goal UI after recovery'
+  )
+  const reconciledDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot => snapshot.pane?.goal === null,
+    'The recovered pane retained a Goal that no longer existed in the executor'
+  )
+  assert.equal(
+    reconciledDebugSnapshot.pane?.goal,
+    null,
+    'The recovered pane did not accept the executor Goal null snapshot'
+  )
+
+  control.releaseGoalSnapshotReconciliationResponse()
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: GOAL_SNAPSHOT_RECONCILIATION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+}
+
+async function selectSupervisorModel(control) {
+  const selector = '[data-testid="task-supervisor-model"] [data-testid="model-selector-button"]'
+  await ensureModelOptionVisible(control, CLOUD_PUBLIC_MODEL_NAME, selector, undefined)
+  await control.command(
+    'click',
+    `[data-testid="model-selector-menu"] [data-testid="model-option-${CLOUD_PUBLIC_MODEL_NAME}"]`
+  )
+}
+
+async function getSelectedSupervisorModel(control) {
+  return control.command('getAttribute', '[data-testid="task-supervisor-model"]', {
+    value: 'data-value',
+  })
+}
+
+async function verifyActiveGoalIdleUnreadLifecycle({ composerSelector, control, executorLogPath }) {
+  control.setScenario('goal_idle')
+  const executorLogOffset = (await readFile(executorLogPath, 'utf8').catch(() => '')).length
+  const taskRowsBeforeGoal = new Set(
+    JSON.parse(await control.command('snapshot', 'body')).testIds.filter(testId =>
+      testId.startsWith('runtime-local-task-row-')
+    )
+  )
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  await selectE2EModel(control)
+  await control.command('click', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="add-context-button"]`)
+  await control.command('click', '[data-testid="set-goal-button"]')
+  await control.command('waitFor', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="goal-draft-pill"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await sendPromptUntilScenarioRequest(control, composerSelector, GOAL_IDLE_PROMPT, 'goal_idle')
+  const goalTaskRowTestId = await waitForNewTaskRow(
+    control,
+    taskRowsBeforeGoal,
+    'WEWORK_DESKTOP_E2E_GOAL_IDLE'
+  )
+  const goalTaskId = goalTaskRowTestId.replace('runtime-local-task-row-', '')
+  const goalUnreadTestId = `runtime-local-task-unread-dot-${goalTaskId}`
+  const goalRunningTestId = `runtime-local-task-running-${goalTaskId}`
+  const goalDotTestId = `runtime-local-task-goal-dot-${goalTaskId}`
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes(goalRunningTestId) &&
+      snapshot.testIds.includes(goalDotTestId) &&
+      !snapshot.testIds.includes(goalUnreadTestId),
+    'The running Goal turn did not render a consistent sidebar state'
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes('pause-response-button') &&
+      snapshotHasAssistantActivity(snapshot) &&
+      !snapshot.testIds.includes('send-message-button'),
+    'The running Goal turn did not render a consistent composer and message state',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+  const runningDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot => snapshot.pane?.status?.isAssistantStreaming === true,
+    'The running Goal turn never entered visible streaming state'
+  )
+  assert.equal(
+    runningDebugSnapshot.workbench?.lifecycleCurrentTaskRunning,
+    true,
+    'The running Goal turn was not authoritative runtime work'
+  )
+  assert.equal(
+    runningDebugSnapshot.pane?.status?.isAssistantStreaming,
+    true,
+    'The running Goal turn did not expose a streaming assistant message'
+  )
+  assert.equal(
+    runningDebugSnapshot.pane?.status?.isBusy,
+    true,
+    'The running Goal turn did not keep the composer busy'
+  )
+  await captureVerificationScreenshot(control, 'goal-idle-01-running.png')
+
+  control.releaseGoalIdleInitialResponse()
+  await withTimeout(
+    control.awaitScenarioRequestCount('goal_idle', 2),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'The active Goal did not start its automatic continuation'
+  )
+  const goalExecutorLog = (
+    await waitForLogPattern(executorLogPath, /codex shared goal turn awaiting/, {
+      fromOffset: executorLogOffset,
+    })
+  ).slice(executorLogOffset)
+  assert.equal(
+    (goalExecutorLog.match(/codex shared goal turn awaiting/g) ?? []).length,
+    1,
+    `The Goal submission did not use exactly one Codex goal-started turn:\n${goalExecutorLog}`
+  )
+  assert.equal(
+    (goalExecutorLog.match(/codex shared turn request started/g) ?? []).length,
+    0,
+    `The Goal submission also issued turn/start and created an overlapping turn:\n${goalExecutorLog}`
+  )
+
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes(goalTaskRowTestId) &&
+      snapshot.testIds.includes(goalRunningTestId) &&
+      snapshot.testIds.includes(goalDotTestId) &&
+      !snapshot.testIds.includes(goalUnreadTestId),
+    'The between-turn Goal gap did not preserve the sidebar and unread state'
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes('goal-status-bar') &&
+      snapshot.testIds.includes('pause-response-button') &&
+      snapshotHasAssistantActivity(snapshot) &&
+      !snapshot.testIds.includes('send-message-button') &&
+      !snapshot.testIds.includes('assistant-error-card') &&
+      snapshot.text.includes(GOAL_IDLE_PROMPT) &&
+      snapshot.text.includes(GOAL_IDLE_INITIAL_TEXT),
+    'The between-turn Goal gap did not preserve the composer and message state',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+  const continuationDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot =>
+      snapshot.pane?.status?.isAssistantStreaming === true &&
+      snapshot.pane?.status?.taskExecution?.running === true,
+    'The automatic Goal continuation never entered visible streaming state'
+  )
+  assert.equal(
+    continuationDebugSnapshot.workbench?.lifecycleCurrentTaskRunning,
+    true,
+    'The active Goal stopped being visibly running during automatic continuation'
+  )
+  assert.equal(
+    continuationDebugSnapshot.pane?.goal?.status,
+    'active',
+    'The Goal stopped being active during automatic continuation'
+  )
+  assert.equal(
+    continuationDebugSnapshot.pane?.status?.taskExecution?.running,
+    true,
+    'The active Goal lost its unified running state during automatic continuation'
+  )
+  assert.equal(
+    continuationDebugSnapshot.pane?.status?.isBusy,
+    true,
+    'The active Goal released the composer during automatic continuation'
+  )
+  await assertConversationTextOccurrences(control, {
+    [GOAL_IDLE_PROMPT]: 1,
+    [GOAL_IDLE_INITIAL_TEXT]: 1,
+  })
+  await control.command(
+    'waitFor',
+    `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="message-assistant"]`,
+    {
+      text: GOAL_IDLE_CONTINUATION_TEXT,
+    }
+  )
+  const goalStatusText = await control.command('getText', '[data-testid="goal-status-bar"]')
+  assert.doesNotMatch(
+    goalStatusText,
+    /正在开始下一轮|Starting next turn/,
+    'A continuation producing output must leave the startup state'
+  )
+  const outputDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot => {
+      const subtaskId = snapshot.pane?.messageStyleComparison?.currentStreaming?.subtaskId
+      return Boolean(subtaskId && subtaskId === snapshot.workbench?.activeLifecycle?.turn?.id)
+    },
+    'Continuation output did not reach the active turn debug projection'
+  )
+  assert.equal(
+    outputDebugSnapshot.pane?.messageStyleComparison?.currentStreaming?.subtaskId,
+    outputDebugSnapshot.workbench?.activeLifecycle?.turn?.id,
+    'Continuation output must belong to its active turn'
+  )
+  await captureVerificationScreenshot(control, 'goal-idle-02-automatic-continuation.png')
+
+  const readyCountBeforeContinuationReload = control.readyCount
+  await control.command('reloadMainWindow', 'body')
+  await withTimeout(
+    control.awaitReadyAfter(readyCountBeforeContinuationReload),
+    WORKBENCH_READY_TIMEOUT_MS,
+    'The reloaded Wework WebView did not reconnect during the active Goal continuation'
+  )
+  await control.command('waitFor', `[data-testid="${goalRunningTestId}"]`, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes(goalTaskRowTestId) &&
+      snapshot.testIds.includes(goalRunningTestId) &&
+      snapshot.testIds.includes(goalDotTestId) &&
+      !snapshot.testIds.includes(goalUnreadTestId),
+    'Reloading lost the provider-confirmed sidebar state during Goal continuation',
+    WORKBENCH_READY_TIMEOUT_MS
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes('pause-response-button') &&
+      !snapshot.testIds.includes('send-message-button'),
+    'Reloading lost the provider-confirmed composer state during Goal continuation',
+    WORKBENCH_READY_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+  const reloadedContinuationDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot =>
+      snapshot.workbench?.lifecycleCurrentTaskRunning === true &&
+      snapshot.pane?.status?.taskExecution?.running === true,
+    'Reloading did not restore the provider-confirmed active Goal turn'
+  )
+  assert.equal(
+    reloadedContinuationDebugSnapshot.pane?.status?.isBusy,
+    true,
+    'Reloading exposed a direct send path while the provider turn was still active'
+  )
+  assert.ok(
+    reloadedContinuationDebugSnapshot.workbench?.currentRuntimeTask,
+    'The reloaded Goal did not expose its runtime address for stale transcript recovery'
+  )
+  await control.command('dispatchRuntimeLifecycleEvent', 'body', {
+    value: JSON.stringify({
+      address: reloadedContinuationDebugSnapshot.workbench.currentRuntimeTask,
+      type: 'transcript_received',
+      transcript: {
+        taskId: goalTaskId,
+        messages: [],
+        running: false,
+        turns: [{ id: 'stale-running-state-turn', items: [], status: 'streaming' }],
+      },
+    }),
+  })
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes(goalTaskRowTestId) &&
+      snapshot.testIds.includes(goalRunningTestId) &&
+      snapshot.testIds.includes(goalDotTestId) &&
+      snapshot.testIds.includes('pause-response-button') &&
+      !snapshot.testIds.includes('send-message-button') &&
+      !snapshot.testIds.includes(goalUnreadTestId) &&
+      snapshot.text.includes(GOAL_IDLE_INITIAL_TEXT),
+    'A stale coarse transcript running flag hid the active turn or its restored transcript'
+  )
+  const staleTranscriptDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot =>
+      snapshot.workbench?.lifecycleCurrentTaskRunning === true &&
+      snapshot.pane?.status?.taskExecution?.running === true &&
+      snapshot.pane?.status?.isBusy === true &&
+      snapshot.pane?.status?.canSendQueuedMessage === false,
+    'The active response did not remain authoritative after receiving stale transcript running state'
+  )
+  assert.equal(
+    staleTranscriptDebugSnapshot.pane?.status?.taskExecution?.running,
+    true,
+    'The stale transcript running flag overrode the concrete active turn'
+  )
+  await assertConversationTextOccurrences(control, {
+    [GOAL_IDLE_INITIAL_TEXT]: 1,
+  })
+  await assertConversationTextNotDuplicated(control, [GOAL_IDLE_PROMPT])
+  await captureVerificationScreenshot(control, 'goal-idle-03-reloaded-continuation.png')
+
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes(goalTaskRowTestId) &&
+      !snapshot.testIds.includes(goalUnreadTestId) &&
+      snapshot.testIds.includes(goalRunningTestId) &&
+      snapshot.testIds.includes(goalDotTestId),
+    'The background Goal continuation stopped running or became unread'
+  )
+  await captureVerificationScreenshot(control, 'goal-idle-04-background-unread-free.png')
+
+  control.releaseGoalIdleResponse()
+  await control.command('waitFor', `[data-testid="${goalUnreadTestId}"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await captureVerificationScreenshot(control, 'goal-idle-05-settled-unread.png')
+  await control.command('clickWhenEnabled', `[data-testid="${goalTaskRowTestId}"]`, {
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: GOAL_IDLE_COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  const completedDebugSnapshot = JSON.parse(
+    await control.command('getWorkbenchDebugSnapshot', 'body')
+  )
+  assert.equal(
+    completedDebugSnapshot.workbench?.lifecycleCurrentTaskRunning,
+    false,
+    `The completed Goal remained authoritative runtime work: ${JSON.stringify(
+      completedDebugSnapshot.workbench?.runningState ?? null
+    )}`
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      !snapshot.testIds.includes(goalUnreadTestId) &&
+      !snapshot.testIds.includes(goalRunningTestId) &&
+      !snapshot.testIds.includes(goalDotTestId),
+    'Opening the completed Goal task did not clear its sidebar state'
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes('send-message-button') &&
+      !snapshot.testIds.includes('pause-response-button') &&
+      !snapshot.testIds.includes('thinking-indicator') &&
+      !snapshot.testIds.includes('assistant-error-card') &&
+      !snapshot.testIds.includes('goal-status-bar'),
+    'Opening the completed Goal task did not render a consistent final workbench state',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+  const settledDebugSnapshot = JSON.parse(
+    await control.command('getWorkbenchDebugSnapshot', 'body')
+  )
+  assert.equal(
+    settledDebugSnapshot.pane?.goal ?? null,
+    null,
+    'The completed Goal remained visible as an active pane goal'
+  )
+  assert.equal(
+    settledDebugSnapshot.pane?.status?.isBusy,
+    false,
+    'The completed Goal kept the composer busy'
+  )
+  await captureVerificationScreenshot(control, 'goal-idle-06-completed-read.png')
+
+  await sendPrompt(control, composerSelector, GOAL_IDLE_FOLLOW_UP_PROMPT)
+  await withTimeout(
+    control.awaitScenarioRequestCount('goal_idle', 4),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'The ordinary continuation after Goal completion did not reach the model'
+  )
+  const followUpDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot =>
+      snapshot.workbench?.currentRuntimeTask?.taskId === goalTaskId &&
+      snapshot.workbench?.lifecycleCurrentTaskRunning === true &&
+      snapshot.pane?.status?.isAssistantStreaming === true,
+    'The ordinary continuation after Goal completion did not enter running state'
+  )
+  await control.command('dispatchRuntimeLifecycleEvent', 'body', {
+    value: JSON.stringify({
+      address: followUpDebugSnapshot.workbench.currentRuntimeTask,
+      type: 'goal_status_received',
+      goalStatus: 'complete',
+    }),
+  })
+  try {
+    await waitForSnapshot(
+      control,
+      snapshot => snapshot.testIds.includes(goalRunningTestId),
+      'A late completed Goal snapshot cleared the sidebar running indicator'
+    )
+    await waitForSnapshot(
+      control,
+      snapshot =>
+        snapshot.testIds.includes('pause-response-button') &&
+        snapshotHasAssistantActivity(snapshot) &&
+        !snapshot.testIds.includes('send-message-button'),
+      'A late completed Goal snapshot cleared the active ordinary continuation',
+      DEFAULT_STEP_TIMEOUT_MS,
+      ACTIVE_WORKBENCH_SELECTOR
+    )
+    const lateGoalSnapshot = await waitForWorkbenchDebugState(
+      control,
+      snapshot =>
+        snapshot.workbench?.lifecycleCurrentTaskRunning === true &&
+        snapshot.pane?.status?.taskExecution?.running === true &&
+        snapshot.pane?.status?.isAssistantStreaming === true,
+      'The live ordinary continuation became idle after the completed Goal replay'
+    )
+    assert.equal(
+      lateGoalSnapshot.pane?.status?.isBusy,
+      true,
+      'The completed Goal replay released the composer during a live ordinary continuation'
+    )
+    await captureVerificationScreenshot(control, 'goal-idle-07-follow-up-running.png')
+  } finally {
+    control.releaseGoalIdleFollowUpResponse()
+  }
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: GOAL_IDLE_FOLLOW_UP_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      !snapshot.testIds.includes(goalRunningTestId) &&
+      snapshot.testIds.includes('send-message-button') &&
+      !snapshot.testIds.includes('pause-response-button') &&
+      !snapshot.testIds.includes('thinking-indicator'),
+    'The ordinary continuation did not settle after the Goal lifecycle regression check',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+}
+
+async function verifyBusyTurnGoalHandoff({ composerSelector, control, executorLogPath }) {
+  control.setScenario('goal_busy_handoff')
+  const executorLogOffset = (await readFile(executorLogPath, 'utf8').catch(() => '')).length
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  await selectE2EModel(control)
+  await ensurePlanMode(control)
+  await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    GOAL_BUSY_PLAN_PROMPT,
+    'goal_busy_handoff'
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes('pause-response-button') && snapshotHasAssistantActivity(snapshot),
+    'The planning turn did not remain active before Goal submission',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+
+  const runningDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot => Boolean(snapshot.workbench?.currentRuntimeTask?.taskId),
+    'The busy Goal handoff did not expose its runtime task ID'
+  )
+  const goalTaskId = runningDebugSnapshot.workbench?.currentRuntimeTask?.taskId
+  assert.ok(goalTaskId, 'The busy Goal handoff did not expose its runtime task ID')
+  const goalTaskRowTestId = `runtime-local-task-row-${goalTaskId}`
+  const goalRunningTestId = `runtime-local-task-running-${goalTaskId}`
+
+  await control.command('click', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="add-context-button"]`)
+  await control.command('click', '[data-testid="set-goal-button"]')
+  await control.command('waitFor', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="goal-draft-pill"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('fill', composerSelector, { value: GOAL_BUSY_OBJECTIVE })
+  await control.command('press', composerSelector, { key: 'Enter' })
+  await control.command('waitFor', '[data-testid="conversation-queue-panel"]', {
+    text: GOAL_BUSY_OBJECTIVE,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot => snapshot.testIds.includes(goalRunningTestId),
+    'Submitting Goal during a planning turn did not preserve the sidebar running state'
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes('goal-status-bar') &&
+      snapshot.testIds.includes('pause-response-button'),
+    'Submitting Goal during a planning turn did not preserve the workbench running state',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  await control.command('clickWhenEnabled', `[data-testid="${goalTaskRowTestId}"]`, {
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('waitFor', '[data-testid="conversation-queue-panel"]', {
+    text: GOAL_BUSY_OBJECTIVE,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+
+  control.releaseGoalBusyPlanResponse()
+  await withTimeout(
+    control.awaitScenarioRequestCount('goal_busy_handoff', 2),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'The queued Goal did not start after the planning turn completed'
+  )
+  const handoffExecutorLog = (
+    await waitForLogPattern(executorLogPath, /codex shared goal turn awaiting/, {
+      fromOffset: executorLogOffset,
+    })
+  ).slice(executorLogOffset)
+  assert.equal(
+    (handoffExecutorLog.match(/codex shared turn request started/g) ?? []).length,
+    1,
+    `The busy Goal handoff did not keep exactly one ordinary planning turn:\n${handoffExecutorLog}`
+  )
+  assert.equal(
+    (handoffExecutorLog.match(/codex shared goal turn awaiting/g) ?? []).length,
+    1,
+    `The queued Goal did not use the Codex initial Goal protocol:\n${handoffExecutorLog}`
+  )
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: GOAL_BUSY_COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot => !snapshot.testIds.includes(goalRunningTestId),
+    'The automatically started Goal remained running in the sidebar'
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.text.includes(GOAL_BUSY_PLAN_TEXT) &&
+      snapshot.text.includes(GOAL_BUSY_COMPLETION_TEXT) &&
+      snapshot.testIds.includes('send-message-button') &&
+      !snapshot.testIds.includes('goal-status-bar') &&
+      !snapshot.testIds.includes('conversation-queue-panel') &&
+      !snapshot.testIds.includes('assistant-error-card'),
+    'The automatically started Goal did not complete cleanly',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+}
+
+async function verifyTaskSupervisorLifecycle({ composerSelector, control }) {
+  await ensureExperimentalFeaturesEnabled(control)
+  control.setScenario('supervisor')
+  const taskRowsBeforeSupervisor = new Set(
+    JSON.parse(await control.command('snapshot', 'body')).testIds.filter(testId =>
+      testId.startsWith('runtime-local-task-row-')
+    )
+  )
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  await selectE2EModel(control, DEFAULT_MODEL_ID, DEFAULT_MODEL_LABEL)
+  await control.command('click', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="add-context-button"]`)
+  await control.command('waitFor', '[data-testid="task-supervisor-toggle-button"]', {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('click', '[data-testid="task-supervisor-toggle-button"]')
+  await control.command('waitFor', '[data-testid="task-supervisor-model"]', {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await selectSupervisorModel(control)
+  assert.equal(
+    await getSelectedSupervisorModel(control),
+    SUPERVISOR_MODEL_KEY,
+    'The supervisor model selector did not retain the selected model'
+  )
+  assert.match(
+    await control.command('getAttribute', '[data-testid="task-supervisor-mode-auto"]', {
+      value: 'class',
+    }),
+    /bg-text-primary/,
+    'The supervisor dialog did not default to auto-correct mode'
+  )
+  await control.command('fill', '[data-testid="task-supervisor-instructions"]', {
+    value: SUPERVISOR_PRINCIPLES,
+  })
+  await control.command('click', '[data-testid="task-supervisor-save-button"]')
+  await control.command('waitFor', '[data-testid="pending-supervisor-indicator"]', {
+    text: '监督将在任务开始后生效',
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('click', '[data-testid="pending-supervisor-indicator"]')
+  await control.command('waitFor', '[data-testid="task-supervisor-model"]', {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  assert.equal(
+    await getSelectedSupervisorModel(control),
+    SUPERVISOR_MODEL_KEY,
+    'Reopening the supervisor reset its selected model'
+  )
+  await control.command('click', '[data-testid="task-supervisor-close-button"]')
+  await captureVerificationScreenshot(control, 'supervisor-pending-context.png')
+  await sendPromptUntilScenarioRequest(control, composerSelector, SUPERVISOR_PROMPT, 'supervisor')
+  control.releaseSupervisorInitialResponse()
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: SUPERVISOR_COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot => !snapshot.testIds.includes('pending-supervisor-indicator'),
+    'The pre-task supervisor indicator remained after the task was created'
+  )
+
+  await withTimeout(
+    control.awaitScenarioRequestCount('supervisor', 2),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'The supervisor evaluator did not inspect the completed task'
+  )
+  await withTimeout(
+    control.awaitScenarioRequestCount('supervisor', 3),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'Auto-correction did not send a normal follow-up turn after the task became idle'
+  )
+  await withTimeout(
+    control.awaitSupervisorCorrectionResponseStarted(),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'The supervisor correction response did not start'
+  )
+  const supervisorTaskRowTestId = await waitForNewTaskRow(
+    control,
+    taskRowsBeforeSupervisor,
+    'WEWORK_DESKTOP_E2E_SUPERVISOR'
+  )
+  const supervisorTaskId = supervisorTaskRowTestId.replace('runtime-local-task-row-', '')
+  const supervisorRunningTestId = `runtime-local-task-running-${supervisorTaskId}`
+  await control.command('waitFor', `[data-testid="${supervisorRunningTestId}"]`, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  const beforeStaleSettlement = JSON.parse(
+    await control.command('getWorkbenchDebugSnapshot', 'body')
+  )
+  assert.equal(
+    beforeStaleSettlement.workbench?.currentRuntimeTask?.taskId,
+    supervisorTaskId,
+    'The supervisor correction task was not current before replaying the stale settlement'
+  )
+  await control.command('dispatchRuntimeLifecycleEvent', 'body', {
+    value: JSON.stringify({
+      address: beforeStaleSettlement.workbench.currentRuntimeTask,
+      type: 'turn_settled',
+      turnId: 'stale-supervisor-turn',
+    }),
+  })
+  try {
+    const runningSnapshot = await waitForWorkbenchDebugState(
+      control,
+      snapshot =>
+        snapshot.workbench?.currentRuntimeTask?.taskId === supervisorTaskId &&
+        snapshot.workbench?.lifecycleCurrentTaskRunning === true &&
+        snapshot.pane?.status?.isBusy === true,
+      'The live supervisor correction was not represented as running'
+    )
+    assert.equal(
+      runningSnapshot.pane?.status?.taskExecution?.running,
+      true,
+      'The supervisor correction had a live executor response but task execution was idle'
+    )
+    await captureVerificationScreenshot(control, 'supervisor-01-correction-running.png')
+  } finally {
+    control.releaseSupervisorCorrectionResponse()
+  }
+  await control.command('waitFor', '[data-testid="message-user"]', {
+    text: SUPERVISOR_CORRECTION,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: SUPERVISOR_CORRECTION_COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot => !snapshot.testIds.includes('task-supervisor-suggestion'),
+    'Auto-correction incorrectly rendered an approval card'
+  )
+  await control.command('click', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="add-context-button"]`)
+  await control.command('click', '[data-testid="task-supervisor-toggle-button"]')
+  await control.command('waitFor', '[data-testid="task-supervisor-next-check"]', {
+    text: '下次巡检',
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  assert.equal(
+    await getSelectedSupervisorModel(control),
+    SUPERVISOR_MODEL_KEY,
+    'The active supervisor did not retain its selected model'
+  )
+  await withTimeout(
+    control.awaitScenarioRequestCount('supervisor', 4),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'The supervisor did not inspect the completed auto-correction'
+  )
+  const supervisorStatusSelector = '[data-testid="task-supervisor-status"]'
+  await control.command('clickWhenEnabled', '[data-testid="task-supervisor-run-now-button"]')
+  await withTimeout(
+    control.awaitScenarioRequestCount('supervisor', 5),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'The immediate supervisor review did not reach the evaluator'
+  )
+  await control.command('waitFor', '[data-testid="task-supervisor-run-now-button"]', {
+    enabled: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  assert.doesNotMatch(
+    await control.command('getText', supervisorStatusSelector),
+    /正在检查|Checking the latest progress/,
+    'The immediate supervisor review remained in its intermediate checking state'
+  )
+  assert.match(
+    await control.command('getText', supervisorStatusSelector),
+    /最近检查|Last checked/,
+    'The immediate supervisor review did not publish its completed check state'
+  )
+  await control.command('waitFor', '[data-testid="task-supervisor-next-check"]', {
+    text: '下次巡检',
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+}
+
+async function verifyGoalRestartRecoveryLifecycle({
+  composerSelector,
+  control,
+  executorLogPath,
+  restartDesktopApp,
+}) {
+  control.setScenario('goal_restart_blocker')
+  const taskRowsBeforeBlocker = new Set(
+    JSON.parse(await control.command('snapshot', 'body')).testIds.filter(testId =>
+      testId.startsWith('runtime-local-task-row-')
+    )
+  )
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  await selectE2EModel(control)
+  await control.command('click', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="add-context-button"]`)
+  await control.command('click', '[data-testid="set-goal-button"]')
+  await control.command('waitFor', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="goal-draft-pill"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    GOAL_RESTART_BLOCKER_PROMPT,
+    'goal_restart_blocker'
+  )
+  const blockerTaskRowTestId = await waitForNewTaskRow(
+    control,
+    taskRowsBeforeBlocker,
+    'WEWORK_DESKTOP_E2E_GOAL_RESTART_BLOCKER'
+  )
+  const blockerTaskId = blockerTaskRowTestId.replace('runtime-local-task-row-', '')
+  await withTimeout(
+    control.awaitScenarioRequestCount('goal_restart_blocker', 2),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'The Goal restart blocker did not enter automatic continuation'
+  )
+
+  control.setScenario('goal_restart')
+  const taskRowsBeforeGoal = new Set(
+    JSON.parse(await control.command('snapshot', 'body')).testIds.filter(testId =>
+      testId.startsWith('runtime-local-task-row-')
+    )
+  )
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  await selectE2EModel(control)
+  await control.command('click', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="add-context-button"]`)
+  await control.command('click', '[data-testid="set-goal-button"]')
+  await control.command('waitFor', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="goal-draft-pill"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    GOAL_RESTART_PROMPT,
+    'goal_restart'
+  )
+  const goalTaskRowTestId = await waitForNewTaskRow(
+    control,
+    taskRowsBeforeGoal,
+    'WEWORK_DESKTOP_E2E_GOAL_RESTART'
+  )
+  const goalTaskId = goalTaskRowTestId.replace('runtime-local-task-row-', '')
+  const goalUnreadTestId = `runtime-local-task-unread-dot-${goalTaskId}`
+  const goalRunningTestId = `runtime-local-task-running-${goalTaskId}`
+  await withTimeout(
+    control.awaitScenarioRequestCount('goal_restart', 2),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'The active Goal did not enter automatic continuation before restart'
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes(goalRunningTestId) && !snapshot.testIds.includes(goalUnreadTestId),
+    'The user did not see the Goal running in the sidebar before Wework restarted'
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes('goal-status-bar') &&
+      snapshot.testIds.includes('pause-response-button') &&
+      snapshotHasAssistantActivity(snapshot) &&
+      !snapshot.testIds.includes('send-message-button') &&
+      snapshot.text.includes(GOAL_RESTART_INITIAL_TEXT),
+    'The user did not see the Goal working before Wework restarted',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  ).catch(async error => {
+    const debugSnapshot = JSON.parse(await control.command('getWorkbenchDebugSnapshot', 'body'))
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}; workbench debug: ${JSON.stringify(
+        {
+          currentRuntimeTask: debugSnapshot.workbench?.currentRuntimeTask ?? null,
+          lifecycleCurrentTaskRunning: debugSnapshot.workbench?.lifecycleCurrentTaskRunning ?? null,
+          goal: debugSnapshot.pane?.goal ?? null,
+          goalContinuing: debugSnapshot.pane?.goalContinuing ?? null,
+          goalDraftActive: debugSnapshot.pane?.goalDraftActive ?? null,
+        }
+      )}`
+    )
+  })
+  await captureVerificationScreenshot(control, 'goal-restart-01-working-before-restart.png')
+  const requestCountsBeforeRestart = {
+    [blockerTaskId]: control.scenarioRequests.get('goal_restart_blocker')?.length ?? 0,
+    [goalTaskId]: control.scenarioRequests.get('goal_restart')?.length ?? 0,
+  }
+  const concurrencyResponse = JSON.parse(
+    await control.command('setLocalRuntimeMaxConcurrentTasks', 'body', { value: '1' })
+  )
+  assert.equal(
+    concurrencyResponse.maxConcurrentTasks,
+    1,
+    'The real executor did not apply the single-slot restart fixture'
+  )
+
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  const executorReadyBeforeRestart = await waitForExecutorRuntimeEvidence(control, executorLogPath)
+  const executorProcessIdBeforeRestart = executorReadyBeforeRestart.processIds.at(-1)
+  assert.ok(executorProcessIdBeforeRestart, 'The original executor process ID was not recorded')
+  const restartExecutorLogOffset = (await readFile(executorLogPath, 'utf8')).length
+
+  await restartDesktopApp()
+
+  const executorReadyAfterRestart = await waitForExecutorRuntimeEvidence(
+    control,
+    executorLogPath,
+    DEFAULT_STEP_TIMEOUT_MS,
+    executorReadyBeforeRestart.processIds.length + 1
+  )
+  const executorProcessIdAfterRestart = executorReadyAfterRestart.processIds.at(-1)
+  assert.ok(executorProcessIdAfterRestart, 'The restarted executor process ID was not recorded')
+  assert.notEqual(
+    executorProcessIdAfterRestart,
+    executorProcessIdBeforeRestart,
+    'Restarting Wework reused the executor process that owned the active Goal'
+  )
+  assert.equal(
+    processIsAlive(executorProcessIdBeforeRestart),
+    false,
+    'The original executor remained alive after a full Wework restart'
+  )
+
+  const recoveringTask = await waitForRecoveringExecutorGoal(control, [blockerTaskId, goalTaskId])
+  const recoveringTaskId = recoveringTask.taskId ?? recoveringTask.task_id
+  const recoveringTaskRowTestId = `runtime-local-task-row-${recoveringTaskId}`
+  const recoveringTaskRunningTestId = `runtime-local-task-running-${recoveringTaskId}`
+  const recoveringTaskUnreadTestId = `runtime-local-task-unread-dot-${recoveringTaskId}`
+  const recoveringScenario =
+    recoveringTaskId === blockerTaskId ? 'goal_restart_blocker' : 'goal_restart'
+  const recoveringPrompt =
+    recoveringTaskId === blockerTaskId ? GOAL_RESTART_BLOCKER_PROMPT : GOAL_RESTART_PROMPT
+  const recoveringCompletionText =
+    recoveringTaskId === blockerTaskId
+      ? GOAL_RESTART_BLOCKER_COMPLETION_TEXT
+      : GOAL_RESTART_COMPLETION_TEXT
+
+  await control.command('waitFor', `[data-testid="${recoveringTaskRowTestId}"]`, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await control.command('clickWhenEnabled', `[data-testid="${recoveringTaskRowTestId}"]`, {
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes(recoveringTaskRowTestId) &&
+      snapshot.testIds.includes(recoveringTaskRunningTestId) &&
+      !snapshot.testIds.includes(recoveringTaskUnreadTestId),
+    'The queued executor-authoritative Goal recovery was not shown as running',
+    DEFAULT_STEP_TIMEOUT_MS
+  ).catch(async error => {
+    const debugSnapshot = JSON.parse(await control.command('getWorkbenchDebugSnapshot', 'body'))
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}; workbench debug: ${JSON.stringify(
+        {
+          currentRuntimeTask: debugSnapshot.workbench?.currentRuntimeTask ?? null,
+          lifecycleCurrentTaskRunning: debugSnapshot.workbench?.lifecycleCurrentTaskRunning ?? null,
+          runningState: debugSnapshot.workbench?.runningState ?? null,
+          activeTask: debugSnapshot.workbench?.activeTask ?? null,
+          goal: debugSnapshot.pane?.goal ?? null,
+        }
+      )}`
+    )
+  })
+  control.releaseFirstGoalRestartResponse()
+  await withTimeout(
+    control.awaitScenarioRequestCount(
+      recoveringScenario,
+      requestCountsBeforeRestart[recoveringTaskId] + 1
+    ),
+    WORKBENCH_READY_TIMEOUT_MS,
+    'The real executor did not start the queued Goal recovery after capacity became available'
+  )
+  await captureVerificationScreenshot(control, 'goal-restart-02-automatically-recovering.png')
+
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes(recoveringTaskRunningTestId) &&
+      !snapshot.testIds.includes(recoveringTaskUnreadTestId) &&
+      snapshot.testIds.includes(recoveringTaskRowTestId),
+    'Opening the recovered Goal did not preserve its running sidebar state',
+    WORKBENCH_READY_TIMEOUT_MS
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes('goal-status-bar') &&
+      snapshot.testIds.includes('pause-response-button') &&
+      !snapshot.testIds.includes('send-message-button') &&
+      snapshot.text.includes(recoveringPrompt),
+    'Opening the automatically recovered Goal did not show active work',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+  const interruptedDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot =>
+      snapshot.workbench?.currentRuntimeTask?.taskId === recoveringTaskId &&
+      snapshot.workbench?.lifecycleCurrentTaskRunning === true &&
+      snapshot.pane?.transcript?.loading === false &&
+      snapshot.pane?.goal?.status === 'active',
+    'The automatically recovered Goal did not finish hydrating after Wework restarted'
+  )
+  assert.equal(
+    interruptedDebugSnapshot.workbench?.lifecycleCurrentTaskRunning,
+    true,
+    'The restarted executor did not own the recovered Goal execution'
+  )
+  assert.equal(
+    interruptedDebugSnapshot.pane?.goal?.status,
+    'active',
+    'Restarting Wework discarded the persisted Goal'
+  )
+  await captureVerificationScreenshot(control, 'goal-restart-03-opened-automatically-running.png')
+
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  releaseGoalRestartTask(control, recoveringTaskId, blockerTaskId)
+  await control.command('waitFor', `[data-testid="${recoveringTaskUnreadTestId}"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await captureVerificationScreenshot(control, 'goal-restart-04-completed-unread.png')
+
+  await control.command('clickWhenEnabled', `[data-testid="${recoveringTaskRowTestId}"]`, {
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: recoveringCompletionText,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      !snapshot.testIds.includes(recoveringTaskUnreadTestId) &&
+      !snapshot.testIds.includes(recoveringTaskRunningTestId),
+    'The recovered Goal did not clear its sidebar state'
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes('send-message-button') &&
+      !snapshot.testIds.includes('pause-response-button') &&
+      !snapshot.testIds.includes('thinking-indicator') &&
+      !snapshot.testIds.includes('goal-status-bar'),
+    'The recovered Goal did not settle into a consistent final workbench state',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+  const restoredConcurrency = JSON.parse(
+    await control.command('setLocalRuntimeMaxConcurrentTasks', 'body', { value: '10' })
+  )
+  assert.equal(
+    restoredConcurrency.maxConcurrentTasks,
+    10,
+    'The Goal restart fixture did not restore executor concurrency'
+  )
+  const restartExecutorLog = (await readFile(executorLogPath, 'utf8')).slice(
+    restartExecutorLogOffset
+  )
+  assert.equal(
+    restartExecutorLog.includes('codex app-server turn made no model or tool progress'),
+    false,
+    `The Goal restart fixture only advanced after a model-progress watchdog failure:\n${restartExecutorLog}`
+  )
+  await captureVerificationScreenshot(control, 'goal-restart-06-completed-read.png')
+}
+
+async function waitForRecoveringExecutorGoal(control, taskIds) {
+  const startedAt = Date.now()
+  let observedTasks = []
+  while (Date.now() - startedAt < DEFAULT_STEP_TIMEOUT_MS) {
+    const runtimeWork = JSON.parse(await control.command('getLocalRuntimeWork', 'body'))
+    const workspaces = Array.isArray(runtimeWork.workspaces)
+      ? runtimeWork.workspaces
+      : Object.values(runtimeWork.workspaces ?? {})
+    observedTasks = workspaces
+      .flatMap(workspace => (Array.isArray(workspace.tasks) ? workspace.tasks : []))
+      .filter(candidate => taskIds.includes(candidate.taskId ?? candidate.task_id))
+      .map(candidate => ({
+        taskId: candidate.taskId ?? candidate.task_id,
+        running: candidate.running,
+        status: candidate.status,
+        threadStatus: candidate.threadStatus ?? candidate.thread_status,
+        turnStatus: candidate.turnStatus ?? candidate.turn_status,
+        goalStatus: candidate.goalStatus ?? candidate.goal_status,
+        goalExecutionStatus: candidate.goalExecutionStatus ?? candidate.goal_execution_status,
+        completedAt: candidate.completedAt ?? candidate.completed_at,
+      }))
+    const task = observedTasks.find(candidate => {
+      const taskId = candidate.taskId ?? candidate.task_id
+      const goalExecutionStatus = candidate.goalExecutionStatus ?? candidate.goal_execution_status
+      const goalStatus = candidate.goalStatus ?? candidate.goal_status
+      return (
+        taskIds.includes(taskId) &&
+        candidate.running === false &&
+        observedTasks.some(other => other.taskId !== taskId && other.running === true) &&
+        (goalExecutionStatus === 'recovering' ||
+          (goalStatus === 'active' && candidate.status === 'queued'))
+      )
+    })
+    if (task) return task
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 100))
+  }
+  throw new Error(
+    `The real executor did not expose a queued recovering Goal after restart: ${JSON.stringify(
+      observedTasks
+    )}`
+  )
+}
+
+function releaseGoalRestartTask(control, taskId, blockerTaskId) {
+  if (taskId === blockerTaskId) {
+    control.releaseGoalRestartBlockerResponse()
+    return
+  }
+  control.releaseGoalRestartResponse()
+}
+
+async function verifyCloudGoalRestartRecoveryLifecycle({
+  composerSelector,
+  control,
+  executorProcessId,
+  restartDesktopApp,
+}) {
+  control.setScenario('cloud_goal_restart')
+  const taskRowsBeforeGoal = new Set(
+    JSON.parse(await control.command('snapshot', 'body')).testIds.filter(testId =>
+      testId.startsWith('runtime-local-task-row-')
+    )
+  )
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  await selectE2EModel(control)
+  await control.command('click', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="add-context-button"]`)
+  await control.command('click', '[data-testid="set-goal-button"]')
+  await control.command('waitFor', `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="goal-draft-pill"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    GOAL_RESTART_PROMPT,
+    'cloud_goal_restart'
+  )
+  const goalTaskRowTestId = await waitForNewTaskRow(
+    control,
+    taskRowsBeforeGoal,
+    'WEWORK_DESKTOP_E2E_GOAL_RESTART'
+  )
+  const goalTaskId = goalTaskRowTestId.replace('runtime-local-task-row-', '')
+  const goalUnreadTestId = `runtime-local-task-unread-dot-${goalTaskId}`
+  const goalRunningTestId = `runtime-local-task-running-${goalTaskId}`
+  await withTimeout(
+    control.awaitScenarioRequestCount('cloud_goal_restart', 2),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'The cloud Goal did not enter automatic continuation before Wework restarted'
+  )
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes(goalRunningTestId) && !snapshot.testIds.includes(goalUnreadTestId),
+    'The cloud Goal was not visibly running before Wework restarted'
+  )
+
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  assert.equal(
+    processIsAlive(executorProcessId),
+    true,
+    'The cloud executor was not alive before Wework restarted'
+  )
+  await restartDesktopApp()
+  assert.equal(
+    processIsAlive(executorProcessId),
+    true,
+    'Restarting Wework stopped the independently running cloud executor'
+  )
+
+  await control.command('waitFor', `[data-testid="${goalTaskRowTestId}"]`, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes(goalRunningTestId) && !snapshot.testIds.includes(goalUnreadTestId),
+    'The cloud Goal did not remain running after Wework restarted',
+    WORKBENCH_READY_TIMEOUT_MS
+  )
+  await control.command('clickWhenEnabled', `[data-testid="${goalTaskRowTestId}"]`, {
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes('goal-status-bar') &&
+      snapshot.testIds.includes('pause-response-button') &&
+      snapshotHasAssistantActivity(snapshot) &&
+      !snapshot.testIds.includes('send-message-button') &&
+      snapshot.text.includes(GOAL_RESTART_INITIAL_TEXT),
+    'Wework did not reconnect to the running cloud Goal after restart',
+    WORKBENCH_READY_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+  const runningDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot =>
+      snapshot.workbench?.currentRuntimeTask?.taskId === goalTaskId &&
+      snapshot.workbench?.lifecycleCurrentTaskRunning === true &&
+      snapshot.pane?.goal?.status === 'active',
+    'The running cloud Goal did not finish hydrating after Wework restarted'
+  )
+  assert.equal(
+    runningDebugSnapshot.pane?.goal?.status,
+    'active',
+    'Restarting Wework discarded the active cloud Goal'
+  )
+
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await waitForBlankConversation(control, composerSelector)
+  control.releaseGoalRestartResponse()
+  await control.command('waitFor', `[data-testid="${goalUnreadTestId}"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('clickWhenEnabled', `[data-testid="${goalTaskRowTestId}"]`, {
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: GOAL_RESTART_COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      !snapshot.testIds.includes(goalUnreadTestId) &&
+      !snapshot.testIds.includes(goalRunningTestId) &&
+      snapshot.testIds.includes('send-message-button') &&
+      !snapshot.testIds.includes('pause-response-button') &&
+      !snapshot.testIds.includes('thinking-indicator') &&
+      !snapshot.testIds.includes('goal-status-bar'),
+    'The cloud Goal did not settle after completing across a Wework restart',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+}
+
+export {
+  verifyActiveGoalIdleUnreadLifecycle,
+  verifyBusyTurnGoalHandoff,
+  verifyCloudGoalRestartRecoveryLifecycle,
+  verifyMissingGoalSnapshotReconciliation,
+  verifyTaskSupervisorLifecycle,
+  verifyGoalRestartRecoveryLifecycle,
+}

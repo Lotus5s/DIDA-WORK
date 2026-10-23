@@ -1,0 +1,848 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { useState, useEffect, useRef } from 'react'
+import { BookOpen, Code2, Database, User, Building2, Users, FileText } from 'lucide-react'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { Switch } from '@/components/ui/switch'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { useTranslation } from '@/hooks/useTranslation'
+import { SimpleConfigRow } from '@/features/settings/components/team-edit/SimpleConfigLayout'
+import { ModelRefSelector } from '@/components/model-select/ModelRefSelector'
+import { UserSearchSelect } from '@/components/common/UserSearchSelect'
+import { getRuntimeConfigSync } from '@/lib/runtime-config'
+import {
+  CodeWikiSourceFields,
+  type CodeWikiSource,
+} from '@/features/knowledge/code-wiki/CodeWikiSourceFields'
+import type {
+  DirectAccessRequirement,
+  KnowledgeBaseCreate,
+  SummaryModelRef,
+  KnowledgeBaseType,
+  RetrievalConfigDraft,
+  RagConfigMode,
+} from '@/types/knowledge'
+import type { SearchUser } from '@/types/api'
+import { GenerationTaskRow } from '@/features/knowledge/code-wiki/GenerationTaskRow'
+import { GenerationStrategySelect } from '@/features/knowledge/code-wiki/GenerationStrategySelect'
+import { getKnowledgeBaseRetrievalProfile } from '@/apis/knowledge'
+import { KnowledgeBaseForm } from './KnowledgeBaseForm'
+import { DingtalkAutoSyncSetting } from './DingtalkAutoSyncSetting'
+import { createDefaultRetrievalConfig } from './retrievalConfig'
+import { useMultimodalKBConfig } from '@/features/knowledge/multimodal/hooks/useMultimodalKBConfig'
+
+/** Available group for selection */
+export interface AvailableGroup {
+  id: string
+  name: string
+  displayName: string
+  type: 'personal' | 'group' | 'organization'
+  canCreate: boolean
+}
+
+interface CreateKnowledgeBaseDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onSubmit: (
+    data: Omit<KnowledgeBaseCreate, 'namespace'> & {
+      /** Selected group ID for creating the KB */
+      selectedGroupId?: string
+    }
+  ) => Promise<void>
+  loading?: boolean
+  scope?: 'personal' | 'group' | 'organization' | 'all'
+  groupName?: string
+  /** Knowledge base type selected from dropdown menu (read-only in dialog) */
+  kbType?: KnowledgeBaseType
+  /** Optional team ID for reading cached model preference */
+  knowledgeDefaultTeamId?: number | null
+  /** Optional bind model name from team's bot config as fallback */
+  bindModel?: string | null
+  /** Available groups for selection (for "All" mode) */
+  availableGroups?: AvailableGroup[]
+  /** Default selected group ID */
+  defaultGroupId?: string
+  /** Whether to show group selector (true when creating from "All" page) */
+  showGroupSelector?: boolean
+}
+
+/** Get icon for group type */
+function GroupTypeIcon({ type }: { type: 'personal' | 'group' | 'organization' }) {
+  switch (type) {
+    case 'personal':
+      return <User className="w-4 h-4" />
+    case 'organization':
+      return <Building2 className="w-4 h-4" />
+    case 'group':
+    default:
+      return <Users className="w-4 h-4" />
+  }
+}
+
+/** Documents are uploaded and organised; code is generated from a repository. */
+type KnowledgeBaseKind = 'document' | 'code'
+
+function createEmptySource(): CodeWikiSource {
+  return {
+    source_type: 'github',
+    source_url: '',
+    language: 'zh',
+    generation_strategy: '',
+    show_generation_task: false,
+    resolution: null,
+  }
+}
+
+export function CreateKnowledgeBaseDialog({
+  open,
+  onOpenChange,
+  onSubmit,
+  loading,
+  scope,
+  groupName,
+  kbType: initialKbType = 'notebook',
+  knowledgeDefaultTeamId,
+  bindModel,
+  availableGroups,
+  defaultGroupId,
+  showGroupSelector = false,
+}: CreateKnowledgeBaseDialogProps) {
+  const { t } = useTranslation()
+  const [name, setName] = useState('')
+  const [description, setDescription] = useState('')
+  const [directAccessRequirement, setDirectAccessRequirement] =
+    useState<DirectAccessRequirement>('read')
+  const [allowDocumentDownload, setAllowDocumentDownload] = useState<boolean | undefined>()
+  // Selected KB type (can be changed by user)
+  const [selectedKbType, setSelectedKbType] = useState<KnowledgeBaseType>(initialKbType)
+  // Which kind of knowledge base is being created. Chosen first because it decides
+  // which fields even apply: a code wiki has a repository and no opening view.
+  const [kind, setKind] = useState<KnowledgeBaseKind>('document')
+  // Staged rollout: creating code wikis is off unless the deployment opts in.
+  // Reading and regenerating existing ones is unaffected, here and on the server.
+  const kindOptions = (
+    [
+      ['document', FileText, 'knowledge:document.knowledgeBase.kindDocument'],
+      ...(getRuntimeConfigSync().enableCodeWiki
+        ? [['code', Code2, 'knowledge:document.knowledgeBase.kindCode'] as const]
+        : []),
+    ] as const
+  ).filter(Boolean) as ReadonlyArray<readonly [KnowledgeBaseKind, typeof FileText, string]>
+  const [source, setSource] = useState<CodeWikiSource>(createEmptySource)
+  const [dingtalkAutoSyncEnabled, setDingtalkAutoSyncEnabled] = useState(false)
+  const [scheduledUpdateEnabled, setScheduledUpdateEnabled] = useState(false)
+  const [initialCadence, setInitialCadence] = useState<
+    'daily' | 'weekly' | 'biweekly' | 'four_weeks' | 'custom'
+  >('weekly')
+  const [initialIntervalDays, setInitialIntervalDays] = useState(7)
+  const [initialWeekday, setInitialWeekday] = useState(0)
+  const [initialTime, setInitialTime] = useState('09:00')
+  const [initialTimezone, setInitialTimezone] = useState(
+    () => Intl.DateTimeFormat().resolvedOptions().timeZone
+  )
+  const [initialRunner, setInitialRunner] = useState<SearchUser[]>([])
+  // Default enable summary for all KB types
+  const [summaryEnabled, setSummaryEnabled] = useState(true)
+  const [summaryModelRef, setSummaryModelRef] = useState<SummaryModelRef | null>(null)
+  const [summaryModelError, setSummaryModelError] = useState('')
+  // Which model reads the repository. Required for a code wiki rather than
+  // inherited from the team's bot: a wiki hands a whole codebase to whichever
+  // model it names, so that has to be a choice the creator sees themselves making.
+  const [executionModelRef, setExecutionModelRef] = useState<SummaryModelRef | null>(null)
+  const [executionModelError, setExecutionModelError] = useState('')
+  const {
+    validate: validateMultimodal,
+    clearError: clearMultimodalError,
+    reset: resetMultimodal,
+    buildSubmitFields: buildMultimodalSubmitFields,
+    formProps: multimodalFormProps,
+  } = useMultimodalKBConfig()
+  const [guidedQuestions, setGuidedQuestions] = useState<string[]>([])
+  const [ragConfigMode, setRagConfigMode] = useState<RagConfigMode>('auto')
+  const [retrievalConfig, setRetrievalConfig] = useState<RetrievalConfigDraft>(
+    createDefaultRetrievalConfig
+  )
+  const profileAppliedRef = useRef(false)
+  const retrievalConfigChangedRef = useRef(false)
+  const [error, setError] = useState('')
+  const [accordionValue, setAccordionValue] = useState<string>('')
+  const [maxCalls, setMaxCalls] = useState(10)
+  const [exemptCalls, setExemptCalls] = useState(5)
+  // Selected group for creating KB (used when showGroupSelector is true)
+  const [selectedGroupId, setSelectedGroupId] = useState<string>(defaultGroupId || 'personal')
+
+  // Get the selected group for retrieval scope
+  const selectedGroup = availableGroups?.find(g => g.id === selectedGroupId)
+  const effectiveScope =
+    showGroupSelector && selectedGroup ? selectedGroup.type : scope || 'personal'
+  const effectiveGroupName =
+    showGroupSelector && selectedGroup && selectedGroup.type === 'group'
+      ? selectedGroup.name
+      : groupName
+
+  // Reset selectedKbType and selectedGroupId when dialog opens
+  useEffect(() => {
+    if (open) {
+      setSelectedKbType(initialKbType)
+      setKind('document')
+      setSource(createEmptySource())
+      setScheduledUpdateEnabled(false)
+      setInitialCadence('weekly')
+      setInitialIntervalDays(7)
+      setInitialWeekday(0)
+      setInitialTime('09:00')
+      setInitialTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone)
+      setInitialRunner([])
+      setSelectedGroupId(defaultGroupId || 'personal')
+      setDirectAccessRequirement('read')
+      setAllowDocumentDownload(true)
+      setRetrievalConfig(createDefaultRetrievalConfig())
+      profileAppliedRef.current = false
+      retrievalConfigChangedRef.current = false
+    }
+  }, [open, initialKbType, defaultGroupId])
+
+  useEffect(() => {
+    if (!open || profileAppliedRef.current) return
+    profileAppliedRef.current = true
+    let cancelled = false
+
+    void getKnowledgeBaseRetrievalProfile()
+      .then(profile => {
+        if (cancelled) return
+        if (profile.health.status === 'valid' && profile.retrieval_config) {
+          if (!retrievalConfigChangedRef.current) {
+            setRetrievalConfig(profile.retrieval_config)
+          }
+          return
+        }
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [open])
+
+  // Update selectedKbType when KB type changes (keep summaryEnabled unchanged)
+  const handleKbTypeChange = (newType: KnowledgeBaseType) => {
+    setSelectedKbType(newType)
+  }
+
+  const handleSubmit = async () => {
+    setError('')
+    setSummaryModelError('')
+    setExecutionModelError('')
+    clearMultimodalError()
+
+    // A code wiki may be left unnamed: the server fills in the repository's own
+    // name. Pre-filling the box here instead would read as the caller's own input.
+    if (!name.trim() && kind !== 'code') {
+      setError(t('knowledge:document.knowledgeBase.nameRequired'))
+      return
+    }
+
+    if (kind === 'code' && !source.source_url) {
+      setError(t('knowledge:codeWiki.create.repositoryRequired'))
+      return
+    }
+
+    if (kind === 'code' && !executionModelRef) {
+      setExecutionModelError(t('knowledge:codeWiki.create.modelRequired'))
+      return
+    }
+
+    if (
+      kind === 'code' &&
+      scheduledUpdateEnabled &&
+      initialCadence === 'custom' &&
+      (!Number.isInteger(initialIntervalDays) ||
+        initialIntervalDays < 2 ||
+        initialIntervalDays > 365)
+    ) {
+      setError(t('knowledge:codeWiki.scheduledUpdate.invalidCustomDays'))
+      return
+    }
+
+    if (kind === 'code' && scheduledUpdateEnabled) {
+      const [hour, minute] = initialTime.split(':').map(Number)
+      if (
+        !Number.isInteger(hour) ||
+        !Number.isInteger(minute) ||
+        hour < 0 ||
+        hour > 23 ||
+        minute < 0 ||
+        minute > 59
+      ) {
+        setError(t('knowledge:codeWiki.scheduledUpdate.invalidTime'))
+        return
+      }
+    }
+
+    if (name.length > 100) {
+      setError(t('knowledge:document.knowledgeBase.nameTooLong'))
+      return
+    }
+
+    // Validate summary model when summary is enabled
+    if (summaryEnabled && !summaryModelRef) {
+      setSummaryModelError(t('knowledge:document.summary.modelRequired'))
+      return
+    }
+
+    // Validate multimodal analysis model when multimodal analysis is enabled
+    if (!validateMultimodal()) {
+      return
+    }
+
+    // Validate call limits
+    if (exemptCalls >= maxCalls) {
+      setError(t('knowledge:document.callLimits.validationError'))
+      setAccordionValue('advanced')
+      return
+    }
+
+    try {
+      // Filter out empty guided questions
+      const validGuidedQuestions = guidedQuestions.filter(q => q.trim().length > 0)
+      await onSubmit({
+        name: name.trim(),
+        description: description.trim() || undefined,
+        direct_access_requirement: directAccessRequirement,
+        allow_document_download: allowDocumentDownload,
+        retrieval_config:
+          ragConfigMode === 'disabled' || !retrievalConfigChangedRef.current
+            ? undefined
+            : retrievalConfig,
+        rag_config_mode: ragConfigMode,
+        dingtalk_auto_sync_enabled: kind !== 'code' && dingtalkAutoSyncEnabled,
+        summary_enabled: summaryEnabled,
+        summary_model_ref: summaryEnabled ? summaryModelRef : null,
+        ...buildMultimodalSubmitFields(),
+        guided_questions: validGuidedQuestions.length > 0 ? validGuidedQuestions : undefined,
+        max_calls_per_conversation: maxCalls,
+        exempt_calls_before_check: exemptCalls,
+        selectedGroupId: showGroupSelector ? selectedGroupId : undefined,
+        kb_type: kind === 'code' ? 'code_wiki' : selectedKbType,
+        ...(kind === 'code'
+          ? {
+              source_type: source.source_type,
+              source_url: source.source_url,
+              language: source.language,
+              ...(source.generation_strategy
+                ? { generation_strategy: source.generation_strategy }
+                : {}),
+              show_generation_task: source.show_generation_task,
+              // Left blank, the repository's own name is used. Sent from what the
+              // form already resolved rather than pre-filled into the box, which
+              // would read as the caller's own input — and rather than resolved
+              // again on the server, which has asked the provider once already.
+              resolved_name: source.resolution?.name,
+              resolved_description: source.resolution?.description,
+              execution_model_ref: executionModelRef,
+              scheduled_update: scheduledUpdateEnabled
+                ? {
+                    enabled: true,
+                    cadence: initialCadence,
+                    interval_days: initialIntervalDays,
+                    weekday: initialWeekday,
+                    hour: Number(initialTime.split(':')[0]),
+                    minute: Number(initialTime.split(':')[1]),
+                    timezone: initialTimezone,
+                    execution_principal_user_id: initialRunner[0]?.id ?? null,
+                  }
+                : null,
+            }
+          : {}),
+      })
+      setName('')
+      setDescription('')
+      setDirectAccessRequirement('read')
+      setAllowDocumentDownload(true)
+      // Reset selectedKbType and keep summaryEnabled as true
+      setSelectedKbType(initialKbType)
+      setKind('document')
+      setSource(createEmptySource())
+      setDingtalkAutoSyncEnabled(false)
+      setScheduledUpdateEnabled(false)
+      setInitialCadence('weekly')
+      setInitialIntervalDays(7)
+      setInitialWeekday(0)
+      setInitialTime('09:00')
+      setInitialTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone)
+      setInitialRunner([])
+      setSummaryEnabled(true)
+      setSummaryModelRef(null)
+      setExecutionModelRef(null)
+      setExecutionModelError('')
+      resetMultimodal()
+      setGuidedQuestions([])
+      setRagConfigMode('auto')
+      setRetrievalConfig(createDefaultRetrievalConfig())
+      setMaxCalls(10)
+      setExemptCalls(5)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common:error'))
+    }
+  }
+
+  const handleOpenChange = (newOpen: boolean) => {
+    if (!newOpen) {
+      setName('')
+      setDescription('')
+      setDirectAccessRequirement('read')
+      setAllowDocumentDownload(true)
+      // Reset selectedKbType and keep summaryEnabled as true
+      setSelectedKbType(initialKbType)
+      setKind('document')
+      setSource(createEmptySource())
+      setDingtalkAutoSyncEnabled(false)
+      setScheduledUpdateEnabled(false)
+      setInitialCadence('weekly')
+      setInitialIntervalDays(7)
+      setInitialWeekday(0)
+      setInitialTime('09:00')
+      setInitialTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone)
+      setInitialRunner([])
+      setSummaryEnabled(true)
+      setSummaryModelRef(null)
+      setExecutionModelRef(null)
+      setExecutionModelError('')
+      setSummaryModelError('')
+      resetMultimodal()
+      setGuidedQuestions([])
+      setRagConfigMode('auto')
+      setRetrievalConfig(createDefaultRetrievalConfig())
+      setMaxCalls(10)
+      setExemptCalls(5)
+      setError('')
+      setAccordionValue('')
+      setSelectedGroupId(defaultGroupId || 'personal')
+    }
+    onOpenChange(newOpen)
+  }
+
+  // Determine if this is a notebook type
+  const isNotebook = selectedKbType === 'notebook'
+  const ragModeOptions: RagConfigMode[] = ['auto', 'disabled']
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent
+        className="max-w-3xl max-h-[90vh] overflow-hidden flex flex-col"
+        data-testid="create-kb-dialog"
+      >
+        <DialogHeader>
+          <DialogTitle>{t('knowledge:document.knowledgeBase.create')}</DialogTitle>
+          <DialogDescription>
+            {t('knowledge:document.knowledgeBase.createDialogDescription')}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex-1 overflow-y-auto space-y-4 py-4 pr-3 [scrollbar-gutter:stable]">
+          {/* Which kind first: it decides which of the fields below even apply. The
+              choice disappears entirely while code wikis are off, rather than being
+              shown disabled: an option nobody in this deployment can pick is noise,
+              and the server refuses the call regardless. */}
+          <div className={`grid gap-3 ${kindOptions.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+            {kindOptions.map(([option, Icon, label]) => (
+              <button
+                key={option}
+                type="button"
+                onClick={() => setKind(option)}
+                data-testid={`create-kb-kind-${option}`}
+                className={`flex items-center gap-3 p-3 rounded-md border transition-colors ${
+                  kind === option
+                    ? 'bg-primary/5 border-primary/20'
+                    : 'bg-muted border-border hover:bg-hover'
+                }`}
+              >
+                <div
+                  className={`flex-shrink-0 w-8 h-8 rounded-md flex items-center justify-center ${
+                    kind === option
+                      ? 'bg-primary/10 text-primary'
+                      : 'bg-surface text-text-secondary'
+                  }`}
+                >
+                  <Icon className="w-4 h-4" />
+                </div>
+                <div className="text-left">
+                  <div className="font-medium text-sm">{t(label)}</div>
+                  <div className="text-xs text-text-muted">{t(`${label}Desc`)}</div>
+                </div>
+              </button>
+            ))}
+          </div>
+          <KnowledgeBaseForm
+            advancedExtras={
+              kind === 'code' ? (
+                <>
+                  <SimpleConfigRow
+                    label={t('knowledge:codeWiki.strategy.label')}
+                    description={t('knowledge:codeWiki.strategy.createDescription')}
+                  >
+                    <GenerationStrategySelect
+                      value={source.generation_strategy}
+                      onChange={generation_strategy =>
+                        setSource({ ...source, generation_strategy })
+                      }
+                      emptyOption="deployment"
+                      testId="code-wiki-generation-strategy"
+                    />
+                  </SimpleConfigRow>
+                  <SimpleConfigRow
+                    label={t('knowledge:codeWiki.create.scheduledUpdate')}
+                    description={t('knowledge:codeWiki.create.scheduledUpdateHint')}
+                    align="start"
+                  >
+                    <div className="space-y-3">
+                      <Switch
+                        checked={scheduledUpdateEnabled}
+                        onCheckedChange={setScheduledUpdateEnabled}
+                        aria-label={t('knowledge:codeWiki.create.scheduledUpdate')}
+                        data-testid="code-wiki-create-scheduled-update"
+                      />
+                      {scheduledUpdateEnabled && (
+                        <div className="space-y-3">
+                          <div className="grid grid-cols-2 gap-2">
+                            <Select
+                              value={initialCadence}
+                              onValueChange={value => {
+                                const cadence = value as typeof initialCadence
+                                setInitialCadence(cadence)
+                                const fixed = {
+                                  daily: 1,
+                                  weekly: 7,
+                                  biweekly: 14,
+                                  four_weeks: 28,
+                                }
+                                if (cadence !== 'custom') setInitialIntervalDays(fixed[cadence])
+                              }}
+                            >
+                              <SelectTrigger data-testid="code-wiki-create-cadence">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="daily">
+                                  {t('knowledge:codeWiki.scheduledUpdate.daily')}
+                                </SelectItem>
+                                <SelectItem value="weekly">
+                                  {t('knowledge:codeWiki.scheduledUpdate.weekly')}
+                                </SelectItem>
+                                <SelectItem value="biweekly">
+                                  {t('knowledge:codeWiki.scheduledUpdate.biweekly')}
+                                </SelectItem>
+                                <SelectItem value="four_weeks">
+                                  {t('knowledge:codeWiki.scheduledUpdate.four_weeks')}
+                                </SelectItem>
+                                <SelectItem value="custom">
+                                  {t('knowledge:codeWiki.scheduledUpdate.custom')}
+                                </SelectItem>
+                              </SelectContent>
+                            </Select>
+                            {initialCadence === 'custom' && (
+                              <Input
+                                type="number"
+                                min={2}
+                                max={365}
+                                value={initialIntervalDays}
+                                onChange={event =>
+                                  setInitialIntervalDays(Number(event.target.value))
+                                }
+                                aria-label={t('knowledge:codeWiki.scheduledUpdate.customDays')}
+                                data-testid="code-wiki-create-custom-days"
+                              />
+                            )}
+                            {['weekly', 'biweekly', 'four_weeks'].includes(initialCadence) && (
+                              <Select
+                                value={String(initialWeekday)}
+                                onValueChange={value => setInitialWeekday(Number(value))}
+                              >
+                                <SelectTrigger data-testid="code-wiki-create-weekday">
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {[0, 1, 2, 3, 4, 5, 6].map(day => (
+                                    <SelectItem key={day} value={String(day)}>
+                                      {t(`knowledge:codeWiki.scheduledUpdate.weekdays.${day}`)}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                            )}
+                            <div className="space-y-2">
+                              <Label htmlFor="code-wiki-create-time">
+                                {t('knowledge:codeWiki.scheduledUpdate.time')}
+                              </Label>
+                              <Input
+                                id="code-wiki-create-time"
+                                type="time"
+                                value={initialTime}
+                                onChange={event => setInitialTime(event.target.value)}
+                                data-testid="code-wiki-create-time"
+                              />
+                            </div>
+                          </div>
+                          <p
+                            className="text-xs text-text-muted"
+                            data-testid="code-wiki-create-timezone"
+                          >
+                            {t('knowledge:codeWiki.scheduledUpdate.timezoneHint', {
+                              timezone: initialTimezone,
+                            })}
+                          </p>
+                          <div className="space-y-2">
+                            <Label>{t('knowledge:codeWiki.scheduledUpdate.runner')}</Label>
+                            <p className="text-xs text-text-secondary">
+                              {t('knowledge:codeWiki.scheduledUpdate.runnerHint')}
+                            </p>
+                            <UserSearchSelect
+                              selectedUsers={initialRunner}
+                              onSelectedUsersChange={setInitialRunner}
+                              multiple={false}
+                              placeholder={t(
+                                'knowledge:codeWiki.scheduledUpdate.runnerPlaceholder'
+                              )}
+                              inputTestId="code-wiki-create-scheduled-runner"
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </SimpleConfigRow>
+                  <GenerationTaskRow
+                    checked={source.show_generation_task}
+                    onChange={checked => setSource({ ...source, show_generation_task: checked })}
+                  />
+                </>
+              ) : (
+                <DingtalkAutoSyncSetting
+                  checked={dingtalkAutoSyncEnabled}
+                  onCheckedChange={setDingtalkAutoSyncEnabled}
+                />
+              )
+            }
+            nameRequired={kind !== 'code'}
+            namePlaceholder={
+              kind === 'code' ? t('knowledge:codeWiki.create.namePlaceholder') : undefined
+            }
+            typeSection={
+              <>
+                {kind === 'code' ? (
+                  <>
+                    <CodeWikiSourceFields value={source} onChange={setSource} />
+                    <SimpleConfigRow
+                      label={t('knowledge:codeWiki.create.modelLabel')}
+                      description={t('knowledge:codeWiki.create.modelDescription')}
+                      align="start"
+                    >
+                      <ModelRefSelector
+                        value={executionModelRef}
+                        onChange={value => {
+                          setExecutionModelRef(value)
+                          // Otherwise the "pick a model" error stays beside a field
+                          // that now has one, until the next submit clears it.
+                          setExecutionModelError('')
+                        }}
+                        error={executionModelError}
+                        placeholder={t('knowledge:codeWiki.create.modelPlaceholder')}
+                        knowledgeDefaultTeamId={knowledgeDefaultTeamId}
+                        bindModel={bindModel}
+                        preferenceScope="wiki"
+                        dataTestId="code-wiki-execution-model-select"
+                      />
+                    </SimpleConfigRow>
+                  </>
+                ) : (
+                  /* KB Type selector - subtle style */
+                  <SimpleConfigRow label={t('knowledge:document.knowledgeBase.type')} align="start">
+                    <div className="space-y-2">
+                      <div className="flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => handleKbTypeChange(isNotebook ? 'classic' : 'notebook')}
+                          className="text-xs text-text-muted hover:text-primary transition-colors"
+                          data-testid="switch-kb-type"
+                        >
+                          {isNotebook
+                            ? t('knowledge:document.knowledgeBase.convertToClassic')
+                            : t('knowledge:document.knowledgeBase.convertToNotebook')}
+                        </button>
+                      </div>
+                      <div
+                        className={`flex items-center gap-3 p-3 rounded-md border ${
+                          isNotebook ? 'bg-primary/5 border-primary/20' : 'bg-muted border-border'
+                        }`}
+                      >
+                        <div
+                          className={`flex-shrink-0 w-8 h-8 rounded-md flex items-center justify-center ${
+                            isNotebook
+                              ? 'bg-primary/10 text-primary'
+                              : 'bg-surface text-text-secondary'
+                          }`}
+                        >
+                          {isNotebook ? (
+                            <BookOpen className="w-4 h-4" />
+                          ) : (
+                            <Database className="w-4 h-4" />
+                          )}
+                        </div>
+                        <div>
+                          <div className="font-medium text-sm">
+                            {isNotebook
+                              ? t('knowledge:document.knowledgeBase.typeNotebook')
+                              : t('knowledge:document.knowledgeBase.typeClassic')}
+                          </div>
+                          <div className="text-xs text-text-muted">
+                            {isNotebook
+                              ? t('knowledge:document.knowledgeBase.notebookDesc')
+                              : t('knowledge:document.knowledgeBase.classicDesc')}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </SimpleConfigRow>
+                )}
+                {/* Group selector - only show when showGroupSelector is true */}
+                {showGroupSelector && availableGroups && availableGroups.length > 0 && (
+                  <SimpleConfigRow
+                    label={
+                      <>
+                        {t('knowledge:document.knowledgeBase.targetGroup', '归属')}{' '}
+                        <span className="text-red-400">*</span>
+                      </>
+                    }
+                  >
+                    <Select value={selectedGroupId} onValueChange={setSelectedGroupId}>
+                      <SelectTrigger data-testid="group-selector" className="bg-base">
+                        <SelectValue
+                          placeholder={t(
+                            'knowledge:document.knowledgeBase.selectGroup',
+                            '选择分组'
+                          )}
+                        />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {availableGroups
+                          .filter(g => g.canCreate)
+                          .map(group => (
+                            <SelectItem key={group.id} value={group.id}>
+                              <div className="flex items-center gap-2">
+                                <GroupTypeIcon type={group.type} />
+                                <span>{group.displayName}</span>
+                              </div>
+                            </SelectItem>
+                          ))}
+                      </SelectContent>
+                    </Select>
+                  </SimpleConfigRow>
+                )}
+              </>
+            }
+            name={name}
+            description={description}
+            onNameChange={value => setName(value)}
+            onDescriptionChange={value => setDescription(value)}
+            directAccessRequirement={directAccessRequirement}
+            onDirectAccessRequirementChange={setDirectAccessRequirement}
+            allowDocumentDownload={allowDocumentDownload}
+            onAllowDocumentDownloadChange={setAllowDocumentDownload}
+            summaryEnabled={summaryEnabled}
+            onSummaryEnabledChange={checked => {
+              setSummaryEnabled(checked)
+              if (!checked) {
+                setSummaryModelRef(null)
+                setSummaryModelError('')
+              }
+            }}
+            summaryModelRef={summaryModelRef}
+            summaryModelError={summaryModelError}
+            onSummaryModelChange={value => {
+              setSummaryModelRef(value)
+              setSummaryModelError('')
+            }}
+            {...multimodalFormProps}
+            knowledgeDefaultTeamId={knowledgeDefaultTeamId}
+            bindModel={bindModel}
+            callLimits={{ maxCalls, exemptCalls }}
+            onCallLimitsChange={({ maxCalls: nextMax, exemptCalls: nextExempt }) => {
+              setMaxCalls(nextMax)
+              setExemptCalls(nextExempt)
+            }}
+            advancedOpen={accordionValue === 'advanced'}
+            onAdvancedOpenChange={open => setAccordionValue(open ? 'advanced' : '')}
+            retrievalModeSection={
+              <div className="space-y-2">
+                <div className="grid grid-cols-2 gap-2">
+                  {ragModeOptions.map(mode => (
+                    <Button
+                      key={mode}
+                      type="button"
+                      variant={ragConfigMode === mode ? 'primary' : 'outline'}
+                      className="h-11 min-w-[44px] px-2 text-xs"
+                      onClick={() => setRagConfigMode(mode)}
+                      data-testid={`rag-mode-${mode}`}
+                    >
+                      {t(`knowledge:document.ragConfigMode.${mode}`)}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            }
+            showRetrievalSection={ragConfigMode !== 'disabled'}
+            retrievalConfig={retrievalConfig}
+            onRetrievalConfigChange={setRetrievalConfig}
+            onRetrievalConfigUserChange={() => {
+              retrievalConfigChangedRef.current = true
+            }}
+            retrievalScope={effectiveScope}
+            retrievalGroupName={effectiveGroupName}
+            showGuidedQuestions={true}
+            guidedQuestions={guidedQuestions}
+            onGuidedQuestionsChange={setGuidedQuestions}
+          />
+
+          {error && <p className="text-sm text-error">{error}</p>}
+        </div>
+        <DialogFooter>
+          <Button
+            variant="outline"
+            onClick={() => handleOpenChange(false)}
+            disabled={loading}
+            className="h-11 min-w-[44px]"
+            data-testid="cancel-create-kb"
+          >
+            {t('common:actions.cancel')}
+          </Button>
+          <Button
+            onClick={handleSubmit}
+            variant="primary"
+            disabled={loading}
+            className="h-11 min-w-[44px]"
+            data-testid="submit-create-kb"
+          >
+            {loading ? t('common:actions.creating') : t('common:actions.create')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}

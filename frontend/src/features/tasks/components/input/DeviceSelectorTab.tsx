@@ -1,0 +1,742 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+/**
+ * DeviceSelectorTab component for selecting execution target in the chat input area.
+ *
+ * Features:
+ * - Card-based device selector with Popover for better multi-device visualization
+ * - Shows device count and online status in trigger button
+ * - Grid layout for device cards with rich information
+ * - Cloud mode option for serverless execution
+ * - Set default execution target (saved to server)
+ * - Read-only state for existing chats
+ */
+
+import { useMemo, useRef, useEffect, useCallback, useState } from 'react'
+import type { KeyboardEvent, MouseEvent } from 'react'
+import { useDevices } from '@/contexts/DeviceContext'
+import { useUser } from '@/features/common/UserContext'
+import { useTranslation } from '@/hooks/useTranslation'
+import { cn } from '@/lib/utils'
+import {
+  Monitor,
+  Cloud,
+  ChevronDown,
+  AlertCircle,
+  Server,
+  Check,
+  Settings,
+  Cpu,
+  AppWindow,
+} from 'lucide-react'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import {
+  compareDevicesByExecutionPriority,
+  formatSlotUsage,
+  getAccountDefaultDeviceId,
+  resolveDeviceSelectionId,
+  getStatusColor,
+  isDeviceAtCapacity,
+} from '@/features/devices/utils/execution-target'
+import { toast } from 'sonner'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { paths } from '@/config/paths'
+import type { DeviceInfo } from '@/apis/devices'
+import type { TaskType } from '@/types/api'
+import { useAdvancedDeviceMode } from '@/features/devices/hooks/useAdvancedDeviceMode'
+import { filterDevicesByAdvancedMode } from '@/features/devices/utils/device-visibility'
+
+interface DeviceSelectorTabProps {
+  /** Additional className */
+  className?: string
+  /** Disabled state */
+  disabled?: boolean
+  /** Existing task ID. Its persisted execution target is always read-only. */
+  taskId?: number | null
+  /** Persisted task type used to distinguish managed and device execution. */
+  taskType?: TaskType | null
+  /** The device ID used when the task was created (for read-only display) */
+  taskDeviceId?: string | null
+}
+
+/**
+ * Device card component for the selector grid
+ */
+function handleSelectableCardKeyDown(
+  event: KeyboardEvent<HTMLDivElement>,
+  isDisabled: boolean,
+  onSelect: () => void
+) {
+  if (isDisabled) return
+
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault()
+    onSelect()
+  }
+}
+
+function DeviceCard({
+  device,
+  isSelected,
+  isDefault,
+  disabled,
+  onSelect,
+  onSetDefault,
+}: {
+  device: DeviceInfo
+  isSelected: boolean
+  isDefault: boolean
+  disabled: boolean
+  onSelect: () => void
+  onSetDefault: (e: MouseEvent<HTMLButtonElement>) => void
+}) {
+  const { t } = useTranslation('devices')
+  const isFull = isDeviceAtCapacity(device.slot_used, device.slot_max)
+  const isOffline = device.status === 'offline'
+  const isDisabled = disabled || isFull || isOffline
+
+  return (
+    <div
+      role="button"
+      tabIndex={isDisabled ? -1 : 0}
+      aria-disabled={isDisabled}
+      onClick={() => !isDisabled && onSelect()}
+      onKeyDown={event => handleSelectableCardKeyDown(event, isDisabled, onSelect)}
+      data-testid={`device-card-${device.device_id}`}
+      className={cn(
+        'group relative flex flex-col p-3 rounded-lg border-2 transition-all text-left w-full min-h-[88px]',
+        'hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/20',
+        isSelected
+          ? 'border-primary bg-primary/5'
+          : 'border-border hover:border-primary/40 bg-surface',
+        isDisabled && 'opacity-50 cursor-not-allowed hover:border-border'
+      )}
+    >
+      {/* Selected indicator */}
+      {isSelected && (
+        <div className="absolute top-2 right-2">
+          <Check className="w-4 h-4 text-primary" />
+        </div>
+      )}
+
+      {/* Device icon and name */}
+      <div className="flex items-start gap-2 mb-2 pr-6">
+        {device.device_type === 'cloud' ? (
+          <Server className="w-5 h-5 text-text-secondary flex-shrink-0 mt-0.5" />
+        ) : (
+          <Monitor className="w-5 h-5 text-text-secondary flex-shrink-0 mt-0.5" />
+        )}
+        <span className="font-medium text-sm text-text-primary break-all line-clamp-2">
+          {device.name}
+        </span>
+        {device.device_type === 'app' && (
+          <span
+            data-testid={`wework-device-badge-${device.device_id}`}
+            className="px-1.5 py-0.5 rounded text-[10px] text-primary bg-primary/10 flex-shrink-0 mt-0.5"
+          >
+            {t('wework_device_badge')}
+          </span>
+        )}
+      </div>
+
+      {/* Status and slots / default button */}
+      <div className="flex items-center justify-between mt-auto">
+        <div className="flex items-center gap-1.5">
+          <span className={cn('w-2 h-2 rounded-full', getStatusColor(device.status))} />
+          <span className="text-xs text-text-muted">
+            {device.status === 'online'
+              ? t('status_online')
+              : device.status === 'busy'
+                ? t('status_busy')
+                : t('status_offline')}
+          </span>
+          <span className={cn('text-xs', isFull ? 'text-red-500' : 'text-text-muted')}>
+            {formatSlotUsage(device.slot_used, device.slot_max)}
+          </span>
+        </div>
+        {/* Default button or indicator */}
+        {isDefault ? (
+          <span className="px-1.5 py-0.5 rounded text-[10px] text-primary bg-primary/10">
+            {t('default_device')}
+          </span>
+        ) : (
+          <button
+            type="button"
+            onClick={onSetDefault}
+            className="opacity-0 group-hover:opacity-100 focus:opacity-100 px-2 py-0.5 rounded border border-border bg-surface text-[10px] text-text-secondary hover:text-primary hover:border-primary/40 hover:bg-primary/5 transition-all"
+            data-testid={`set-default-device-${device.device_id}`}
+          >
+            {t('set_as_default')}
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Cloud mode card component
+ */
+function CloudModeCard({
+  isSelected,
+  isDefault,
+  disabled,
+  onSelect,
+  onSetDefault,
+}: {
+  isSelected: boolean
+  isDefault: boolean
+  disabled: boolean
+  onSelect: () => void
+  onSetDefault: (e: MouseEvent<HTMLButtonElement>) => void
+}) {
+  const { t } = useTranslation('devices')
+
+  return (
+    <div
+      role="button"
+      tabIndex={disabled ? -1 : 0}
+      aria-disabled={disabled}
+      onClick={() => !disabled && onSelect()}
+      onKeyDown={event => handleSelectableCardKeyDown(event, disabled, onSelect)}
+      data-testid="cloud-mode-card"
+      className={cn(
+        'group relative flex flex-col p-3 rounded-lg border-2 transition-all text-left w-full min-h-[88px]',
+        'hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/20',
+        isSelected
+          ? 'border-primary bg-primary/5'
+          : 'border-border hover:border-primary/40 bg-surface',
+        disabled && 'opacity-50 cursor-not-allowed hover:border-border'
+      )}
+    >
+      {/* Selected indicator */}
+      {isSelected && (
+        <div className="absolute top-2 right-2">
+          <Check className="w-4 h-4 text-primary" />
+        </div>
+      )}
+
+      {/* Cloud icon and name */}
+      <div className="flex items-center gap-2 mb-2">
+        <Cloud className="w-5 h-5 text-primary flex-shrink-0" />
+        <span className="font-medium text-sm text-text-primary">{t('cloud_mode')}</span>
+      </div>
+
+      {/* Description and default button */}
+      <div className="flex items-center justify-between mt-auto">
+        <span className="text-xs text-text-muted">{t('cloud_mode_description')}</span>
+        {/* Default button or indicator */}
+        {isDefault ? (
+          <span className="px-1.5 py-0.5 rounded text-[10px] text-primary bg-primary/10 flex-shrink-0">
+            {t('default_device')}
+          </span>
+        ) : (
+          <button
+            type="button"
+            onClick={onSetDefault}
+            className="opacity-0 group-hover:opacity-100 focus:opacity-100 px-2 py-0.5 rounded border border-border bg-surface text-[10px] text-text-secondary hover:text-primary hover:border-primary/40 hover:bg-primary/5 transition-all flex-shrink-0"
+            data-testid="set-default-cloud-mode"
+          >
+            {t('set_as_default')}
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export function DeviceSelectorTab({
+  className,
+  disabled,
+  taskId,
+  taskType,
+  taskDeviceId,
+}: DeviceSelectorTabProps) {
+  const { t } = useTranslation('devices')
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const { user, updatePreferences } = useUser()
+  const { devices, selectedDeviceId, setSelectedDeviceId, isLoading } = useDevices()
+  const { showAdvancedDevices, isAdvancedDeviceModeReady } = useAdvancedDeviceMode()
+  const newTaskSelectionInitializedRef = useRef(false)
+  const previousTaskIdRef = useRef<number | null>(taskId ?? null)
+  const [isOpen, setIsOpen] = useState(false)
+  const hoverTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const closeTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // Handle hover open with delay
+  const handleMouseEnter = useCallback(() => {
+    if (disabled || isLoading || taskId != null) return
+    // Clear any pending close timeout
+    if (closeTimeoutRef.current) {
+      clearTimeout(closeTimeoutRef.current)
+      closeTimeoutRef.current = null
+    }
+    // Open after a short delay to prevent accidental triggers
+    hoverTimeoutRef.current = setTimeout(() => {
+      setIsOpen(true)
+    }, 150)
+  }, [disabled, isLoading, taskId])
+
+  // Handle hover close with delay
+  const handleMouseLeave = useCallback(() => {
+    // Clear any pending open timeout
+    if (hoverTimeoutRef.current) {
+      clearTimeout(hoverTimeoutRef.current)
+      hoverTimeoutRef.current = null
+    }
+    // Close after a delay to allow moving to the popover content
+    closeTimeoutRef.current = setTimeout(() => {
+      setIsOpen(false)
+    }, 300)
+  }, [])
+
+  // Cleanup timeouts on unmount
+  useEffect(() => {
+    return () => {
+      if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current)
+      if (closeTimeoutRef.current) clearTimeout(closeTimeoutRef.current)
+    }
+  }, [])
+
+  // Get user's default execution target preference
+  const defaultExecutionTarget = user?.preferences?.default_execution_target
+
+  const visibleDevices = useMemo(
+    () => filterDevicesByAdvancedMode(devices, showAdvancedDevices),
+    [devices, showAdvancedDevices]
+  )
+
+  const displayDevices = useMemo(
+    () => [...visibleDevices].sort(compareDevicesByExecutionPriority),
+    [visibleDevices]
+  )
+
+  // Count online devices
+  const onlineDeviceCount = useMemo(
+    () => visibleDevices.filter(device => device.status !== 'offline').length,
+    [visibleDevices]
+  )
+
+  const totalDeviceCount = visibleDevices.length
+
+  const localDevices = useMemo(() => {
+    return displayDevices.filter(device => device.device_type !== 'cloud')
+  }, [displayDevices])
+
+  const cloudDevices = useMemo(() => {
+    return displayDevices.filter(device => device.device_type === 'cloud')
+  }, [displayDevices])
+
+  const isExistingTask = taskId != null
+  const persistedTaskDeviceId =
+    isExistingTask && taskType === 'task' ? taskDeviceId?.trim() || null : null
+  const selectedTargetDeviceId = resolveDeviceSelectionId(
+    devices,
+    isExistingTask ? persistedTaskDeviceId : selectedDeviceId
+  )
+  const resolvedDefaultDeviceId = resolveDeviceSelectionId(
+    devices,
+    getAccountDefaultDeviceId(defaultExecutionTarget)
+  )
+  const selectedDevice = selectedTargetDeviceId
+    ? (devices.find(device => device.device_id === selectedTargetDeviceId) ?? null)
+    : null
+  const hasExplicitDeviceParam = Boolean(
+    searchParams.get('deviceId') || searchParams.get('device_id')
+  )
+
+  useEffect(() => {
+    if (isExistingTask) {
+      previousTaskIdRef.current = taskId ?? null
+      newTaskSelectionInitializedRef.current = false
+      return
+    }
+
+    if (
+      isLoading ||
+      !isAdvancedDeviceModeReady ||
+      hasExplicitDeviceParam ||
+      newTaskSelectionInitializedRef.current
+    ) {
+      return
+    }
+
+    const returningFromTask = previousTaskIdRef.current != null
+    previousTaskIdRef.current = null
+    newTaskSelectionInitializedRef.current = true
+
+    // A new draft starts from the account default. Preserve an existing
+    // selection only on the first mount, where it may be an explicit launch
+    // choice made by the device page before this selector mounted.
+    const selectedDeviceIsVisible = visibleDevices.some(
+      device => device.device_id === selectedDeviceId
+    )
+    if (returningFromTask || !selectedDeviceId || !selectedDeviceIsVisible) {
+      const defaultDeviceId = resolveDeviceSelectionId(
+        visibleDevices,
+        getAccountDefaultDeviceId(defaultExecutionTarget)
+      )
+      const availableDefaultDeviceId = visibleDevices.some(
+        device =>
+          device.device_id === defaultDeviceId || device.registered_device_id === defaultDeviceId
+      )
+        ? defaultDeviceId
+        : null
+      setSelectedDeviceId(availableDefaultDeviceId)
+    }
+  }, [
+    defaultExecutionTarget,
+    hasExplicitDeviceParam,
+    isAdvancedDeviceModeReady,
+    isExistingTask,
+    isLoading,
+    selectedDeviceId,
+    setSelectedDeviceId,
+    taskId,
+    visibleDevices,
+  ])
+
+  const isSelectedDeviceAvailable =
+    !selectedTargetDeviceId || (selectedDevice != null && selectedDevice.status !== 'offline')
+
+  const handleDeviceSelect = (deviceId: string) => {
+    if (disabled || isExistingTask || isLoading) return
+    newTaskSelectionInitializedRef.current = true
+    setSelectedDeviceId(deviceId)
+    setIsOpen(false)
+  }
+
+  const handleCloudModeSelect = () => {
+    if (disabled || isExistingTask || isLoading) return
+    newTaskSelectionInitializedRef.current = true
+    setSelectedDeviceId(null)
+    setIsOpen(false)
+  }
+
+  // Set default execution target (saved to server)
+  const handleSetDefaultTarget = useCallback(
+    async (e: MouseEvent<HTMLButtonElement>, target: string) => {
+      e.stopPropagation()
+      e.preventDefault()
+      try {
+        await updatePreferences({ default_execution_target: target })
+        toast.success(t('default_target_saved'))
+      } catch {
+        toast.error(t('default_target_save_failed'))
+      }
+    },
+    [updatePreferences, t]
+  )
+
+  // Navigate to device management page
+  const handleManageDevices = () => {
+    setIsOpen(false)
+    router.push(paths.devices.getHref())
+  }
+
+  const renderTriggerContent = () => {
+    if (selectedDevice) {
+      const devicePrefix =
+        selectedDevice.device_type === 'cloud'
+          ? t('cloud_device_prefix')
+          : selectedDevice.device_type === 'app'
+            ? t('wework_device_prefix')
+            : t('local_device_prefix')
+      const displayName = `${devicePrefix}${selectedDevice.name}`
+
+      return (
+        <>
+          {selectedDevice.device_type === 'cloud' ? (
+            <Server className="w-3.5 h-3.5 text-primary flex-shrink-0" />
+          ) : selectedDevice.device_type === 'app' ? (
+            <AppWindow className="w-3.5 h-3.5 text-primary flex-shrink-0" />
+          ) : (
+            <Monitor className="w-3.5 h-3.5 text-primary flex-shrink-0" />
+          )}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="max-w-[200px] truncate">{displayName}</span>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-[300px]">
+              <p className="break-all">{displayName}</p>
+            </TooltipContent>
+          </Tooltip>
+          <span
+            className={cn(
+              'w-1.5 h-1.5 rounded-full flex-shrink-0',
+              getStatusColor(selectedDevice.status)
+            )}
+          />
+          {totalDeviceCount > 0 && (
+            <span className="text-text-muted text-[10px] ml-0.5 flex-shrink-0">
+              {onlineDeviceCount}/{totalDeviceCount}
+            </span>
+          )}
+        </>
+      )
+    }
+
+    if (selectedTargetDeviceId) {
+      return (
+        <>
+          <Monitor className="w-3.5 h-3.5 text-red-500 flex-shrink-0" />
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="max-w-[200px] truncate">{selectedTargetDeviceId}</span>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-[300px]">
+              <p className="break-all">{selectedTargetDeviceId}</p>
+            </TooltipContent>
+          </Tooltip>
+          <AlertCircle className="w-3.5 h-3.5 text-red-500 flex-shrink-0" />
+        </>
+      )
+    }
+
+    return (
+      <>
+        <Cloud className="w-3.5 h-3.5 text-primary" />
+        <span>{t('cloud_mode')}</span>
+        {totalDeviceCount > 0 && (
+          <span className="text-text-muted text-[10px] ml-0.5">
+            {onlineDeviceCount}/{totalDeviceCount}
+          </span>
+        )}
+      </>
+    )
+  }
+
+  // Read-only mode for existing chats
+  if (isExistingTask) {
+    return (
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div
+              className={cn(
+                'flex items-center gap-1.5 px-2 py-1.5 rounded-md',
+                'bg-surface border border-border',
+                'text-xs text-text-secondary',
+                className
+              )}
+            >
+              {selectedDevice ? (
+                <>
+                  {selectedDevice.device_type === 'cloud' ? (
+                    <Server className="w-3.5 h-3.5" />
+                  ) : selectedDevice.device_type === 'app' ? (
+                    <AppWindow className="w-3.5 h-3.5" />
+                  ) : (
+                    <Monitor className="w-3.5 h-3.5" />
+                  )}
+                  <span className="truncate max-w-[160px]">
+                    {selectedDevice.device_type === 'cloud'
+                      ? t('cloud_device_prefix')
+                      : selectedDevice.device_type === 'app'
+                        ? t('wework_device_prefix')
+                        : t('local_device_prefix')}
+                    {selectedDevice.name}
+                  </span>
+                  <span
+                    className={cn(
+                      'w-1.5 h-1.5 rounded-full',
+                      getStatusColor(selectedDevice.status)
+                    )}
+                  />
+                </>
+              ) : persistedTaskDeviceId ? (
+                <>
+                  <Monitor className="w-3.5 h-3.5 text-red-500" />
+                  <span className="truncate max-w-[160px]">{persistedTaskDeviceId}</span>
+                  <AlertCircle className="w-3.5 h-3.5 text-red-500" />
+                </>
+              ) : (
+                <>
+                  <Cloud className="w-3.5 h-3.5" />
+                  <span>{t('cloud_mode')}</span>
+                </>
+              )}
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            <p>{t('select_device_hint')}</p>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    )
+  }
+
+  return (
+    <TooltipProvider>
+      <div
+        ref={containerRef}
+        className={cn(
+          'flex items-center overflow-hidden',
+          disabled && 'opacity-80 cursor-not-allowed',
+          className
+        )}
+        onMouseEnter={handleMouseEnter}
+        onMouseLeave={handleMouseLeave}
+      >
+        <Popover open={isOpen} onOpenChange={setIsOpen}>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              disabled={disabled || isLoading}
+              data-testid="execution-target-trigger"
+              className={cn(
+                'flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-all duration-200 border rounded-t-md',
+                'bg-base text-primary border-border border-b-base relative z-10 shadow-sm',
+                (disabled || isLoading) && 'opacity-50 cursor-not-allowed'
+              )}
+            >
+              {renderTriggerContent()}
+              <ChevronDown
+                className={cn(
+                  'w-3 h-3 opacity-70 transition-transform duration-200',
+                  isOpen && 'rotate-180'
+                )}
+              />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent
+            align="start"
+            sideOffset={8}
+            className="w-[400px] p-0 bg-base border border-border shadow-lg"
+            onMouseEnter={handleMouseEnter}
+            onMouseLeave={handleMouseLeave}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+              <div className="flex items-center gap-2">
+                <Cpu className="w-4 h-4 text-primary" />
+                <span className="font-medium text-sm">{t('select_execution_target')}</span>
+              </div>
+              <button
+                type="button"
+                onClick={handleManageDevices}
+                className="flex items-center gap-1 text-xs text-primary hover:underline"
+                data-testid="manage-devices-link"
+              >
+                <Settings className="w-3.5 h-3.5" />
+                {t('manage_devices')}
+              </button>
+            </div>
+
+            {/* Device grid */}
+            <div className="p-4 space-y-4 max-h-[400px] overflow-y-auto">
+              {/* Local devices section */}
+              {localDevices.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-xs font-medium text-text-muted">
+                    <Monitor className="w-3.5 h-3.5" />
+                    {t('local_devices_section')}
+                    <span className="text-text-muted/60">({localDevices.length})</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {localDevices.map(device => (
+                      <DeviceCard
+                        key={device.device_id}
+                        device={device}
+                        isSelected={selectedTargetDeviceId === device.device_id}
+                        isDefault={resolvedDefaultDeviceId === device.device_id}
+                        disabled={disabled || isLoading}
+                        onSelect={() => handleDeviceSelect(device.device_id)}
+                        onSetDefault={e => void handleSetDefaultTarget(e, device.device_id)}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Cloud devices section */}
+              {cloudDevices.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-xs font-medium text-text-muted">
+                    <Server className="w-3.5 h-3.5" />
+                    {t('cloud_devices_section')}
+                    <span className="text-text-muted/60">({cloudDevices.length})</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {cloudDevices.map(device => (
+                      <DeviceCard
+                        key={device.device_id}
+                        device={device}
+                        isSelected={selectedTargetDeviceId === device.device_id}
+                        isDefault={resolvedDefaultDeviceId === device.device_id}
+                        disabled={disabled || isLoading}
+                        onSelect={() => handleDeviceSelect(device.device_id)}
+                        onSetDefault={e => void handleSetDefaultTarget(e, device.device_id)}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Cloud mode option */}
+              <div className="space-y-2">
+                <div className="flex items-center gap-2 text-xs font-medium text-text-muted">
+                  <Cloud className="w-3.5 h-3.5" />
+                  {t('cloud_executor')}
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <CloudModeCard
+                    isSelected={!selectedTargetDeviceId}
+                    isDefault={defaultExecutionTarget === 'cloud'}
+                    disabled={disabled || isLoading}
+                    onSelect={handleCloudModeSelect}
+                    onSetDefault={e => void handleSetDefaultTarget(e, 'cloud')}
+                  />
+                </div>
+              </div>
+
+              {/* Empty state hint */}
+              {displayDevices.length === 0 && (
+                <div className="text-center py-4">
+                  <p className="text-sm text-text-muted mb-2">{t('no_devices_available')}</p>
+                  <button
+                    type="button"
+                    onClick={handleManageDevices}
+                    className="text-sm text-primary hover:underline"
+                  >
+                    {t('add_device')}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Footer hint */}
+            <div className="px-4 py-2.5 border-t border-border bg-surface/50">
+              <p className="text-xs text-text-muted flex items-center gap-1.5">
+                <AlertCircle className="w-3.5 h-3.5" />
+                {t('multi_device_hint')}
+              </p>
+            </div>
+          </PopoverContent>
+        </Popover>
+
+        {selectedTargetDeviceId && !isSelectedDeviceAvailable && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div className="px-1.5">
+                <AlertCircle className="w-4 h-4 text-red-500" />
+              </div>
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              <p>{t('device_offline_cannot_send')}</p>
+            </TooltipContent>
+          </Tooltip>
+        )}
+      </div>
+    </TooltipProvider>
+  )
+}
+
+export default DeviceSelectorTab

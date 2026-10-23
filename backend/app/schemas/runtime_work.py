@@ -1,0 +1,1174 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Schemas for runtime-native local work surfaced through Wework."""
+
+from datetime import datetime
+from typing import Any, Literal, Optional
+
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+
+from app.schemas.plugin_config import validate_non_secret_plugin_configs
+
+RuntimeName = Literal["codex", "claude_code"]
+RuntimeWorkspaceKind = Literal["workspace", "worktree", "chat"]
+RuntimeWorkspaceSource = Literal["local", "remote"]
+RuntimeGoalStatus = Literal[
+    "active",
+    "paused",
+    "blocked",
+    "usageLimited",
+    "budgetLimited",
+    "complete",
+]
+RuntimeSupervisorMode = Literal["suggest", "auto"]
+
+
+class RuntimeWorktreeDeviceRequest(BaseModel):
+    """Address one Runtime-owned Worktree operation by logical device ID."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    device_id: str = Field(..., alias="deviceId", min_length=1)
+
+
+class RuntimeWorktreePreflightRequest(RuntimeWorktreeDeviceRequest):
+    """Validate one source workspace before enabling managed Worktrees."""
+
+    source_path: str = Field(..., alias="sourcePath", min_length=1)
+    ref: Optional[str] = None
+
+
+class RuntimeWorktreeSettingsPatch(RuntimeWorktreeDeviceRequest):
+    """Update Runtime-owned Worktree settings."""
+
+    worktree_root: Optional[str] = Field(default=None, alias="worktreeRoot")
+    auto_cleanup_enabled: Optional[bool] = Field(
+        default=None,
+        alias="autoCleanupEnabled",
+    )
+    keep_count: Optional[int] = Field(default=None, alias="keepCount", ge=1)
+
+
+class RuntimeWorktreePrepareRequest(RuntimeWorktreeDeviceRequest):
+    """Prepare one managed Worktree on the addressed Runtime."""
+
+    source_path: str = Field(..., alias="sourcePath", min_length=1)
+    worktree_id: str = Field(..., alias="worktreeId", min_length=1)
+    ref: Optional[str] = None
+    permanent: Optional[bool] = None
+
+
+class RuntimeWorktreePathRequest(RuntimeWorktreeDeviceRequest):
+    """Delete or restore one managed Worktree path."""
+
+    path: str = Field(..., min_length=1)
+    preserve_snapshot: Optional[bool] = Field(
+        default=None,
+        alias="preserveSnapshot",
+    )
+
+
+class RuntimeTaskAddress(BaseModel):
+    """Transient address for a device-local runtime task."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    device_id: str = Field(..., alias="deviceId", min_length=1)
+    workspace_path: Optional[str] = Field(default=None, alias="workspacePath")
+    local_task_id: str = Field(
+        ...,
+        alias="taskId",
+        validation_alias=AliasChoices("taskId", "localTaskId", "local_task_id"),
+        min_length=1,
+    )
+    runtime_handle: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="runtimeHandle",
+    )
+
+
+class RuntimeModelSelection(BaseModel):
+    """Model selection persisted with a device-local runtime task."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    model_name: str = Field(..., alias="modelName", min_length=1)
+    model_type: Optional[str] = Field(default=None, alias="modelType")
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class RuntimeGoalCreateInput(BaseModel):
+    """Initial persistent goal configured before the first Runtime turn."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    objective: str = Field(..., min_length=1)
+    status: Optional[RuntimeGoalStatus] = None
+    token_budget: Optional[int] = Field(default=None, alias="tokenBudget", ge=1)
+
+
+class RuntimeSupervisorCreateInput(BaseModel):
+    """Initial supervisor configured atomically with Runtime task creation."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    mode: RuntimeSupervisorMode
+    instructions: str = ""
+    model_selection: RuntimeModelSelection = Field(..., alias="modelSelection")
+    supervisor_model_config: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="modelConfig",
+    )
+    interval_seconds: Literal[10, 30, 60, 300] = Field(
+        ...,
+        alias="intervalSeconds",
+    )
+
+
+class ProjectSessionScope(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    project_id: str = Field(..., alias="projectId", min_length=1)
+    issue_id: str = Field(..., alias="issueId", min_length=1)
+
+
+class RuntimeTranscriptRequest(RuntimeTaskAddress):
+    """Request a page of a device-local runtime transcript."""
+
+    limit: Optional[int] = Field(default=None, ge=1, le=200)
+    project_session: Optional[ProjectSessionScope] = Field(
+        default=None, alias="projectSession"
+    )
+    before_cursor: Optional[str] = Field(default=None, alias="beforeCursor")
+    after_cursor: Optional[str] = Field(default=None, alias="afterCursor")
+    include_full_content: bool = Field(default=False, alias="includeFullContent")
+    conversation_context_only: bool = Field(
+        default=False,
+        alias="conversationContextOnly",
+    )
+
+
+class RuntimeFileChangesRevertRequest(BaseModel):
+    """Revert a device-local runtime file-change artifact."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    address: RuntimeTaskAddress
+    file_changes: dict[str, Any] = Field(..., alias="fileChanges")
+
+
+class RuntimeFileChangesRevertResponse(BaseModel):
+    """Updated runtime artifact summary after revert."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    file_changes: dict[str, Any] = Field(..., alias="fileChanges")
+
+
+class RuntimeMessageSource(BaseModel):
+    """Optional source overlay for runtime transcript messages."""
+
+    source: Literal["im"]
+    external_id: str
+    channel_type: str
+    channel_id: int
+    conversation_id: str
+    sender_id: str
+    message_id: Optional[str] = None
+
+
+class NormalizedRuntimeMessage(BaseModel):
+    """Normalized message rendered by Wework for native runtime transcripts."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    client_user_message_id: Optional[str] = Field(
+        default=None, alias="clientUserMessageId"
+    )
+    turn_id: Optional[str] = Field(default=None, alias="turnId")
+    role: Literal["user", "assistant", "system", "tool"]
+    content: str = ""
+    subtask_id: Optional[str | int] = Field(default=None, alias="subtaskId")
+    status: Optional[str] = None
+    created_at: Optional[str | int] = Field(default=None, alias="createdAt")
+    source: Optional[RuntimeMessageSource] = None
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    blocks: list[dict[str, Any]] = Field(default_factory=list)
+    file_changes: Optional[dict[str, Any]] = Field(default=None, alias="fileChanges")
+
+
+class RuntimeTaskAddressRef(RuntimeTaskAddress):
+    """Parent/child task reference with the same transient address shape."""
+
+
+class LocalTaskSummary(BaseModel):
+    """Executor-local task metadata returned from an online device."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    local_task_id: str = Field(
+        ...,
+        alias="taskId",
+        validation_alias=AliasChoices("taskId", "localTaskId", "local_task_id"),
+    )
+    workspace_path: str = Field(..., alias="workspacePath")
+    workspace_kind: RuntimeWorkspaceKind = Field(
+        default="workspace",
+        alias="workspaceKind",
+    )
+    worktree_id: Optional[str] = Field(default=None, alias="worktreeId")
+    title: str
+    runtime: RuntimeName
+    runtime_handle: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="runtimeHandle",
+        exclude=True,
+    )
+    model_selection: Optional[RuntimeModelSelection] = Field(
+        default=None,
+        alias="modelSelection",
+    )
+    queue_position: Optional[int] = Field(default=None, alias="queuePosition", ge=1)
+    git_info: Optional[dict[str, Any]] = Field(default=None, alias="gitInfo")
+    parent: Optional[RuntimeTaskAddressRef] = None
+    children: list[RuntimeTaskAddressRef] = Field(default_factory=list)
+    created_at: Optional[str | int] = Field(default=None, alias="createdAt")
+    updated_at: Optional[str | int] = Field(default=None, alias="updatedAt")
+    recency_at: Optional[str | int] = Field(default=None, alias="recencyAt")
+    completed_at: Optional[str | int] = Field(default=None, alias="completedAt")
+    running: bool = False
+    continuable: Optional[bool] = None
+    thread_status: Optional[str] = Field(default=None, alias="threadStatus")
+    turn_status: Optional[str] = Field(default=None, alias="turnStatus")
+    goal_status: Optional[str] = Field(default=None, alias="goalStatus")
+    supervisor: Optional[dict[str, Any]] = None
+    pinned: Optional[bool] = None
+    pinned_order: Optional[int] = Field(default=None, alias="pinnedOrder")
+    sidebar_order: Optional[int] = Field(default=None, alias="sidebarOrder")
+    status: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def project_safe_runtime_identity(cls, value: Any) -> Any:
+        """Expose model identity without returning the private runtime handle."""
+
+        if not isinstance(value, dict):
+            return value
+        if value.get("modelSelection") or value.get("model_selection"):
+            return value
+        handle = value.get("runtimeHandle") or value.get("runtime_handle")
+        if not isinstance(handle, dict):
+            return value
+        selection = handle.get("modelSelection") or handle.get("model_selection")
+        if not isinstance(selection, dict):
+            return value
+        return {**value, "modelSelection": selection}
+
+
+class DeviceWorkspaceUpsert(BaseModel):
+    """Create or update a central device workspace mapping."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    project_id: int = Field(..., alias="projectId", ge=1)
+    device_id: str = Field(..., alias="deviceId", min_length=1)
+    workspace_path: str = Field(..., alias="workspacePath", min_length=1)
+    repo_url: Optional[str] = Field(default=None, alias="repoUrl")
+    repo_root_fingerprint: Optional[str] = Field(
+        default=None,
+        alias="repoRootFingerprint",
+    )
+    label: Optional[str] = None
+
+
+class DeviceWorkspacePrepareRequest(BaseModel):
+    """Prepare one device folder and store it as a project child workspace."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    project_id: int = Field(..., alias="projectId", ge=1)
+    device_id: str = Field(..., alias="deviceId", min_length=1)
+    workspace_path: str = Field(..., alias="workspacePath", min_length=1)
+    action: Literal["create", "select"]
+    label: Optional[str] = None
+
+
+class DeviceWorkspaceResponse(BaseModel):
+    """Kind-backed DeviceWorkspace mapping response."""
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: int
+    user_id: int = Field(..., alias="userId")
+    project_id: int = Field(..., alias="projectId")
+    device_id: str = Field(..., alias="deviceId")
+    workspace_path: str = Field(..., alias="workspacePath")
+    repo_url: Optional[str] = Field(default=None, alias="repoUrl")
+    repo_root_fingerprint: Optional[str] = Field(
+        default=None,
+        alias="repoRootFingerprint",
+    )
+    label: Optional[str] = None
+    created_at: datetime = Field(..., alias="createdAt")
+    updated_at: datetime = Field(..., alias="updatedAt")
+    last_seen_at: Optional[datetime] = Field(default=None, alias="lastSeenAt")
+
+
+class DeviceWorkspacePrepareResponse(BaseModel):
+    """Prepared device workspace mapping plus the device-side action result."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    mapping: DeviceWorkspaceResponse
+    prepared_action: Literal["created", "selected", "cloned", "reused_git"] = Field(
+        ...,
+        alias="preparedAction",
+    )
+
+
+class RuntimeProjectRef(BaseModel):
+    """Runtime workspace identity used by runtime work lists."""
+
+    id: Optional[int] = None
+    key: str
+    name: str
+    description: str = ""
+    color: Optional[str] = None
+
+
+class RuntimeDeviceWorkspace(BaseModel):
+    """Device workspace with runtime tasks attached."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: Optional[int] = None
+    project_id: Optional[int] = Field(default=None, alias="projectId")
+    device_id: str = Field(..., alias="deviceId")
+    device_name: str = Field(..., alias="deviceName")
+    device_status: str = Field(..., alias="deviceStatus")
+    workspace_path: str = Field(..., alias="workspacePath")
+    workspace_kind: RuntimeWorkspaceKind = Field(
+        default="workspace",
+        alias="workspaceKind",
+    )
+    worktree_id: Optional[str] = Field(default=None, alias="worktreeId")
+    repo_url: Optional[str] = Field(default=None, alias="repoUrl")
+    repo_root_fingerprint: Optional[str] = Field(
+        default=None,
+        alias="repoRootFingerprint",
+    )
+    label: Optional[str] = None
+    workspace_source: Optional[RuntimeWorkspaceSource] = Field(
+        default=None,
+        alias="workspaceSource",
+    )
+    remote_host_id: Optional[str] = Field(default=None, alias="remoteHostId")
+    mapped: bool
+    available: bool
+    error: Optional[str] = None
+    tasks: list[LocalTaskSummary] = Field(
+        default_factory=list,
+        alias="tasks",
+    )
+
+
+class RuntimeProjectWork(BaseModel):
+    """Runtime work grouped under one central Project."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    project: RuntimeProjectRef
+    device_workspaces: list[RuntimeDeviceWorkspace] = Field(
+        default_factory=list,
+        alias="deviceWorkspaces",
+    )
+
+
+class RuntimeWorkListResponse(BaseModel):
+    """Project -> Device Workspace -> runtime task workbench tree."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    projects: list[RuntimeProjectWork] = Field(default_factory=list)
+    chats: list[RuntimeDeviceWorkspace] = Field(
+        default_factory=list,
+        alias="chats",
+    )
+    total_tasks: int = Field(..., alias="totalTasks")
+
+
+class ArchivedConversationsListRequest(BaseModel):
+    """Filter archived conversations stored on the user's devices."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    device_id: Optional[str] = Field(default=None, alias="deviceId")
+    workspace_path: Optional[str] = Field(default=None, alias="workspacePath")
+    project_id: Optional[int] = Field(default=None, alias="projectId", ge=1)
+    runtime_project_key: Optional[str] = Field(
+        default=None,
+        alias="runtimeProjectKey",
+    )
+    search: Optional[str] = None
+    source: Literal["all", "local", "cloud"] = "all"
+    sort: Literal["updated", "created", "alphabetical"] = "updated"
+
+
+class ArchivedConversationItem(BaseModel):
+    """Archived conversation metadata normalized by Backend."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    task_id: str = Field(
+        ...,
+        alias="taskId",
+        validation_alias=AliasChoices("taskId", "localTaskId", "local_task_id"),
+    )
+    thread_id: Optional[str] = Field(default=None, alias="threadId")
+    title: str
+    project_id: Optional[int] = Field(default=None, alias="projectId")
+    project_key: Optional[str] = Field(default=None, alias="projectKey")
+    project_name: Optional[str] = Field(default=None, alias="projectName")
+    workspace_path: str = Field(..., alias="workspacePath")
+    workspace_kind: RuntimeWorkspaceKind = Field(
+        default="workspace",
+        alias="workspaceKind",
+    )
+    device_id: str = Field(..., alias="deviceId")
+    device_name: Optional[str] = Field(default=None, alias="deviceName")
+    device_address: Optional[str] = Field(default=None, alias="deviceAddress")
+    source: Literal["local", "cloud"] = "local"
+    runtime: Optional[RuntimeName] = None
+    runtime_handle: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="runtimeHandle",
+    )
+    created_at: Optional[str] = Field(default=None, alias="createdAt")
+    updated_at: Optional[str] = Field(default=None, alias="updatedAt")
+
+
+class ArchivedConversationProjectGroup(BaseModel):
+    """Archived conversation counts grouped by project/workspace."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    project_id: Optional[int] = Field(default=None, alias="projectId")
+    project_key: Optional[str] = Field(default=None, alias="projectKey")
+    project_name: str = Field(..., alias="projectName")
+    count: int
+
+
+class ArchivedConversationsListResponse(BaseModel):
+    """Archived conversations plus project-group counts."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: list[ArchivedConversationItem] = Field(default_factory=list)
+    project_groups: list[ArchivedConversationProjectGroup] = Field(
+        default_factory=list,
+        alias="projectGroups",
+    )
+    total: int
+
+
+class RuntimeArchiveProjectConversationsRequest(BaseModel):
+    """Archive all active conversations under one runtime project."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    project_id: Optional[int] = Field(default=None, alias="projectId", ge=1)
+    runtime_project_key: Optional[str] = Field(
+        default=None,
+        alias="runtimeProjectKey",
+    )
+
+
+class RuntimeArchivedConversationBulkRequest(BaseModel):
+    """Bulk operation over device-local runtime task addresses."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: list[RuntimeTaskAddress] = Field(default_factory=list)
+
+
+class RuntimeArchivedConversationBulkResponse(BaseModel):
+    """Bulk archive/delete acknowledgement."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    accepted: bool
+    requested_count: int = Field(..., alias="requestedCount")
+    accepted_count: int = Field(..., alias="acceptedCount")
+    deleted_count: Optional[int] = Field(default=None, alias="deletedCount")
+    results: list[dict[str, Any]] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
+class RuntimeTranscriptResponse(BaseModel):
+    """Transcript returned by the owning local executor."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    local_task_id: str = Field(..., alias="taskId")
+    workspace_path: str = Field(..., alias="workspacePath")
+    runtime: RuntimeName
+    title: Optional[str] = None
+    messages: list[NormalizedRuntimeMessage] = Field(default_factory=list)
+    turns: list[dict[str, Any]]
+    running: Optional[bool] = None
+    origin: Optional[dict[str, Any]] = None
+    history_unavailable: bool = Field(default=False, alias="historyUnavailable")
+    turn_navigation: list[dict[str, Any]] = Field(
+        default_factory=list, alias="turnNavigation"
+    )
+    context_usage: Optional[dict[str, Any]] = Field(default=None, alias="contextUsage")
+    full_content: bool = Field(default=False, alias="fullContent")
+    range_start: Optional[int] = Field(default=None, alias="rangeStart")
+    range_end: Optional[int] = Field(default=None, alias="rangeEnd")
+    has_more_before: bool = Field(default=False, alias="hasMoreBefore")
+    before_cursor: Optional[str] = Field(default=None, alias="beforeCursor")
+    has_more_after: bool = Field(default=False, alias="hasMoreAfter")
+    after_cursor: Optional[str] = Field(default=None, alias="afterCursor")
+    parse_error: Optional[str] = Field(default=None, alias="parseError")
+
+
+class RuntimeWorkSearchRequest(BaseModel):
+    """Full-text search request for online runtime transcripts."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    query: str = Field(..., min_length=1)
+    limit: int = Field(default=20, ge=1, le=50)
+    include_archived: bool = Field(default=False, alias="includeArchived")
+    project_id: Optional[int] = Field(default=None, alias="projectId", ge=1)
+
+
+class RuntimeWorkSearchProjectRef(BaseModel):
+    """Project metadata attached to a runtime search hit."""
+
+    id: int
+    name: str
+
+
+class RuntimeWorkSearchItem(BaseModel):
+    """One message-level full-text search hit."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    address: RuntimeTaskAddress
+    runtime: RuntimeName
+    title: str
+    snippet: str
+    match_start: int = Field(..., alias="matchStart")
+    match_end: int = Field(..., alias="matchEnd")
+    message_id: str = Field("", alias="messageId")
+    message_role: str = Field("", alias="messageRole")
+    message_created_at: Optional[str] = Field(default=None, alias="messageCreatedAt")
+    updated_at: Optional[str] = Field(default=None, alias="updatedAt")
+    device_name: str = Field(..., alias="deviceName")
+    workspace_path: str = Field(..., alias="workspacePath")
+    project: Optional[RuntimeWorkSearchProjectRef] = None
+
+
+class RuntimeWorkSearchResponse(BaseModel):
+    """Search hits merged across online runtime devices."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: list[RuntimeWorkSearchItem] = Field(default_factory=list)
+
+
+class RuntimeSendRequest(BaseModel):
+    """Request to continue a native runtime task."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    address: RuntimeTaskAddress
+    message: str = Field(..., min_length=1)
+    client_user_message_id: Optional[str] = Field(
+        default=None,
+        alias="clientUserMessageId",
+    )
+    attachment_ids: list[int] = Field(default_factory=list, alias="attachmentIds")
+    model_selection: Optional[RuntimeModelSelection] = Field(
+        default=None,
+        alias="modelSelection",
+    )
+    source: Optional[RuntimeMessageSource] = None
+    request_user_input_response: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="requestUserInputResponse",
+    )
+    additional_context: Optional[dict[str, dict[str, Any]]] = Field(
+        default=None,
+        alias="additionalContext",
+        validation_alias=AliasChoices("additionalContext", "additional_context"),
+    )
+
+
+class RuntimeSendResponse(BaseModel):
+    """Acknowledgement from the runtime send RPC."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    accepted: bool
+    local_task_id: str = Field(..., alias="taskId")
+    status: Optional[Literal["queued", "running"]] = None
+    queue_position: Optional[int] = Field(default=None, alias="queuePosition")
+    error: Optional[str] = None
+
+
+class RuntimeGuidanceRequest(BaseModel):
+    """Request to steer an active native runtime turn."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    address: RuntimeTaskAddress
+    message: str = ""
+    attachment_ids: list[int] = Field(default_factory=list, alias="attachmentIds")
+    client_guidance_id: Optional[str] = Field(
+        default=None,
+        alias="clientGuidanceId",
+        validation_alias=AliasChoices("clientGuidanceId", "client_guidance_id"),
+    )
+    additional_context: Optional[dict[str, dict[str, Any]]] = Field(
+        default=None,
+        alias="additionalContext",
+        validation_alias=AliasChoices("additionalContext", "additional_context"),
+    )
+
+    @model_validator(mode="after")
+    def require_message_or_attachment(self) -> "RuntimeGuidanceRequest":
+        if self.message.strip() or self.attachment_ids:
+            return self
+        raise ValueError("message or attachment is required")
+
+
+class RuntimeGuidanceResponse(BaseModel):
+    """Acknowledgement from the runtime guidance RPC."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    accepted: bool
+    success: bool = True
+    local_task_id: str = Field(..., alias="taskId")
+    guidance_id: Optional[str] = Field(default=None, alias="guidanceId")
+    turn_id: Optional[str] = Field(default=None, alias="turnId")
+    error: Optional[str] = None
+    code: Optional[str] = None
+
+
+class RuntimeWorkspaceOpenRequest(BaseModel):
+    """Request to register/open a device-local runtime workspace."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    device_id: str = Field(..., alias="deviceId", min_length=1)
+    workspace_path: str = Field(..., alias="workspacePath", min_length=1)
+    runtime: RuntimeName = "codex"
+    label: Optional[str] = None
+    action: Optional[Literal["create", "select"]] = None
+
+
+class RuntimeWorkspaceRenameRequest(BaseModel):
+    """Request to rename a device-local runtime workspace project."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    device_id: str = Field(..., alias="deviceId", min_length=1)
+    workspace_path: str = Field(..., alias="workspacePath", min_length=1)
+    runtime: RuntimeName = "codex"
+    name: str = Field(..., min_length=1)
+
+
+class RuntimeWorkspaceRemoveRequest(BaseModel):
+    """Request to remove a device-local runtime workspace project."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    device_id: str = Field(..., alias="deviceId", min_length=1)
+    project_key: Optional[str] = Field(default=None, alias="projectKey")
+    workspace_path: str = Field(..., alias="workspacePath", min_length=1)
+    runtime: RuntimeName = "codex"
+
+
+class RuntimeWorkspaceOpenResponse(BaseModel):
+    """Acknowledgement from opening a runtime workspace without a turn."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    accepted: bool
+    device_id: str = Field(..., alias="deviceId")
+    workspace_path: str = Field(..., alias="workspacePath")
+    runtime: RuntimeName
+    thread_id: Optional[str] = Field(default=None, alias="threadId")
+    error: Optional[str] = None
+
+
+class RuntimeWorkspaceSearchRequest(BaseModel):
+    """Search files and directories in one device-local runtime workspace."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    device_id: str = Field(..., alias="deviceId", min_length=1)
+    root: str = Field(..., min_length=1)
+    query: str = Field(..., min_length=1)
+    cancellation_token: Optional[str] = Field(default=None, alias="cancellationToken")
+
+
+class RuntimeWorkspaceSearchItem(BaseModel):
+    """One fuzzy workspace path match returned by the owning executor."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    root: str
+    path: str
+    file_name: str = Field(..., alias="fileName")
+    match_type: Literal["file", "directory"] = Field(..., alias="matchType")
+    score: int
+    indices: Optional[list[int]] = None
+
+
+class RuntimeWorkspaceSearchResponse(BaseModel):
+    """Fuzzy workspace path matches."""
+
+    files: list[RuntimeWorkspaceSearchItem] = Field(default_factory=list)
+
+
+class BindRuntimeTaskIMSessionsRequest(BaseModel):
+    """Bind private IM sessions to a device-local runtime task."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    address: RuntimeTaskAddress
+    task_title: str = Field(..., alias="taskTitle", min_length=1, max_length=255)
+    session_keys: list[str] = Field(..., alias="sessionKeys", min_length=1)
+    model_selection: Optional[RuntimeModelSelection] = Field(
+        default=None,
+        alias="modelSelection",
+    )
+
+
+class BindRuntimeTaskIMSessionsResponse(BaseModel):
+    """Acknowledgement for binding private IM sessions to a runtime task."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    address: RuntimeTaskAddress
+    bound_session_keys: list[str] = Field(..., alias="boundSessionKeys")
+    notified_count: int = Field(..., alias="notifiedCount")
+
+
+class RuntimeIMNotificationSession(BaseModel):
+    """Private IM session metadata used for notification target selection."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    session_key: str = Field(..., alias="sessionKey")
+    channel_type: str = Field(..., alias="channelType")
+    channel_label: str = Field(..., alias="channelLabel")
+    channel_id: int = Field(..., alias="channelId")
+    conversation_id: str = Field(..., alias="conversationId")
+    sender_id: str = Field(..., alias="senderId")
+    display_name: str = Field("", alias="displayName")
+
+
+class RuntimeGlobalIMNotificationSettings(BaseModel):
+    """User-level IM notification switch and default session."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    enabled: bool = False
+    session_key: Optional[str] = Field(default=None, alias="sessionKey")
+    session: Optional[RuntimeIMNotificationSession] = None
+
+
+class RuntimeTaskIMNotificationSubscription(BaseModel):
+    """Task-level IM notification subscription state."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    address: RuntimeTaskAddress
+    session_keys: list[str] = Field(default_factory=list, alias="sessionKeys")
+    sessions: list[RuntimeIMNotificationSession] = Field(default_factory=list)
+
+
+class RuntimeIMNotificationSettingsResponse(BaseModel):
+    """All runtime IM notification settings needed by Wework."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    global_settings: RuntimeGlobalIMNotificationSettings = Field(..., alias="global")
+    runtime_task_subscriptions: list[RuntimeTaskIMNotificationSubscription] = Field(
+        default_factory=list,
+        alias="runtimeTaskSubscriptions",
+    )
+
+
+class RuntimeGlobalIMNotificationUpdateRequest(BaseModel):
+    """Update the global IM notification switch."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    enabled: bool
+    session_key: Optional[str] = Field(default=None, alias="sessionKey")
+
+
+class RuntimeTaskIMNotificationSubscriptionRequest(BaseModel):
+    """Subscribe a runtime task to one or more private IM sessions."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    address: RuntimeTaskAddress
+    session_keys: list[str] = Field(..., alias="sessionKeys", min_length=1)
+
+
+class RuntimeTaskIMNotificationSubscriptionResponse(BaseModel):
+    """Acknowledgement for task-level IM notification subscription changes."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    address: RuntimeTaskAddress
+    subscribed: bool
+    session_keys: list[str] = Field(default_factory=list, alias="sessionKeys")
+
+
+class RuntimeTaskArchiveResponse(BaseModel):
+    """Acknowledgement from the runtime archive RPC."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    accepted: bool
+    local_task_id: str = Field(..., alias="taskId")
+    workspace_path: Optional[str] = Field(default=None, alias="workspacePath")
+    error: Optional[str] = None
+
+
+class RuntimeTaskRenameRequest(BaseModel):
+    """Request to rename one device-local runtime task."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    address: RuntimeTaskAddress
+    title: str = Field(..., min_length=1, max_length=120)
+
+
+class RuntimeTaskCancelResponse(BaseModel):
+    """Acknowledgement from the runtime cancel RPC."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    accepted: bool
+    local_task_id: str = Field(..., alias="taskId")
+    workspace_path: Optional[str] = Field(default=None, alias="workspacePath")
+    error: Optional[str] = None
+
+
+class RuntimeTaskQueueReorderRequest(RuntimeTaskAddress):
+    """Move one queued runtime task to a one-based queue position."""
+
+    queue_position: int = Field(..., alias="queuePosition", ge=1)
+
+
+class RuntimeTaskQueueReorderResponse(RuntimeTaskCancelResponse):
+    """Acknowledgement and resulting task order for a queue reorder."""
+
+    ordered_task_ids: list[str] = Field(default_factory=list, alias="orderedTaskIds")
+
+
+class RuntimeTaskCreateRequest(BaseModel):
+    """Producer-facing task intent before target and CRD materialization."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_version: Literal[1, 2, 3] = Field(default=1, alias="schemaVersion")
+    force_start: Optional[bool] = Field(default=None, alias="forceStart")
+    wegent_team_id: Optional[int] = Field(
+        default=None,
+        alias="wegentTeamId",
+        ge=1,
+    )
+    project_id: Optional[int] = Field(default=None, alias="projectId", ge=1)
+    device_workspace_id: Optional[int] = Field(
+        default=None,
+        alias="deviceWorkspaceId",
+        ge=1,
+    )
+    device_id: Optional[str] = Field(default=None, alias="deviceId")
+    workspace_path: Optional[str] = Field(default=None, alias="workspacePath")
+    standalone_chat_workspace: Optional[bool] = Field(
+        default=None,
+        alias="standaloneChatWorkspace",
+    )
+    runtime_project_key: Optional[str] = Field(default=None, alias="runtimeProjectKey")
+    runtime_project_name: Optional[str] = Field(
+        default=None,
+        alias="runtimeProjectName",
+    )
+    runtime_workspace_roots: list[str] = Field(
+        default_factory=list,
+        alias="runtimeWorkspaceRoots",
+    )
+    project_instructions: Optional[str] = Field(
+        default=None,
+        alias="projectInstructions",
+    )
+    project_plugins: list[dict[str, Any]] = Field(
+        default_factory=list,
+        alias="projectPlugins",
+    )
+    local_task_id: Optional[str] = Field(
+        default=None,
+        alias="taskId",
+        validation_alias=AliasChoices("taskId", "localTaskId", "local_task_id"),
+    )
+    runtime: RuntimeName
+    runtime_executable_path: Optional[str] = Field(
+        default=None,
+        alias="runtimeExecutablePath",
+    )
+    runtime_permission_mode: Optional[
+        Literal["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
+    ] = Field(default=None, alias="runtimePermissionMode")
+    message: str = Field(..., min_length=1)
+    bot: list[dict[str, Any]] = Field(default_factory=list)
+    client_user_message_id: Optional[str] = Field(
+        default=None,
+        alias="clientUserMessageId",
+    )
+    title: Optional[str] = None
+    model_id: Optional[str] = Field(default=None, alias="modelId")
+    model_type: Optional[str] = Field(default=None, alias="modelType")
+    model_options: dict[str, Any] = Field(
+        default_factory=dict,
+        alias="modelOptions",
+    )
+    model_selection: Optional[RuntimeModelSelection] = Field(
+        default=None,
+        alias="modelSelection",
+    )
+    runtime_model_config: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="modelConfig",
+    )
+    friendly_title: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="friendlyTitle",
+    )
+    additional_skills: list[Any] = Field(
+        default_factory=list,
+        alias="additionalSkills",
+    )
+    attachment_ids: list[int] = Field(default_factory=list, alias="attachmentIds")
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    execution: Optional[dict[str, Any]] = None
+    initial_goal: Optional[RuntimeGoalCreateInput] = Field(
+        default=None,
+        alias="initialGoal",
+    )
+    initial_supervisor: Optional[RuntimeSupervisorCreateInput] = Field(
+        default=None,
+        alias="initialSupervisor",
+    )
+    ephemeral: Optional[bool] = None
+    side_source: Optional[RuntimeTaskAddress] = Field(
+        default=None,
+        alias="sideSource",
+    )
+    workspace_source_task: Optional[RuntimeTaskAddress] = Field(
+        default=None,
+        alias="workspaceSourceTask",
+    )
+    delivery_id: Optional[str] = Field(
+        default=None, alias="deliveryId", min_length=36, max_length=36
+    )
+    cloud_project_id: Optional[str] = Field(
+        default=None,
+        alias="cloudProjectId",
+        min_length=1,
+    )
+    origin: Optional[dict[str, Any]] = None
+    additional_context: Optional[dict[str, dict[str, Any]]] = Field(
+        default=None,
+        alias="additionalContext",
+        validation_alias=AliasChoices("additionalContext", "additional_context"),
+    )
+
+    @model_validator(mode="after")
+    def validate_versioned_intent_boundary(self) -> "RuntimeTaskCreateRequest":
+        """Validate fields introduced by versioned producer contracts."""
+
+        validate_non_secret_plugin_configs(
+            self.project_plugins,
+            field_name="projectPlugins",
+        )
+        if self.schema_version >= 2 and self.runtime_model_config is not None:
+            raise ValueError(
+                "RuntimeTaskCreateRequest V2+ cannot carry materialized modelConfig"
+            )
+        if self.wegent_team_id is not None and self.schema_version < 3:
+            raise ValueError("wegentTeamId requires RuntimeTaskCreateRequest V3")
+        return self
+
+
+class RuntimeTaskMaterializeRequest(RuntimeTaskCreateRequest):
+    """Team intent compiled for direct local Executor dispatch."""
+
+    new_session: bool = Field(default=True, alias="newSession")
+
+
+class RuntimeTaskCreatePayload(BaseModel):
+    """Executor-facing wire payload after Backend materialization."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    schema_version: Literal[1, 2] = Field(default=1, alias="schemaVersion")
+    force_start: Optional[bool] = Field(default=None, alias="forceStart")
+    runtime: RuntimeName
+    message: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    execution_request: dict[str, Any] = Field(..., alias="executionRequest")
+    workspace_path: Optional[str] = Field(default=None, alias="workspacePath")
+    local_task_id: Optional[str] = Field(default=None, alias="taskId")
+    runtime_executable_path: Optional[str] = Field(
+        default=None,
+        alias="runtimeExecutablePath",
+    )
+    runtime_permission_mode: Optional[
+        Literal["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
+    ] = Field(default=None, alias="runtimePermissionMode")
+    client_user_message_id: Optional[str] = Field(
+        default=None,
+        alias="clientUserMessageId",
+    )
+    standalone_chat_workspace: Optional[bool] = Field(
+        default=None,
+        alias="standaloneChatWorkspace",
+    )
+    runtime_project_key: Optional[str] = Field(default=None, alias="runtimeProjectKey")
+    runtime_project_name: Optional[str] = Field(
+        default=None,
+        alias="runtimeProjectName",
+    )
+    runtime_workspace_roots: list[str] = Field(
+        default_factory=list,
+        alias="runtimeWorkspaceRoots",
+    )
+    project_instructions: Optional[str] = Field(
+        default=None,
+        alias="projectInstructions",
+    )
+    project_plugins: list[dict[str, Any]] = Field(
+        default_factory=list,
+        alias="projectPlugins",
+    )
+    additional_skills: list[Any] = Field(
+        default_factory=list,
+        alias="additionalSkills",
+    )
+    bot: list[dict[str, Any]] = Field(default_factory=list)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    friendly_title: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="friendlyTitle",
+    )
+    model_id: Optional[str] = Field(default=None, alias="modelId")
+    model_type: Optional[str] = Field(default=None, alias="modelType")
+    model_options: dict[str, Any] = Field(default_factory=dict, alias="modelOptions")
+    model_selection: Optional[RuntimeModelSelection] = Field(
+        default=None,
+        alias="modelSelection",
+    )
+    runtime_model_config: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="modelConfig",
+    )
+    execution: Optional[dict[str, Any]] = None
+    initial_goal: Optional[RuntimeGoalCreateInput] = Field(
+        default=None,
+        alias="initialGoal",
+    )
+    initial_supervisor: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="initialSupervisor",
+    )
+    ephemeral: Optional[bool] = None
+    side_source: Optional[RuntimeTaskAddress] = Field(
+        default=None,
+        alias="sideSource",
+    )
+    workspace_source_task: Optional[RuntimeTaskAddress] = Field(
+        default=None,
+        alias="workspaceSourceTask",
+    )
+    cloud_project_id: Optional[str] = Field(default=None, alias="cloudProjectId")
+    origin: Optional[dict[str, Any]] = None
+    additional_context: Optional[dict[str, dict[str, Any]]] = Field(
+        default=None,
+        alias="additionalContext",
+    )
+
+
+class RuntimeTaskMaterializeResponse(BaseModel):
+    """Executor payload compiled by Backend without dispatching it."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    payload: RuntimeTaskCreatePayload
+    runtime_handle: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="runtimeHandle",
+    )
+
+
+class RuntimeTaskCreateResponse(BaseModel):
+    """Acknowledgement from device-local runtime task creation."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    accepted: bool
+    device_id: str = Field(..., alias="deviceId")
+    local_task_id: str = Field(..., alias="taskId")
+    workspace_path: str = Field(..., alias="workspacePath")
+    workspace_pending: bool = Field(default=False, alias="workspacePending")
+    runtime: RuntimeName
+    runtime_handle: Optional[dict[str, Any]] = Field(
+        default=None,
+        alias="runtimeHandle",
+    )
+    error: Optional[str] = None
+    error_code: Optional[str] = Field(default=None, alias="errorCode")
+
+
+class RuntimeTaskForkTarget(BaseModel):
+    """Target device workspace for a runtime-native task fork."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    device_id: str = Field(..., alias="deviceId", min_length=1)
+    workspace_path: str = Field(..., alias="workspacePath", min_length=1)
+
+
+class RuntimeTaskForkRequest(BaseModel):
+    """Fork a device-local runtime task to another device workspace."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    source: RuntimeTaskAddress
+    target: RuntimeTaskForkTarget
+
+
+class RuntimeTaskForkResponse(BaseModel):
+    """Acknowledgement for a runtime-native task fork."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    accepted: bool
+    source: RuntimeTaskAddress
+    target: RuntimeTaskAddress
+    runtime: RuntimeName
+    error: Optional[str] = None

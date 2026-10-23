@@ -1,0 +1,353 @@
+---
+sidebar_position: 26
+---
+
+# Wework 桌面版发布
+
+Wework 桌面应用使用 Electron。正式构建和发布由
+`.github/workflows/wework-app.yml` 负责；该工作流同时生成 macOS、Windows 和
+Linux 的 Electron 安装包。
+
+macOS arm64 发布使用 Apple Silicon `macos-14` runner，x64 发布使用原生 Intel
+`macos-15-intel` runner。安装依赖前，工作流校验宿主硬件、运行中的 Node.js
+架构与目标架构一致，避免在 Rosetta 转译下运行发布工具。Intel 构建可能更慢；
+不能仅为缩短编译时间恢复转译路径。资源准备日志记录各子进程的命令、PID 和
+完成状态，失败时保留退出码或信号，以定位并行准备中的具体失败步骤。
+Harness Runtime 的原生依赖按
+运行中的 Node.js 架构准备，仅指定 Electron Builder 的目标架构不足以交叉构建
+完整运行环境。架构不匹配时应修正 Node.js 架构并重新构建，不能复用错误架构的
+产物或仅重跑发布步骤。
+
+正式 macOS arm64 包验证失败时，工作流会清理体积较大的临时运行时目录，并上传
+保留七天的桌面 E2E 诊断产物。必须先用这些日志定位根因，不能通过重跑或放宽
+E2E 断言隐藏失败。
+
+## macOS 应用图标
+
+macOS 包同时包含现有 `wework/resources/icons/icon.icns` 和
+构建时生成的 `Assets.car`，通过 `CFBundleIconName=Wework` 注册资产目录
+中的 App 图标。macOS 27 会给未注册的 ICNS 图标再加一层底板并缩小图案；注册资产
+目录可避免重复处理。目录中的所有尺寸直接取自现有 ICNS，保留 macOS 15 的圆角、
+留白和图案，不回退旧图标，也不使用 Icon Composer 重新生成旧系统的位图。
+
+Electron Packager 本地包、Electron Builder 安装包和在线更新包必须都将资产目录
+放在 `Contents/Resources/Assets.car`，并保留 `CFBundleIconFile` 指向的 ICNS。
+macOS 打包需要完整 Xcode。Packager 在打包前、Builder 在 `beforePack` 阶段自动
+从当前 ICNS 编译图标，安装包和在线更新包使用同一生成流程。编译失败会阻止打包。
+产物写入已忽略的 `wework/electron/resources/macos/`，不提交生成的二进制文件。
+
+```mermaid
+flowchart LR
+  ICNS[Existing ICNS artwork] --> Compiler[iconutil and actool]
+  Compiler --> Catalog[Generated Assets.car]
+  Catalog --> Packager[Local app bundle]
+  Catalog --> Builder[Installer and online update]
+```
+
+修改 ICNS 后，可在安装完整 Xcode 的 Mac 上单独检查编译和产物：
+
+```bash
+node wework/electron/scripts/compile-macos-app-icon.mjs
+pnpm --dir wework/electron test scripts/macos-app-icon.test.mjs
+```
+
+脚本从 ICNS 提取全部十个尺寸表示并编译标准 `.appiconset`，同时更新
+同一生成目录下 `app-icon.json` 的源文件和产物 SHA-256。编译产物以原子替换方式
+写入，避免并行安装包和在线更新构建读取不完整文件；回归测试实际编译目录并核对
+十种尺寸和哈希。
+
+## 版本与产物
+
+发布版本同时写入 `wework/package.json` 和 `wework/electron/package.json`。正式
+发布时，工作流会提交这两个版本文件，再从该提交构建所有平台，确保关于页、
+Electron 应用包和发布标签使用同一版本。
+
+Electron 发版构建命令：
+
+```bash
+pnpm --dir wework/electron build:release
+```
+
+产物位于 `wework/electron/release-installer/`，主要包括：
+
+```text
+WeWork_<version>_macos_<arch>.dmg
+WeWork_<version>_macos_<arch>.zip
+WeWork_<version>_windows_x64-setup.exe
+WeWork_<version>_linux_x64.AppImage
+```
+
+## 自动升级
+
+Electron 版本通过 `electron-updater` 检查 `wework-updater` Release 中的
+`latest*.yml` 或 `beta*.yml`，下载完成后先关闭本地运行时，再安装并重启。
+如果所选通道尚未发布 Electron 版本，对应 YAML 清单可以不存在；客户端将其视为
+“暂无可用更新”，而不是网络错误。其他检查失败仍需原样报告。
+
+Wework 禁用 `electron-updater` 的差分下载和旧 ZIP 缓存。macOS 与 Windows
+客户端只下载经过压缩的完整 Host 更新包，避免低复用率差分产生大量 Range 请求、
+重复流量和额外磁盘占用。组件更新仍按内容哈希复用未变化的组件。
+
+发布流程只生成 Electron YAML 更新清单和组件清单。macOS 和 Windows 使用
+Electron 自身的 ZIP/NSIS 更新链路；Linux 暂不提供应用内自动升级，继续使用
+AppImage 手工替换。
+
+## 初始包与组件更新
+
+初始 Electron 安装包必须包含一套可离线启动的完整运行环境：
+
+- Electron；其内置 Node 同时供 Electron 主进程、Core DSH、插件子进程和
+  Codex skill 脚本使用；
+- Core DSH；
+- Wework 核心 DSH 插件；
+- Wework 应用静态资源；
+- 内置个人插件与 Skills；
+- Executor；
+- Codex；
+- DWS。
+
+`components.json` 记录应用版本、发布通道、每个组件的版本、资源路径和内容
+SHA-256。Electron 应用本身仍通过 `electron-updater` 升级；其余七个组件使用
+`components-<channel>-<platform>-<arch>.json` 独立升级。
+
+macOS 发布先按未签名内容、证书身份、架构、签名参数和构建工具版本定位不可变的
+已签名组件。输入和签名策略不变时，安装包与在线组件复用完全相同的已签名字节；
+任一输入变化时重新签名并校验。Electron Builder 跳过这些已处理的托管资源，避免
+签名时间戳单独改变组件哈希。发布组件清单中的内容 SHA-256 必须从这份最终资源
+计算，不得从重新签名后的安装包再次提取组件。
+
+重新签名已有 Mach-O 文件时必须保留原签名中的 entitlement。Codex 及其
+`codex-code-mode-host` 依赖 `allow-jit` 和 `allow-unsigned-executable-memory`
+运行 V8；仅执行 `codesign --verify` 无法发现 entitlement 被移除。任何签名参数
+变化都必须更新签名策略版本，使旧的已签名组件缓存失效。
+
+Codex 组件的发布边界是完整的 `codex/` 运行时目录，不是单独的 `codex` 可执行
+文件。组件必须包含 `WEGENT_CODEX_BINARY.json`、目标架构的 `codex` 与
+`codex-code-mode-host`、`codex-path` 工具和 legal 资源。客户端从运行时描述中的
+`binaryPath` 解析主程序，并在激活组件前校验同目录的 code-mode host；发布脚本不得
+把 `components.json` 中的 Codex 路径指向主程序或只归档主程序。
+
+组件压缩包以压缩包 SHA-256 命名并作为不可变资产保存。本项目源码构建的 Wework
+核心插件及 UI、应用静态资源、内置插件和 Executor 压缩包存放在对应的版本
+Release；外部 Core DSH、Codex 和 DWS 压缩包集中存放在 `wework-updater`，供
+不同版本复用。版本 Release 不得附带 Core DSH、Codex 或 DWS 二进制。每次发布
+对应的版本 Release 都携带完整安装包和当次组件清单，并且只向相应位置上传尚未
+存在的哈希资产。
+
+版本边界按是否必须与 Electron 宿主原子兼容划分：
+
+- 跟随应用版本：Electron/Chromium/Node、主进程、preload、启动 Shell、Host
+  capability 实现、原生 Node 模块、应用标识、签名权限、图标、安装器、updater
+  协议与不兼容的本地数据迁移；
+- 独立组件版本：Core DSH、Wework 核心 DSH 插件及 UI、Wework 应用静态资源、
+  内置个人插件与 Skills、Executor、Codex、DWS；
+- 用户从插件市场安装的插件继续由插件系统独立管理，不进入桌面组件发布。
+
+独立组件仍必须与当前 Electron `appVersion` 精确匹配，并作为一个组件集合原子
+切换。如果某个组件开始依赖新的 Host capability、原生模块或不兼容的数据格式，
+该次发布自动升级为整包发布。
+
+Wework UI、核心插件、应用静态资源、内置个人插件和 Executor 共用同一个
+`wework-<sourceSha12>` 运行时版本，其中 `sourceSha12` 是源码提交 SHA 的前 12
+个十六进制字符；它们通过同一份组件清单原子切换。物理上仍使用独立的内容寻址
+压缩包，因此只下载发生变化的文件；这个拆分只是传输优化，不代表 Executor 独立于
+Wework 发布。Codex 和 DWS 保留各自的产品版本。
+
+Wework 应用按变化频率进一步拆分：`weworkCorePlugins` 保存经常变化的应用代码和
+UI，`weworkAppStatic` 保存稳定的 `web/vendor` 与 `web/wasm`。客户端在启动前将
+同一版本的两个组件原子组合成完整插件目录。常规 Wework UI 修改只应发布并下载
+`weworkCorePlugins`，其压缩包必须小于 20 MiB；如果超过该上限，应重新检查组件
+归属，不得把 Codex、Core DSH、DWS 等外部二进制塞入版本 Release。
+
+发布工作流会自动比较上一次组件清单记录的源码提交。如果改动只影响可管理组件，
+当前 Electron 应用版本保持不变，已安装客户端只收到组件清单；Electron 主进程、
+preload、打包资源或发布边界发生变化时，工作流才提升应用版本并推进 Electron
+整包更新清单。无法安全归类的 Wework 改动一律按整包更新处理。
+
+无论选择组件更新还是整包更新，每次发布都会创建一个不可变的版本 Release，并
+携带包含最新组件的完整安装包。整包更新使用 `wework-v<appVersion>` 标签；组件
+更新使用 `wework-v<appVersion>-runtime.<sourceSha12>` 标签，其中 `sourceSha12`
+是源码提交 SHA 的前 12 个十六进制字符，不提升 Electron `appVersion`。稳定渠道
+的最新版本 Release 标记为 GitHub `latest`，新人从该 Release 下载完整安装包，
+任意历史 Release 也都可以独立完成首次安装。
+
+本项目源码构建的 Wework 核心插件及 UI、应用静态资源、内置插件和 Executor
+组件包上传到对应的版本 Release。Core DSH、Codex、DWS 等外部或非本项目源码
+构建的二进制依赖，以内容哈希命名并统一存放在 `wework-updater`，供不同版本复用。
+滚动组件清单也发布到 `wework-updater`，但这里不再作为新人完整安装包的下载入口。
+已有用户因此只下载实际发生变化的组件，无需因为纯 Wework UI 或组件改动重复下载
+Electron 和 Chromium。
+
+版本 Release 的组件附件上传前会校验已有同名附件的上传状态、大小和 SHA-256，
+完全一致时直接复用，不覆盖不可变组件。如果 GitHub CLI 上传报错，脚本会重新
+查询附件列表；只有远端附件已完整上传且与本地压缩包完全一致才继续发布。
+缺失、不完整或摘要不符的附件仍会阻止发布，原始 CLI 错误会保留在日志中。
+
+发布 Job 检出发布源码后，使用共享的 `setup-node-workspace` action 准备 Node.js、
+pnpm 和工作区依赖，再运行发布脚本。Harness Runtime 归档收集使用 Wework 声明的
+`tar` 包；构建 Job 中已安装的依赖不会自动传递到发布 Job。
+
+Electron 宿主在线更新使用独立的 `WeWorkHostUpdate` 产物。滚动 Electron 清单只有
+在当前已发布版本声明 `componentizedHostUpdate: 1` 后，才会指向不含上述七个托管
+组件的精简宿主包；客户端会先暂存目标应用版本的完整组件集合，再安装宿主更新。
+不具备该能力的旧客户端会先收到一次包含托管组件的迁移宿主包，避免升级后缺少
+运行资源。组件清单和压缩包必须先于 Electron YAML 发布，防止客户端看到宿主更新
+时对应组件尚不可下载。`WeWorkHostUpdate` ZIP 必须使用正常压缩，不能使用仅封装
+原始字节的 `store` 模式；正式 Release E2E 会读取 ZIP 摘要并拒绝未压缩的宿主更新
+产物。完整安装包始终包含所有组件，以支持离线首次安装。
+
+客户端只接受与当前 Electron 应用版本、通道、平台和架构完全匹配的组件清单。
+清单中的 `downloadUrl` 可以指向版本 Release、共享依赖 Release 或独立对象存储，
+不要求与滚动清单同源或位于同一路径。下载内容的可信边界由完整性校验确定：客户端
+先校验压缩包大小与 SHA-256，再解压并校验组件内容 SHA-256。组件先写入用户数据
+目录的内容寻址存储并标记为 `pending`，下次启动时通过一个原子状态文件整体切换。
+工作台和 Core DSH 完成启动后才确认新组件；如果启动失败或进程在确认前退出，下次
+启动自动回滚到上一组组件。打包内资源始终保留为最终兜底。
+
+应用更新由主进程中的单个任务管理。同一版本和通道的自动下载、手动下载与重复检查
+共享任务，检查操作不得清空正在进行的下载。缺失组件最多使用三个并发下载；全部
+完成大小、压缩包哈希和解包内容校验后才写入 `pending`。更新进度依次覆盖组件、
+宿主下载和安装就绪阶段；Squirrel.Mac 对已下载 ZIP 的本地安装交接不计入网络
+下载量。
+
+单个组件下载遇到明确的瞬时传输失败时，客户端最多尝试三次，并在失败后分别等待
+一秒、两秒再重试。可重试范围仅包括连接中断、DNS/连接/请求超时、HTTP 408、429
+和 5xx。HTTP 4xx（408、429 除外）、压缩包大小或 SHA-256 不匹配、解包内容
+SHA-256 不匹配不得重试，必须保留为真实更新失败。失败尝试已传输的组件字节会在
+重试前从当前进度扣除。`app-update.log` 的失败事件记录脱敏后的错误类型、错误码、
+消息及首层 cause，URL 不写入日志。
+
+Wework 不再打包或下载第二份 Node。启动时会在用户数据目录生成轻量 `node`
+入口，将 `PATH`、`WEWORK_NODE_PATH`、`NODE` 和 `npm_node_execpath` 统一指向
+Electron，并设置 `ELECTRON_RUN_AS_NODE=1`。因此 Core DSH 以及 Codex skill 中
+显式执行的 `node script.ts` 或 `#!/usr/bin/env node` 都使用与当前 Electron
+版本绑定的 Node。
+
+该入口还会预加载标准流保护脚本。stdio MCP 或其他 Node 子进程的消费端关闭后，
+向已断开的 `stderr` 写诊断信息不得触发 Electron 的主进程异常弹窗；协议
+`stdout` 断开则表示调用方已经离开，子进程应正常退出。保护只处理 `EPIPE`，
+其他标准流错误仍保持失败并暴露根因。自定义 Node 可执行文件使用原生 Node
+错误处理，不加载这段 Electron 专用逻辑。
+
+Electron 主进程也可能由终端、开发脚本或自动化 runner 通过管道启动，并在这些
+父进程结束后继续驻留。主进程必须在加载其他 Electron 模块前为自身的 `stdout`
+和 `stderr` 安装同样严格的 `EPIPE` 保护，避免后续 Node warning 或诊断日志因
+接收端已经关闭而触发未捕获异常弹窗。这里不能退出主进程，也不能吞掉 `EPIPE`
+以外的错误；桌面窗口和本地运行时的生命周期不属于日志消费者。
+
+## Bundled sidecars 与资源
+
+构建前必须准备 Codex 和 DWS：
+
+```bash
+cd wework
+pnpm run prepare:codex --materialize
+pnpm run prepare:dws
+```
+
+Codex 下载包按 `wework/codex-binaries.lock.json` 固定并校验 SHA-512。准备后的桌面
+资源统一位于 `wework/resources/`，Electron 打包脚本
+`wework/electron/scripts/prepare-package-assets.mjs` 会把 sidecar、插件、图标和运行时
+描述复制到应用资源目录。不要重新建立第二份桌面资源目录或资源清单。
+
+当前固定版本为 Codex `0.153.3`。Codex `0.152` 开始默认关闭
+`tools.update_plan.enabled`，但 Wework 会消费对应的计划事件并渲染计划块，因此
+Executor 启动 Codex 时必须显式启用该工具。桌面 E2E 默认验证锁文件中的二进制；
+只有专用的 `WEWORK_E2E_CODEX_BIN` 可以覆盖它，不能继承通用 `CODEX_BIN`，否则
+本机已安装应用中的旧版本可能绕过待验证的仓库版本。
+
+桌面发行物还必须携带项目及 bundled sidecar 的许可证和归属信息：
+
+- 应用资源根目录的 `LICENSE` 是 Wegent 的 Apache-2.0 许可证；
+- `licenses/` 保存 CUA Driver 等 Electron 依赖的第三方许可证；
+- `codex/legal/` 保存 Codex 的 Apache-2.0 许可证、`NOTICE` 和 Ratatui MIT
+  许可证。
+
+`prepare-codex-binary.mjs` 生成 Codex legal 目录，
+`prepare-package-assets.mjs` 必须将其与目标架构二进制一起复制到桌面资源。修改
+打包链路时，应解包或检查真实应用产物，确认这些文件存在且与仓库中的源文件一致；
+仅检查中间资源目录不能证明最终发行物合规。
+
+## 开发模式热更新
+
+`pnpm --dir wework run dev:mac` 会通过
+`wework/scripts/dev-wework-app-watch.mjs` 持续构建原始 Wework 应用。监听器启动时
+清理一次 `dsh/app-wework/web`，后续增量构建不得再次清空该目录；正在运行的
+renderer 可能仍在请求上一代哈希资源，提前删除会在新产物写入期间造成白屏。
+
+每次构建只有在 Vite 完成 bundle、关闭构建结果并规范化文件查看器元数据后，才能
+写入 `.wework-build-id`。Core DSH 使用这个标记作为已发布构建 ID，页面只在标记
+变化后刷新，不能把 `index.html` 的中间写入状态当成可加载版本。
+
+自动刷新只在带有 Wework Electron preload 能力的桌面 renderer 中启用。直接在
+系统默认浏览器访问 Core DSH 地址时不得启动热更新轮询。桌面 renderer 发现新的
+已发布构建后，必须先记录该构建 ID，再尝试刷新；如果新页面加载失败并且旧页面仍然
+存活，同一个构建不得重复触发刷新。后续构建发布新的 ID 后仍应正常刷新。
+
+开发热更新模式下，`/wework/app/` 下的静态资源必须返回
+`Cache-Control: no-store`。除哈希资源外，该目录还包含固定文件名的
+`plugins/*.js`；如果这些文件使用生产环境的长期 immutable 缓存，刷新后会把旧插件
+bundle 与新主 bundle 混合，导致 React Context 等模块出现两份实例。正式构建仍
+使用 `public, max-age=31536000, immutable`。
+
+## 本地验证
+
+发布相关改动至少运行：
+
+```bash
+pnpm --filter wework typecheck
+pnpm --dir wework/electron typecheck
+pnpm --dir wework/electron test
+pnpm --dir wework/electron build:release
+```
+
+涉及窗口、托盘、IPC、内置浏览器、sidecar 或打包资源时，还必须使用隔离的真实
+Electron 会话验证：
+
+```bash
+pnpm --filter wework ai:verify start --packaged true
+```
+
+多个 worktree 并行验证时，为每个实例使用独立 `WEWORK_PORT`。隔离会话会使用独立
+的 Executor Home、应用数据目录和单实例锁。
+
+## GitHub Actions
+
+`.github/workflows/wework-app.yml` 支持稳定版与测试版渠道、可选版本覆盖、三平台
+并行构建、Actions artifact、正式 GitHub Release，以及 Electron 和组件滚动升级
+清单。发布类型由工作流根据上次发布后的源码变化自动判断，不提供人工选择；
+稳定版同时推进 stable 和 beta 渠道，测试版只推进 beta 渠道。工作流安装
+`wework/electron` 自己的依赖，准备 bundled sidecars，再调用统一的 Electron
+构建命令。桌面资源变化应修改 `wework/resources/` 或 Electron 打包脚本，不要在
+workflow 中复制另一份资源列表。
+
+滚动通道只有在 Electron YAML 和四个构建目标的组件清单全部存在时，才可因版本
+未变而跳过上传。相同版本但资产不完整时必须补齐；如果远端是不完整的更高版本，
+工作流必须失败，避免用旧版本覆盖。组件压缩包不可覆盖，只能在对应内容哈希尚不
+存在时上传。
+
+## 组件更新准备的 I/O 并发
+
+正式包验证中的 `component-update` 需要在现有预算内暂存完整组件集。
+组件哈希由发布脚本和 Electron 运行时共享同一个实现：每棵目录树最多并行
+读取八个文件，再按排序后的路径顺序写入哈希。目录记录、文件摘要和路径分隔符
+保持一致，不改变已有组件摘要；符号链接等不支持的条目仍拒绝校验。
+独立组件的校验和缓存准备并行执行，全部成功后才下载缺失组件并写入 pending 状态。
+不得通过扩大 E2E 超时或省略摘要校验掩盖串行 I/O 的耗时。
+
+## 正式安装包验证的 Runner 容量
+
+正式安装包的三个检查点由共享 runner 依次执行，并发上限为一。
+`release-package-startup`、`component-update` 和 `app-update-full` 全部保留。
+每个隔离应用都要解包自己的 Core Runtime；三个应用并发冷启动时，发布日志记录
+单次解包约 121 秒，两个应用在连接控制器或等待首个 UI 操作时耗尽现有预算。
+这属于正式包验证的资源争用，不能通过重跑或增大测试超时处理。
+常规桌面 CI 的分片与并发不变，正式包的场景代码、断言和超时也不变。
+
+## Apple 票据服务的传输错误
+
+公证上传、票据附加和票据校验复用同一套有限的传输重试，默认最多三次，
+间隔依次为五秒和十秒。只处理已识别的连接断开、超时等网络错误；公证拒绝、
+无效票据和其他验证失败立即停止。`stapler validate` 的 CloudKit 查询同样会
+出现 `NSURLErrorDomain -1005`，不能把这种查询失败当成缺少票据再重复提交公证。
+传输重试耗尽后仍让发布失败，不跳过最终票据验证。

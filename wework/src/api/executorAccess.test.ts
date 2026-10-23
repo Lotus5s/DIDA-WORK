@@ -1,0 +1,364 @@
+import { describe, expect, test, vi } from 'vitest'
+import { createExecutorClientFromApis } from './executorAccess'
+import type { DeviceInfo, RuntimeWorkListResponse } from '@/types/api'
+
+function createDevice(overrides: Partial<DeviceInfo> = {}): DeviceInfo {
+  return {
+    id: 1,
+    device_id: 'device-1',
+    name: 'Executor',
+    status: 'online',
+    is_default: true,
+    device_type: 'cloud',
+    capabilities: ['runtime-work', 'device-commands'],
+    executor_version: '1.8.5',
+    ...overrides,
+  }
+}
+
+function createRuntimeWork(): RuntimeWorkListResponse {
+  return {
+    projects: [],
+    chats: [],
+    totalTasks: 0,
+  }
+}
+
+function createApis(devices: DeviceInfo[] = [createDevice()]) {
+  const deviceApi = {
+    listDevices: vi.fn().mockResolvedValue(devices),
+    getHomeDirectory: vi.fn().mockResolvedValue('/Users/me'),
+    getProjectWorkspaceRoot: vi.fn().mockResolvedValue('/Users/me/Documents'),
+    listDirectories: vi.fn().mockResolvedValue(['/Users/me/project']),
+    createDirectory: vi.fn().mockResolvedValue(undefined),
+    executeCommand: vi.fn().mockResolvedValue({
+      success: true,
+      stdout: 'ok',
+      stderr: '',
+      exit_code: 0,
+    }),
+    upgradeDevice: vi.fn().mockResolvedValue({ accepted: true }),
+    listSkills: vi.fn().mockResolvedValue([]),
+    listWorkspaceEntries: vi.fn().mockResolvedValue({
+      path: '/Users/me/project',
+      entries: [],
+    }),
+    readWorkspaceTextFile: vi.fn().mockResolvedValue({
+      path: '/Users/me/project/README.md',
+      name: 'README.md',
+      content: 'hello',
+      truncated: false,
+      size: 5,
+    }),
+    readWorkspaceFileChunk: vi.fn().mockResolvedValue({
+      path: '/Users/me/project/image.png',
+      name: 'image.png',
+      data: 'AA==',
+      offset: 0,
+      next_offset: 1,
+      size: 1,
+      eof: true,
+    }),
+  }
+  const runtimeWorkApi = {
+    prepareRuntimeModel: vi.fn().mockResolvedValue(true),
+    listRuntimeWork: vi.fn().mockResolvedValue(createRuntimeWork()),
+    prepareDeviceWorkspace: vi.fn(),
+    deleteDeviceWorkspace: vi.fn(),
+    getRuntimeTranscript: vi.fn(),
+    searchRuntimeWork: vi.fn(),
+    revertRuntimeFileChanges: vi.fn(),
+    sendRuntimeMessage: vi.fn(),
+    rollbackRuntimeTask: vi.fn(),
+    compactRuntimeTask: vi.fn(),
+    openRuntimeWorkspace: vi.fn(),
+    renameRuntimeWorkspace: vi.fn(),
+    removeRuntimeWorkspace: vi.fn(),
+    archiveRuntimeTask: vi.fn(),
+    renameRuntimeTask: vi.fn(),
+    listArchivedConversations: vi.fn(),
+    archiveConversation: vi.fn(),
+    archiveProjectConversations: vi.fn(),
+    archiveAllConversations: vi.fn(),
+    unarchiveConversation: vi.fn(),
+    deleteArchivedConversation: vi.fn(),
+    deleteArchivedConversationsBulk: vi.fn(),
+    getWorktreeCapabilities: vi.fn(),
+    preflightWorktree: vi.fn(),
+    cancelRuntimeTask: vi.fn(),
+    createRuntimeTask: vi.fn(),
+    forkRuntimeTask: vi.fn(),
+  }
+  return { deviceApi, runtimeWorkApi }
+}
+
+describe('executor access layer', () => {
+  test('refreshes the registry from the configured transport device list', async () => {
+    const { deviceApi, runtimeWorkApi } = createApis()
+    const client = createExecutorClientFromApis({
+      transportKind: 'backend-relay',
+      deviceApi,
+      runtimeWorkApi,
+    })
+
+    await expect(client.commands.listDevices()).resolves.toEqual([createDevice()])
+    expect(client.registry.list()).toEqual([
+      expect.objectContaining({
+        deviceId: 'device-1',
+        transportKind: 'backend-relay',
+        capabilities: ['runtime-work', 'device-commands'],
+      }),
+    ])
+  })
+
+  test('routes file access through the executor file capability', async () => {
+    const { deviceApi, runtimeWorkApi } = createApis()
+    const client = createExecutorClientFromApis({
+      transportKind: 'local-ipc',
+      deviceApi,
+      runtimeWorkApi,
+    })
+
+    await expect(
+      client.files.listWorkspaceEntries('device-1', '/Users/me/project')
+    ).resolves.toEqual({
+      path: '/Users/me/project',
+      entries: [],
+    })
+    await expect(
+      client.files.readWorkspaceTextFile(
+        'device-1',
+        '/Users/me/project/README.md',
+        '/Users/me/project'
+      )
+    ).resolves.toMatchObject({ content: 'hello' })
+
+    expect(deviceApi.listWorkspaceEntries).toHaveBeenCalledWith('device-1', '/Users/me/project')
+    expect(deviceApi.readWorkspaceTextFile).toHaveBeenCalledWith(
+      'device-1',
+      '/Users/me/project/README.md',
+      '/Users/me/project'
+    )
+  })
+
+  test('normalizes unknown devices into executor-not-found errors', async () => {
+    const { deviceApi, runtimeWorkApi } = createApis()
+    const client = createExecutorClientFromApis({
+      transportKind: 'backend-relay',
+      deviceApi,
+      runtimeWorkApi,
+    })
+
+    await expect(client.commands.getHomeDirectory('missing-device')).rejects.toThrow(
+      'executor-not-found:missing-device'
+    )
+    expect(deviceApi.getHomeDirectory).not.toHaveBeenCalled()
+  })
+
+  test('rejects binary file reads before invoking an unknown executor', async () => {
+    const { deviceApi, runtimeWorkApi } = createApis()
+    const client = createExecutorClientFromApis({
+      transportKind: 'backend-relay',
+      deviceApi,
+      runtimeWorkApi,
+    })
+
+    await expect(
+      client.files.readWorkspaceFileChunk(
+        'missing-device',
+        '/Users/me/project/image.png',
+        0,
+        '/Users/me/project'
+      )
+    ).rejects.toThrow('executor-not-found:missing-device')
+    expect(deviceApi.readWorkspaceFileChunk).not.toHaveBeenCalled()
+  })
+
+  test('loads a missing executor through the targeted resolver', async () => {
+    const { deviceApi, runtimeWorkApi } = createApis()
+    const resolveDevice = vi.fn().mockResolvedValue(
+      createDevice({
+        id: 2,
+        device_id: 'cloud-device',
+        name: 'Cloud Device',
+      })
+    )
+    const client = createExecutorClientFromApis({
+      transportKind: 'backend-relay',
+      deviceApi,
+      runtimeWorkApi,
+      resolveDevice,
+    })
+
+    await client.commands.executeCommand('cloud-device', {
+      command_key: 'git_branch',
+      cwd: '/workspace/cloud',
+    })
+
+    expect(resolveDevice).toHaveBeenCalledWith('cloud-device')
+    expect(deviceApi.executeCommand).toHaveBeenCalledWith('cloud-device', {
+      command_key: 'git_branch',
+      cwd: '/workspace/cloud',
+    })
+  })
+
+  test('normalizes offline devices into executor-offline errors', async () => {
+    const { deviceApi, runtimeWorkApi } = createApis([createDevice({ status: 'offline' })])
+    const client = createExecutorClientFromApis({
+      transportKind: 'backend-relay',
+      deviceApi,
+      runtimeWorkApi,
+    })
+
+    await expect(client.commands.getHomeDirectory('device-1')).rejects.toThrow(
+      'executor-offline:device-1'
+    )
+    expect(deviceApi.getHomeDirectory).not.toHaveBeenCalled()
+  })
+
+  test('uses the local IPC route status when the cloud route is offline', async () => {
+    const routedDevice = createDevice({
+      status: 'offline',
+      device_type: 'local',
+      runtime_routes: [
+        {
+          kind: 'local-ipc',
+          device_id: 'device-1',
+          runtime_device_id: 'device-1',
+          device_type: 'local',
+          name: 'Local Executor',
+          status: 'online',
+        },
+        {
+          kind: 'cloud-relay',
+          device_id: 'cloud-device-1',
+          runtime_device_id: 'device-1',
+          device_type: 'cloud',
+          name: 'Cloud Relay',
+          status: 'offline',
+        },
+      ],
+    })
+    const { deviceApi, runtimeWorkApi } = createApis([routedDevice])
+    const client = createExecutorClientFromApis({
+      transportKind: 'local-ipc',
+      deviceApi,
+      runtimeWorkApi,
+    })
+
+    await expect(client.commands.getHomeDirectory('device-1')).resolves.toBe('/Users/me')
+    expect(deviceApi.getHomeDirectory).toHaveBeenCalledWith('device-1')
+  })
+
+  test('keeps the cloud relay offline when only the local IPC route is online', async () => {
+    const routedDevice = createDevice({
+      status: 'online',
+      device_type: 'cloud',
+      runtime_routes: [
+        {
+          kind: 'local-ipc',
+          device_id: 'local-device-1',
+          runtime_device_id: 'device-1',
+          device_type: 'local',
+          name: 'Local Executor',
+          status: 'online',
+        },
+        {
+          kind: 'cloud-relay',
+          device_id: 'device-1',
+          runtime_device_id: 'device-1',
+          device_type: 'cloud',
+          name: 'Cloud Relay',
+          status: 'offline',
+        },
+      ],
+    })
+    const { deviceApi, runtimeWorkApi } = createApis([routedDevice])
+    const client = createExecutorClientFromApis({
+      transportKind: 'backend-relay',
+      deviceApi,
+      runtimeWorkApi,
+    })
+
+    await expect(client.commands.getHomeDirectory('device-1')).rejects.toThrow(
+      'executor-offline:device-1'
+    )
+    expect(deviceApi.getHomeDirectory).not.toHaveBeenCalled()
+  })
+
+  test('passes aggregate runtime work calls to the runtime transport', async () => {
+    const { runtimeWorkApi, deviceApi } = createApis()
+    const client = createExecutorClientFromApis({
+      transportKind: 'backend-relay',
+      deviceApi,
+      runtimeWorkApi,
+    })
+
+    await expect(client.runtime.listRuntimeWork()).resolves.toEqual(createRuntimeWork())
+    expect(runtimeWorkApi.listRuntimeWork).toHaveBeenCalledTimes(1)
+  })
+
+  test('guards Worktree capability and preflight calls with the target executor', async () => {
+    const { runtimeWorkApi, deviceApi } = createApis()
+    runtimeWorkApi.getWorktreeCapabilities.mockResolvedValue({
+      success: true,
+      deviceId: 'device-1',
+      runtimeWorktrees: null,
+    })
+    runtimeWorkApi.preflightWorktree.mockResolvedValue({
+      success: true,
+      deviceId: 'device-1',
+      supported: true,
+      sourcePath: '/Users/me/project',
+      sourceExists: true,
+      sourceDirectory: true,
+      gitRepository: true,
+      gitCommonDirValid: true,
+      gitCommonDirWritable: true,
+      writable: true,
+    })
+    const client = createExecutorClientFromApis({
+      transportKind: 'backend-relay',
+      deviceApi,
+      runtimeWorkApi,
+    })
+
+    await client.runtime.getWorktreeCapabilities({ deviceId: 'device-1' })
+    await client.runtime.preflightWorktree({
+      deviceId: 'device-1',
+      sourcePath: '/Users/me/project',
+    })
+
+    expect(runtimeWorkApi.getWorktreeCapabilities).toHaveBeenCalledWith({
+      deviceId: 'device-1',
+    })
+    expect(runtimeWorkApi.preflightWorktree).toHaveBeenCalledWith({
+      deviceId: 'device-1',
+      sourcePath: '/Users/me/project',
+    })
+  })
+
+  test('rejects Worktree preflight for unknown and offline executors', async () => {
+    const { runtimeWorkApi, deviceApi } = createApis([createDevice({ status: 'offline' })])
+    const client = createExecutorClientFromApis({
+      transportKind: 'backend-relay',
+      deviceApi,
+      runtimeWorkApi,
+    })
+
+    await expect(
+      client.runtime.preflightWorktree({
+        deviceId: 'missing-device',
+        sourcePath: '/Users/me/project',
+      })
+    ).rejects.toThrow('executor-not-found:missing-device')
+    await expect(
+      client.runtime.preflightWorktree({
+        deviceId: 'device-1',
+        sourcePath: '/Users/me/project',
+      })
+    ).rejects.toThrow('executor-offline:device-1')
+
+    expect(runtimeWorkApi.preflightWorktree).not.toHaveBeenCalled()
+  })
+})

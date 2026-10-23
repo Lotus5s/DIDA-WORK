@@ -1,0 +1,1124 @@
+#!/bin/bash
+# =============================================================================
+# AI Push Gate - Pre-push Quality Check Controller
+# =============================================================================
+# This script implements quality checks before push for AI coding agents:
+#
+# - Runs all quality checks (lint, type, test, build)
+# - Generates a comprehensive report
+# - Blocks push if critical checks fail
+# - Shows documentation reminders before requiring AI_VERIFIED=1
+#
+# Usage:
+#   git push                    (shows documentation work without running checks)
+#   AI_VERIFIED=1 git push      (runs checks after the AI updates documentation)
+#   AI_PUSH_FULL_TESTS=1 git push  (also run full Python and Rust test suites)
+# =============================================================================
+
+# Don't exit on error - we want to run all checks and report at the end
+set +e
+
+# Create temp directory for storing check outputs (reduces memory usage)
+TEMP_DIR=$(mktemp -d)
+trap "rm -rf $TEMP_DIR" EXIT
+
+# Colors for output
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Git passes the remote name and URL to pre-push hooks. Husky forwards them from
+# frontend/.husky/pre-push so new-branch diffs can use the correct default branch.
+REMOTE_NAME="${1:-}"
+
+should_run_full_tests() {
+    [ "${AI_PUSH_FULL_TESTS:-0}" = "1" ]
+}
+
+collect_wework_check_scope() {
+    WEWORK_RENDERER_CHANGED=0
+    WEWORK_RENDERER_FULL_TESTS=0
+    WEWORK_ELECTRON_CHANGED=0
+    WEWORK_DSH_CHANGED=0
+    WEWORK_SCRIPTS_CHANGED=0
+    WEWORK_LINT_FULL=0
+    WEWORK_LINT_FILES=()
+    WEWORK_RELATED_FILES=()
+
+    while IFS= read -r changed_file; do
+        [ -z "$changed_file" ] && continue
+
+        case "$changed_file" in
+            wework/package.json|wework/eslint.config.*)
+                WEWORK_LINT_FULL=1
+                ;;
+            wework/*.[cm]ts|wework/*.[cm]tsx|wework/*.ts|wework/*.tsx)
+                if [ -f "$changed_file" ]; then
+                    WEWORK_LINT_FILES+=("${changed_file#wework/}")
+                fi
+                ;;
+        esac
+
+        case "$changed_file" in
+            wework/electron/*)
+                WEWORK_ELECTRON_CHANGED=1
+                ;;
+            wework/dsh/*)
+                WEWORK_DSH_CHANGED=1
+                ;;
+            wework/scripts/*)
+                WEWORK_SCRIPTS_CHANGED=1
+                ;;
+            wework/src/*.[cm][jt]s|wework/src/*.[cm][jt]sx|wework/src/*.js|wework/src/*.jsx|wework/src/*.ts|wework/src/*.tsx)
+                WEWORK_RENDERER_CHANGED=1
+                if [ ! -e "$changed_file" ] ||
+                    [ "$changed_file" = "wework/src/test/setup.ts" ]; then
+                    WEWORK_RENDERER_FULL_TESTS=1
+                else
+                    WEWORK_RELATED_FILES+=("${changed_file#wework/}")
+                fi
+                ;;
+            wework/package.json)
+                WEWORK_RENDERER_CHANGED=1
+                ;;
+            wework/src/*|wework/wecode/*|wework/vite.config.*|wework/tsconfig*.json|wework/eslint.config.*)
+                WEWORK_RENDERER_CHANGED=1
+                WEWORK_RENDERER_FULL_TESTS=1
+                ;;
+        esac
+    done < <(printf '%s\n' "$CHANGED_FILES")
+}
+
+run_wework_lint() {
+    : > "$TEMP_DIR/wework_eslint.log"
+
+    if [ "$WEWORK_LINT_FULL" -eq 1 ]; then
+        pnpm --filter wework lint > "$TEMP_DIR/wework_eslint.log" 2>&1
+        return $?
+    fi
+
+    if [ "${#WEWORK_LINT_FILES[@]}" -gt 0 ]; then
+        if ! pnpm --filter wework exec eslint \
+            "${WEWORK_LINT_FILES[@]}" >> "$TEMP_DIR/wework_eslint.log" 2>&1; then
+            return 1
+        fi
+    fi
+
+    if [ "$WEWORK_RENDERER_CHANGED" -eq 1 ]; then
+        if ! pnpm --filter wework run lint:typography \
+            >> "$TEMP_DIR/wework_eslint.log" 2>&1; then
+            return 1
+        fi
+        if ! pnpm --filter wework run lint:task-lifecycle \
+            >> "$TEMP_DIR/wework_eslint.log" 2>&1; then
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+collect_node_test_files() {
+    local directory="$1"
+    find "$directory" -type f -name '*.test.mjs' -print 2>/dev/null | sort
+}
+
+append_unique_file() {
+    local candidate="$1"
+    local existing
+
+    for existing in "${WEWORK_FOCUSED_TEST_FILES[@]}"; do
+        [ "$existing" = "$candidate" ] && return
+    done
+    WEWORK_FOCUSED_TEST_FILES+=("$candidate")
+}
+
+format_worker_count() {
+    if [ "$1" = "1" ]; then
+        printf '1 worker'
+    else
+        printf '%s workers' "$1"
+    fi
+}
+
+run_wework_full_renderer_tests() {
+    local test_workers="$1"
+    local test_timeout_ms="${WEWORK_PRE_PUSH_TEST_TIMEOUT_MS:-15000}"
+    local shard_count=2
+    local shard
+    local shard_exit=0
+    local test_exit=0
+    local shard_pids=()
+    local shard_logs=()
+
+    for ((shard = 1; shard <= shard_count; shard++)); do
+        shard_logs+=("$TEMP_DIR/wework_test_shard_${shard}.log")
+        pnpm --filter wework exec vitest run --dir src --pool=threads \
+            --maxWorkers "$test_workers" \
+            --testTimeout "$test_timeout_ms" \
+            --shard="$shard/$shard_count" \
+            > "${shard_logs[$((shard - 1))]}" 2>&1 &
+        shard_pids+=("$!")
+    done
+
+    for ((shard = 1; shard <= shard_count; shard++)); do
+        wait "${shard_pids[$((shard - 1))]}"
+        shard_exit=$?
+        cat "${shard_logs[$((shard - 1))]}" >> "$TEMP_DIR/wework_test.log"
+        if [ "$shard_exit" -ne 0 ]; then
+            test_exit=1
+        fi
+    done
+
+    return "$test_exit"
+}
+
+collect_wework_renderer_tests() {
+    local source_file
+    local base_path
+    local candidate
+    local source_directory
+
+    WEWORK_FOCUSED_TEST_FILES=()
+
+    for source_file in "${WEWORK_RELATED_FILES[@]}"; do
+        case "$source_file" in
+            *.test.js|*.test.jsx|*.test.ts|*.test.tsx|*.test.mjs|*.test.mts)
+                append_unique_file "$source_file"
+                continue
+                ;;
+        esac
+
+        base_path="${source_file%.*}"
+        candidate=""
+        for test_suffix in test.ts test.tsx test.js test.jsx test.mts test.mjs; do
+            if [ -f "wework/$base_path.$test_suffix" ]; then
+                candidate="$base_path.$test_suffix"
+                break
+            fi
+        done
+
+        if [ -n "$candidate" ]; then
+            append_unique_file "$candidate"
+        else
+            source_directory=$(dirname "$source_file")
+            while IFS= read -r candidate; do
+                append_unique_file "$candidate"
+            done < <(
+                find "wework/$source_directory" -maxdepth 1 -type f \
+                    \( -name '*.test.js' -o -name '*.test.jsx' \
+                    -o -name '*.test.ts' -o -name '*.test.tsx' \
+                    -o -name '*.test.mjs' -o -name '*.test.mts' \) \
+                    -print 2>/dev/null |
+                    sed 's#^wework/##' |
+                    sort
+            )
+        fi
+    done
+}
+
+run_wework_unit_tests() {
+    local test_exit=0
+    local test_workers
+
+    : > "$TEMP_DIR/wework_test.log"
+
+    if [ "$WEWORK_RENDERER_CHANGED" -eq 1 ]; then
+        if [ "$WEWORK_RENDERER_FULL_TESTS" -eq 1 ]; then
+            # Two concurrent shards share the renderer's default two-worker budget.
+            test_workers="${WEWORK_PRE_PUSH_TEST_WORKERS:-1}"
+            echo -e "   Running full renderer unit tests in 2 shards with $(format_worker_count "$test_workers") each..."
+            if ! run_wework_full_renderer_tests "$test_workers"; then
+                test_exit=1
+            fi
+        else
+            collect_wework_renderer_tests
+            if [ "${#WEWORK_FOCUSED_TEST_FILES[@]}" -gt 0 ]; then
+                test_workers="${WEWORK_PRE_PUSH_TEST_WORKERS:-2}"
+                echo -e "   Running focused renderer unit tests with $(format_worker_count "$test_workers")..."
+                if ! pnpm --filter wework exec vitest run --pool=threads \
+                    --maxWorkers "$test_workers" \
+                    "${WEWORK_FOCUSED_TEST_FILES[@]}" \
+                    >> "$TEMP_DIR/wework_test.log" 2>&1; then
+                    test_exit=1
+                fi
+            else
+                echo -e "   ${YELLOW}↪ Renderer unit tests: SKIPPED (no colocated tests)${NC}"
+            fi
+        fi
+    fi
+
+    if [ "$WEWORK_ELECTRON_CHANGED" -eq 1 ] && [ "$ELECTRON_INSTALL_EXIT" -eq 0 ]; then
+        echo -e "   Running Electron unit tests..."
+        if ! pnpm --dir wework/electron test >> "$TEMP_DIR/wework_test.log" 2>&1; then
+            test_exit=1
+        fi
+    fi
+
+    if [ "$WEWORK_DSH_CHANGED" -eq 1 ]; then
+        echo -e "   Running DSH unit tests..."
+        DSH_TEST_FILES=()
+        while IFS= read -r test_file; do
+            DSH_TEST_FILES+=("${test_file#wework/}")
+        done < <(collect_node_test_files "wework/dsh")
+        if ! pnpm --filter wework test \
+            "${DSH_TEST_FILES[@]}" >> "$TEMP_DIR/wework_test.log" 2>&1; then
+            test_exit=1
+        fi
+    fi
+
+    if [ "$WEWORK_SCRIPTS_CHANGED" -eq 1 ]; then
+        echo -e "   Running Wework script unit tests..."
+        SCRIPT_TEST_FILES=()
+        while IFS= read -r test_file; do
+            SCRIPT_TEST_FILES+=("${test_file#wework/}")
+        done < <(collect_node_test_files "wework/scripts")
+        if ! pnpm --filter wework test \
+            "${SCRIPT_TEST_FILES[@]}" >> "$TEMP_DIR/wework_test.log" 2>&1; then
+            test_exit=1
+        fi
+    fi
+
+    return "$test_exit"
+}
+
+resolve_default_base() {
+    local remote_name="${1:-}"
+    local candidate=""
+
+    if [ -n "$remote_name" ]; then
+        candidate=$(git symbolic-ref --quiet --short "refs/remotes/$remote_name/HEAD" 2>/dev/null || true)
+        if [ -n "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+
+        for branch in main master; do
+            if git rev-parse --verify --quiet "$remote_name/$branch" >/dev/null; then
+                echo "$remote_name/$branch"
+                return 0
+            fi
+        done
+    fi
+
+    candidate=$(git rev-parse --abbrev-ref "@{upstream}" 2>/dev/null || true)
+    if [ -n "$candidate" ]; then
+        echo "$candidate"
+        return 0
+    fi
+
+    for candidate in github/main origin/main gitee/main main master; do
+        if git rev-parse --verify --quiet "$candidate" >/dev/null; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+maybe_run_full_python_tests() {
+    local module_name="$1"
+    local test_cmd="$2"
+    local log_file="$3"
+    local failed_check_name="$4"
+
+    if ! should_run_full_tests; then
+        echo -e "   ${YELLOW}↪ Pytest: SKIPPED in pre-push (set AI_PUSH_FULL_TESTS=1 to run full suite)${NC}"
+        return 0
+    fi
+
+    echo -e "   Running pytest..."
+    eval "$test_cmd" > "$log_file" 2>&1
+    PYTEST_EXIT=$?
+    if [ $PYTEST_EXIT -eq 0 ]; then
+        echo -e "   ${GREEN}✅ Pytest: PASSED${NC}"
+    else
+        echo -e "   ${RED}❌ Pytest: FAILED${NC}"
+        CHECK_FAILED=1
+        FAILED_CHECKS+=("$failed_check_name")
+        FAILED_LOGS+=("$log_file")
+    fi
+}
+
+run_changed_python_syntax_check() {
+    local module_name="$1"
+    local module_dir="$2"
+    local file_pattern="$3"
+    local log_file="$4"
+    local uv_args="${5:-}"
+    local syntax_files
+    local syntax_error=0
+
+    syntax_files=$(echo "$CHANGED_FILES" | grep -E "$file_pattern" || true)
+    if [ -z "$syntax_files" ]; then
+        echo -e "   ${YELLOW}↪ Syntax Check: SKIPPED (no changed Python files)${NC}"
+        return 0
+    fi
+
+    echo -e "   Running Python syntax check..."
+    > "$log_file"
+
+    while IFS= read -r pyfile; do
+        [ -z "$pyfile" ] && continue
+        if [ -f "$PROJECT_ROOT/$pyfile" ]; then
+            (
+                cd "$module_dir" || exit 1
+                uv run $uv_args python -m py_compile "$PROJECT_ROOT/$pyfile"
+            ) 2>> "$log_file"
+            if [ $? -ne 0 ]; then
+                echo -e "   ${RED}   Syntax error in: $pyfile${NC}"
+                syntax_error=1
+            fi
+        fi
+    done < <(printf '%s\n' "$syntax_files")
+
+    if [ $syntax_error -eq 0 ]; then
+        echo -e "   ${GREEN}✅ Syntax Check: PASSED${NC}"
+    else
+        echo -e "   ${RED}❌ Syntax Check: FAILED${NC}"
+        CHECK_FAILED=1
+        FAILED_CHECKS+=("$module_name Syntax")
+        FAILED_LOGS+=("$log_file")
+    fi
+}
+
+# Get the commits being pushed
+# When run by pre-commit, stdin may not be available, so we detect changes differently
+get_changed_files() {
+    local files=""
+
+    # Try to read from stdin first (direct pre-push hook provides ref info)
+    if ! [ -t 0 ]; then
+        # stdin is available (piped), try to read pre-push hook format
+        while read local_ref local_sha remote_ref remote_sha 2>/dev/null; do
+            if [ -n "$local_sha" ] && [ "$local_sha" != "0000000000000000000000000000000000000000" ]; then
+                if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+                    # New branch, compare with default branch
+                    local default_base
+                    default_base=$(resolve_default_base "$REMOTE_NAME" || true)
+                    if [ -n "$default_base" ]; then
+                        files=$(git diff --name-only "$default_base...$local_sha" 2>/dev/null || true)
+                    fi
+                else
+                    # Existing branch, compare with remote
+                    files=$(git diff --name-only "$remote_sha...$local_sha" 2>/dev/null || true)
+                fi
+                if [ -n "$files" ]; then
+                    echo "$files"
+                    return
+                fi
+            fi
+        done
+    fi
+
+    # Fallback: Compare current branch with its upstream or origin/main
+    local base_ref
+    base_ref=$(resolve_default_base "$REMOTE_NAME" || true)
+    if [ -n "$base_ref" ]; then
+        files=$(git diff --name-only "$base_ref"...HEAD 2>/dev/null || true)
+    fi
+
+    if [ -n "$files" ]; then
+        echo "$files"
+        return
+    fi
+
+    # Last resort: compare with last commit
+    git diff --name-only HEAD~1 HEAD 2>/dev/null || true
+}
+
+# Get list of changed files in the commits being pushed
+CHANGED_FILES=$(get_changed_files)
+
+if [ -z "$CHANGED_FILES" ]; then
+    echo -e "${GREEN}✅ No files changed, skipping checks${NC}"
+    exit 0
+fi
+
+# =============================================================================
+# Generate Quality Check Report
+# =============================================================================
+
+echo ""
+echo -e "${CYAN}${BOLD}══════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}${BOLD}📋 AI Code Quality Check Report (Pre-push)${NC}"
+echo -e "${CYAN}${BOLD}══════════════════════════════════════════════════════════${NC}"
+echo ""
+
+# Track check results
+WARNINGS=()
+DOC_REMINDERS=()
+FAILED_CHECKS=()
+FAILED_LOGS=()
+
+# -----------------------------------------------------------------------------
+# Check: Changed files summary
+# -----------------------------------------------------------------------------
+echo -e "${BLUE}📁 Files to be pushed:${NC}"
+FILE_COUNT=$(echo "$CHANGED_FILES" | wc -l)
+echo -e "   Total: $FILE_COUNT file(s)"
+echo ""
+
+# Count by module
+BACKEND_COUNT=$(echo "$CHANGED_FILES" | grep -c "^backend/" 2>/dev/null || echo 0)
+FRONTEND_COUNT=$(echo "$CHANGED_FILES" | grep -c "^frontend/" 2>/dev/null || echo 0)
+WEWORK_COUNT=$(echo "$CHANGED_FILES" | grep -c "^wework/" 2>/dev/null || echo 0)
+EXECUTOR_COUNT=$(echo "$CHANGED_FILES" | grep -c "^executor/" 2>/dev/null || echo 0)
+EXECUTOR_MGR_COUNT=$(echo "$CHANGED_FILES" | grep -c "^executor_manager/" 2>/dev/null || echo 0)
+SHARED_COUNT=$(echo "$CHANGED_FILES" | grep -c "^shared/" 2>/dev/null || echo 0)
+KNOWLEDGE_ENGINE_COUNT=$(echo "$CHANGED_FILES" | grep -c "^knowledge_engine/" 2>/dev/null || echo 0)
+KNOWLEDGE_RUNTIME_COUNT=$(echo "$CHANGED_FILES" | grep -c "^knowledge_runtime/" 2>/dev/null || echo 0)
+OTHER_COUNT=$(echo "$CHANGED_FILES" | grep -cvE "^(backend|frontend|wework|executor|executor_manager|shared|knowledge_engine|knowledge_runtime)/" 2>/dev/null || echo 0)
+
+echo -e "   ${BLUE}Modules affected:${NC}"
+[ "$BACKEND_COUNT" -gt 0 ] 2>/dev/null && echo -e "   - Backend: $BACKEND_COUNT file(s)"
+[ "$FRONTEND_COUNT" -gt 0 ] 2>/dev/null && echo -e "   - Frontend: $FRONTEND_COUNT file(s)"
+[ "$WEWORK_COUNT" -gt 0 ] 2>/dev/null && echo -e "   - Wework: $WEWORK_COUNT file(s)"
+[ "$EXECUTOR_COUNT" -gt 0 ] 2>/dev/null && echo -e "   - Executor: $EXECUTOR_COUNT file(s)"
+[ "$EXECUTOR_MGR_COUNT" -gt 0 ] 2>/dev/null && echo -e "   - Executor Manager: $EXECUTOR_MGR_COUNT file(s)"
+[ "$SHARED_COUNT" -gt 0 ] 2>/dev/null && echo -e "   - Shared: $SHARED_COUNT file(s)"
+[ "$KNOWLEDGE_ENGINE_COUNT" -gt 0 ] 2>/dev/null && echo -e "   - Knowledge Engine: $KNOWLEDGE_ENGINE_COUNT file(s)"
+[ "$KNOWLEDGE_RUNTIME_COUNT" -gt 0 ] 2>/dev/null && echo -e "   - Knowledge Runtime: $KNOWLEDGE_RUNTIME_COUNT file(s)"
+[ "$OTHER_COUNT" -gt 0 ] 2>/dev/null && echo -e "   - Other: $OTHER_COUNT file(s)"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Check: Documentation reminders
+# -----------------------------------------------------------------------------
+echo -e "${BLUE}📝 Documentation Check:${NC}"
+
+# Backend API/Services changed → User guides (creating-bots, creating-teams, etc.)
+BACKEND_API=$(echo "$CHANGED_FILES" | grep -E "^backend/app/(api|services)/.*\.py$" || true)
+if [ -n "$BACKEND_API" ]; then
+    DOC_REMINDERS+=("Backend API/Services changed → Check docs/*/guides/user/ for user guide updates")
+fi
+
+# Backend Models/Schemas changed → YAML specification reference
+BACKEND_MODELS=$(echo "$CHANGED_FILES" | grep -E "^backend/app/(models|schemas)/.*\.py$" || true)
+if [ -n "$BACKEND_MODELS" ]; then
+    DOC_REMINDERS+=("Backend Models/Schemas changed → Check docs/*/reference/yaml-specification.md")
+fi
+
+# Executor/Agent changed → Architecture and concepts docs
+EXECUTOR_CODE=$(echo "$CHANGED_FILES" | grep -E "^executor/.*\.(py|rs|toml)$|^executor/Cargo\.lock$" || true)
+if [ -n "$EXECUTOR_CODE" ]; then
+    DOC_REMINDERS+=("Executor changed → Check docs/*/concepts/architecture.md")
+fi
+
+# Project config changed → Getting started and installation docs
+CONFIG_FILES=$(echo "$CHANGED_FILES" | grep -E "(docker-compose|Dockerfile|requirements\.txt|package\.json)" || true)
+if [ -n "$CONFIG_FILES" ]; then
+    DOC_REMINDERS+=("Project config changed → Check docs/*/getting-started/ for installation/setup updates")
+fi
+
+# Any code change → Consider updating AGENTS.md and README
+ANY_CODE=$(echo "$CHANGED_FILES" | grep -E "^(backend|frontend|wework|executor|executor_manager|shared|knowledge_engine|knowledge_runtime)/.*\.(py|rs|ts|tsx)$" || true)
+if [ -n "$ANY_CODE" ]; then
+    DOC_REMINDERS+=("Code changed → Consider updating AGENTS.md and README.md/README_zh.md if needed")
+fi
+
+if [ ${#DOC_REMINDERS[@]} -eq 0 ]; then
+    echo -e "   ${GREEN}✅ No documentation updates detected${NC}"
+else
+    echo -e "   ${YELLOW}⚠️ Documentation reminders:${NC}"
+    for reminder in "${DOC_REMINDERS[@]}"; do
+        echo -e "   ${YELLOW}   - $reminder${NC}"
+        WARNINGS+=("Doc: $reminder")
+    done
+fi
+echo ""
+
+if [ "${AI_VERIFIED:-0}" != "1" ]; then
+    echo -e "${YELLOW}${BOLD}Ask the AI to review and complete documentation for these changes.${NC}"
+    echo -e "${YELLOW}After documentation is complete, run:${NC}"
+    echo -e "${GREEN}${BOLD}AI_VERIFIED=1 git push${NC}"
+    echo ""
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Run Quality Checks
+# -----------------------------------------------------------------------------
+echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+# Keep background checks running across macOS idle and maintenance sleep.
+# The assertion ends automatically when this hook exits.
+if [ "$(uname -s)" = "Darwin" ]; then
+    caffeinate -is -w "$$" >/dev/null 2>&1 &
+fi
+
+echo -e "${CYAN}📊 Running Quality Checks${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+echo ""
+
+# Track overall check status
+CHECK_FAILED=0
+
+# -----------------------------------------------------------------------------
+# Frontend Checks (if frontend files changed)
+# -----------------------------------------------------------------------------
+if [ "$FRONTEND_COUNT" -gt 0 ] 2>/dev/null; then
+    echo -e "${BLUE}🔍 Frontend Checks:${NC}"
+    
+    # Check if workspace dependencies are installed.
+    if [ ! -d "node_modules" ] || [ ! -d "frontend/node_modules" ]; then
+        echo -e "   ${YELLOW}⚠️ SKIP: node_modules not found${NC}"
+        echo -e "   ${YELLOW}   Run 'pnpm install' from the repository root to install dependencies${NC}"
+        WARNINGS+=("Frontend: node_modules not found, checks skipped")
+    else
+        # ESLint (output to temp file to reduce memory usage)
+        echo -e "   Running ESLint..."
+        pnpm --filter wecode-ai-assistant lint > "$TEMP_DIR/eslint.log" 2>&1
+        ESLINT_EXIT=$?
+        if [ $ESLINT_EXIT -eq 0 ]; then
+            echo -e "   ${GREEN}✅ ESLint: PASSED${NC}"
+        else
+            echo -e "   ${RED}❌ ESLint: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Frontend ESLint")
+            FAILED_LOGS+=("$TEMP_DIR/eslint.log")
+        fi
+        
+        # Regenerate Next.js route types before TypeScript validation. Generated
+        # files can otherwise retain imports for routes removed by a branch switch.
+        echo -e "   Running TypeScript check..."
+        pnpm --filter wecode-ai-assistant exec next typegen > "$TEMP_DIR/tsc.log" 2>&1
+        TYPEGEN_EXIT=$?
+        if [ $TYPEGEN_EXIT -eq 0 ]; then
+            pnpm --filter wecode-ai-assistant exec tsc --noEmit >> "$TEMP_DIR/tsc.log" 2>&1
+            TSC_EXIT=$?
+        else
+            TSC_EXIT=$TYPEGEN_EXIT
+        fi
+        if [ $TSC_EXIT -eq 0 ]; then
+            echo -e "   ${GREEN}✅ TypeScript: PASSED${NC}"
+        else
+            echo -e "   ${RED}❌ TypeScript: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Frontend TypeScript")
+            FAILED_LOGS+=("$TEMP_DIR/tsc.log")
+        fi
+        
+        # Unit tests (output to temp file to reduce memory usage)
+        echo -e "   Running unit tests..."
+        pnpm --filter @wegent/chat-core test > "$TEMP_DIR/test.log" 2>&1
+        CORE_TEST_EXIT=$?
+        # Bound JSDOM workers, as with Wework, to avoid CPU and memory
+        # contention turning short UI interactions into test timeouts.
+        FRONTEND_TEST_WORKERS="${FRONTEND_PRE_PUSH_TEST_WORKERS:-2}"
+        pnpm --filter wecode-ai-assistant run test --passWithNoTests \
+            --maxWorkers "$FRONTEND_TEST_WORKERS" >> "$TEMP_DIR/test.log" 2>&1
+        TEST_EXIT=$?
+        if [ $CORE_TEST_EXIT -eq 0 ] && [ $TEST_EXIT -eq 0 ]; then
+            echo -e "   ${GREEN}✅ Unit Tests: PASSED${NC}"
+        else
+            echo -e "   ${RED}❌ Unit Tests: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Frontend Unit Tests")
+            FAILED_LOGS+=("$TEMP_DIR/test.log")
+        fi
+        # Note: Build check removed to reduce memory usage (~1.5GB).
+        # TypeScript check above already validates type correctness.
+        # Full build verification should be done in CI pipeline.
+        
+    fi
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Wework Checks (if wework files changed)
+# -----------------------------------------------------------------------------
+if [ "$WEWORK_COUNT" -gt 0 ] 2>/dev/null; then
+    echo -e "${BLUE}🔍 Wework Checks:${NC}"
+
+    # Check if workspace dependencies are installed.
+    if [ ! -d "node_modules" ] || [ ! -d "wework/node_modules" ]; then
+        echo -e "   ${YELLOW}⚠️ SKIP: node_modules not found${NC}"
+        echo -e "   ${YELLOW}   Run 'pnpm install' from the repository root to install dependencies${NC}"
+        WARNINGS+=("Wework: node_modules not found, checks skipped")
+    else
+        collect_wework_check_scope
+        echo -e "   Running static checks and unit tests in parallel..."
+
+        run_wework_lint &
+        ESLINT_PID=$!
+
+        TSC_PID=""
+        TSC_EXIT=0
+        ELECTRON_TSC_EXIT=0
+
+        if [ "$WEWORK_RENDERER_CHANGED" -eq 1 ]; then
+            pnpm --filter wework typecheck > "$TEMP_DIR/wework_tsc.log" 2>&1 &
+            TSC_PID=$!
+        fi
+
+        if [ "$WEWORK_ELECTRON_CHANGED" -eq 1 ]; then
+            CI=true pnpm --filter wework run prepare:electron > "$TEMP_DIR/wework_electron_install.log" 2>&1
+            ELECTRON_INSTALL_EXIT=$?
+            if [ "$ELECTRON_INSTALL_EXIT" -eq 0 ]; then
+                # Both Electron package commands stage the same vendor directory.
+                # Finish typechecking before unit tests can replace those files.
+                pnpm --dir wework/electron typecheck > "$TEMP_DIR/wework_electron_tsc.log" 2>&1
+                ELECTRON_TSC_EXIT=$?
+            else
+                ELECTRON_TSC_EXIT=$ELECTRON_INSTALL_EXIT
+            fi
+        fi
+
+        run_wework_unit_tests &
+        WEWORK_TEST_PID=$!
+
+        wait "$ESLINT_PID"
+        ESLINT_EXIT=$?
+
+        if [ -n "$TSC_PID" ]; then
+            wait "$TSC_PID"
+            TSC_EXIT=$?
+        fi
+
+        wait "$WEWORK_TEST_PID"
+        TEST_EXIT=$?
+
+        if [ $ESLINT_EXIT -eq 0 ]; then
+            echo -e "   ${GREEN}✅ ESLint: PASSED${NC}"
+        else
+            echo -e "   ${RED}❌ ESLint: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Wework ESLint")
+            FAILED_LOGS+=("$TEMP_DIR/wework_eslint.log")
+        fi
+
+        if [ "$WEWORK_RENDERER_CHANGED" -eq 1 ]; then
+            if [ $TSC_EXIT -eq 0 ]; then
+                echo -e "   ${GREEN}✅ TypeScript: PASSED${NC}"
+            else
+                echo -e "   ${RED}❌ TypeScript: FAILED${NC}"
+                CHECK_FAILED=1
+                FAILED_CHECKS+=("Wework TypeScript")
+                FAILED_LOGS+=("$TEMP_DIR/wework_tsc.log")
+            fi
+        fi
+
+        if [ "$WEWORK_ELECTRON_CHANGED" -eq 1 ]; then
+            if [ $ELECTRON_TSC_EXIT -eq 0 ]; then
+                echo -e "   ${GREEN}✅ Electron TypeScript: PASSED${NC}"
+            else
+                echo -e "   ${RED}❌ Electron TypeScript: FAILED${NC}"
+                CHECK_FAILED=1
+                FAILED_CHECKS+=("Wework Electron TypeScript")
+                if [ "$ELECTRON_INSTALL_EXIT" -ne 0 ]; then
+                    FAILED_LOGS+=("$TEMP_DIR/wework_electron_install.log")
+                else
+                    FAILED_LOGS+=("$TEMP_DIR/wework_electron_tsc.log")
+                fi
+            fi
+        fi
+
+        if [ $TEST_EXIT -eq 0 ]; then
+            echo -e "   ${GREEN}✅ Unit Tests: PASSED${NC}"
+        else
+            echo -e "   ${RED}❌ Unit Tests: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Wework Unit Tests")
+            FAILED_LOGS+=("$TEMP_DIR/wework_test.log")
+        fi
+    fi
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Backend Checks (if backend files changed)
+# -----------------------------------------------------------------------------
+if [ "$BACKEND_COUNT" -gt 0 ] 2>/dev/null; then
+    echo -e "${BLUE}🔍 Backend Checks:${NC}"
+    
+    cd backend
+    
+    # Check if virtual environment or Python packages are available
+    if ! command -v black &> /dev/null && [ ! -f "venv/bin/black" ] && [ ! -f ".venv/bin/black" ]; then
+        echo -e "   ${YELLOW}⚠️ SKIP: black not found${NC}"
+        echo -e "   ${YELLOW}   Run 'pip install black isort pytest' to install dependencies${NC}"
+        WARNINGS+=("Backend: black not found, format checks skipped")
+        
+        # Still try to run other checks if available
+        # isort check
+        if ! command -v isort &> /dev/null && [ ! -f "venv/bin/isort" ] && [ ! -f ".venv/bin/isort" ]; then
+            echo -e "   ${YELLOW}⚠️ SKIP: isort not found${NC}"
+            WARNINGS+=("Backend: isort not found, import sort checks skipped")
+        fi
+
+        maybe_run_full_python_tests \
+            "Backend" \
+            "pytest tests/ --tb=short -q" \
+            "$TEMP_DIR/backend_pytest.log" \
+            "Backend Pytest"
+        
+        # Python syntax check
+        # Python syntax check
+        echo -e "   Running Python syntax check..."
+        SYNTAX_ERROR=0
+        > "$TEMP_DIR/syntax.log"  # Clear/create the file
+        for pyfile in $(echo "$CHANGED_FILES" | grep "^backend/.*\.py$"); do
+            if [ -f "../$pyfile" ]; then
+                uv run python -m py_compile "../$pyfile" 2>> "$TEMP_DIR/syntax.log"
+                if [ $? -ne 0 ]; then
+                    echo -e "   ${RED}   Syntax error in: $pyfile${NC}"
+                    SYNTAX_ERROR=1
+                fi
+            fi
+        done
+        if [ $SYNTAX_ERROR -eq 0 ]; then
+            echo -e "   ${GREEN}✅ Syntax Check: PASSED${NC}"
+        else
+            echo -e "   ${RED}❌ Syntax Check: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Backend Syntax")
+            FAILED_LOGS+=("$TEMP_DIR/syntax.log")
+        fi
+    else
+        # Black format check (output to temp file)
+        echo -e "   Running Black format check..."
+        uv run black --check app/ > "$TEMP_DIR/black.log" 2>&1
+        BLACK_EXIT=$?
+        if [ $BLACK_EXIT -eq 0 ]; then
+            echo -e "   ${GREEN}✅ Black: PASSED${NC}"
+        else
+            echo -e "   ${RED}❌ Black: FAILED (run 'cd backend && black app/' to fix)${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Backend Black")
+            # Append fix hint to log file
+            echo -e "\nFix: cd backend && black app/" >> "$TEMP_DIR/black.log"
+            FAILED_LOGS+=("$TEMP_DIR/black.log")
+        fi
+        
+        # isort check
+        if ! command -v isort &> /dev/null && [ ! -f "venv/bin/isort" ] && [ ! -f ".venv/bin/isort" ]; then
+            echo -e "   ${YELLOW}⚠️ SKIP: isort not found${NC}"
+            echo -e "   ${YELLOW}   Run 'pip install isort' to install dependencies${NC}"
+            WARNINGS+=("Backend: isort not found, import sort checks skipped")
+        else
+            uv run isort --check-only --diff app/ > "$TEMP_DIR/isort.log" 2>&1
+            ISORT_EXIT=$?
+            if [ $ISORT_EXIT -eq 0 ]; then
+                echo -e "   ${GREEN}✅ isort: PASSED${NC}"
+            else
+                echo -e "   ${RED}❌ isort: FAILED (run 'cd backend && isort app/' to fix)${NC}"
+                CHECK_FAILED=1
+                FAILED_CHECKS+=("Backend isort")
+                echo -e "\nFix: cd backend && isort app/" >> "$TEMP_DIR/isort.log"
+                FAILED_LOGS+=("$TEMP_DIR/isort.log")
+            fi
+        fi
+        
+        maybe_run_full_python_tests \
+            "Backend" \
+            "uv run pytest tests/ --tb=short -q" \
+            "$TEMP_DIR/backend_pytest.log" \
+            "Backend Pytest"
+        # Python syntax check (output to temp file)
+        echo -e "   Running Python syntax check..."
+        SYNTAX_ERROR=0
+        > "$TEMP_DIR/syntax.log"  # Clear/create the file
+        for pyfile in $(echo "$CHANGED_FILES" | grep "^backend/.*\.py$"); do
+            if [ -f "../$pyfile" ]; then
+                uv run python -m py_compile "../$pyfile" 2>> "$TEMP_DIR/syntax.log"
+                if [ $? -ne 0 ]; then
+                    echo -e "   ${RED}   Syntax error in: $pyfile${NC}"
+                    SYNTAX_ERROR=1
+                fi
+            fi
+        done
+        if [ $SYNTAX_ERROR -eq 0 ]; then
+            echo -e "   ${GREEN}✅ Syntax Check: PASSED${NC}"
+        else
+            echo -e "   ${RED}❌ Syntax Check: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Backend Syntax")
+            FAILED_LOGS+=("$TEMP_DIR/syntax.log")
+        fi
+    fi
+    cd ..
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Settings Configuration Check (if backend files changed)
+# -----------------------------------------------------------------------------
+if [ "$BACKEND_COUNT" -gt 0 ] 2>/dev/null; then
+    echo -e "${BLUE}🔍 Settings Configuration Check:${NC}"
+    
+    # Get script directory and run settings check
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    SETTINGS_CHECK_SCRIPT="$SCRIPT_DIR/check-settings-config.sh"
+    
+    if [ -x "$SETTINGS_CHECK_SCRIPT" ]; then
+        "$SETTINGS_CHECK_SCRIPT" > "$TEMP_DIR/settings.log" 2>&1
+        SETTINGS_EXIT=$?
+        
+        if [ $SETTINGS_EXIT -eq 0 ]; then
+            echo -e "   ${GREEN}✅ Settings Configuration: PASSED${NC}"
+        elif [ $SETTINGS_EXIT -eq 1 ]; then
+            echo -e "   ${RED}❌ Settings Configuration: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Settings Configuration")
+            FAILED_LOGS+=("$TEMP_DIR/settings.log")
+        else
+            echo -e "   ${YELLOW}⚠️ Settings check could not determine status${NC}"
+            WARNINGS+=("Settings: check returned unexpected exit code $SETTINGS_EXIT")
+        fi
+    else
+        echo -e "   ${YELLOW}⚠️ SKIP: Settings check script not found${NC}"
+        WARNINGS+=("Settings: check script not found at $SETTINGS_CHECK_SCRIPT")
+    fi
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Knowledge Engine Checks (if knowledge_engine files changed)
+# -----------------------------------------------------------------------------
+if [ "$KNOWLEDGE_ENGINE_COUNT" -gt 0 ] 2>/dev/null; then
+    echo -e "${BLUE}🔍 Knowledge Engine Checks:${NC}"
+
+    if [ ! -d "knowledge_engine" ]; then
+        echo -e "   ${YELLOW}⚠️ SKIP: knowledge_engine directory not found${NC}"
+        WARNINGS+=("Knowledge Engine: project directory not found")
+    else
+        cd knowledge_engine
+
+        if [ ! -d "tests" ]; then
+            echo -e "   ${YELLOW}⚠️ SKIP: tests directory not found${NC}"
+            WARNINGS+=("Knowledge Engine: tests directory not found")
+        else
+            maybe_run_full_python_tests \
+                "Knowledge Engine" \
+                "uv run --group dev pytest tests/ --tb=short -q" \
+                "$TEMP_DIR/knowledge_engine_pytest.log" \
+                "Knowledge Engine Pytest"
+            run_changed_python_syntax_check \
+                "Knowledge Engine" \
+                "$PROJECT_ROOT/knowledge_engine" \
+                "^knowledge_engine/.*\\.py$" \
+                "$TEMP_DIR/knowledge_engine_syntax.log" \
+                "--group dev"
+        fi
+
+        cd ..
+    fi
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Knowledge Runtime Checks (if knowledge_runtime files changed)
+# -----------------------------------------------------------------------------
+if [ "$KNOWLEDGE_RUNTIME_COUNT" -gt 0 ] 2>/dev/null; then
+    echo -e "${BLUE}🔍 Knowledge Runtime Checks:${NC}"
+
+    if [ ! -d "knowledge_runtime" ]; then
+        echo -e "   ${YELLOW}⚠️ SKIP: knowledge_runtime directory not found${NC}"
+        WARNINGS+=("Knowledge Runtime: project directory not found")
+    else
+        cd knowledge_runtime
+
+        if [ ! -d "tests" ]; then
+            echo -e "   ${YELLOW}⚠️ SKIP: tests directory not found${NC}"
+            WARNINGS+=("Knowledge Runtime: tests directory not found")
+        else
+            maybe_run_full_python_tests \
+                "Knowledge Runtime" \
+                "uv run --group dev pytest tests/ --tb=short -q" \
+                "$TEMP_DIR/knowledge_runtime_pytest.log" \
+                "Knowledge Runtime Pytest"
+            run_changed_python_syntax_check \
+                "Knowledge Runtime" \
+                "$PROJECT_ROOT/knowledge_runtime" \
+                "^knowledge_runtime/.*\\.py$" \
+                "$TEMP_DIR/knowledge_runtime_syntax.log" \
+                "--group dev"
+        fi
+
+        cd ..
+    fi
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Executor Checks (if executor files changed)
+# -----------------------------------------------------------------------------
+if [ "$EXECUTOR_COUNT" -gt 0 ] 2>/dev/null; then
+    echo -e "${BLUE}🔍 Executor Checks:${NC}"
+    
+    cd executor
+    
+    if ! command -v cargo &> /dev/null; then
+        echo -e "   ${YELLOW}⚠️ SKIP: cargo not found${NC}"
+        echo -e "   ${YELLOW}   Install Rust to run executor pre-push checks${NC}"
+        WARNINGS+=("Executor: cargo not found, Rust checks skipped")
+    elif [ ! -d "tests" ]; then
+        echo -e "   ${YELLOW}⚠️ SKIP: tests directory not found${NC}"
+        WARNINGS+=("Executor: tests directory not found")
+    else
+        echo -e "   Running cargo fmt --check..."
+        if cargo fmt --check > "$TEMP_DIR/executor_fmt.log" 2>&1; then
+            echo -e "   ${GREEN}✅ cargo fmt: PASSED${NC}"
+        else
+            echo -e "   ${RED}❌ cargo fmt: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Executor cargo fmt")
+            FAILED_LOGS+=("$TEMP_DIR/executor_fmt.log")
+        fi
+
+        echo -e "   Running cargo test --all-features --lib..."
+        if cargo test --all-features --lib > "$TEMP_DIR/executor_test.log" 2>&1; then
+            echo -e "   ${GREEN}✅ cargo test: PASSED${NC}"
+        else
+            echo -e "   ${RED}❌ cargo test: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Executor cargo test")
+            FAILED_LOGS+=("$TEMP_DIR/executor_test.log")
+        fi
+
+        if should_run_full_tests; then
+            echo -e "   Running full cargo test --all-features..."
+            if cargo test --all-features > "$TEMP_DIR/executor_full_test.log" 2>&1; then
+                echo -e "   ${GREEN}✅ full cargo test: PASSED${NC}"
+            else
+                echo -e "   ${RED}❌ full cargo test: FAILED${NC}"
+                CHECK_FAILED=1
+                FAILED_CHECKS+=("Executor full cargo test")
+                FAILED_LOGS+=("$TEMP_DIR/executor_full_test.log")
+            fi
+        else
+            echo -e "   ${YELLOW}↪ Full cargo test: SKIPPED in pre-push (set AI_PUSH_FULL_TESTS=1 to run full suite)${NC}"
+        fi
+
+        echo -e "   Running cargo clippy..."
+        if cargo clippy --all-targets --all-features -- -D warnings > "$TEMP_DIR/executor_clippy.log" 2>&1; then
+            echo -e "   ${GREEN}✅ cargo clippy: PASSED${NC}"
+        else
+            echo -e "   ${RED}❌ cargo clippy: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Executor cargo clippy")
+            FAILED_LOGS+=("$TEMP_DIR/executor_clippy.log")
+        fi
+    fi
+
+    cd ..
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Executor Manager Checks (if executor_manager files changed)
+# -----------------------------------------------------------------------------
+if [ "$EXECUTOR_MGR_COUNT" -gt 0 ] 2>/dev/null; then
+    echo -e "${BLUE}🔍 Executor Manager Checks:${NC}"
+    
+    cd executor_manager
+    if ! command -v uv &> /dev/null; then
+        echo -e "   ${YELLOW}⚠️ SKIP: uv not found${NC}"
+        echo -e "   ${YELLOW}   Install uv to run Python pre-push checks${NC}"
+        WARNINGS+=("Executor Manager: uv not found, Python checks skipped")
+    else
+        if [ -d "tests" ]; then
+            maybe_run_full_python_tests \
+                "Executor Manager" \
+                "uv run pytest tests/ --tb=short -q" \
+                "$TEMP_DIR/exec_mgr_pytest.log" \
+                "Executor Manager Pytest"
+            run_changed_python_syntax_check \
+                "Executor Manager" \
+                "$PROJECT_ROOT/executor_manager" \
+                "^executor_manager/.*\\.py$" \
+                "$TEMP_DIR/exec_mgr_syntax.log"
+        else
+            echo -e "   ${YELLOW}⚠️ SKIP: tests directory not found${NC}"
+            WARNINGS+=("Executor Manager: tests directory not found")
+        fi
+    fi
+    
+    cd ..
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Alembic Multi-Head Checks (if backend files changed)
+# -----------------------------------------------------------------------------
+if [ "$BACKEND_COUNT" -gt 0 ] 2>/dev/null; then
+    echo -e "${BLUE}🔍 Alembic Multi-Head Check:${NC}"
+
+    # Get script directory and run alembic check
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    ALEMBIC_CHECK_SCRIPT="$SCRIPT_DIR/check-alembic-heads.sh"
+
+    if [ -x "$ALEMBIC_CHECK_SCRIPT" ]; then
+        "$ALEMBIC_CHECK_SCRIPT" > "$TEMP_DIR/alembic.log" 2>&1
+        ALEMBIC_EXIT=$?
+
+        if [ $ALEMBIC_EXIT -eq 0 ]; then
+            echo -e "   ${GREEN}✅ Alembic Multi-Head Check: PASSED${NC}"
+        elif [ $ALEMBIC_EXIT -eq 1 ]; then
+            echo -e "   ${RED}❌ Alembic Multi-Head Check: FAILED${NC}"
+            CHECK_FAILED=1
+            FAILED_CHECKS+=("Alembic Multi-Head")
+            FAILED_LOGS+=("$TEMP_DIR/alembic.log")
+        else
+            echo -e "   ${YELLOW}⚠️ Alembic check could not determine status${NC}"
+            WARNINGS+=("Alembic: check returned unexpected exit code $ALEMBIC_EXIT")
+        fi
+    else
+        echo -e "   ${YELLOW}⚠️ SKIP: Alembic check script not found${NC}"
+        WARNINGS+=("Alembic: check script not found at $ALEMBIC_CHECK_SCRIPT")
+    fi
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Check Results Summary
+# -----------------------------------------------------------------------------
+echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}📊 Check Results Summary${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+echo ""
+
+if [ $CHECK_FAILED -eq 1 ]; then
+    echo -e "${RED}${BOLD}❌ Some checks failed. Please fix the issues before pushing.${NC}"
+    echo ""
+    
+    # Output detailed error logs at the end for AI tail monitoring
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    echo -e "${RED}${BOLD}FAILED CHECKS DETAIL (for AI monitoring):${NC}"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    echo ""
+    for i in "${!FAILED_CHECKS[@]}"; do
+        echo -e "${RED}❌ ${FAILED_CHECKS[$i]}${NC}"
+        # FAILED_LOGS now contains file paths, read content from file
+        if [ -f "${FAILED_LOGS[$i]}" ]; then
+            echo -e "${YELLOW}=== ${FAILED_CHECKS[$i]} Errors ===${NC}"
+            cat "${FAILED_LOGS[$i]}"
+        else
+            # Fallback for inline messages (shouldn't happen with new code)
+            echo -e "${YELLOW}${FAILED_LOGS[$i]}${NC}"
+        fi
+        echo ""
+    done
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    echo -e "${RED}Total failed: ${#FAILED_CHECKS[@]} check(s)${NC}"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}✅ All quality checks passed!${NC}"
+echo ""
+
+if [ ${#WARNINGS[@]} -gt 0 ]; then
+    echo -e "   ${YELLOW}⚠️ Warnings: ${#WARNINGS[@]}${NC}"
+    for warning in "${WARNINGS[@]}"; do
+        echo -e "      ${YELLOW}- $warning${NC}"
+    done
+    echo ""
+fi
+
+exit 0

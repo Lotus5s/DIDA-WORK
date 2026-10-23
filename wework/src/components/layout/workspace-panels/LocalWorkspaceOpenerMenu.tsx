@@ -1,0 +1,329 @@
+import type { TFunction } from 'i18next'
+import { ChevronDown, Code2, Folder, Monitor, Plus, SquareTerminal } from 'lucide-react'
+import { createPortal } from 'react-dom'
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type MouseEvent,
+  type ReactNode,
+} from 'react'
+import {
+  visibleOpenersForPlatform,
+  type LocalWorkspaceOpenerDef,
+  type LocalWorkspaceOpenerId,
+} from '@/lib/local-workspace-openers'
+import { fileManagerAppLabel, terminalAppLabel } from '@/lib/file-manager'
+import { getPlatform } from '@/lib/platform'
+import { useTranslation } from '@/hooks/useTranslation'
+import { cn } from '@/lib/utils'
+
+const MENU_GAP = 8
+const VIEWPORT_PADDING = 8
+const MENU_WIDTH = 280
+
+interface MenuPosition {
+  left: number
+  top: number
+}
+
+interface LocalWorkspaceOpenerPickerProps {
+  ariaLabel: string
+  buttonTestId?: string
+  menuTestId?: string
+  optionTestIdPrefix?: string
+  disabled?: boolean
+  buttonClassName: string
+  preferredPlacement?: 'above' | 'below'
+  align?: 'start' | 'end'
+  availability: Record<LocalWorkspaceOpenerId, boolean | undefined>
+  labels?: Record<string, string | undefined>
+  onChooseOther?: () => void | Promise<void>
+  onOpen?: () => void | Promise<void>
+  onSelect: (opener: LocalWorkspaceOpenerId) => void | Promise<void>
+}
+
+export function LocalWorkspaceOpenerPicker({
+  ariaLabel,
+  buttonTestId,
+  menuTestId,
+  optionTestIdPrefix,
+  disabled = false,
+  buttonClassName,
+  preferredPlacement = 'below',
+  align = 'end',
+  availability,
+  labels,
+  onChooseOther,
+  onOpen,
+  onSelect,
+}: LocalWorkspaceOpenerPickerProps) {
+  const { t } = useTranslation('common')
+  const [open, setOpen] = useState(false)
+  const [position, setPosition] = useState<MenuPosition | null>(null)
+  const buttonRef = useRef<HTMLButtonElement | null>(null)
+  const menuRef = useRef<HTMLDivElement | null>(null)
+
+  useLayoutEffect(() => {
+    if (!open) return
+
+    const updatePosition = () => {
+      const buttonRect = buttonRef.current?.getBoundingClientRect()
+      const menuRect = menuRef.current?.getBoundingClientRect()
+      if (!buttonRect || !menuRect) return
+
+      const viewportWidth = window.innerWidth
+      const viewportHeight = window.innerHeight
+      const menuWidth = Math.max(menuRect.width, MENU_WIDTH)
+      const menuHeight = menuRect.height
+      const belowTop = buttonRect.bottom + MENU_GAP
+      const aboveTop = buttonRect.top - menuHeight - MENU_GAP
+      const hasRoomBelow = belowTop + menuHeight <= viewportHeight - VIEWPORT_PADDING
+      const hasRoomAbove = aboveTop >= VIEWPORT_PADDING
+      const placeBelow =
+        preferredPlacement === 'below'
+          ? hasRoomBelow || !hasRoomAbove
+          : !(hasRoomAbove || !hasRoomBelow)
+      const top = placeBelow ? belowTop : Math.max(VIEWPORT_PADDING, aboveTop)
+      const preferredLeft = align === 'end' ? buttonRect.right - menuWidth : buttonRect.left
+      const maxLeft = viewportWidth - menuWidth - VIEWPORT_PADDING
+      const left = Math.max(VIEWPORT_PADDING, Math.min(preferredLeft, maxLeft))
+
+      setPosition({ left, top })
+    }
+
+    updatePosition()
+    window.addEventListener('resize', updatePosition)
+    window.addEventListener('scroll', updatePosition, true)
+    return () => {
+      window.removeEventListener('resize', updatePosition)
+      window.removeEventListener('scroll', updatePosition, true)
+    }
+  }, [align, open, preferredPlacement])
+
+  useEffect(() => {
+    if (!open) return
+
+    const handlePointerDown = (event: globalThis.PointerEvent) => {
+      const target = event.target as Node
+      if (buttonRef.current?.contains(target) || menuRef.current?.contains(target)) {
+        return
+      }
+      setOpen(false)
+      setPosition(null)
+    }
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+        setPosition(null)
+      }
+    }
+
+    document.addEventListener('pointerdown', handlePointerDown, true)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [open])
+
+  const toggleOpen = async (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation()
+
+    if (open) {
+      setOpen(false)
+      setPosition(null)
+      return
+    }
+
+    await onOpen?.()
+    setPosition(null)
+    setOpen(true)
+  }
+
+  const selectOpener = async (opener: LocalWorkspaceOpenerId) => {
+    setOpen(false)
+    setPosition(null)
+    await onSelect(opener)
+  }
+
+  const platform = getPlatform()
+  const openers = visibleOpenersForPlatform(platform)
+  const showChooseOther = platform === 'win' && onChooseOther != null
+
+  return (
+    <>
+      <button
+        ref={buttonRef}
+        type="button"
+        data-testid={buttonTestId}
+        onClick={event => void toggleOpen(event)}
+        disabled={disabled}
+        className={buttonClassName}
+        aria-label={ariaLabel}
+        aria-expanded={open}
+        aria-haspopup="menu"
+      >
+        <ChevronDown className="h-4 w-4" />
+      </button>
+      {open &&
+        createPortal(
+          <div
+            ref={menuRef}
+            data-testid={menuTestId}
+            role="menu"
+            style={{
+              left: position?.left ?? 0,
+              top: position?.top ?? 0,
+              visibility: position ? 'visible' : 'hidden',
+            }}
+            className="fixed z-system-popover max-h-[520px] w-[280px] overflow-y-auto rounded-2xl border border-border bg-popover p-2 text-text-primary shadow-[0_18px_54px_rgba(0,0,0,0.16)] ring-1 ring-black/5"
+          >
+            <div className="py-1">
+              {openers.map(opener => {
+                const openerId = opener.id as LocalWorkspaceOpenerId
+                if (availability[openerId] !== true) return null
+                return (
+                  <button
+                    key={openerId}
+                    type="button"
+                    role="menuitem"
+                    data-testid={
+                      optionTestIdPrefix ? `${optionTestIdPrefix}-${openerId}` : undefined
+                    }
+                    onClick={() => void selectOpener(openerId)}
+                    className="flex h-10 w-full min-w-0 items-center gap-3 rounded-xl px-2.5 text-left text-base font-normal leading-5 text-text-primary transition-colors hover:bg-muted"
+                  >
+                    <LocalWorkspaceOpenerIcon opener={openerId} className="h-5 w-5 shrink-0" />
+                    <span className="min-w-0 flex-1 truncate">
+                      {openerDisplayLabel(opener, t, labels)}
+                    </span>
+                  </button>
+                )
+              })}
+              {showChooseOther && (
+                <>
+                  <div className="my-1 h-px bg-border/60" />
+                  <button
+                    type="button"
+                    data-testid="open-local-workspace-choose-other-button"
+                    onClick={() => void onChooseOther?.()}
+                    className="flex h-10 w-full min-w-0 items-center gap-3 rounded-xl px-2.5 text-left text-base font-normal leading-5 text-text-secondary transition-colors hover:bg-muted"
+                  >
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-black/5 bg-muted text-text-secondary shadow-sm">
+                      <Plus className="h-3.5 w-3.5" />
+                    </span>
+                    <span className="min-w-0 flex-1 truncate">
+                      {t('workbench.opener_choose_other')}
+                    </span>
+                  </button>
+                </>
+              )}
+            </div>
+          </div>,
+          document.body
+        )}
+    </>
+  )
+}
+
+function openerDisplayLabel(
+  opener: LocalWorkspaceOpenerDef,
+  t: TFunction,
+  labels?: Record<string, string | undefined>
+): string {
+  if (opener.id === 'file-manager') return fileManagerAppLabel(t)
+  if (opener.id === 'terminal') return terminalAppLabel(t)
+  return labels?.[opener.id] ?? opener.label
+}
+
+export function LocalWorkspaceOpenerIcon({
+  opener,
+  className,
+}: {
+  opener: LocalWorkspaceOpenerId
+  className?: string
+}) {
+  const wrapperClassName = cn(
+    'inline-flex items-center justify-center overflow-hidden rounded-md border border-black/5 shadow-sm',
+    className
+  )
+
+  if (opener === 'vscode' || opener === 'vscode-insiders') {
+    const color = opener === 'vscode' ? '#1f7fbf' : '#4aa99d'
+    return (
+      <span className={cn(wrapperClassName, 'bg-background')} aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" className="h-full w-full" aria-hidden="true">
+          <path
+            data-testid="local-workspace-vscode-mark"
+            d="M18.5 2.5 10.8 9.9 5.4 5.7 2 7.4v9.2l3.4 1.7 5.4-4.2 7.7 7.4 3.5-1.8V4.3l-3.5-1.8ZM5.4 15.7V8.3l4.2 3.7-4.2 3.7Zm12.9 2.1-6.5-5.8 6.5-5.8v11.6Z"
+            fill={color}
+            fillRule="evenodd"
+          />
+        </svg>
+      </span>
+    )
+  }
+
+  return (
+    <span className={cn(wrapperClassName, openerIconBackground(opener))} aria-hidden="true">
+      {openerIconContent(opener)}
+    </span>
+  )
+}
+
+function openerIconBackground(opener: LocalWorkspaceOpenerId): string {
+  switch (opener) {
+    case 'cursor':
+      return 'bg-[#505050] text-white'
+    case 'sublime-text':
+      return 'bg-[#5b5f64] text-[#ffb64a]'
+    case 'windsurf':
+      return 'bg-[#f7f7f4] text-[#4d4d4d]'
+    case 'file-manager':
+      return 'bg-[#5aa9ff] text-white'
+    case 'terminal':
+    case 'cmd':
+    case 'powershell':
+      return 'bg-[#525252] text-white'
+    case 'iterm2':
+      return 'bg-[#3a3541] text-[#67e887]'
+    case 'ghostty':
+      return 'bg-[#5969a6] text-white'
+    case 'warp':
+      return 'bg-[#e6e8eb] text-[#4f5357]'
+    case 'xcode':
+      return 'bg-[#49b9f2] text-white'
+    case 'android-studio':
+      return 'bg-white text-[#3f82f8]'
+    case 'intellij-idea':
+      return 'bg-gradient-to-br from-[#ff6b3d] via-[#d642e9] to-[#2f7df6] text-white'
+    default:
+      return 'bg-[#f2f7fb] text-[#007ACC]'
+  }
+}
+
+function openerIconContent(opener: LocalWorkspaceOpenerId): ReactNode {
+  switch (opener) {
+    case 'file-manager':
+      return <Folder className="h-3.5 w-3.5" />
+    case 'terminal':
+    case 'cmd':
+    case 'powershell':
+    case 'iterm2':
+    case 'ghostty':
+    case 'warp':
+      return <SquareTerminal className="h-3.5 w-3.5" />
+    case 'xcode':
+    case 'android-studio':
+    case 'intellij-idea':
+      return <Monitor className="h-3.5 w-3.5" />
+    case 'cursor':
+    case 'sublime-text':
+    case 'windsurf':
+      return <Code2 className="h-3.5 w-3.5" />
+    default:
+      return <Code2 className="h-3.5 w-3.5" />
+  }
+}

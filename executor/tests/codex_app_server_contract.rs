@@ -1,0 +1,1964 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+use serde_json::{json, Value};
+use tokio::{
+    runtime::Runtime,
+    sync::{Mutex, MutexGuard},
+};
+use wegent_executor::{
+    agents::{CodexAppServerClient, CodexAppServerEngine, CodexAppServerTurnOptions},
+    protocol::ExecutionRequest,
+    runner::{AgentEngine, ExecutionOutcome},
+};
+
+macro_rules! shared_runtime_tests {
+    ($(async fn $name:ident() $body:block)*) => {
+        $(
+            #[test]
+            fn $name() {
+                shared_test_runtime().block_on(async $body)
+            }
+        )*
+    };
+}
+
+shared_runtime_tests! {
+async fn codex_named_home_persists_mcp_and_rebinds_followup_credentials() {
+    let _lock = env_lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let _workbench = EnvGuard::set("WEGENT_WORKBENCH_HOME", root.path().to_str().unwrap());
+    let log = root.path().join("native.jsonl");
+    let native = write_fake_codex_logging_start(&log, &["CODEX_HOME"]);
+    let engine = CodexAppServerEngine::new(native.display().to_string());
+    let mut request: ExecutionRequest = serde_json::from_value(json!({
+        "task_id":"persist", "new_session":true,
+        "backend_url":"https://backend.example", "user_id":7, "user_name":"synthetic",
+        "team_id":12, "team_namespace":"default", "team_name":"agent",
+        "team_owner":{"kind":"user","id":7,"name":"synthetic"},
+        "bot":[{"id":7,"shell_type":"Codex"}], "prompt":"hello",
+        "auth_token":"synthetic-first-secret",
+        "mcp_servers":[{"name":"retained", "command":"probe", "env":{"TOKEN":"${{auth_token}}"}}],
+        "model_config":{"model":"openai","model_id":"gpt-5","protocol":"openai-responses"}
+    })).unwrap();
+    assert!(matches!(engine.run(request.clone()).await, ExecutionOutcome::Completed { .. }));
+    let path = root.path().join("agents/synthetic/default/agent/config.toml");
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(content.contains("[mcp_servers.retained]"));
+    assert!(!content.contains("synthetic-first-secret"));
+    request.task_id = "another-task".to_owned();
+    request.mcp_servers.clear();
+    request.auth_token = Some("synthetic-second-secret".to_owned());
+    assert!(matches!(engine.run(request).await, ExecutionOutcome::Completed { .. }));
+    assert_eq!(fs::read_to_string(&path).unwrap(), content);
+    let messages: Vec<Value> = fs::read_to_string(&log).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    let starts: Vec<_> = messages.iter().filter(|message| message["method"] == "thread/start").collect();
+    assert_eq!(starts.len(), 2);
+    for (start, secret) in starts.iter().zip(["synthetic-first-secret", "synthetic-second-secret"]) {
+        assert_eq!(start["params"]["config"]["mcp_servers.retained"]["env"]["TOKEN"], secret);
+    }
+    let launches: Vec<_> = messages.iter().filter(|message| message.get("args").is_some()).collect();
+    assert_eq!(launches.len(), 2);
+    for message in launches {
+        let args = message["args"].to_string();
+        assert!(!args.contains("synthetic-first-secret"));
+        assert!(!args.contains("synthetic-second-secret"));
+        assert!(!args.contains("mcp_servers.retained"));
+    }
+}
+
+async fn codex_agent_home_preserves_spaces_in_environment_and_config_paths() {
+    let _lock = env_lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let workbench = root.path().join("workbench with spaces");
+    let _workbench = EnvGuard::set("WEGENT_WORKBENCH_HOME", workbench.to_str().unwrap());
+    let log = root.path().join("native.jsonl");
+    let native = write_fake_codex_logging_start(&log, &["CODEX_HOME", "CODEX_SQLITE_HOME"]);
+    let engine = CodexAppServerEngine::new(native.display().to_string());
+    let request: ExecutionRequest = serde_json::from_value(json!({
+        "task_id":"spaces", "new_session":true,
+        "backend_url":"https://backend.example", "user_id":7, "user_name":"executing user",
+        "team_id":12, "team_namespace":"design  space", "team_name":"agent name",
+        "team_owner":{"kind":"group","id":8,"name":"design team"},
+        "bot":[{"id":7,"shell_type":"Codex"}], "prompt":"hello",
+        "model_config":{"model":"openai","model_id":"gpt-5","protocol":"openai-responses"}
+    })).unwrap();
+    assert!(matches!(engine.run(request).await, ExecutionOutcome::Completed { .. }));
+    let first: Value = serde_json::from_str(fs::read_to_string(&log).unwrap().lines().next().unwrap()).unwrap();
+    let home = workbench.join("agents/executing user/design  space/agent name");
+    assert_eq!(first["env"]["CODEX_HOME"], home.to_str().unwrap());
+    assert_eq!(first["env"]["CODEX_SQLITE_HOME"], home.to_str().unwrap());
+    assert!(home.join("runtime/tasks/spaces.json").is_file());
+}
+
+async fn codex_bot_home_requires_user_identity_but_not_backend_url() {
+    let _lock = env_lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let _workbench = EnvGuard::set("WEGENT_WORKBENCH_HOME", root.path().to_str().unwrap());
+    let log = root.path().join("native.jsonl");
+    let native = write_fake_codex(&log);
+    let engine = CodexAppServerEngine::new(native.display().to_string());
+    let mut request = ExecutionRequest {
+        task_id: "identity-contract".to_owned(),
+        new_session: true,
+        bot: json!([{"id":7,"shell_type":"Codex"}]),
+        prompt: json!("implement feature"),
+        model_config: json!({"model":"openai","model_id":"gpt-5","protocol":"openai-responses"}),
+        ..ExecutionRequest::default()
+    };
+    assert!(matches!(engine.run(request.clone()).await,
+        ExecutionOutcome::Failed { ref message } if message.contains("user identity")));
+    assert!(!log.exists());
+    request.extra.insert("user_id".to_owned(), json!(7));
+    request.user_name = Some("user7".to_owned());
+    request.team_namespace = Some("default".to_owned());
+    request.extra.insert("team_id".to_owned(), json!(12));
+    request.extra.insert("team_name".to_owned(), json!("design"));
+    assert!(matches!(engine.run(request).await, ExecutionOutcome::Completed { .. }));
+    assert!(log.exists());
+    let home = root.path().join("agents/user7/default/design");
+    assert!(home.join("runtime/tasks/identity-contract.json").is_file());
+    let marker: Value = serde_json::from_slice(&fs::read(home.join("agent.json")).unwrap()).unwrap();
+    assert_eq!(marker["user_id"], "7");
+    assert!(marker.get("backend_url").is_none());
+}
+
+async fn codex_app_server_engine_drives_thread_and_turn_over_json_rpc() {
+    let _lock = env_lock().await;
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-rpc-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex(&log_path);
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        task_id: "task-525".to_owned(),
+        auth_token: Some("task-jwt".to_owned()),
+        skill_identity_token: Some("skill-jwt".to_owned()),
+        user_name: Some("alice".to_owned()),
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses",
+            "reasoning": {"effort": "high", "summary": "concise"}
+        }),
+        project_workspace_path: Some("/tmp/wegent/project".to_owned()),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Completed {
+            content: "done".to_owned()
+        }
+    );
+
+    let messages = fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(messages[0]["method"], "initialize");
+    assert_eq!(
+        messages[0]["params"]["capabilities"]["experimentalApi"],
+        true
+    );
+    assert_eq!(messages[1]["method"], "initialized");
+    assert_eq!(messages[2]["method"], "thread/start");
+    assert_eq!(messages[2]["params"]["model"], "gpt-5");
+    assert_eq!(messages[2]["params"]["cwd"], "/tmp/wegent/project");
+    assert_eq!(messages[2]["params"]["permissions"], ":danger-full-access");
+    assert_eq!(
+        messages[2]["params"]["approvalPolicy"],
+        json!({
+            "granular": {
+                "sandbox_approval": false,
+                "rules": false,
+                "skill_approval": false,
+                "request_permissions": false,
+                "mcp_elicitations": true,
+            }
+        })
+    );
+    assert_eq!(
+        messages[2]["params"]["config"]["shell_environment_policy.set.WEGENT_TASK_ID"],
+        "task-525"
+    );
+    assert_eq!(
+        messages[2]["params"]["config"]["shell_environment_policy.set.AUTH_TOKEN"],
+        "task-jwt"
+    );
+    assert_eq!(
+        messages[2]["params"]["config"]["shell_environment_policy.set.WEGENT_SKILL_IDENTITY_TOKEN"],
+        "skill-jwt"
+    );
+    assert_eq!(
+        messages[2]["params"]["config"]["shell_environment_policy.set.WEGENT_SKILL_USER_NAME"],
+        "alice"
+    );
+    assert_eq!(messages[3]["method"], "turn/start");
+    assert_eq!(messages[3]["params"]["threadId"], "thread-1");
+    assert_eq!(messages[3]["params"]["model"], "gpt-5");
+    assert_eq!(messages[3]["params"]["cwd"], "/tmp/wegent/project");
+    assert_eq!(messages[3]["params"]["effort"], "high");
+    assert_eq!(messages[3]["params"]["summary"], "concise");
+    assert_eq!(
+        messages[3]["params"]["input"][0],
+        json!({"type": "text", "text": "implement feature", "text_elements": []})
+    );
+    assert_eq!(messages[3]["params"]["permissions"], ":danger-full-access");
+    assert_eq!(
+        messages[3]["params"]["approvalPolicy"],
+        json!({
+            "granular": {
+                "sandbox_approval": false,
+                "rules": false,
+                "skill_approval": false,
+                "request_permissions": false,
+                "mcp_elicitations": true,
+            }
+        })
+    );
+    assert!(messages[3]["params"].get("sandboxPolicy").is_none());
+}
+
+async fn codex_app_server_removes_inherited_task_identity_before_starting_threads() {
+    let _lock = env_lock().await;
+    let _auth_token = EnvGuard::set("AUTH_TOKEN", "inherited-task-token");
+    let _runtime_auth_token =
+        EnvGuard::set("WEGENT_RUNTIME_AUTH_TOKEN", "inherited-runtime-token");
+    let _task_id = EnvGuard::set("WEGENT_TASK_ID", "inherited-task");
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-task-env-rpc-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex_logging_start(
+        &log_path,
+        &["AUTH_TOKEN", "WEGENT_RUNTIME_AUTH_TOKEN", "WEGENT_TASK_ID"],
+    );
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        task_id: "current-task".to_owned(),
+        auth_token: Some("current-task-token".to_owned()),
+        runtime_auth_token: Some("current-runtime-token".to_owned()),
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
+    let messages = read_json_lines(&log_path);
+    assert_eq!(messages[0]["env"]["AUTH_TOKEN"], "");
+    assert_eq!(messages[0]["env"]["WEGENT_RUNTIME_AUTH_TOKEN"], "");
+    assert_eq!(messages[0]["env"]["WEGENT_TASK_ID"], "");
+    assert_eq!(
+        messages[3]["params"]["config"]["shell_environment_policy.set.AUTH_TOKEN"],
+        "current-task-token"
+    );
+    assert_eq!(
+        messages[3]["params"]["config"]
+            ["shell_environment_policy.set.WEGENT_RUNTIME_AUTH_TOKEN"],
+        "current-runtime-token"
+    );
+    assert_eq!(
+        messages[3]["params"]["config"]["shell_environment_policy.set.WEGENT_TASK_ID"],
+        "current-task"
+    );
+}
+
+async fn codex_app_server_engine_rejects_a_stale_thread_provider_before_turn_start() {
+    let _lock = env_lock().await;
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-stale-provider-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex_with_thread_provider(&log_path, "stale-provider");
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Failed {
+            message: "codex app-server thread/start applied unexpected model provider: \
+                      expected=openai, actual=stale-provider"
+                .to_owned()
+        }
+    );
+    let messages = read_json_lines(&log_path);
+    assert_eq!(messages[2]["method"], "thread/start");
+    assert!(
+        messages
+            .iter()
+            .all(|message| message["method"] != "turn/start"),
+        "a mismatched provider must be rejected before starting the turn"
+    );
+}
+
+async fn codex_shared_app_server_rejects_a_cross_provider_resume() {
+    let _lock = env_lock().await;
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-stale-resume-provider-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex_with_stale_resume_provider(&log_path);
+    let client = CodexAppServerClient::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        task_id: "stale-resume-provider-task".to_owned(),
+        subtask_id: "stale-resume-provider-subtask".to_owned(),
+        prompt: json!("continue"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5.6-sol",
+            "base_url": "http://127.0.0.1:3456/v1",
+            "api_key": "test-key",
+            "api_format": "responses",
+            "codex_responses_compat_proxy": true
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let error = client
+        .run_turn_with_cancel(
+            request,
+            CodexAppServerTurnOptions {
+                resume_thread_id: Some("thread-1".to_owned()),
+                ..CodexAppServerTurnOptions::default()
+            },
+        )
+        .await
+        .expect_err("a thread must not resume through a different model provider");
+
+    assert_eq!(
+        error,
+        "codex app-server thread/resume applied unexpected model provider: \
+         expected=wework-router, actual=openai"
+    );
+    let messages = read_json_lines(&log_path);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message["method"] == "initialize")
+            .count(),
+        1
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message["method"] == "thread/resume")
+            .count(),
+        1
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message["method"] == "turn/start")
+            .count(),
+        0
+    );
+}
+
+async fn codex_app_server_engine_maps_vision_prompt_blocks_to_user_input() {
+    let _lock = env_lock().await;
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-vision-rpc-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex(&log_path);
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!([
+            {"type": "input_text", "text": "Analyze this image"},
+            {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+            {"type": "localImage", "path": "/tmp/wegent/image.png"}
+        ]),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Completed {
+            content: "done".to_owned()
+        }
+    );
+
+    let messages = fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages[3]["params"]["input"],
+        json!([
+            {"type": "text", "text": "Analyze this image", "text_elements": []},
+            {"type": "image", "url": "data:image/png;base64,abc"},
+            {"type": "localImage", "path": "/tmp/wegent/image.png"}
+        ])
+    );
+}
+
+async fn codex_app_server_engine_routes_provider_overrides_through_local_proxy() {
+    let _lock = env_lock().await;
+    let _api_key = EnvGuard::set("WECODE_USER_API_KEY", "sk-from-executor-env");
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-config-rpc-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex_logging_start(&log_path, &[]);
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5.5",
+            "base_url": "http://127.0.0.1:3456/v1/",
+            "api_key": "${WECODE_USER_API_KEY}",
+            "api_format": "responses",
+            "reasoning": "Ultra",
+            "service_tier": "快速",
+            "default_headers": {
+                "wecode-action": "wecode-cli",
+                "x-weibo-downstream": "shanghai-intranet"
+            }
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(with_project_id(request, json!(42))).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Completed {
+            content: "done".to_owned()
+        }
+    );
+
+    let messages = read_json_lines(&log_path);
+    let args = messages[0]["args"].as_array().unwrap();
+    assert_config_arg(args, "forced_login_method=api");
+    assert_config_arg(args, "model=gpt-5.5");
+    assert_config_arg(args, "model_provider=wework-router");
+    assert_config_arg(
+        args,
+        "model_providers.wework-router.name=\"Wework model router\"",
+    );
+    assert_config_arg(args, "model_providers.wework-router.wire_api=\"responses\"");
+    assert!(args.iter().any(|value| {
+        value.as_str().is_some_and(|value| {
+            value.starts_with("model_providers.wework-router.base_url=\"http://127.0.0.1:")
+                && value.ends_with("/v1/codex-router\"")
+        })
+    }));
+    assert!(!args.iter().any(|value| {
+        value
+            .as_str()
+            .is_some_and(|value| value.contains("sk-from-executor-env"))
+    }));
+    assert_eq!(messages[3]["params"]["modelProvider"], "wework-router");
+    assert_eq!(
+        messages[3]["params"]["config"]["model_reasoning_effort"],
+        "ultra"
+    );
+    assert_eq!(messages[3]["params"]["config"]["service_tier"], "priority");
+    assert_eq!(messages[4]["params"]["effort"], "ultra");
+}
+
+async fn codex_app_server_engine_uses_user_runtime_proxy_without_provider_override() {
+    let _lock = env_lock().await;
+    let _no_proxy = EnvGuard::set("NO_PROXY", "localhost,.internal");
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-user-runtime-rpc-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex_logging_start(
+        &log_path,
+        &["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy"],
+    );
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5.5",
+            "api_format": "responses",
+            "runtime_config": {
+                "codex": {
+                    "use_user_config": true,
+                    "configured": true,
+                    "use_proxy": true
+                }
+            },
+            "proxy": {"url": "socks5://127.0.0.1:7890"},
+            "model_provider": "openai"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(with_project_id(request, json!(42))).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Completed {
+            content: "done".to_owned()
+        }
+    );
+
+    let messages = read_json_lines(&log_path);
+    let args = messages[0]["args"].as_array().unwrap();
+    assert_config_arg(args, "model=gpt-5.5");
+    assert_no_config_arg(args, "forced_login_method=api");
+    assert_no_config_arg(args, "model_provider=wecode-openai");
+    assert!(
+        !args.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| value.starts_with("model_providers.openai."))
+        }),
+        "built-in OpenAI provider must not receive model_providers overrides; args={args:?}"
+    );
+    assert_eq!(messages[0]["env"]["HTTP_PROXY"], "socks5://127.0.0.1:7890");
+    assert_eq!(messages[0]["env"]["HTTPS_PROXY"], "socks5://127.0.0.1:7890");
+    assert_eq!(
+        messages[0]["env"]["NO_PROXY"],
+        "localhost,.internal,127.0.0.1,::1,host.docker.internal"
+    );
+    assert_eq!(
+        messages[0]["env"]["no_proxy"],
+        "localhost,.internal,127.0.0.1,::1,host.docker.internal"
+    );
+    assert_eq!(messages[3]["params"]["modelProvider"], "openai");
+}
+
+async fn codex_auxiliary_rpc_and_task_share_one_proxy_configured_app_server() {
+    let _lock = env_lock().await;
+    let _debug = EnvGuard::set("WEGENT_DEBUG_CLAUDE_STDOUT", "1");
+    let stdout_path = std::env::temp_dir().join(format!(
+        "wegent-codex-stdout-{}.jsonl",
+        std::process::id()
+    ));
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-shared-proxy-rpc-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex_for_auxiliary_rpc_then_turn(&log_path);
+    let client = CodexAppServerClient::new(fake_codex.display().to_string());
+    client
+        .configure_runtime_proxy(Some("http://127.0.0.1:7890"))
+        .await
+        .expect("runtime proxy should be configured");
+
+    client
+        .request("account/rateLimits/read", Value::Null)
+        .await
+        .expect("auxiliary RPC should start the shared app-server");
+    let turn = client
+        .run_turn_with_cancel(
+            ExecutionRequest {
+                prompt: json!("implement feature"),
+                bot: json!([{"shell_type": "ClaudeCode"}]),
+                model_config: json!({
+                    "model": "openai",
+                    "model_id": "gpt-5.5",
+                    "protocol": "openai-responses"
+                }),
+                ..ExecutionRequest::default()
+            },
+            CodexAppServerTurnOptions::default(),
+        )
+        .await
+        .expect("task should reuse the proxy-configured app-server");
+
+    let stdout = read_json_lines(&stdout_path);
+    assert!(stdout.iter().any(|line| line["id"] == 1));
+    assert!(stdout.iter().any(|line| line["method"] == "turn/completed"));
+    assert!(stdout.iter().all(|line| line["received_at"].is_string()));
+    client.restart().await;
+    fs::remove_file(stdout_path).unwrap();
+
+    assert_eq!(
+        turn.outcome,
+        ExecutionOutcome::Completed {
+            content: "done".to_owned()
+        }
+    );
+    let messages = read_json_lines(&log_path);
+    assert_eq!(messages[0]["env"]["HTTP_PROXY"], "http://127.0.0.1:7890");
+    assert_eq!(messages[0]["env"]["HTTPS_PROXY"], "http://127.0.0.1:7890");
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message["method"] == "initialize")
+            .count(),
+        1,
+        "auxiliary RPC and task should share one Codex app-server process"
+    );
+    assert!(messages
+        .iter()
+        .any(|message| message["method"] == "account/rateLimits/read"));
+    assert!(messages
+        .iter()
+        .any(|message| message["method"] == "turn/start"));
+}
+
+async fn codex_app_server_receives_normalized_developer_path() {
+    let _lock = env_lock().await;
+    let _path = EnvGuard::set("PATH", "/usr/bin:/bin");
+    let _extra_paths = EnvGuard::set("WEGENT_EXTRA_PATHS", "/custom/bin:/opt/homebrew/bin");
+    let _runtime_bin = EnvGuard::remove("WEWORK_RUNTIME_BIN");
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-path-rpc-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex_logging_start(&log_path, &["PATH"]);
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("check path"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
+    let messages = read_json_lines(&log_path);
+    let args = messages[0]["args"].as_array().unwrap();
+    assert_config_arg(
+        args,
+        "shell_environment_policy.set.PATH=\"/usr/bin:/bin:/custom/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/Library/Apple/usr/bin\"",
+    );
+    let path = messages[0]["env"]["PATH"].as_str().unwrap();
+    assert!(path.starts_with("/usr/bin:/bin:/custom/bin:/opt/homebrew/bin"));
+    assert_eq!(path.matches("/opt/homebrew/bin").count(), 1);
+    assert!(path.contains("/opt/homebrew/sbin"));
+    assert!(path.contains("/usr/local/bin"));
+}
+
+async fn codex_app_server_engine_uses_isolated_wework_runtime_home() {
+    let _lock = env_lock().await;
+    let home = unique_dir("codex-user-home");
+    let user_codex_home = unique_dir("codex-user-config-home");
+    let wework_codex_home = unique_dir("codex-wework-home");
+    let _home = EnvGuard::set("HOME", &home.display().to_string());
+    let _codex_home = EnvGuard::set("CODEX_HOME", &user_codex_home.display().to_string());
+    let _wework_codex_home = EnvGuard::set(
+        "WEGENT_CODEX_HOME",
+        &wework_codex_home.display().to_string(),
+    );
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-user-home-rpc-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex_logging_start(&log_path, &["CODEX_HOME", "HOME"]);
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("list skills"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "runtime_config": {
+                "codex": {
+                    "use_user_config": true,
+                    "configured": true
+                }
+            },
+            "model_provider": "openai"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Completed {
+            content: "done".to_owned()
+        }
+    );
+    let messages = read_json_lines(&log_path);
+    assert_eq!(
+        messages[0]["env"]["CODEX_HOME"],
+        wework_codex_home.display().to_string()
+    );
+    assert_eq!(messages[0]["env"]["HOME"], home.display().to_string());
+}
+
+async fn codex_app_server_engine_injects_global_mcp_config_overrides() {
+    let _lock = env_lock().await;
+    let _stdio_environment = EnvGuard::remove("FOO");
+    let executor_home = unique_dir("codex-mcp-home");
+    let _home = EnvGuard::set("WEGENT_EXECUTOR_HOME", &executor_home.display().to_string());
+    let _capabilities = EnvGuard::set("WEGENT_CAPABILITIES_HOME", executor_home.join("capabilities").to_str().unwrap());
+    let manifest_path = executor_home.join("capabilities/manifest.json");
+    fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+    fs::write(
+        &manifest_path,
+        serde_json::to_string(&json!({
+            "version": 1,
+            "revision": 1,
+            "skills": {},
+            "plugins": {},
+            "mcps": {
+                "docs": {
+                    "server": {
+                        "type": "streamable-http",
+                        "url": "https://mcp.example.com/docs",
+                        "base_url": "https://ignored.example.com/docs",
+                        "bearer_token_env_var": "DOCS_TOKEN"
+                    }
+                },
+                "shell": {
+                    "server": {
+                        "type": "stdio",
+                        "command": "uvx",
+                        "args": ["tool", "--flag"],
+                        "env": {"FOO": "bar"}
+                    }
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-mcp-rpc-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex_logging_start(&log_path, &["FOO"]);
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5.5",
+            "base_url": "http://127.0.0.1:3456/v1",
+            "api_key": "wecode-proxy-placeholder",
+            "api_format": "responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Completed {
+            content: "done".to_owned()
+        }
+    );
+
+    let messages = read_json_lines(&log_path);
+    let args = messages[0]["args"].as_array().unwrap();
+    assert_config_arg(
+        args,
+        "mcp_servers.docs.url=\"https://mcp.example.com/docs\"",
+    );
+    assert_config_arg(args, "mcp_servers.docs.bearer_token_env_var=\"DOCS_TOKEN\"");
+    assert_config_arg(args, "mcp_servers.shell.command=\"uvx\"");
+    assert_config_arg(args, "mcp_servers.shell.args=[\"tool\",\"--flag\"]");
+    assert_eq!(messages[0]["env"]["FOO"], "");
+    assert!(!args.iter().filter_map(Value::as_str).any(|argument| argument.starts_with("mcp_servers.shell.env")));
+    let start = messages.iter().find(|message| message["method"] == "thread/start").unwrap();
+    assert_eq!(start["params"]["config"]["mcp_servers.shell.env"]["FOO"], "bar");
+}
+
+async fn codex_app_server_engine_injects_request_mcp_config_overrides() {
+    let _lock = env_lock().await;
+    let _stdio_environment = EnvGuard::remove("BOT_ENV");
+    let executor_home = unique_dir("codex-request-mcp-home");
+    let _home = EnvGuard::set("WEGENT_EXECUTOR_HOME", &executor_home.display().to_string());
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-request-mcp-rpc-{}.jsonl",
+        std::process::id()
+    ));
+    let fake_codex = write_fake_codex_logging_start(&log_path, &["BOT_ENV"]);
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{
+            "shell_type": "Codex",
+            "mcp_servers": {
+                "bot-shell": {
+                    "type": "stdio",
+                    "command": "uvx",
+                    "args": ["bot-tool"],
+                    "env": {"BOT_ENV": "1"}
+                },
+                "sensitive-shell": {
+                    "type": "stdio",
+                    "command": "node",
+                    "args": ["sensitive-tool"],
+                    "default_tools_approval_mode": "prompt"
+                }
+            }
+        }]),
+        mcp_servers: vec![
+            json!({
+                "name": "request-docs",
+                "type": "streamable-http",
+                "url": "https://mcp.example.com/request-docs",
+                "bearer_token_env_var": "REQUEST_DOCS_TOKEN",
+                "headers": {"Authorization": "Bearer task-token"}
+            }),
+            json!({
+                "name": "request-sensitive",
+                "type": "streamable-http",
+                "url": "https://mcp.example.com/request-sensitive",
+                "defaultToolsApprovalMode": "prompt"
+            }),
+        ],
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5.5",
+            "base_url": "http://127.0.0.1:3456/v1",
+            "api_key": "wecode-proxy-placeholder",
+            "api_format": "responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Completed {
+            content: "done".to_owned()
+        }
+    );
+
+    let messages = read_json_lines(&log_path);
+    let args = messages[0]["args"].as_array().unwrap();
+    assert_config_arg(
+        args,
+        "mcp_servers.request-docs.url=\"https://mcp.example.com/request-docs\"",
+    );
+    assert_config_arg(
+        args,
+        "mcp_servers.request-docs.bearer_token_env_var=\"REQUEST_DOCS_TOKEN\"",
+    );
+    assert!(args.iter().filter_map(Value::as_str).any(|argument| argument.starts_with(
+        "mcp_servers.request-docs.env_http_headers.Authorization=\"WEGENT_MCP_HEADER_"
+    )));
+    assert!(!args.iter().filter_map(Value::as_str).any(|argument| argument.contains("Bearer task-token")));
+    assert_config_arg(args, "mcp_servers.bot-shell.command=\"uvx\"");
+    assert_config_arg(args, "mcp_servers.bot-shell.args=[\"bot-tool\"]");
+    assert_eq!(messages[0]["env"]["BOT_ENV"], "");
+    assert!(!args.iter().filter_map(Value::as_str).any(|argument| argument.starts_with("mcp_servers.bot-shell.env")));
+    let start = messages.iter().find(|message| message["method"] == "thread/start").unwrap();
+    assert_eq!(start["params"]["config"]["mcp_servers.bot-shell.env"]["BOT_ENV"], "1");
+    assert_config_arg(
+        args,
+        "mcp_servers.bot-shell.default_tools_approval_mode=\"approve\"",
+    );
+    assert_config_arg(args, "mcp_servers.sensitive-shell.command=\"node\"");
+    assert_config_arg(
+        args,
+        "mcp_servers.sensitive-shell.default_tools_approval_mode=\"prompt\"",
+    );
+    assert_config_arg(
+        args,
+        "mcp_servers.request-docs.default_tools_approval_mode=\"approve\"",
+    );
+    assert_config_arg(
+        args,
+        "mcp_servers.request-sensitive.default_tools_approval_mode=\"prompt\"",
+    );
+}
+
+async fn codex_app_server_engine_times_out_unresponsive_rpc() {
+    let _lock = env_lock().await;
+    let _timeout = EnvGuard::set("WEGENT_CODEX_RPC_TIMEOUT_SECONDS", "1");
+    let fake_codex = write_fake_codex_hang();
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Failed {
+            message: "codex app-server initialize timed out after 1s".to_owned()
+        }
+    );
+}
+
+async fn codex_app_server_engine_does_not_timeout_running_turn() {
+    let _lock = env_lock().await;
+    let _timeout = EnvGuard::set("WEGENT_CODEX_RPC_TIMEOUT_SECONDS", "3");
+    let _startup_timeout = EnvGuard::set("WEGENT_CODEX_TURN_STARTUP_TIMEOUT_SECONDS", "1");
+    let fake_codex = write_fake_codex_slow_turn();
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Completed {
+            content: "done".to_owned()
+        }
+    );
+}
+
+async fn codex_app_server_idle_restart_preserves_in_flight_requests() {
+    let _lock = env_lock().await;
+    let request_marker = unique_dir("codex-pending-request'quoted").join("received");
+    let fake_codex = write_fake_codex_with_pending_request(&request_marker);
+    let client = CodexAppServerClient::new(fake_codex.display().to_string());
+    let request_client = client.clone();
+    let pending_request =
+        tokio::spawn(async move { request_client.request("plugin/list", json!({})).await });
+
+    wait_for_path(&request_marker, "pending app-server request should reach Codex").await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(client.restart_if_idle().await, Err((0, 1))) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pending app-server request should be observed");
+
+    client.restart().await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), pending_request)
+        .await
+        .expect("forced restart should settle the pending request")
+        .expect("pending request task should join");
+    assert_eq!(result.unwrap_err(), "codex app-server was restarted");
+}
+
+async fn codex_app_server_proxy_restart_settles_in_flight_requests() {
+    let _lock = env_lock().await;
+    let request_marker = unique_dir("codex-proxy-pending-request").join("received");
+    let fake_codex = write_fake_codex_with_pending_request(&request_marker);
+    let client = CodexAppServerClient::new(fake_codex.display().to_string());
+    let request_client = client.clone();
+    let pending_request =
+        tokio::spawn(async move { request_client.request("plugin/list", json!({})).await });
+
+    wait_for_path(&request_marker, "pending app-server request should reach Codex").await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(client.restart_if_idle().await, Err((0, 1))) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pending app-server request should be observed");
+
+    assert!(client
+        .configure_runtime_proxy_for_restart(Some("http://127.0.0.1:7890"))
+        .await
+        .expect("runtime proxy should update"));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), pending_request)
+        .await
+        .expect("proxy restart should settle the pending request")
+        .expect("pending request task should join");
+    assert_eq!(
+        result.unwrap_err(),
+        "codex app-server was restarted after its runtime proxy changed"
+    );
+}
+
+async fn codex_app_server_engine_times_out_turn_without_progress() {
+    let _lock = env_lock().await;
+    let _timeout = EnvGuard::set("WEGENT_CODEX_TURN_STARTUP_TIMEOUT_SECONDS", "1");
+    let marker_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-engine-stall-marker-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-engine-stall-log-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let fake_codex = write_fake_codex_turn_startup_stall(&marker_path, &log_path);
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Failed {
+            message: "codex app-server turn made no model or tool progress for 1s".to_owned()
+        }
+    );
+}
+
+async fn codex_shared_app_server_restarts_after_turn_startup_stalls() {
+    let _lock = env_lock().await;
+    let _timeout = EnvGuard::set("WEGENT_CODEX_TURN_STARTUP_TIMEOUT_SECONDS", "1");
+    let marker_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-startup-stall-marker-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let log_path = std::env::temp_dir().join(format!(
+        "wegent-executor-codex-startup-stall-log-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let fake_codex = write_fake_codex_turn_startup_stall(&marker_path, &log_path);
+    let client = CodexAppServerClient::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let stalled_result = client
+        .run_turn_with_cancel(request.clone(), CodexAppServerTurnOptions::default())
+        .await;
+    let recovered_result = client
+        .run_turn_with_cancel(request, CodexAppServerTurnOptions::default())
+        .await;
+
+    assert_eq!(
+        stalled_result.unwrap_err(),
+        "codex app-server turn made no model or tool progress for 1s; the shared app-server was restarted"
+    );
+    assert_eq!(
+        recovered_result.unwrap().outcome,
+        ExecutionOutcome::Completed {
+            content: "recovered".to_owned()
+        }
+    );
+    assert_eq!(
+        fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("launch "))
+            .count(),
+        2
+    );
+}
+
+async fn codex_shared_app_server_isolates_active_turns_from_cross_thread_bursts() {
+    let _lock = env_lock().await;
+    let fake_codex = write_fake_codex_cross_thread_burst();
+    let client = CodexAppServerClient::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let (first, second) = tokio::join!(
+        client.run_turn_with_cancel(request.clone(), CodexAppServerTurnOptions::default()),
+        client.run_turn_with_cancel(request, CodexAppServerTurnOptions::default())
+    );
+
+    for result in [first, second] {
+        assert_eq!(
+            result
+                .expect("cross-thread traffic must not fail an active turn")
+                .outcome,
+            ExecutionOutcome::Completed {
+                content: "isolated".to_owned()
+            }
+        );
+    }
+}
+
+async fn codex_shared_app_server_corrects_compaction_turn_from_matching_user_message() {
+    let _lock = env_lock().await;
+    let fake_codex = write_fake_codex_compaction_turn_correction();
+    let client = CodexAppServerClient::new(fake_codex.display().to_string());
+    let mut request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+    request.extra.insert(
+        "client_user_message_id".to_owned(),
+        Value::String("runtime-local-pane-1".to_owned()),
+    );
+
+    let turn = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.run_turn_with_cancel(
+            request,
+            CodexAppServerTurnOptions {
+                resume_thread_id: Some("thread-1".to_owned()),
+                ..CodexAppServerTurnOptions::default()
+            },
+        ),
+    )
+    .await
+    .expect("the real user turn should settle after context compaction")
+    .expect("the corrected turn should complete");
+
+    assert_eq!(
+        turn.outcome,
+        ExecutionOutcome::Completed {
+            content: "corrected".to_owned()
+        }
+    );
+}
+
+async fn codex_app_server_engine_reports_nested_turn_error_details() {
+    let _lock = env_lock().await;
+    let fake_codex = write_fake_codex_nested_turn_error();
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Failed {
+            message:
+                "Reconnecting... 2/5: stream disconnected before completion: tls handshake eof"
+                    .to_owned()
+        }
+    );
+}
+
+async fn codex_app_server_engine_waits_for_retryable_turn_error_recovery() {
+    let _lock = env_lock().await;
+    let fake_codex = write_fake_codex_retryable_turn_error();
+    let engine = CodexAppServerEngine::new(fake_codex.display().to_string());
+    let request = ExecutionRequest {
+        prompt: json!("implement feature"),
+        bot: json!([{"shell_type": "ClaudeCode"}]),
+        model_config: json!({
+            "model": "openai",
+            "model_id": "gpt-5",
+            "protocol": "openai-responses"
+        }),
+        ..ExecutionRequest::default()
+    };
+
+    let outcome = engine.run(request).await;
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::Completed {
+            content: "recovered".to_owned()
+        }
+    );
+}
+}
+
+fn shared_test_runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("shared Codex contract test runtime should initialize")
+    })
+}
+
+/// Point the executor and Codex homes at a per-run directory before any test
+/// can use them.
+///
+/// The engine persists the Codex thread it started under
+/// `<executor home>/sessions/<task id>/.codex_thread_id` and resumes it on the
+/// next run. These tests use fixed task ids, so a marker left in a developer's
+/// real home turns an expected `thread/start` into a `thread/resume` that the
+/// fake binaries never answer, and the run times out. Every test takes the
+/// `env_lock` first, so setting the variables there is ordered ahead of any read.
+async fn env_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static EXECUTOR_HOME: OnceLock<PathBuf> = OnceLock::new();
+    let guard = LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let executor_home = EXECUTOR_HOME.get_or_init(|| unique_dir("codex-app-server-home"));
+    std::env::set_var("WEGENT_EXECUTOR_HOME", executor_home);
+    std::env::set_var("WEGENT_CODEX_HOME", executor_home.join("codex"));
+    guard
+}
+
+fn write_fake_codex(log_path: &Path) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let _ = fs::remove_file(log_path);
+    let content = format!(
+        r#"#!/bin/sh
+LOG_PATH='{}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG_PATH"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"id":1,"result":{{"protocolVersion":1}}}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"thread-1"}}}}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1","status":"inProgress"}}}}}}'
+      printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"delta":"done","phase":"finalAnswer"}}}}'
+      printf '%s\n' '{{"method":"turn/completed","params":{{"turn":{{"id":"turn-1","status":"completed"}}}}}}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+        log_path.display()
+    );
+    fs::write(&path, content).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn write_fake_codex_with_thread_provider(log_path: &Path, provider: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-thread-provider-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let _ = fs::remove_file(log_path);
+    let content = format!(
+        r#"#!/bin/sh
+LOG_PATH='{}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG_PATH"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"id":1,"result":{{"protocolVersion":1}}}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{{"id":2,"result":{{"modelProvider":"{}","thread":{{"id":"thread-1","modelProvider":"{}"}}}}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1","status":"inProgress"}}}}}}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+        log_path.display(),
+        provider,
+        provider
+    );
+    fs::write(&path, content).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn write_fake_codex_with_stale_resume_provider(log_path: &Path) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-stale-resume-provider-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let process_count_path = path.with_extension("process-count");
+    let _ = fs::remove_file(log_path);
+    let _ = fs::remove_file(&process_count_path);
+    let content = format!(
+        r#"#!/bin/sh
+LOG_PATH='{}'
+PROCESS_COUNT_PATH='{}'
+process_count=0
+if [ -f "$PROCESS_COUNT_PATH" ]; then
+  process_count=$(cat "$PROCESS_COUNT_PATH")
+fi
+process_count=$((process_count + 1))
+printf '%s\n' "$process_count" > "$PROCESS_COUNT_PATH"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG_PATH"
+  request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"id":%s,"result":{{"protocolVersion":1}}}}\n' "$request_id"
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/unsubscribe"'*)
+      printf '{{"id":%s,"result":{{}}}}\n' "$request_id"
+      ;;
+    *'"method":"thread/resume"'*)
+      if [ "$process_count" -eq 1 ]; then
+        provider='openai'
+      else
+        provider='wework-router'
+      fi
+      printf '{{"id":%s,"result":{{"modelProvider":"%s","thread":{{"id":"thread-1","modelProvider":"%s"}}}}}}\n' "$request_id" "$provider" "$provider"
+      ;;
+    *'"method":"thread/goal/get"'*)
+      printf '{{"id":%s,"result":{{"goal":null}}}}\n' "$request_id"
+      ;;
+    *'"method":"turn/start"'*)
+      printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1","status":"inProgress"}}}}}}\n' "$request_id"
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"thread-1","turnId":"turn-1","item":{{"id":"message-1","type":"agentMessage","phase":"final_answer","text":"done"}}}}}}'
+      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-1","turn":{{"id":"turn-1","status":"completed"}}}}}}'
+      ;;
+  esac
+done
+"#,
+        log_path.display(),
+        process_count_path.display()
+    );
+    fs::write(&path, content).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn write_fake_codex_for_auxiliary_rpc_then_turn(log_path: &Path) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-shared-proxy-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let _ = fs::remove_file(log_path);
+    let content = format!(
+        r#"#!/bin/sh
+LOG_PATH='{}'
+http_proxy=$(printenv HTTP_PROXY)
+https_proxy=$(printenv HTTPS_PROXY)
+printf '{{"env":{{"HTTP_PROXY":"%s","HTTPS_PROXY":"%s"}}}}\n' "$http_proxy" "$https_proxy" >> "$LOG_PATH"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG_PATH"
+  request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"id":%s,"result":{{"protocolVersion":1}}}}\n' "$request_id"
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"account/rateLimits/read"'*)
+      printf '{{"id":%s,"result":{{"rateLimits":[]}}}}\n' "$request_id"
+      ;;
+    *'"method":"thread/start"'*)
+      printf '{{"id":%s,"result":{{"thread":{{"id":"thread-1"}}}}}}\n' "$request_id"
+      ;;
+    *'"method":"turn/start"'*)
+      printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1","status":"inProgress"}}}}}}\n' "$request_id"
+      printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"delta":"done","phase":"finalAnswer"}}}}'
+      printf '%s\n' '{{"method":"turn/completed","params":{{"turn":{{"id":"turn-1","status":"completed"}}}}}}'
+      ;;
+  esac
+done
+"#,
+        log_path.display()
+    );
+    fs::write(&path, content).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn write_fake_codex_with_pending_request(request_marker: &Path) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-pending-request-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let content = r#"#!/bin/sh
+while IFS= read -r line; do
+  request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"id":%s,"result":{"protocolVersion":1}}\n' "$request_id"
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"plugin/list"'*)
+      touch __REQUEST_MARKER__
+      sleep 30
+      ;;
+  esac
+done
+"#
+    .replace("__REQUEST_MARKER__", &shell_quote(request_marker));
+    fs::write(&path, content).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn write_fake_codex_logging_start(log_path: &Path, env_keys: &[&str]) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-log-start-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let _ = fs::remove_file(log_path);
+    let env_log_commands = env_keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let comma = if index == 0 {
+                String::new()
+            } else {
+                "printf ',' >> \"$LOG_PATH\"\n".to_owned()
+            };
+            format!(
+                r#"{comma}value=$(printenv '{key}')
+escaped=$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')
+printf '"{key}":"%s"' "$escaped" >> "$LOG_PATH""#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = format!(
+        r#"#!/bin/sh
+LOG_PATH='{}'
+printf '{{"args":[' >> "$LOG_PATH"
+first=1
+for arg in "$@"; do
+  if [ "$first" = 0 ]; then
+    printf ',' >> "$LOG_PATH"
+  fi
+  first=0
+  escaped=$(printf '%s' "$arg" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf '"%s"' "$escaped" >> "$LOG_PATH"
+done
+printf '],"env":{{' >> "$LOG_PATH"
+{}
+printf '}}}}\n' >> "$LOG_PATH"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG_PATH"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"id":1,"result":{{"protocolVersion":1}}}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"thread-1"}}}}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1","status":"inProgress"}}}}}}'
+      printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"delta":"done","phase":"finalAnswer"}}}}'
+      printf '%s\n' '{{"method":"turn/completed","params":{{"turn":{{"id":"turn-1","status":"completed"}}}}}}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+        log_path.display(),
+        env_log_commands
+    );
+    fs::write(&path, content).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn write_fake_codex_hang() -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-hang-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+while IFS= read -r _line; do
+  sleep 30
+done
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn write_fake_codex_slow_turn() -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-slow-turn-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"protocolVersion":1}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"item":{"id":"tool-1","type":"commandExecution","status":"inProgress"},"threadId":"thread-1","turnId":"turn-1"}}'
+      sleep 4
+      printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"done","phase":"finalAnswer"}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn write_fake_codex_turn_startup_stall(marker_path: &Path, log_path: &Path) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-turn-startup-stall-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let content = r#"#!/bin/sh
+MARKER_PATH='__MARKER_PATH__'
+LOG_PATH='__LOG_PATH__'
+if [ -e "$MARKER_PATH" ]; then
+  MODE=recover
+else
+  touch "$MARKER_PATH"
+  MODE=stall
+fi
+printf 'launch %s\n' "$MODE" >> "$LOG_PATH"
+while IFS= read -r line; do
+  request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"id":%s,"result":{"protocolVersion":1}}\n' "$request_id"
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '{"id":%s,"result":{"thread":{"id":"thread-1"}}}\n' "$request_id"
+      ;;
+    *'"method":"turn/start"'*)
+      printf '{"id":%s,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}\n' "$request_id"
+      if [ "$MODE" = stall ]; then
+        printf '%s\n' '{"method":"item/completed","params":{"item":{"id":"user-1","type":"userMessage","content":[{"type":"text","text":"implement feature"}]},"threadId":"thread-1","turnId":"turn-1"}}'
+      else
+        printf '%s\n' '{"method":"item/completed","params":{"item":{"id":"message-1","type":"agentMessage","phase":"final_answer","text":"recovered"},"threadId":"thread-1","turnId":"turn-1"}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}'
+      fi
+      ;;
+  esac
+done
+"#
+    .replace("__MARKER_PATH__", &marker_path.display().to_string())
+    .replace("__LOG_PATH__", &log_path.display().to_string());
+    fs::write(&path, content).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn write_fake_codex_cross_thread_burst() -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-cross-thread-burst-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+thread_count=0
+turn_count=0
+while IFS= read -r line; do
+  request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"id":%s,"result":{"protocolVersion":1}}\n' "$request_id"
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      thread_count=$((thread_count + 1))
+      printf '{"id":%s,"result":{"thread":{"id":"thread-%s"}}}\n' "$request_id" "$thread_count"
+      ;;
+    *'"method":"turn/start"'*)
+      turn_count=$((turn_count + 1))
+      thread_id=$(printf '%s' "$line" | sed -n 's/.*"threadId":"\([^"]*\)".*/\1/p')
+      turn_id="turn-${thread_id}"
+      printf '{"id":%s,"result":{"turn":{"id":"%s","status":"inProgress"}}}\n' "$request_id" "$turn_id"
+      if [ "$turn_count" -eq 2 ]; then
+        index=0
+        while [ "$index" -lt 2200 ]; do
+          printf '{"method":"item/commandExecution/outputDelta","params":{"threadId":"noise-thread","turnId":"noise-turn","itemId":"noise-item","delta":"%s"}}\n' "$index"
+          index=$((index + 1))
+        done
+        for active in 1 2; do
+          printf '{"method":"item/completed","params":{"threadId":"thread-%s","turnId":"turn-thread-%s","item":{"id":"message-%s","type":"agentMessage","phase":"final_answer","text":"isolated"}}}\n' "$active" "$active" "$active"
+          printf '{"method":"turn/completed","params":{"threadId":"thread-%s","turn":{"id":"turn-thread-%s","status":"completed"}}}\n' "$active" "$active"
+        done
+      fi
+      ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn write_fake_codex_compaction_turn_correction() -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-compaction-turn-correction-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"id":%s,"result":{"protocolVersion":1}}\n' "$request_id"
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/unsubscribe"'*)
+      printf '{"id":%s,"result":{}}\n' "$request_id"
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '{"id":%s,"result":{"thread":{"id":"thread-1"}}}\n' "$request_id"
+      ;;
+    *'"method":"thread/goal/get"'*)
+      printf '{"id":%s,"result":{"goal":{"status":"active"}}}\n' "$request_id"
+      ;;
+    *'"method":"turn/start"'*)
+      printf '{"id":%s,"result":{"turn":{"id":"turn-compaction","status":"inProgress"}}}\n' "$request_id"
+      printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-1","turnId":"turn-user","goal":{"status":"complete"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-user","item":{"id":"user-1","clientId":"runtime-local-pane-1","type":"userMessage"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-user","item":{"id":"message-1","type":"agentMessage","phase":"final_answer","text":"corrected"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-user","status":"completed"}}}'
+      ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn write_fake_codex_nested_turn_error() -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-nested-turn-error-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"protocolVersion":1}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}'
+      printf '%s\n' '{"method":"error","params":{"error":{"additionalDetails":"stream disconnected before completion: tls handshake eof","message":"Reconnecting... 2/5"},"threadId":"thread-1","turnId":"turn-1","willRetry":false}}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn write_fake_codex_retryable_turn_error() -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fake-codex-retryable-turn-error-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"protocolVersion":1}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}'
+      printf '%s\n' '{"method":"error","params":{"error":{"additionalDetails":"stream disconnected before completion: tls handshake eof","message":"Reconnecting... 2/5"},"threadId":"thread-1","turnId":"turn-1","willRetry":true}}'
+      printf '%s\n' '{"method":"item/completed","params":{"item":{"id":"message-1","type":"agentMessage","phase":"final_answer","text":"recovered"},"threadId":"thread-1","turnId":"turn-1"}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    path
+}
+
+fn unique_suffix() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
+fn read_json_lines(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>()
+}
+
+async fn wait_for_path(path: &Path, message: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(message);
+}
+
+fn assert_config_arg(args: &[Value], expected: &str) {
+    assert!(
+        args.windows(2)
+            .any(|window| window[0] == "-c" && window[1] == expected),
+        "missing -c {expected}; args={args:?}"
+    );
+}
+
+fn assert_no_config_arg(args: &[Value], unexpected: &str) {
+    assert!(
+        !args
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1] == unexpected),
+        "unexpected -c {unexpected}; args={args:?}"
+    );
+}
+
+fn with_project_id(mut request: ExecutionRequest, project_id: Value) -> ExecutionRequest {
+    request.extra.insert("project_id".to_owned(), project_id);
+    request
+}
+
+fn unique_dir(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "wegent-executor-{name}-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let _ = fs::remove_dir_all(&path);
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}

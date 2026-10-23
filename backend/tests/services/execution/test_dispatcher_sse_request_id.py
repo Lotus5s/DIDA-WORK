@@ -1,0 +1,298 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for SSE request_id propagation from backend to chat_shell."""
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from openai import APIConnectionError
+
+from app.services.execution.dispatcher import ExecutionDispatcher
+from app.services.execution.router import CommunicationMode, ExecutionTarget
+from shared.models import EventType
+from shared.telemetry.context import get_request_id, request_context
+
+
+class _FakeEvent:
+    def __init__(self, event_type: str):
+        self.type = event_type
+
+    def model_dump(self):
+        return {
+            "type": self.type,
+            "response": {"output": []},
+        }
+
+
+class _FakeStream:
+    def __init__(self, events):
+        self._events = list(events)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._events:
+            raise StopAsyncIteration
+        return self._events.pop(0)
+
+
+def _build_fake_openai_module(calls: dict, events=None):
+    if events is None:
+        events = [_FakeEvent("response.completed")]
+
+    class _FakeResponses:
+        async def create(
+            self,
+            model,
+            input,
+            instructions,
+            tools,
+            stream,
+            extra_body,
+            extra_headers,
+        ):
+            calls["model"] = model
+            calls["input"] = input
+            calls["instructions"] = instructions
+            calls["tools"] = tools
+            calls["stream"] = stream
+            calls["extra_headers"] = extra_headers
+            calls["extra_body"] = extra_body
+            return _FakeStream(events)
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            calls["client_kwargs"] = kwargs
+            self.responses = _FakeResponses()
+            self.base_url = kwargs["base_url"].rstrip("/") + "/"
+
+        async def close(self):
+            calls["client_closed"] = True
+
+    return SimpleNamespace(
+        AsyncOpenAI=_FakeAsyncOpenAI, APIConnectionError=APIConnectionError
+    )
+
+
+def _make_request(subtask_id: int, request_id: str = ""):
+    return SimpleNamespace(
+        task_id=1001,
+        subtask_id=subtask_id,
+        message_id=2002,
+        bot=[],
+        model_config={},
+        request_id=request_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_sse_keeps_existing_metadata_request_id():
+    dispatcher = ExecutionDispatcher()
+    request = _make_request(subtask_id=99, request_id="backend-request-id")
+    target = ExecutionTarget(
+        mode=CommunicationMode.SSE,
+        url="http://chat-shell",
+        namespace=None,
+        event="task:execute",
+        room=None,
+    )
+    emitter = AsyncMock()
+    calls = {}
+    session_manager = AsyncMock()
+    session_manager.register_stream.return_value = asyncio.Event()
+    session_manager.is_cancelled.return_value = False
+
+    with (
+        patch.dict("sys.modules", {"openai": _build_fake_openai_module(calls)}),
+        patch(
+            "app.services.execution.chat_shell_sse.OpenAIRequestConverter.from_execution_request",
+            return_value={
+                "model": "test-model",
+                "input": "hello",
+                "metadata": {"request_id": "metadata-request-id"},
+                "model_config": {},
+            },
+        ),
+        patch("app.services.chat.storage.session.session_manager", session_manager),
+    ):
+        await dispatcher._dispatch_sse(request, target, emitter)
+
+    assert (
+        calls["extra_headers"]["X-Request-ID"]
+        == calls["extra_body"]["metadata"]["request_id"]
+    )
+    assert calls["extra_body"]["metadata"]["request_id"] == "metadata-request-id"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_sse_uses_request_request_id_when_metadata_missing():
+    dispatcher = ExecutionDispatcher()
+    request = _make_request(subtask_id=99, request_id="backend-request-id")
+    target = ExecutionTarget(
+        mode=CommunicationMode.SSE,
+        url="http://chat-shell",
+        namespace=None,
+        event="task:execute",
+        room=None,
+    )
+    emitter = AsyncMock()
+    calls = {}
+    session_manager = AsyncMock()
+    session_manager.register_stream.return_value = asyncio.Event()
+    session_manager.is_cancelled.return_value = False
+
+    with (
+        patch.dict("sys.modules", {"openai": _build_fake_openai_module(calls)}),
+        patch(
+            "app.services.execution.chat_shell_sse.OpenAIRequestConverter.from_execution_request",
+            return_value={
+                "model": "test-model",
+                "input": "hello",
+                "metadata": {},
+                "model_config": {},
+            },
+        ),
+        patch("app.services.chat.storage.session.session_manager", session_manager),
+    ):
+        await dispatcher._dispatch_sse(request, target, emitter)
+
+    assert (
+        calls["extra_headers"]["X-Request-ID"]
+        == calls["extra_body"]["metadata"]["request_id"]
+    )
+    assert calls["extra_body"]["metadata"]["request_id"] == "backend-request-id"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_sse_generates_request_id_when_missing():
+    dispatcher = ExecutionDispatcher()
+    request = _make_request(subtask_id=77, request_id="")
+    target = ExecutionTarget(
+        mode=CommunicationMode.SSE,
+        url="http://chat-shell",
+        namespace=None,
+        event="task:execute",
+        room=None,
+    )
+    emitter = AsyncMock()
+    calls = {}
+    session_manager = AsyncMock()
+    session_manager.register_stream.return_value = asyncio.Event()
+    session_manager.is_cancelled.return_value = False
+
+    with (
+        patch.dict("sys.modules", {"openai": _build_fake_openai_module(calls)}),
+        patch(
+            "app.services.execution.chat_shell_sse.OpenAIRequestConverter.from_execution_request",
+            return_value={
+                "model": "test-model",
+                "input": "hello",
+                "metadata": {},
+                "model_config": {},
+            },
+        ),
+        patch("app.services.chat.storage.session.session_manager", session_manager),
+    ):
+        await dispatcher._dispatch_sse(request, target, emitter)
+
+    assert (
+        calls["extra_headers"]["X-Request-ID"]
+        == calls["extra_body"]["metadata"]["request_id"]
+    )
+    assert calls["extra_body"]["metadata"]["request_id"] == "req_77"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError])
+async def test_sequential_sse_dispatches_restore_caller_context(failure):
+    dispatcher = ExecutionDispatcher()
+    target = ExecutionTarget(
+        mode=CommunicationMode.SSE,
+        url="http://chat-shell",
+        namespace=None,
+        event="task:execute",
+        room=None,
+    )
+    calls = {}
+    emitter = AsyncMock()
+    session_manager = AsyncMock()
+    session_manager.register_stream.return_value = asyncio.Event()
+    session_manager.is_cancelled.return_value = False
+
+    async def unregister(subtask_id):
+        assert get_request_id() == f"dispatch-{subtask_id}"
+        if failure:
+            raise failure("cleanup interrupted")
+
+    session_manager.unregister_stream.side_effect = unregister
+    with (
+        request_context("caller-context"),
+        patch.dict("sys.modules", {"openai": _build_fake_openai_module(calls)}),
+        patch(
+            "app.services.execution.chat_shell_sse.OpenAIRequestConverter.from_execution_request",
+            side_effect=lambda request: {"model": "test-model", "input": "hello"},
+        ),
+        patch("app.services.chat.storage.session.session_manager", session_manager),
+    ):
+        for number in (1, 2):
+            request = _make_request(number, f"dispatch-{number}")
+            if failure:
+                with pytest.raises(failure, match="cleanup interrupted"):
+                    await dispatcher._dispatch_sse(request, target, emitter)
+            else:
+                await dispatcher._dispatch_sse(request, target, emitter)
+            assert get_request_id() == "caller-context"
+            assert calls["extra_headers"]["X-Request-ID"] == f"dispatch-{number}"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_sse_emits_error_when_stream_ends_without_terminal_event():
+    dispatcher = ExecutionDispatcher()
+    request = _make_request(subtask_id=88, request_id="backend-request-id")
+    target = ExecutionTarget(
+        mode=CommunicationMode.SSE,
+        url="http://chat-shell",
+        namespace=None,
+        event="task:execute",
+        room=None,
+    )
+    emitter = AsyncMock()
+    calls = {}
+    session_manager = AsyncMock()
+    session_manager.register_stream.return_value = asyncio.Event()
+    session_manager.is_cancelled.return_value = False
+
+    with (
+        patch.dict("sys.modules", {"openai": _build_fake_openai_module(calls, [])}),
+        patch(
+            "app.services.execution.chat_shell_sse.OpenAIRequestConverter.from_execution_request",
+            return_value={
+                "model": "test-model",
+                "input": "hello",
+                "metadata": {},
+                "model_config": {},
+            },
+        ),
+        patch("app.services.chat.storage.session.session_manager", session_manager),
+    ):
+        await dispatcher._dispatch_sse(request, target, emitter)
+
+    emitted_events = [call.args[0] for call in emitter.emit.call_args_list]
+    assert len(emitted_events) == 1
+    error_event = emitted_events[0]
+    assert error_event.type == EventType.ERROR.value
+    assert error_event.task_id == request.task_id
+    assert error_event.subtask_id == request.subtask_id
+    assert error_event.message_id == request.message_id
+    assert "ended without terminal event" in error_event.error

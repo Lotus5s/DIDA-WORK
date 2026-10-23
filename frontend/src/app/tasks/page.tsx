@@ -1,0 +1,102 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { Suspense, useState } from 'react'
+import dynamic from 'next/dynamic'
+import { teamService } from '@/features/tasks/service/teamService'
+import TopNavigation from '@/features/layout/TopNavigation'
+import { TaskSidebar } from '@/features/tasks/components/sidebar'
+import { TaskParamSync } from '@/features/tasks/components/params'
+import { TeamShareHandler } from '@/features/tasks/components/share'
+import OidcTokenHandler from '@/features/login/components/OidcTokenHandler'
+import '@/app/tasks/tasks.css'
+import '@/features/common/scrollbar.css'
+import { GithubStarButton } from '@/features/layout/GithubStarButton'
+import { ThemeToggle } from '@/features/theme/ThemeToggle'
+import { useIsMobile } from '@/features/layout/hooks/useMediaQuery'
+import { Team } from '@/types/api'
+import { UserProvider } from '@/features/common/UserContext'
+import { TaskSessionProvider } from '@/features/tasks/session/TaskSession'
+import { SocketProvider } from '@/contexts/SocketContext'
+import { DeviceProvider } from '@/contexts/DeviceContext'
+import { ProjectProvider } from '@/features/projects/contexts/projectContext'
+
+const ChatArea = dynamic(() => import('@/features/tasks/components/chat/ChatArea'), {
+  ssr: false,
+})
+
+function TasksPageContent() {
+  // Team state from service
+  const { teams, isTeamsLoading, loadError, refreshTeams } = teamService.useTeams()
+
+  // Mobile detection
+  const isMobile = useIsMobile()
+
+  // Mobile sidebar state
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false)
+
+  const handleRefreshTeams = async (): Promise<Team[]> => {
+    return await refreshTeams()
+  }
+
+  return (
+    <>
+      {/* Handle OIDC token from URL parameters */}
+      <OidcTokenHandler />
+      <Suspense>
+        <TaskParamSync />
+      </Suspense>
+      <Suspense>
+        <TeamShareHandler teams={teams} onRefreshTeams={handleRefreshTeams} />
+      </Suspense>
+      <div className="flex smart-h-screen bg-base text-text-primary box-border">
+        {/* Responsive sidebar */}
+        <TaskSidebar
+          isMobileSidebarOpen={isMobileSidebarOpen}
+          setIsMobileSidebarOpen={setIsMobileSidebarOpen}
+          pageType="code"
+        />
+        {/* Main content area */}
+        <div className="flex-1 flex flex-col min-w-0">
+          {/* Top navigation */}
+          <TopNavigation
+            activePage="code"
+            showLogo={false}
+            onMobileSidebarToggle={() => setIsMobileSidebarOpen(true)}
+          >
+            {isMobile ? <ThemeToggle /> : <GithubStarButton />}
+          </TopNavigation>
+          {/* Chat area */}
+          <ChatArea
+            teams={teams}
+            isTeamsLoading={isTeamsLoading}
+            loadError={teams.length === 0 ? loadError : null}
+            rawTeamsEmpty={teams.length === 0}
+            selectedTeamForNewTask={null}
+            taskType="code"
+            onRefreshTeams={handleRefreshTeams}
+          />
+        </div>
+      </div>
+    </>
+  )
+}
+
+export default function TasksPage() {
+  return (
+    <UserProvider>
+      <SocketProvider>
+        <DeviceProvider>
+          <ProjectProvider>
+            <TaskSessionProvider>
+              <TasksPageContent />
+            </TaskSessionProvider>
+          </ProjectProvider>
+        </DeviceProvider>
+      </SocketProvider>
+    </UserProvider>
+  )
+}

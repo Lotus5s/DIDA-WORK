@@ -1,0 +1,316 @@
+import { isElectronRuntime } from './runtime-environment'
+import { navigateTo } from './navigation'
+import { getPlatform } from './platform'
+
+export const OPEN_TERMINAL_COMMAND = 'openTerminal'
+export const OPEN_SETTINGS_COMMAND = 'openSettings'
+export const OPEN_SEARCH_COMMAND = 'openSearch'
+export const GO_BACK_COMMAND = 'goBack'
+export const GO_FORWARD_COMMAND = 'goForward'
+export const TOGGLE_SIDEBAR_COMMAND = 'toggleSidebar'
+export const TOGGLE_SIDE_PANEL_COMMAND = 'toggleSidePanel'
+export const TOGGLE_MODEL_SELECTOR_COMMAND = 'toggleModelSelector'
+export const TOGGLE_PRIORITY_FILTER_COMMAND = 'togglePriorityFilter'
+export const INCREASE_FONT_SIZE_COMMAND = 'increaseFontSize'
+export const DECREASE_FONT_SIZE_COMMAND = 'decreaseFontSize'
+export const RESET_FONT_SIZE_COMMAND = 'resetFontSize'
+export const WEWORK_OPEN_TERMINAL_EVENT = 'wework:open-terminal'
+export const WEWORK_STEP_FONT_SIZE_EVENT = 'wework:step-font-size'
+export const WEWORK_RESET_FONT_SIZE_EVENT = 'wework:reset-font-size'
+export const KEYBINDINGS_CHANGED_EVENT = 'wework:keybindings-changed'
+export const ACTIVE_KEYBINDINGS_CHANGED_EVENT = 'wework:active-keybindings-changed'
+export const TOGGLE_BOTTOM_WORKSPACE_PANEL_BUTTON_TEST_ID = 'toggle-bottom-workspace-panel-button'
+export const TOGGLE_RIGHT_WORKSPACE_PANEL_BUTTON_TEST_ID = 'toggle-right-workspace-panel-button'
+export const MODEL_SELECTOR_BUTTON_TEST_ID = 'model-selector-button'
+
+export interface KeybindingOverride {
+  command: string
+  key: string | null
+}
+
+export interface KeybindingCommand {
+  command: string
+  defaultKey: string
+  secondaryKeys?: string[]
+}
+
+export const DEFAULT_KEYBINDINGS: KeybindingCommand[] = [
+  {
+    command: OPEN_TERMINAL_COMMAND,
+    defaultKey: 'Command+J',
+  },
+  {
+    command: OPEN_SETTINGS_COMMAND,
+    defaultKey: 'Command+,',
+  },
+  {
+    command: OPEN_SEARCH_COMMAND,
+    defaultKey: 'Command+K',
+  },
+  {
+    command: GO_BACK_COMMAND,
+    defaultKey: 'Command+[',
+    secondaryKeys: ['Mouse Back'],
+  },
+  {
+    command: GO_FORWARD_COMMAND,
+    defaultKey: 'Command+]',
+    secondaryKeys: ['Mouse Forward'],
+  },
+  {
+    command: TOGGLE_SIDEBAR_COMMAND,
+    defaultKey: 'Command+B',
+  },
+  {
+    command: TOGGLE_SIDE_PANEL_COMMAND,
+    defaultKey: 'Alt+Command+B',
+  },
+  {
+    command: TOGGLE_MODEL_SELECTOR_COMMAND,
+    defaultKey: 'Control+Shift+M',
+  },
+  {
+    command: TOGGLE_PRIORITY_FILTER_COMMAND,
+    defaultKey: 'Alt+Command+U',
+  },
+  {
+    command: INCREASE_FONT_SIZE_COMMAND,
+    defaultKey: 'Command+Plus',
+  },
+  {
+    command: DECREASE_FONT_SIZE_COMMAND,
+    defaultKey: 'Command+Minus',
+  },
+  {
+    command: RESET_FONT_SIZE_COMMAND,
+    defaultKey: 'Command+0',
+  },
+]
+
+const WIN_DEFAULT_KEYBINDINGS: KeybindingCommand[] = DEFAULT_KEYBINDINGS.map(item => ({
+  ...item,
+  defaultKey: item.defaultKey.replace('Command', 'Control'),
+  secondaryKeys: item.secondaryKeys,
+}))
+
+export function getDefaultKeybindings(platform = getPlatform()): KeybindingCommand[] {
+  return platform === 'win' ? WIN_DEFAULT_KEYBINDINGS : DEFAULT_KEYBINDINGS
+}
+
+let activeKeybindings = mergeKeybindings([])
+
+export function mergeKeybindings(
+  overrides: KeybindingOverride[],
+  platform = getPlatform(),
+  contributions: readonly KeybindingCommand[] = []
+): Record<string, string | null> {
+  const merged = new Map<string, string | null>(
+    [...getDefaultKeybindings(platform), ...contributions].map(item => [
+      item.command,
+      normalizeKeybinding(item.defaultKey),
+    ])
+  )
+  overrides.forEach(item => {
+    if (!item.command) return
+    merged.set(item.command, item.key ? normalizeKeybinding(item.key) : null)
+  })
+  return Object.fromEntries(merged.entries())
+}
+
+export function normalizeKeybinding(value: string): string {
+  const parts = value
+    .split('+')
+    .map(part => normalizeKeyPart(part.trim()))
+    .filter(Boolean)
+  const key = parts.pop()
+  if (!key) return ''
+
+  const modifiers = ['Control', 'Alt', 'Shift', 'Command'].filter(modifier =>
+    parts.includes(modifier)
+  )
+  return [...modifiers, key].join('+')
+}
+
+export function keybindingFromKeyboardEvent(event: KeyboardEvent): string {
+  const key = normalizeKeyPart(
+    event.altKey ? keybindingKeyFromPhysicalCode(event.code) || event.key : event.key
+  )
+  const mainKey = key && !['Command', 'Control', 'Alt', 'Shift'].includes(key) ? key : null
+  if (!mainKey) return ''
+
+  const includeShift = event.shiftKey && key !== 'Plus' && key !== 'Minus'
+  return [
+    event.ctrlKey ? 'Control' : null,
+    event.altKey ? 'Alt' : null,
+    includeShift ? 'Shift' : null,
+    event.metaKey ? 'Command' : null,
+    mainKey,
+  ]
+    .filter(Boolean)
+    .join('+')
+}
+
+export function setActiveKeybindings(
+  overrides: KeybindingOverride[],
+  contributions: readonly KeybindingCommand[] = []
+): Record<string, string | null> {
+  activeKeybindings = mergeKeybindings(overrides, getPlatform(), contributions)
+  window.dispatchEvent(new CustomEvent(ACTIVE_KEYBINDINGS_CHANGED_EVENT))
+  return activeKeybindings
+}
+
+export function getActiveKeybinding(command: string): string | null {
+  return activeKeybindings[command] ?? null
+}
+
+export function isEditableShortcutTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  if (target.closest('.xterm')) return false
+  const tagName = target.tagName.toLowerCase()
+  return (
+    target.isContentEditable ||
+    tagName === 'input' ||
+    tagName === 'textarea' ||
+    tagName === 'select'
+  )
+}
+
+export function shouldIgnoreWorkbenchShortcut(event: KeyboardEvent): boolean {
+  if (event.isComposing) return true
+  if (!isEditableShortcutTarget(event.target)) return false
+  // Conversation autofocus must not disable workbench commands. Keep typing
+  // and Option-only text input in the editor, including custom bare-key bindings.
+  return (
+    (!event.metaKey && !event.ctrlKey) ||
+    !(event.target instanceof HTMLElement) ||
+    !event.target.closest('[data-testid="chat-message-input"]')
+  )
+}
+
+export function dispatchOpenTerminalShortcut() {
+  const toggleButton = document.querySelector<HTMLButtonElement>(
+    `[data-testid="${TOGGLE_BOTTOM_WORKSPACE_PANEL_BUTTON_TEST_ID}"]`
+  )
+  if (toggleButton && !toggleButton.disabled) {
+    toggleButton.click()
+    return
+  }
+
+  window.dispatchEvent(new CustomEvent(WEWORK_OPEN_TERMINAL_EVENT))
+}
+
+export function dispatchOpenSettingsShortcut() {
+  navigateTo('/settings')
+}
+
+export function dispatchGoBackShortcut() {
+  window.history.back()
+}
+
+export function dispatchGoForwardShortcut() {
+  window.history.forward()
+}
+
+export function dispatchToggleSidebarShortcut() {
+  const toggleButton = document.querySelector<HTMLButtonElement>(
+    '[data-testid="collapse-sidebar-button"], [data-testid="expand-sidebar-button"]'
+  )
+  if (toggleButton && !toggleButton.disabled) {
+    toggleButton.click()
+  }
+}
+
+export function dispatchToggleSidePanelShortcut() {
+  const toggleButton = document.querySelector<HTMLButtonElement>(
+    `[data-testid="${TOGGLE_RIGHT_WORKSPACE_PANEL_BUTTON_TEST_ID}"]`
+  )
+  if (toggleButton && !toggleButton.disabled) {
+    toggleButton.click()
+  }
+}
+
+export function dispatchToggleModelSelectorShortcut() {
+  const activePaneButton = document.querySelector<HTMLButtonElement>(
+    `[data-active-workbench-pane="true"] [data-testid="${MODEL_SELECTOR_BUTTON_TEST_ID}"]`
+  )
+  const button =
+    activePaneButton ??
+    Array.from(
+      document.querySelectorAll<HTMLButtonElement>(
+        `[data-testid="${MODEL_SELECTOR_BUTTON_TEST_ID}"]`
+      )
+    ).find(candidate => !candidate.disabled && candidate.getAttribute('aria-hidden') !== 'true')
+  if (button && !button.disabled) button.click()
+}
+
+export function dispatchStepFontSizeShortcut(delta: -1 | 1) {
+  window.dispatchEvent(new CustomEvent(WEWORK_STEP_FONT_SIZE_EVENT, { detail: { delta } }))
+}
+
+export function dispatchResetFontSizeShortcut() {
+  window.dispatchEvent(new CustomEvent(WEWORK_RESET_FONT_SIZE_EVENT))
+}
+
+const BUILTIN_SHORTCUT_HANDLERS: Readonly<Record<string, () => void>> = {
+  [OPEN_TERMINAL_COMMAND]: dispatchOpenTerminalShortcut,
+  [OPEN_SETTINGS_COMMAND]: dispatchOpenSettingsShortcut,
+  [GO_BACK_COMMAND]: dispatchGoBackShortcut,
+  [GO_FORWARD_COMMAND]: dispatchGoForwardShortcut,
+  [TOGGLE_SIDEBAR_COMMAND]: dispatchToggleSidebarShortcut,
+  [TOGGLE_SIDE_PANEL_COMMAND]: dispatchToggleSidePanelShortcut,
+  [TOGGLE_MODEL_SELECTOR_COMMAND]: dispatchToggleModelSelectorShortcut,
+  [INCREASE_FONT_SIZE_COMMAND]: () => dispatchStepFontSizeShortcut(1),
+  [DECREASE_FONT_SIZE_COMMAND]: () => dispatchStepFontSizeShortcut(-1),
+  [RESET_FONT_SIZE_COMMAND]: dispatchResetFontSizeShortcut,
+}
+
+export function isBuiltinShortcutCommand(command: string): boolean {
+  return command in BUILTIN_SHORTCUT_HANDLERS
+}
+
+export function dispatchBuiltinShortcutCommand(command: string): boolean {
+  const handler = BUILTIN_SHORTCUT_HANDLERS[command]
+  if (!handler) return false
+  handler()
+  return true
+}
+
+export function shortcutsAvailable(): boolean {
+  return isElectronRuntime()
+}
+
+function normalizeKeyPart(value: string): string {
+  const lower = value.toLowerCase()
+  if (['cmd', 'command', 'meta', '⌘'].includes(lower)) return 'Command'
+  if (['ctrl', 'control', '⌃'].includes(lower)) return 'Control'
+  if (['alt', 'option', 'opt', '⌥'].includes(lower)) return 'Alt'
+  if (['shift', '⇧'].includes(lower)) return 'Shift'
+  if (lower === ' ') return 'Space'
+  if (lower === 'escape') return 'Esc'
+  if (lower === '+' || lower === '=' || lower === 'plus') return 'Plus'
+  if (lower === '-' || lower === '_' || lower === 'minus') return 'Minus'
+  if (value.length === 1) return value.toUpperCase()
+  return value
+}
+
+function keybindingKeyFromPhysicalCode(code: string): string {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3)
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5)
+
+  return (
+    {
+      Space: 'Space',
+      Equal: 'Plus',
+      Minus: 'Minus',
+      Backquote: '`',
+      BracketLeft: '[',
+      BracketRight: ']',
+      Backslash: '\\',
+      Semicolon: ';',
+      Quote: "'",
+      Comma: ',',
+      Period: '.',
+      Slash: '/',
+    }[code] ?? ''
+  )
+}

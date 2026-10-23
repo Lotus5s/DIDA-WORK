@@ -1,0 +1,165 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+'use client'
+
+import { useState, useEffect, type ReactNode } from 'react'
+import ShellList from './ShellList'
+import { GroupSelector } from './groups/GroupSelector'
+import { listGroups } from '@/apis/groups'
+import type { BaseRole } from '@/types/base-role'
+import type { Group } from '@/types/group'
+import type { ManagedResourceSourceFilter } from '@/features/resource-library/types'
+import type { ResourceLibrarySortMode } from '@/features/resource-library/resourceSorting'
+import type { ResourceCreateRequest } from '@/features/resource-library/components/ResourceCreateButton'
+
+interface ShellListWithScopeProps {
+  scope: 'personal' | 'group' | 'all'
+  selectedGroup?: string | null
+  onGroupChange?: (groupName: string | null) => void
+  sourceControls?: ReactNode
+  sortControls?: ReactNode
+  sourceFilter?: ManagedResourceSourceFilter
+  groups?: Group[]
+  groupFilter?: string[]
+  sortMode?: ResourceLibrarySortMode
+  createRequest?: ResourceCreateRequest
+  onCreateRequestClose?: () => void
+  creationOnly?: boolean
+  hideCreateActions?: boolean
+  compact?: boolean
+  searchQuery?: string
+}
+
+export function ShellListWithScope({
+  scope,
+  selectedGroup: externalSelectedGroup,
+  onGroupChange,
+  sourceControls,
+  sortControls,
+  sourceFilter,
+  groups: externalGroups,
+  groupFilter,
+  sortMode = 'default',
+  createRequest,
+  onCreateRequestClose,
+  creationOnly = false,
+  hideCreateActions = false,
+  compact = false,
+  searchQuery = '',
+}: ShellListWithScopeProps) {
+  // Use external state if provided, otherwise use internal state
+  const [internalSelectedGroup, setInternalSelectedGroup] = useState<string | null>(null)
+  const [groupRoleMap, setGroupRoleMap] = useState<Map<string, BaseRole>>(new Map())
+  const [internalGroups, setInternalGroups] = useState<Group[]>([])
+  const groups = externalGroups ?? internalGroups
+
+  const selectedGroup =
+    externalSelectedGroup !== undefined ? externalSelectedGroup : internalSelectedGroup
+  const setSelectedGroup = onGroupChange || setInternalSelectedGroup
+
+  // Sync internal state with external state
+  useEffect(() => {
+    if (externalSelectedGroup !== undefined && externalSelectedGroup !== internalSelectedGroup) {
+      setInternalSelectedGroup(externalSelectedGroup)
+    }
+  }, [externalSelectedGroup, internalSelectedGroup])
+
+  // Fetch all groups and build role map
+  useEffect(() => {
+    listGroups()
+      .then(response => {
+        const roleMap = new Map<string, BaseRole>()
+        response.items.forEach(group => {
+          if (group.my_role) {
+            roleMap.set(group.name, group.my_role)
+          }
+        })
+        setInternalGroups(response.items || [])
+        setGroupRoleMap(roleMap)
+      })
+      .catch(error => {
+        console.error('Failed to fetch groups:', error)
+      })
+  }, [])
+
+  // Handle editing a resource - auto-select its group
+  const handleEditResource = (namespace: string) => {
+    if (namespace && namespace !== 'default') {
+      setSelectedGroup(namespace)
+    }
+  }
+
+  if (scope === 'personal') {
+    return (
+      <ShellList
+        scope="personal"
+        sourceControls={sourceControls}
+        sortControls={sortControls}
+        sourceFilter={sourceFilter}
+        groups={groups}
+        groupFilter={groupFilter}
+        sortMode={sortMode}
+        createRequest={createRequest}
+        onCreateRequestClose={onCreateRequestClose}
+        creationOnly={creationOnly}
+        hideCreateActions={hideCreateActions}
+        compact={compact}
+        searchQuery={searchQuery}
+      />
+    )
+  }
+
+  if (scope === 'all') {
+    return (
+      <ShellList
+        scope="all"
+        groupRoleMap={groupRoleMap}
+        sourceControls={sourceControls}
+        sortControls={sortControls}
+        sourceFilter={sourceFilter}
+        groups={groups}
+        groupFilter={groupFilter}
+        sortMode={sortMode}
+        createRequest={createRequest}
+        onCreateRequestClose={onCreateRequestClose}
+        creationOnly={creationOnly}
+        hideCreateActions={hideCreateActions}
+        compact={compact}
+        searchQuery={searchQuery}
+      />
+    )
+  }
+
+  // When selectedGroup is provided externally (from nav), don't show GroupSelector
+  const showGroupSelector = externalSelectedGroup === undefined
+
+  return (
+    <div className="space-y-4">
+      {scope === 'group' && showGroupSelector && (
+        <div className="bg-surface border border-border rounded-lg p-4">
+          <GroupSelector value={selectedGroup} onChange={setSelectedGroup} scope={scope} />
+        </div>
+      )}
+      <ShellList
+        scope="group"
+        groupName={selectedGroup || undefined}
+        groupRoleMap={groupRoleMap}
+        onEditResource={handleEditResource}
+        sourceControls={sourceControls}
+        sortControls={sortControls}
+        sourceFilter={sourceFilter}
+        groups={groups}
+        groupFilter={groupFilter}
+        sortMode={sortMode}
+        createRequest={createRequest}
+        onCreateRequestClose={onCreateRequestClose}
+        creationOnly={creationOnly}
+        hideCreateActions={hideCreateActions}
+        compact={compact}
+        searchQuery={searchQuery}
+      />
+    </div>
+  )
+}

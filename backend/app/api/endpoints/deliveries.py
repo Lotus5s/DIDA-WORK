@@ -1,0 +1,1362 @@
+# SPDX-FileCopyrightText: 2026 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Authenticated project TODO and delivery endpoints."""
+
+import logging
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
+from fastapi.responses import Response
+from sqlalchemy.orm import Session
+
+from app.api.dependencies import get_db
+from app.core.config import settings
+from app.core.security import (
+    get_current_user,
+    get_current_user_jwt_apikey_tasktoken,
+)
+from app.models.delivery import (
+    Delivery,
+    LoopItem,
+    ProjectAutomationRule,
+    ProjectChatAgent,
+)
+from app.models.user import User
+from app.schemas.base_role import BaseRole
+from app.schemas.delivery import (
+    ArchivedLoopItemPageResponse,
+    ArchivedLoopItemResponse,
+    DeliveryAssetAccessResponse,
+    DeliveryAssetResponse,
+    DeliveryCreate,
+    DeliveryDetailResponse,
+    DeliveryFinalize,
+    DeliveryListResponse,
+    DeliveryResponse,
+    LoopItemAttachmentAccessResponse,
+    LoopItemAttachmentImport,
+    LoopItemAttachmentResponse,
+    LoopItemCollaboratorCreate,
+    LoopItemCollaboratorResponse,
+    LoopItemCommentCreate,
+    LoopItemCommentResponse,
+    LoopItemCreate,
+    LoopItemListResponse,
+    LoopItemPageResponse,
+    LoopItemRead,
+    LoopItemReorder,
+    LoopItemResponse,
+    LoopItemRestoreResponse,
+    LoopItemTaskBind,
+    LoopItemTaskBindingResponse,
+    LoopItemUpdate,
+    MyWorkItemResponse,
+    MyWorkListResponse,
+)
+from app.schemas.issue_assignment import (
+    IssueAssignmentCreate,
+    IssueAssignmentCreateResponse,
+    IssueAssignmentListResponse,
+    IssueAssignmentResponse,
+)
+from app.schemas.project_chat import LoopItemAssign
+from app.schemas.project_incoming_hook import (
+    ChangeRequestBindingInput,
+    ChangeRequestBindingView,
+)
+from app.services.cloud_projects import cloud_project_service
+from app.services.cloud_projects.access import (
+    IssueAction,
+    require_cloud_project_role,
+    require_issue_action,
+)
+from app.services.delivery import delivery_service
+from app.services.issue_assignments import issue_assignment_service
+from app.services.loop_item_events import publish_loop_item_changed
+from app.services.loop_item_status_history import (
+    project_status_transition,
+)
+from app.services.loop_items.external_provider import external_loop_item_provider
+from app.services.loop_items.provider_router import (
+    loop_item_attachment_provider_router,
+    loop_item_provider_router,
+)
+from app.services.loop_items.service import MY_WORK_ITEM_LIMIT, loop_item_service
+from app.services.project_automation_domain import ProjectAutomationEvent
+from app.services.project_automations import (
+    project_automation_processor,
+)
+from app.services.project_board_snapshot import project_board_snapshot_service
+from app.services.project_change_request_bindings import (
+    project_change_request_binding_service,
+)
+from app.services.project_incoming_hooks import project_incoming_hook_service
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _loop_item_response(
+    db: Session, item: object, current_user: User
+) -> LoopItemResponse:
+    return LoopItemResponse.model_validate(
+        loop_item_service.response_values(db, item, current_user.id)
+    )
+
+
+def _automation_selection_error(
+    *,
+    code: str,
+    message: str,
+    candidates: list[ProjectAutomationRule] | None = None,
+) -> HTTPException:
+    detail: dict[str, object] = {"code": code, "message": message}
+    if candidates is not None:
+        detail["candidates"] = [
+            {
+                "id": str(rule.id),
+                "name": rule.title,
+                "description": rule.description or "",
+            }
+            for rule in candidates
+        ]
+    return HTTPException(status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _selected_event_automation_id(
+    db: Session,
+    event: ProjectAutomationEvent,
+    *,
+    requested_id: str | None,
+    bound_rule_id: str = "",
+) -> str | None:
+    matching_rules = project_automation_processor.matching_rules(db, event)
+    if requested_id:
+        selected_rule = next(
+            (rule for rule in matching_rules if str(rule.id) == requested_id),
+            None,
+        )
+        if selected_rule is None or (bound_rule_id and bound_rule_id != requested_id):
+            raise _automation_selection_error(
+                code="automation_selection_stale",
+                message="The selected automation no longer matches this Issue",
+            )
+        return requested_id
+    if bound_rule_id:
+        return next(
+            (str(rule.id) for rule in matching_rules if str(rule.id) == bound_rule_id),
+            None,
+        )
+    if len(matching_rules) > 1:
+        raise _automation_selection_error(
+            code="automation_selection_required",
+            message="Multiple automations match this Issue",
+            candidates=matching_rules,
+        )
+    return str(matching_rules[0].id) if matching_rules else None
+
+
+def _delivery_response(db: Session, delivery: Delivery) -> DeliveryResponse:
+    return DeliveryResponse.model_validate(
+        {
+            "id": delivery.id,
+            "loop_item_id": delivery.loop_item_id,
+            "created_by_user_id": delivery.created_by_user_id,
+            "source_task_binding_id": delivery.source_task_binding_id,
+            "source_task_snapshot": delivery.source_task_snapshot,
+            "status": delivery.status,
+            "created_at": delivery.created_at,
+            "delivered_at": delivery.delivered_at,
+            "assets": delivery_service.list_assets(db, delivery.id),
+            "fulfillments": delivery_service.fulfillment_values(delivery),
+        }
+    )
+
+
+@router.get("/cloud-work-items/my-work", response_model=MyWorkListResponse)
+def list_my_work(
+    limit: int = Query(default=MY_WORK_ITEM_LIMIT, ge=1, le=MY_WORK_ITEM_LIMIT),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> MyWorkListResponse:
+    items = loop_item_service.list_my_work(db, current_user.id, limit=limit)
+    return MyWorkListResponse(
+        items=[MyWorkItemResponse.model_validate(item) for item in items]
+    )
+
+
+@router.get(
+    "/loop-items/{item_id}/collaborators",
+    response_model=list[LoopItemCollaboratorResponse],
+)
+def list_loop_item_collaborators(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[LoopItemCollaboratorResponse]:
+    collaborators = loop_item_service.list_collaborators(db, item_id, current_user.id)
+    return [
+        LoopItemCollaboratorResponse.model_validate(collaborator)
+        for collaborator in collaborators
+    ]
+
+
+@router.post(
+    "/loop-items/{item_id}/collaborators",
+    response_model=LoopItemCollaboratorResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def add_loop_item_collaborator(
+    item_id: str,
+    values: LoopItemCollaboratorCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LoopItemCollaboratorResponse:
+    collaborator = loop_item_service.add_collaborator(
+        db, item_id, values.user_id, current_user.id
+    )
+    return LoopItemCollaboratorResponse.model_validate(collaborator)
+
+
+@router.delete(
+    "/loop-items/{item_id}/collaborators/{collaborator_user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def remove_loop_item_collaborator(
+    item_id: str,
+    collaborator_user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    loop_item_service.remove_collaborator(
+        db, item_id, collaborator_user_id, current_user.id
+    )
+
+
+@router.get("/runtime-tasks/loop-item", response_model=LoopItemResponse)
+def find_runtime_task_loop_item(
+    device_id: str = Query(min_length=1),
+    task_id: str = Query(min_length=1),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LoopItemResponse:
+    item = loop_item_service.find_for_runtime_task(
+        db, current_user.id, device_id, task_id
+    )
+    return _loop_item_response(db, item, current_user)
+
+
+@router.post(
+    "/cloud-projects/{project_id}/tasks",
+    response_model=LoopItemTaskBindingResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def bind_cloud_project_task(
+    project_id: int,
+    values: LoopItemTaskBind,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LoopItemTaskBindingResponse:
+    binding = loop_item_service.bind_project_task(
+        db, project_id, values, current_user.id
+    )
+    return LoopItemTaskBindingResponse.model_validate(binding)
+
+
+@router.delete("/runtime-tasks/cloud-context", status_code=status.HTTP_204_NO_CONTENT)
+def unbind_runtime_task_cloud_context(
+    values: LoopItemTaskBind,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    loop_item_service.unbind_cloud_context(db, values, current_user.id)
+
+
+@router.get(
+    "/cloud-projects/{project_id}/loop-items",
+    response_model=LoopItemListResponse,
+)
+def list_loop_items(
+    project_id: int,
+    assignee_type: str | None = Query(default=None),
+    assignee_id: str | None = Query(default=None),
+    execution_state: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> LoopItemListResponse:
+    _, items = project_board_snapshot_service.list_item_views(
+        db,
+        project_id,
+        current_user.id,
+        assignee_type=assignee_type,
+        assignee_id=assignee_id,
+        execution_state=execution_state,
+    )
+    return LoopItemListResponse(items=items)
+
+
+@router.get(
+    "/cloud-projects/{project_id}/loop-item-pages",
+    response_model=LoopItemPageResponse,
+)
+def list_loop_item_page(
+    project_id: int,
+    item_status: str = Query(alias="status", max_length=32),
+    parent_id: str | None = Query(default=None, max_length=64),
+    cursor: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=10, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LoopItemPageResponse:
+    items, next_cursor = external_loop_item_provider.list_page(
+        db,
+        project_id,
+        current_user.id,
+        item_status=item_status,
+        parent_id=parent_id,
+        cursor=cursor,
+        limit=limit,
+    )
+    item_ids = [str(item["id"]) for item in items]
+    bindings = loop_item_service.list_project_task_bindings(
+        db,
+        project_id,
+        current_user.id,
+        item_ids=item_ids,
+    )
+    return LoopItemPageResponse(
+        items=[LoopItemResponse.model_validate(item) for item in items],
+        task_bindings=[
+            LoopItemTaskBindingResponse.model_validate(binding) for binding in bindings
+        ],
+        next_cursor=next_cursor,
+    )
+
+
+@router.post(
+    "/cloud-projects/{project_id}/loop-items",
+    response_model=LoopItemResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_loop_item(
+    project_id: int,
+    values: LoopItemCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> LoopItemResponse:
+    """Create a board task using a user JWT, personal API key, or task token."""
+
+    project = cloud_project_service.get(db, project_id, current_user.id)
+    event_payload = values.model_dump(
+        mode="json",
+        exclude={"automation_rule_id"},
+    )
+    event_payload["status"] = values.status or "inbox"
+    event = ProjectAutomationEvent(
+        event_type="task.created",
+        project_id=str(project.id),
+        subject_id="",
+        source=project.task_provider,
+        actor_user_id=current_user.id,
+        payload=event_payload,
+    )
+    project_metadata = (
+        project.metadata_json if isinstance(project.metadata_json, dict) else {}
+    )
+    project_workflow = project_metadata.get("workflow_definition")
+    explicit_workflow = values.workflow
+    has_explicit_human_assignee = values.assignee_user_id is not None
+    has_bound_workflow = (
+        explicit_workflow is not None
+        and (
+            explicit_workflow.stage_mode == "dag"
+            or explicit_workflow.advancement_policy == "ai"
+        )
+    ) or (
+        isinstance(project_workflow, dict)
+        and (
+            project_workflow.get("stage_mode") == "dag"
+            or project_workflow.get("advancement_policy") == "ai"
+        )
+    )
+    if has_explicit_human_assignee:
+        selected_automation_id = None
+    elif has_bound_workflow:
+        if values.automation_rule_id:
+            raise _automation_selection_error(
+                code="automation_selection_stale",
+                message="The selected automation no longer matches this Issue",
+            )
+        selected_automation_id = None
+    else:
+        selected_automation_id = _selected_event_automation_id(
+            db,
+            event,
+            requested_id=values.automation_rule_id,
+        )
+
+    created = loop_item_provider_router.create(db, project, current_user, values)
+    response = LoopItemResponse.model_validate(created.values)
+
+    try:
+        if not has_bound_workflow and selected_automation_id:
+            await project_incoming_hook_service.ingest_internal(
+                db,
+                ProjectAutomationEvent(
+                    event_type="task.created",
+                    project_id=str(project.id),
+                    subject_id=str(created.values["id"]),
+                    source=project.task_provider,
+                    actor_user_id=current_user.id,
+                    payload=response.model_dump(mode="json"),
+                ),
+                automation_id=selected_automation_id,
+            )
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Project automation processing failed after task creation "
+            "project=%s task=%s",
+            project.id,
+            created.values.get("id"),
+        )
+    if created.internal_item is not None:
+        db.refresh(created.internal_item)
+        if project.task_provider in {"github", "gitlab"}:
+            return LoopItemResponse.model_validate(
+                external_loop_item_provider.get(
+                    db,
+                    str(created.values["id"]),
+                    current_user.id,
+                )
+            )
+        return _loop_item_response(db, created.internal_item, current_user)
+    return response
+
+
+@router.post(
+    "/cloud-projects/{project_id}/loop-items/reorder",
+    response_model=LoopItemListResponse,
+)
+def reorder_loop_items(
+    project_id: int,
+    values: LoopItemReorder,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> LoopItemListResponse:
+    project = cloud_project_service.get(db, project_id, current_user.id)
+    if project.task_provider in {"github", "gitlab"}:
+        return LoopItemListResponse(
+            items=[
+                LoopItemResponse.model_validate(item)
+                for item in external_loop_item_provider.list(
+                    db, project_id, current_user.id
+                )
+            ]
+        )
+    items = loop_item_service.reorder(db, project_id, current_user.id, values)
+    return LoopItemListResponse(
+        items=[_loop_item_response(db, item, current_user) for item in items]
+    )
+
+
+@router.get("/loop-items/{item_id}", response_model=LoopItemResponse)
+def get_loop_item(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> LoopItemResponse:
+    if external_loop_item_provider.is_external_item(db, item_id):
+        return LoopItemResponse.model_validate(
+            external_loop_item_provider.get(db, item_id, current_user.id)
+        )
+    item = loop_item_service.get(db, item_id, current_user.id)
+    return _loop_item_response(db, item, current_user)
+
+
+@router.post("/loop-items/{item_id}/read", response_model=LoopItemResponse)
+def mark_loop_item_read(
+    item_id: str,
+    values: LoopItemRead | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LoopItemResponse:
+    if external_loop_item_provider.is_external_item(db, item_id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "External provider tasks do not support Wegent read state",
+        )
+    item = loop_item_service.mark_read(
+        db,
+        item_id,
+        current_user.id,
+        activity_sequence=values.activity_sequence if values else None,
+    )
+    return _loop_item_response(db, item, current_user)
+
+
+@router.patch("/loop-items/{item_id}", response_model=LoopItemResponse)
+async def update_loop_item(
+    item_id: str,
+    values: LoopItemUpdate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> LoopItemResponse:
+    if external_loop_item_provider.is_external_item(db, item_id):
+        response = external_loop_item_provider.update(
+            db, item_id, current_user.id, values
+        )
+        if values.assignee_agent_id or values.assignee_group_id:
+            from app.tasks.robot_queue_tasks import consume_queues_background
+
+            background_tasks.add_task(consume_queues_background)
+            response = external_loop_item_provider.get(db, item_id, current_user.id)
+        return LoopItemResponse.model_validate(response)
+    existing = loop_item_service.get(db, item_id, current_user.id)
+    previous_status = existing.status
+    previous_tags = set(existing.tags)
+    project = cloud_project_service.get(
+        db,
+        int(existing.cloud_project_id),
+        current_user.id,
+    )
+    selected_status_automation_id: str | None = None
+    selected_tag_automation_id: str | None = None
+    requested_status = (
+        values.status
+        if "status" in values.model_fields_set and values.status is not None
+        else previous_status
+    )
+    requested_transition = project_status_transition(
+        project,
+        previous_status=previous_status,
+        current_status=requested_status,
+    )
+    status_changed = requested_status != previous_status
+    entered_processing = status_changed and requested_transition.entered_processing
+    if entered_processing:
+        event_payload = _loop_item_response(
+            db,
+            existing,
+            current_user,
+        ).model_dump(mode="json")
+        event_payload["previous_status"] = previous_status
+        event_payload["status"] = requested_status
+        if "priority" in values.model_fields_set and values.priority is not None:
+            event_payload["priority"] = values.priority
+        if "tags" in values.model_fields_set and values.tags is not None:
+            event_payload["tags"] = values.tags
+        event = ProjectAutomationEvent(
+            event_type="task.status_changed",
+            project_id=str(existing.cloud_project_id),
+            subject_id=str(existing.id),
+            source="board",
+            actor_user_id=current_user.id,
+            payload=event_payload,
+        )
+        selected_status_automation_id = _selected_event_automation_id(
+            db,
+            event,
+            requested_id=values.automation_rule_id,
+            bound_rule_id="",
+        )
+    requested_tags = (
+        set(values.tags)
+        if "tags" in values.model_fields_set and values.tags is not None
+        else previous_tags
+    )
+    requested_added_tags = requested_tags - previous_tags
+    if requested_added_tags:
+        event_payload = _loop_item_response(
+            db,
+            existing,
+            current_user,
+        ).model_dump(mode="json")
+        event_payload["tags"] = sorted(requested_tags)
+        event_payload["added_tags"] = sorted(requested_added_tags)
+        selected_tag_automation_id = _selected_event_automation_id(
+            db,
+            ProjectAutomationEvent(
+                event_type="task.tag_added",
+                project_id=str(existing.cloud_project_id),
+                subject_id=str(existing.id),
+                source="board",
+                actor_user_id=current_user.id,
+                payload=event_payload,
+            ),
+            requested_id=values.automation_rule_id,
+            bound_rule_id="",
+        )
+
+    item = loop_item_service.update(db, item_id, current_user.id, values)
+    queue_wakeup_scheduled = False
+    if (item.assignee_agent_id and "assignee_agent_id" in values.model_fields_set) or (
+        "assignee_group_id" in values.model_fields_set
+        and values.assignee_group_id is not None
+    ):
+        from app.tasks.robot_queue_tasks import consume_queues_background
+
+        background_tasks.add_task(consume_queues_background)
+        queue_wakeup_scheduled = True
+    elif item.assignee_agent_id and (
+        "execution_config" in values.model_fields_set or entered_processing
+    ):
+        item = loop_item_service.refresh_agent_execution_configuration(
+            db,
+            item=item,
+            user_id=current_user.id,
+        )
+        from app.tasks.robot_queue_tasks import consume_queues_background
+
+        background_tasks.add_task(consume_queues_background)
+        queue_wakeup_scheduled = True
+    if status_changed and not queue_wakeup_scheduled:
+        from app.tasks.robot_queue_tasks import consume_queues_background
+
+        background_tasks.add_task(consume_queues_background)
+    if status_changed:
+        try:
+            await project_incoming_hook_service.ingest_internal(
+                db,
+                ProjectAutomationEvent(
+                    event_type="task.status_changed",
+                    project_id=str(item.cloud_project_id),
+                    subject_id=str(item.id),
+                    source="board",
+                    actor_user_id=current_user.id,
+                    payload={
+                        **_loop_item_response(db, item, current_user).model_dump(
+                            mode="json"
+                        ),
+                        "previous_status": previous_status,
+                    },
+                ),
+                automation_id=selected_status_automation_id,
+            )
+            db.refresh(item)
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Project automation processing failed after task status change "
+                "project=%s task=%s previous_status=%s status=%s",
+                item.cloud_project_id,
+                item.id,
+                previous_status,
+                item.status,
+            )
+    added_tags = set(item.tags) - previous_tags
+    if added_tags:
+        try:
+            await project_incoming_hook_service.ingest_internal(
+                db,
+                ProjectAutomationEvent(
+                    event_type="task.tag_added",
+                    project_id=str(item.cloud_project_id),
+                    subject_id=str(item.id),
+                    source="board",
+                    actor_user_id=current_user.id,
+                    payload={
+                        **_loop_item_response(db, item, current_user).model_dump(
+                            mode="json"
+                        ),
+                        "added_tags": sorted(added_tags),
+                    },
+                ),
+                automation_id=selected_tag_automation_id,
+            )
+            db.refresh(item)
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Project automatic processing failed after tags were added "
+                "project=%s task=%s tags=%s",
+                item.cloud_project_id,
+                item.id,
+                sorted(added_tags),
+            )
+    publish_loop_item_changed(
+        db,
+        item=item,
+        reason="user_update",
+        actor_user_id=current_user.id,
+    )
+    return _loop_item_response(db, item, current_user)
+
+
+@router.delete("/loop-items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def archive_loop_item(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    if external_loop_item_provider.is_external_item(db, item_id):
+        external_loop_item_provider.archive(db, item_id, current_user.id)
+        return
+    loop_item_service.delete(db, item_id, current_user.id)
+
+
+@router.get(
+    "/cloud-projects/{project_id}/archived-loop-items",
+    response_model=ArchivedLoopItemPageResponse,
+)
+def list_archived_loop_items(
+    project_id: int,
+    cursor: str | None = Query(default=None, max_length=32),
+    limit: int = Query(default=50, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ArchivedLoopItemPageResponse:
+    try:
+        offset = int(cursor or "0")
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Invalid archive cursor",
+        ) from exc
+    if offset < 0:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Invalid archive cursor",
+        )
+    project = cloud_project_service.get(db, project_id, current_user.id)
+    if project.task_provider in {"github", "gitlab"}:
+        external_items, next_cursor = external_loop_item_provider.list_archived(
+            db,
+            project_id,
+            current_user.id,
+            offset=offset,
+            limit=limit,
+        )
+        return ArchivedLoopItemPageResponse(
+            items=[
+                ArchivedLoopItemResponse.model_validate(item) for item in external_items
+            ],
+            next_cursor=next_cursor,
+        )
+    items, next_cursor = loop_item_service.list_deleted(
+        db, project_id, current_user.id, offset=offset, limit=limit
+    )
+    return ArchivedLoopItemPageResponse(
+        items=[
+            ArchivedLoopItemResponse.model_validate(
+                {
+                    **loop_item_service.response_values(db, item, current_user.id),
+                    "archived_at": item.deleted_at,
+                }
+            )
+            for item in items
+        ],
+        next_cursor=next_cursor,
+    )
+
+
+@router.post(
+    "/loop-items/{item_id}/restore",
+    response_model=LoopItemRestoreResponse,
+)
+def restore_loop_item(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LoopItemRestoreResponse:
+    if external_loop_item_provider.is_external_item(db, item_id):
+        return LoopItemRestoreResponse(
+            items=[
+                LoopItemResponse.model_validate(item)
+                for item in external_loop_item_provider.restore(
+                    db, item_id, current_user.id
+                )
+            ]
+        )
+    items = loop_item_service.restore(db, item_id, current_user.id)
+    return LoopItemRestoreResponse(
+        items=[_loop_item_response(db, item, current_user) for item in items]
+    )
+
+
+@router.post(
+    "/loop-items/{item_id}/comments",
+    response_model=LoopItemCommentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def add_loop_item_comment(
+    item_id: str,
+    values: LoopItemCommentCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> LoopItemCommentResponse:
+    if not external_loop_item_provider.is_external_item(db, item_id):
+        return LoopItemCommentResponse.model_validate(
+            loop_item_service.add_comment(db, item_id, current_user.id, values.body)
+        )
+    return LoopItemCommentResponse.model_validate(
+        external_loop_item_provider.add_comment(
+            db, item_id, current_user.id, values.body
+        )
+    )
+
+
+@router.get(
+    "/loop-items/{item_id}/comments",
+    response_model=list[LoopItemCommentResponse],
+)
+def list_loop_item_comments(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> list[LoopItemCommentResponse]:
+    if external_loop_item_provider.is_external_item(db, item_id):
+        return [
+            LoopItemCommentResponse.model_validate(comment)
+            for comment in external_loop_item_provider.list_comments(
+                db, item_id, current_user.id
+            )
+        ]
+    return [
+        LoopItemCommentResponse.model_validate(comment)
+        for comment in loop_item_service.list_comments(db, item_id, current_user.id)
+    ]
+
+
+@router.get(
+    "/loop-items/{item_id}/assignments",
+    response_model=IssueAssignmentListResponse,
+)
+def list_issue_assignments(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> IssueAssignmentListResponse:
+    if external_loop_item_provider.is_external_item(db, item_id):
+        external_loop_item_provider.ensure_shadow(db, item_id, current_user.id)
+    project, _ = issue_assignment_service.project_for_issue(
+        db,
+        issue_id=item_id,
+        user_id=current_user.id,
+    )
+    rows = issue_assignment_service.list(
+        db,
+        project_id=int(project.id),
+        issue_id=item_id,
+        user_id=current_user.id,
+    )
+    return IssueAssignmentListResponse(
+        items=[
+            IssueAssignmentResponse.model_validate(
+                issue_assignment_service.response_values(db, row)
+            )
+            for row in rows
+        ]
+    )
+
+
+@router.post(
+    "/loop-items/{item_id}/assignments",
+    response_model=IssueAssignmentCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_issue_assignment(
+    item_id: str,
+    values: IssueAssignmentCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> IssueAssignmentCreateResponse:
+    is_external = external_loop_item_provider.is_external_item(db, item_id)
+    if is_external:
+        external_loop_item_provider.ensure_shadow(db, item_id, current_user.id)
+    project, item = issue_assignment_service.project_for_issue(
+        db,
+        issue_id=item_id,
+        user_id=current_user.id,
+    )
+    access = require_cloud_project_role(
+        db,
+        int(project.id),
+        current_user.id,
+        BaseRole.Viewer,
+    )
+    require_issue_action(
+        access,
+        action=IssueAction.ASSIGN,
+        issue_creator_user_id=item.created_by_user_id,
+        user_id=current_user.id,
+    )
+    legacy_type, legacy_id = issue_assignment_service.require_canonical_member(
+        db,
+        project=project,
+        member_type=values.target_type,
+        member_id=values.target_id,
+    )
+    existing = issue_assignment_service.active(
+        db,
+        issue_id=item_id,
+        member_type=values.target_type,
+        member_id=values.target_id,
+        workflow_step=values.workflow_step,
+    )
+    if existing is not None and existing.metadata.get("trigger") != "default":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Assignment is already active for this workflow step",
+        )
+
+    if is_external:
+        comment_values = None
+        if values.comment_body:
+            comment_values = external_loop_item_provider.add_comment(
+                db, item_id, current_user.id, values.comment_body
+            )
+        current_issue = external_loop_item_provider.get(db, item_id, current_user.id)
+        external_loop_item_provider.assign(
+            db,
+            item_id,
+            current_user.id,
+            LoopItemAssign(
+                version=int(current_issue["version"]),
+                assignee_type=legacy_type,
+                assignee_id=legacy_id,
+                workflow_step=values.workflow_step,
+                notify_assignee=values.notify_target,
+                trigger=values.trigger,
+                runner_selection=values.runner_selection,
+            ),
+        )
+        issue_values = external_loop_item_provider.get(db, item_id, current_user.id)
+        assignment = issue_assignment_service.active(
+            db,
+            issue_id=item_id,
+            member_type=values.target_type,
+            member_id=values.target_id,
+            workflow_step=values.workflow_step,
+        )
+        if assignment is None:
+            raise RuntimeError("Assignment was not persisted")
+    else:
+        try:
+            comment_values = (
+                loop_item_service.add_comment(
+                    db,
+                    item_id,
+                    current_user.id,
+                    values.comment_body,
+                    commit=False,
+                )
+                if values.comment_body
+                else None
+            )
+            item = loop_item_service.assign(
+                db,
+                project_id=int(project.id),
+                item_id=item_id,
+                user_id=current_user.id,
+                values=LoopItemAssign(
+                    version=item.version,
+                    assignee_type=legacy_type,
+                    assignee_id=legacy_id,
+                    workflow_step=values.workflow_step,
+                    notify_assignee=values.notify_target,
+                    trigger=values.trigger,
+                    runner_selection=values.runner_selection,
+                ),
+                assignment_comment_id=(
+                    str(comment_values["id"]) if comment_values is not None else None
+                ),
+                commit=False,
+            )
+            assignment = issue_assignment_service.active(
+                db,
+                issue_id=item_id,
+                member_type=values.target_type,
+                member_id=values.target_id,
+                workflow_step=values.workflow_step,
+            )
+            if assignment is None:
+                raise RuntimeError("Assignment was not persisted")
+            db.commit()
+            db.refresh(item)
+        except Exception:
+            db.rollback()
+            raise
+        issue_values = loop_item_service.response_values(db, item, current_user.id)
+        publish_loop_item_changed(
+            db,
+            item=item,
+            reason="assignment",
+            actor_user_id=current_user.id,
+        )
+        if values.target_type == "agent":
+            agent = db.get(ProjectChatAgent, values.target_id)
+            if agent is not None and agent.created_by_user_id:
+                from app.services.loop_item_executions.wake import wake_robot_creator
+
+                wake_robot_creator(
+                    user_id=agent.created_by_user_id,
+                    project_id=str(project.id),
+                    agent_id=agent.id,
+                )
+
+    if values.target_type == "agent":
+        from app.tasks.robot_queue_tasks import consume_queues_background
+
+        background_tasks.add_task(consume_queues_background)
+        if is_external:
+            issue_values = external_loop_item_provider.get(db, item_id, current_user.id)
+        else:
+            indexed_item = db.get(LoopItem, item_id)
+            if indexed_item is None:
+                raise RuntimeError("Agent assignment index is unavailable")
+            issue_values = loop_item_service.response_values(
+                db, indexed_item, current_user.id
+            )
+
+    return IssueAssignmentCreateResponse(
+        assignment=IssueAssignmentResponse.model_validate(
+            issue_assignment_service.response_values(db, assignment)
+        ),
+        comment=(
+            LoopItemCommentResponse.model_validate(comment_values)
+            if comment_values is not None
+            else None
+        ),
+        issue=LoopItemResponse.model_validate(issue_values),
+    )
+
+
+@router.delete(
+    "/loop-items/{item_id}/assignments/{assignment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def remove_issue_assignment(
+    item_id: str,
+    assignment_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> None:
+    if external_loop_item_provider.is_external_item(db, item_id):
+        external_loop_item_provider.ensure_shadow(db, item_id, current_user.id)
+    project, item = issue_assignment_service.project_for_issue(
+        db,
+        issue_id=item_id,
+        user_id=current_user.id,
+    )
+    issue_assignment_service.remove(
+        db,
+        project_id=int(project.id),
+        issue_id=item_id,
+        assignment_id=assignment_id,
+        user_id=current_user.id,
+    )
+    issue_assignment_service.project_legacy_assignment(db, item=item)
+    db.commit()
+    publish_loop_item_changed(
+        db, item=item, reason="assignment_removed", actor_user_id=current_user.id
+    )
+
+
+@router.get(
+    "/loop-items/{item_id}/attachments",
+    response_model=list[LoopItemAttachmentResponse],
+)
+def list_loop_item_attachments(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> list[LoopItemAttachmentResponse]:
+    attachments = loop_item_attachment_provider_router.list(
+        db, item_id, current_user.id
+    )
+    return [LoopItemAttachmentResponse.model_validate(item) for item in attachments]
+
+
+@router.post(
+    "/loop-items/{item_id}/attachments",
+    response_model=LoopItemAttachmentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def add_loop_item_attachment(
+    item_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> LoopItemAttachmentResponse:
+    attachment = loop_item_attachment_provider_router.add(
+        db,
+        item_id,
+        current_user.id,
+        file.filename or "attachment",
+        file.content_type or "application/octet-stream",
+        file.file,
+        settings.DELIVERY_MAX_ASSET_SIZE_MB * 1024 * 1024,
+    )
+    return LoopItemAttachmentResponse.model_validate(attachment)
+
+
+@router.post(
+    "/loop-items/{item_id}/attachments/import-contexts",
+    response_model=list[LoopItemAttachmentResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+def import_loop_item_attachments(
+    item_id: str,
+    values: LoopItemAttachmentImport,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> list[LoopItemAttachmentResponse]:
+    """Copy uploaded conversation contexts into the task attachment store."""
+
+    attachments = loop_item_service.import_context_attachments(
+        db, item_id, current_user.id, values.context_ids
+    )
+    return [
+        LoopItemAttachmentResponse.model_validate(attachment)
+        for attachment in attachments
+    ]
+
+
+@router.get(
+    "/loop-item-attachments/{attachment_id}/access",
+    response_model=LoopItemAttachmentAccessResponse,
+)
+def access_loop_item_attachment(
+    attachment_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LoopItemAttachmentAccessResponse:
+    loop_item_attachment_provider_router.require_access(
+        db, attachment_id, current_user.id
+    )
+    return LoopItemAttachmentAccessResponse(
+        url=f"wegent://attachments/{attachment_id}",
+        expires_in_seconds=0,
+    )
+
+
+@router.get("/loop-item-attachments/{attachment_id}/content")
+def read_loop_item_attachment(
+    attachment_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> Response:
+    content, content_type, filename = loop_item_attachment_provider_router.content(
+        db, attachment_id, current_user.id
+    )
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
+@router.delete(
+    "/loop-item-attachments/{attachment_id}", status_code=status.HTTP_204_NO_CONTENT
+)
+def delete_loop_item_attachment(
+    attachment_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> None:
+    loop_item_attachment_provider_router.delete(db, attachment_id, current_user.id)
+
+
+@router.get(
+    "/loop-items/{item_id}/tasks",
+    response_model=list[LoopItemTaskBindingResponse],
+)
+def list_loop_item_tasks(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> list[LoopItemTaskBindingResponse]:
+    external_loop_item_provider.ensure_shadow(db, item_id, current_user.id)
+    bindings = loop_item_service.list_task_bindings(db, item_id, current_user.id)
+    return [LoopItemTaskBindingResponse.model_validate(binding) for binding in bindings]
+
+
+@router.delete(
+    "/loop-items/{item_id}/tasks",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def unbind_loop_item_task(
+    item_id: str,
+    values: LoopItemTaskBind,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> None:
+    external_loop_item_provider.ensure_shadow(db, item_id, current_user.id)
+    loop_item_service.unbind_task(db, item_id, values, current_user.id)
+
+
+@router.post(
+    "/loop-items/{item_id}/tasks",
+    response_model=LoopItemTaskBindingResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def bind_loop_item_task(
+    item_id: str,
+    values: LoopItemTaskBind,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> LoopItemTaskBindingResponse:
+    external_loop_item_provider.ensure_shadow(db, item_id, current_user.id)
+    binding = loop_item_service.bind_task(db, item_id, values, current_user.id)
+    return LoopItemTaskBindingResponse.model_validate(binding)
+
+
+@router.post(
+    "/loop-items/{item_id}/tasks/{binding_id}/change-requests",
+    response_model=ChangeRequestBindingView,
+)
+def bind_change_request(
+    item_id: str,
+    binding_id: int,
+    values: ChangeRequestBindingInput,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ChangeRequestBindingView:
+    bindings = loop_item_service.list_task_bindings(db, item_id, current_user.id)
+    binding = next((item for item in bindings if int(item.id) == binding_id), None)
+    if binding is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Task binding not found")
+    stored = project_change_request_binding_service.upsert(
+        db,
+        binding=binding,
+        values=values,
+    )
+    return ChangeRequestBindingView.model_validate(stored)
+
+
+@router.post(
+    "/loop-items/{item_id}/deliveries",
+    response_model=DeliveryResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_delivery(
+    item_id: str,
+    values: DeliveryCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> DeliveryResponse:
+    external_loop_item_provider.ensure_shadow(db, item_id, current_user.id)
+    delivery = delivery_service.create_delivery(db, item_id, current_user.id, values)
+    return _delivery_response(db, delivery)
+
+
+@router.post(
+    "/deliveries/{delivery_id}/assets",
+    response_model=DeliveryAssetResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def add_delivery_asset(
+    delivery_id: str,
+    file: UploadFile = File(...),
+    relative_path: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> DeliveryAssetResponse:
+    asset = delivery_service.add_asset(
+        db,
+        delivery_id,
+        current_user.id,
+        relative_path,
+        file.filename or relative_path,
+        file.content_type or "application/octet-stream",
+        file.file,
+    )
+    return DeliveryAssetResponse.model_validate(asset)
+
+
+@router.get(
+    "/delivery-assets/{asset_id}/access",
+    response_model=DeliveryAssetAccessResponse,
+)
+def access_delivery_asset(
+    asset_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> DeliveryAssetAccessResponse:
+    return DeliveryAssetAccessResponse(
+        url=delivery_service.access_asset_url(db, asset_id, current_user.id)
+    )
+
+
+@router.get("/delivery-assets/{asset_id}/content")
+def read_delivery_asset(
+    asset_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Response:
+    content, content_type, filename = delivery_service.read_asset_content(
+        db, asset_id, current_user.id
+    )
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
+@router.delete("/deliveries/{delivery_id}", status_code=status.HTTP_204_NO_CONTENT)
+def discard_delivery_draft(
+    delivery_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> None:
+    delivery_service.discard_draft(db, delivery_id, current_user.id)
+
+
+@router.post("/deliveries/{delivery_id}/finalize", response_model=DeliveryResponse)
+async def finalize_delivery(
+    delivery_id: str,
+    values: DeliveryFinalize | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> DeliveryResponse:
+    draft = delivery_service.get_delivery(db, delivery_id, current_user.id)
+    item = loop_item_service.get(db, draft.loop_item_id, current_user.id)
+    delivery = delivery_service.finalize(
+        db,
+        delivery_id,
+        current_user.id,
+        values or DeliveryFinalize(),
+    )
+    return _delivery_response(db, delivery)
+
+
+@router.get("/loop-items/{item_id}/deliveries", response_model=DeliveryListResponse)
+def list_deliveries(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> DeliveryListResponse:
+    deliveries = delivery_service.list_deliveries(db, item_id, current_user.id)
+    return DeliveryListResponse(
+        items=[_delivery_response(db, item) for item in deliveries]
+    )
+
+
+@router.get("/deliveries/{delivery_id}", response_model=DeliveryDetailResponse)
+def get_delivery(
+    delivery_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_jwt_apikey_tasktoken),
+) -> DeliveryDetailResponse:
+    delivery = delivery_service.get_delivery(db, delivery_id, current_user.id)
+    response = _delivery_response(db, delivery)
+    return DeliveryDetailResponse(
+        **response.model_dump(),
+        markdown=delivery_service.read_markdown(delivery),
+        chat=delivery_service.read_chat(delivery),
+    )

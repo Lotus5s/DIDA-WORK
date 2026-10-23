@@ -1,0 +1,235 @@
+{
+  "access_denied_title": "无访问权限",
+  "access_denied_description": "您没有权限访问此任务。该任务可能已被删除或您没有必要的权限。",
+  "access_denied_go_home": "返回首页",
+  "attachment": {
+    "characters": "字符"
+  },
+  "remote_workspace": {
+    "button": "查看任务文件",
+    "unavailable": "远程会话不可用",
+    "reason_loading": "正在检查远程工作区状态...",
+    "reason_status_check_failed": "远程工作区状态检查失败",
+    "reason_not_connected": "远程会话尚未连接",
+    "reason_sandbox_not_running": "远程沙箱未运行",
+    "reason_booting": "远程工作区正在启动",
+    "reason_warming": "远程工作区正在预热",
+    "reason_starting": "远程工作区正在启动中",
+    "chat_shell_disabled": "普通聊天模式不支持文件管理",
+    "title": "远程工作区",
+    "root": "工作区",
+    "parent": "上级目录",
+    "parent_entry": "返回上级目录",
+    "parent_entry_hint": "回到上一层文件夹",
+    "search_placeholder": "搜索当前文件列表",
+    "sort": {
+      "label": "排序",
+      "options": {
+        "name_asc": "名称（A-Z）",
+        "name_desc": "名称（Z-A）",
+        "size_desc": "大小（从大到小）",
+        "modified_desc": "最近修改"
+      }
+    },
+    "actions": {
+      "cancel": "取消",
+      "close": "关闭",
+      "download": "下载",
+      "exit_fullscreen": "退出全屏",
+      "fullscreen": "全屏预览",
+      "go": "前往",
+      "preview": "预览",
+      "refresh": "刷新"
+    },
+    "download_confirm": {
+      "title": "确认下载所选文件？",
+      "description": "将下载 {{count}} 个已选文件，浏览器可能会显示多个下载提示。"
+    },
+    "columns": {
+      "select_all": "全选文件",
+      "name": "名称",
+      "size": "大小",
+      "modified": "修改时间",
+      "type": "类型"
+    },
+    "status": {
+      "path": "路径",
+      "selected": "已选中",
+      "items": "项",
+      "has_files": "有文件"
+    },
+    "path": {
+      "edit": "编辑路径",
+      "invalid": "路径超出工作区范围"
+    },
+    "types": {
+      "folder": "目录",
+      "file": "文件",
+      "text": "文本",
+      "image": "图片",
+      "pdf": "PDF"
+    },
+    "detail": {
+      "title": "详情",
+      "no_file_selected": "请选择一个文件查看详情",
+      "multiple_selected": "已选中多个项目",
+      "metadata": "元数据",
+      "metadata_path": "路径",
+      "metadata_size": "大小",
+      "metadata_modified": "修改时间",
+      "metadata_type": "类型"
+    },
+    "mobile": {
+      "tabs": {
+        "files": "文件",
+        "preview": "预览"
+      }
+    },
+    "tree": {
+      "title": "目录树",
+      "expand": "展开",
+      "collapse": "收起",
+      "open_directory": "打开目录",
+      "loading": "加载中...",
+      "loading_children": "正在加载子目录...",
+      "empty": "未找到文件",
+      "load_failed": "工作区目录加载失败",
+      "load_children_failed": "子目录加载失败",
+      "retry": "重试"
+    },
+    "preview": {
+      "title": "预览",
+      "hint": "双击文件名可打开预览",
+      "empty": "请选择要预览的文件",
+      "loading": "正在加载预览...",
+      "load_failed": "预览加载失败",
+      "unsupported": "当前文件类型暂不支持预览，请下载后查看。"
+    }
+  },
+  "workbench": {
+    "overview": "概览",
+    "files_changed": "文件变更",
+    "close_panel": "关闭面板",
+    "open_main_menu": "打开主菜单",
+    "waiting_result": "等待任务执行结果...",
+    "loading_states": ["正在加载任务数据...", "正在获取代码变更...", "正在分析执行结果..."],
+    "tips": [
+      "💡 任务完成后会自动生成摘要和变更列表",
+      "⚡ 可以点击提交记录查看每次变更的详情",
+      "🔍 切换到「文件变更」标签可以查看完整的代码差异",
+      "📋 点击提交 ID 可以快速复制到剪贴板",
+      "🎯 工作台会实时显示任务的执行进度和状态",
+      "✨ 展开「原始提示词」可以回顾任务的初始需求"
+    ],
+    "status": {
+      "completed": "已完成",
+      "failed": "失败",
+      "pending_confirmation": "等待确认",
+      "running": "运行中"
+    },
+    "summary": "摘要",
+    "commits": "次提交",
+    "last_updated": "最后更新",
+    "copy_commit_id": "复制完整提交ID",
+    "files": "个文件",
+    "original_prompt": "原始提示词",
+    "no_file_changes": "未检测到文件变更",
+    "no_changes_found": "未找到变更",
+    "file_status": {
+      "new": "新建",
+      "deleted": "已删除",
+      "renamed": "已重命名",
+      "modified": "已修改",
+      "added": "已添加",
+      "removed": "已移除"
+    },
+    "loading_diff": "正在加载代码差异...",
+    "diff_load_failed": "加载差异数据失败",
+    "view_error_details": "查看错误详情",
+    "error_details": "错误详情",
+    "retry": "重试",
+    "diff_error": {
+      "title": "无法加载代码差异",
+      "branch_not_found": "未找到该分支，可能已被删除或重命名。",
+      "access_denied": "访问被拒绝，请检查您的仓库权限。",
+      "server_error": "Git 服务器暂时不可用，请稍后重试。",
+      "network_error": "网络错误，请检查网络连接后重试。",
+      "unknown_error": "加载差异时发生意外错误。",
+      "hint_file_list": "您仍然可以查看下方的文件变更列表。"
+    },
+    "additions": "添加",
+    "deletions": "删除",
+    "expand_all": "全部展开",
+    "collapse_all": "全部收起",
+    "changes": "变更",
+    "loading_diff_message": "加载中...",
+    "no_changes_between_branches": "分支之间未发现变更",
+    "execution_timeline": "执行时间线",
+    "no_repository": "该任务未关联代码仓库"
+  },
+  "thinking": {
+    "execution_completed": "执行完成",
+    "execution_failed": "执行失败",
+    "execution_cancelled": "执行已取消",
+    "tool_actions": {
+      "Read": "读取文件",
+      "Edit": "编辑文件",
+      "Write": "写入文件",
+      "Bash": "执行命令",
+      "Grep": "搜索代码",
+      "Glob": "查找文件",
+      "Task": "执行任务",
+      "WebFetch": "获取网页",
+      "WebSearch": "搜索网络"
+    }
+  },
+  "urlPreview": {
+    "loading": "正在加载链接预览...",
+    "loadFailed": "无法加载链接预览",
+    "openInNewTab": "在新标签页打开",
+    "imageLoadFailed": "图片加载失败",
+    "zoomIn": "放大",
+    "zoomOut": "缩小",
+    "rotate": "旋转",
+    "download": "下载",
+    "close": "关闭"
+  },
+  "streaming_wait": {
+    "thinking": "正在思考",
+    "analyzing": "正在深入分析",
+    "generating_response": "请稍候，正在生成回复",
+    "longer_than_usual": "响应时间较长，请耐心等待"
+  },
+  "preserve_executor": {
+    "preserve": "保留环境",
+    "preserved": "已保留",
+    "enabled_title": "已保留执行环境",
+    "enabled_desc": "此任务的执行环境将在任务完成后保留，不会被清理。",
+    "disabled_title": "已启用环境清理",
+    "disabled_desc": "此任务的执行环境将按正常规则清理。",
+    "error_title": "更新失败",
+    "error_desc": "无法更新执行环境保留设置。",
+    "tooltip_preserved": "执行环境已保留，不会被清理",
+    "tooltip_not_preserved": "点击保留执行环境，防止被清理"
+  },
+  "preview": {
+    "title": "订阅任务预览",
+    "task_name": "任务名称",
+    "trigger": "触发方式",
+    "prompt": "执行提示",
+    "preserve_history": "保留历史",
+    "retry": "重试次数",
+    "timeout": "超时时间",
+    "cancel": "取消",
+    "confirm": "确认创建",
+    "create_success": "订阅任务创建成功",
+    "create_error": "创建订阅任务失败",
+    "cancelled": "已取消创建",
+    "confirmed_title": "创建成功",
+    "confirmed_desc": "订阅任务已成功创建，将按照设定的时间自动执行。",
+    "cancelled_title": "已取消",
+    "cancelled_desc": "订阅任务创建已取消。",
+    "expired_title": "预览已过期",
+    "expired_desc": "该预览已过期，请重新生成预览。"
+  }
+}

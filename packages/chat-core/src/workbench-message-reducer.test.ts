@@ -1,0 +1,1310 @@
+import { describe, expect, test } from 'vitest'
+import {
+  limitWorkbenchProcessingBlock,
+  nestWorkbenchProcessingBlocks,
+  normalizeWorkbenchBlockStatus,
+  projectWorkbenchSubagentActivity,
+  reduceWorkbenchMessages,
+  type WorkbenchMessage
+} from './index'
+
+test('bounds subagent text fields and nested processing blocks', () => {
+  const block = limitWorkbenchProcessingBlock({
+    id: 'subagent-1',
+    subtaskId: 'turn-1',
+    type: 'subagent',
+    title: `${'t'.repeat(120_000)}title-tail`,
+    description: `${'d'.repeat(120_000)}description-tail`,
+    output: `${'o'.repeat(120_000)}output-tail`,
+    summary: `${'s'.repeat(120_000)}summary-tail`,
+    children: Array.from({ length: 300 }, (_, index) => ({
+      id: `child-${index}`,
+      subtaskId: 'turn-1',
+      type: 'text' as const,
+      content: `child ${index}`,
+      status: 'done' as const,
+      createdAt: index
+    })),
+    status: 'streaming',
+    createdAt: 1
+  })
+
+  expect(block.type).toBe('subagent')
+  if (block.type !== 'subagent') return
+  expect(block.title).toHaveLength(120_000)
+  expect(block.title?.endsWith('title-tail')).toBe(true)
+  expect(block.description).toHaveLength(120_000)
+  expect(block.description?.endsWith('description-tail')).toBe(true)
+  expect(block.output).toHaveLength(120_000)
+  expect(block.output?.endsWith('output-tail')).toBe(true)
+  expect(block.summary).toHaveLength(120_000)
+  expect(block.summary?.endsWith('summary-tail')).toBe(true)
+  expect(block.children).toHaveLength(256)
+  expect(block.children?.[0]?.id).toBe('child-44')
+  expect(block.contentTruncated).toBe(true)
+})
+
+test('nests streamed child blocks under their subagent', () => {
+  const nested = nestWorkbenchProcessingBlocks([
+    {
+      id: 'subagent-thread-1',
+      subtaskId: 'turn-1',
+      type: 'subagent',
+      agentThreadId: 'thread-1',
+      status: 'streaming',
+      createdAt: 1
+    },
+    {
+      id: 'child-text',
+      subtaskId: 'turn-1',
+      parentToolUseId: 'subagent-thread-1',
+      type: 'text',
+      content: 'Streaming child output',
+      status: 'streaming',
+      createdAt: 2
+    }
+  ])
+
+  expect(nested).toHaveLength(1)
+  expect(nested[0]).toMatchObject({
+    type: 'subagent',
+    children: [
+      {
+        id: 'child-text',
+        content: 'Streaming child output'
+      }
+    ]
+  })
+})
+
+test('projects persisted spawn and wait tools into a completed subagent activity', () => {
+  const projected = projectWorkbenchSubagentActivity([
+    {
+      id: 'spawn-1',
+      subtaskId: 'turn-1',
+      type: 'tool',
+      toolName: 'multi_agent_v1.spawn_agent',
+      toolInput: {
+        message: 'Say hello',
+        agent_type: 'explorer'
+      },
+      toolOutput: JSON.stringify({ agent_id: 'agent-1' }),
+      status: 'done',
+      createdAt: 1
+    },
+    {
+      id: 'wait-1',
+      subtaskId: 'turn-1',
+      type: 'tool',
+      toolName: 'multi_agent_v1.wait_agent',
+      toolInput: { targets: ['agent-1'] },
+      toolOutput: JSON.stringify({ status: 'completed' }),
+      status: 'done',
+      createdAt: 2
+    }
+  ])
+
+  expect(projected).toEqual([
+    expect.objectContaining({
+      id: 'subagent-agent-1',
+      type: 'subagent',
+      agentId: 'agent-1',
+      agentThreadId: 'agent-1',
+      description: 'Say hello',
+      status: 'done',
+      agentStatus: 'done'
+    })
+  ])
+})
+
+test('merges streamed child content into the canonical persisted subagent projection', () => {
+  const projected = projectWorkbenchSubagentActivity([
+    {
+      id: 'spawn-1',
+      subtaskId: 'turn-1',
+      type: 'tool',
+      toolName: 'spawnAgent',
+      toolInput: { prompt: 'Inspect the stream' },
+      toolOutput: { agentId: 'agent-1' },
+      status: 'done',
+      createdAt: 1
+    },
+    {
+      id: 'subagent-agent-1',
+      subtaskId: 'turn-1',
+      type: 'subagent',
+      agentThreadId: 'agent-1',
+      description: 'Inspect the stream',
+      status: 'streaming',
+      createdAt: 2,
+      children: [
+        {
+          id: 'child-text',
+          subtaskId: 'turn-1',
+          type: 'text',
+          content: 'Partial child output',
+          status: 'streaming',
+          createdAt: 3
+        }
+      ]
+    }
+  ])
+
+  expect(projected).toHaveLength(1)
+  expect(projected[0]).toMatchObject({
+    id: 'subagent-agent-1',
+    anchorBlockId: 'spawn-1',
+    type: 'subagent',
+    status: 'streaming',
+    children: [{ content: 'Partial child output' }]
+  })
+})
+
+test('anchors merged subagent activity at the original spawn block', () => {
+  const projected = projectWorkbenchSubagentActivity([
+    {
+      id: 'spawn-1',
+      subtaskId: 'turn-1',
+      type: 'tool',
+      toolName: 'spawnAgent',
+      toolInput: { prompt: 'Inspect the stream' },
+      toolOutput: { agentId: 'agent-1' },
+      status: 'done',
+      createdAt: 1
+    },
+    {
+      id: 'assistant-progress',
+      subtaskId: 'turn-1',
+      type: 'text',
+      content: 'Continuing parent work',
+      status: 'streaming',
+      createdAt: 2
+    },
+    {
+      id: 'subagent-agent-1',
+      subtaskId: 'turn-1',
+      type: 'subagent',
+      agentThreadId: 'agent-1',
+      status: 'streaming',
+      createdAt: 3
+    }
+  ])
+
+  expect(projected).toEqual([
+    expect.objectContaining({
+      id: 'subagent-agent-1',
+      anchorBlockId: 'spawn-1',
+      agentThreadId: 'agent-1'
+    }),
+    expect.objectContaining({
+      id: 'assistant-progress',
+      type: 'text'
+    })
+  ])
+})
+
+describe('reduceWorkbenchMessages', () => {
+  test('keeps only a preview window for very long assistant content', () => {
+    const longPrefix = 'a'.repeat(200_010)
+    const state = reduceWorkbenchMessages([], {
+      type: 'assistant_chunk',
+      subtaskId: 'long-text',
+      content: `${longPrefix}tail`
+    })
+
+    expect(state[0].content.length).toBe(200_000)
+    expect(state[0].content.endsWith('tail')).toBe(true)
+    expect(state[0]).toMatchObject({
+      contentTruncated: true,
+      contentOriginalChars: 200_014,
+      contentLoadRef: {
+        messageId: 'assistant-long-text',
+        subtaskId: 'long-text',
+        kind: 'message_content'
+      }
+    })
+  })
+
+  test('does not restore full long assistant content on done', () => {
+    const done = reduceWorkbenchMessages([], {
+      type: 'assistant_done',
+      subtaskId: 'done-long-text',
+      content: `${'b'.repeat(200_010)}final`
+    })
+
+    expect(done[0].content.length).toBe(200_000)
+    expect(done[0].content.endsWith('final')).toBe(true)
+    expect(done[0].contentTruncated).toBe(true)
+  })
+
+  test('clears stale stream truncation metadata when done supplies short content', () => {
+    const streamed = reduceWorkbenchMessages([], {
+      type: 'assistant_chunk',
+      subtaskId: 'short-final-content',
+      content: 'partial response',
+      offset: 20_000
+    })
+
+    expect(streamed[0]).toMatchObject({
+      content: 'partial response',
+      contentTruncated: undefined,
+      contentOriginalChars: undefined,
+      contentLoadRef: undefined
+    })
+
+    const done = reduceWorkbenchMessages(streamed, {
+      type: 'assistant_done',
+      subtaskId: 'short-final-content',
+      content: 'final response'
+    })
+
+    expect(done[0]).toMatchObject({
+      content: 'final response',
+      contentTruncated: undefined,
+      contentOriginalChars: undefined,
+      contentLoadRef: undefined
+    })
+  })
+
+  test('keeps growing assistant original length after content is unloaded', () => {
+    const truncated = reduceWorkbenchMessages([], {
+      type: 'assistant_chunk',
+      subtaskId: 'growing-long-text',
+      content: `${'a'.repeat(200_010)}tail`,
+      offset: 0
+    })
+    const next = reduceWorkbenchMessages(truncated, {
+      type: 'assistant_chunk',
+      subtaskId: 'growing-long-text',
+      content: 'next',
+      offset: 200_014
+    })
+
+    expect(next[0].content.length).toBe(200_000)
+    expect(next[0].content.endsWith('tailnext')).toBe(true)
+    expect(next[0].contentOriginalChars).toBe(200_018)
+  })
+
+  test('keeps only a preview window for very long tool output', () => {
+    const state = reduceWorkbenchMessages(
+      reduceWorkbenchMessages([], {
+        type: 'block_created',
+        subtaskId: '9',
+        block: {
+          id: 'call_1',
+          subtaskId: '9',
+          type: 'tool',
+          toolName: 'bash',
+          status: 'pending',
+          createdAt: 1770000000000
+        }
+      }),
+      {
+        type: 'block_updated',
+        subtaskId: '9',
+        blockId: 'call_1',
+        updates: {
+          status: 'streaming',
+          toolOutputDelta: `${'x'.repeat(120_010)}tail`
+        }
+      }
+    )
+
+    expect(state[0].blocks?.[0]).toMatchObject({
+      id: 'call_1',
+      type: 'tool',
+      toolOutputTruncated: true,
+      toolOutputOriginalChars: 120_014,
+      toolOutputLoadRef: {
+        subtaskId: '9',
+        blockId: 'call_1',
+        kind: 'tool_output'
+      }
+    })
+    const output =
+      state[0].blocks?.[0]?.type === 'tool' ? state[0].blocks[0].toolOutput : ''
+    expect(typeof output).toBe('string')
+    expect((output as string).length).toBe(64 * 1024)
+    expect((output as string).endsWith('tail')).toBe(true)
+  })
+
+  test('keeps growing tool output original length after output is unloaded', () => {
+    const truncated = reduceWorkbenchMessages(
+      reduceWorkbenchMessages([], {
+        type: 'block_created',
+        subtaskId: '9',
+        block: {
+          id: 'call_1',
+          subtaskId: '9',
+          type: 'tool',
+          toolName: 'bash',
+          status: 'pending',
+          createdAt: 1770000000000
+        }
+      }),
+      {
+        type: 'block_updated',
+        subtaskId: '9',
+        blockId: 'call_1',
+        updates: {
+          status: 'streaming',
+          toolOutputDelta: `${'x'.repeat(120_010)}tail`
+        }
+      }
+    )
+
+    const next = reduceWorkbenchMessages(truncated, {
+      type: 'block_updated',
+      subtaskId: '9',
+      blockId: 'call_1',
+      updates: {
+        status: 'streaming',
+        toolOutputDelta: 'next'
+      }
+    })
+
+    const block = next[0].blocks?.[0]
+    expect(block?.type).toBe('tool')
+    if (block?.type !== 'tool') return
+    expect(block.toolOutputOriginalChars).toBe(120_018)
+    expect(String(block.toolOutput).length).toBe(64 * 1024)
+    expect(String(block.toolOutput).endsWith('tailnext')).toBe(true)
+  })
+
+  test('adds user message and streams assistant chunks into one message', () => {
+    const initial: WorkbenchMessage[] = []
+    const withUser = reduceWorkbenchMessages(initial, {
+      type: 'user_added',
+      message: {
+        id: 'local-1',
+        role: 'user',
+        content: 'hello',
+        status: 'done',
+        createdAt: '2026-05-25T00:00:00.000Z'
+      }
+    })
+    const withStart = reduceWorkbenchMessages(withUser, {
+      type: 'assistant_started',
+      taskId: '1',
+      subtaskId: '9',
+      shellType: 'ClaudeCode'
+    })
+    const withChunk = reduceWorkbenchMessages(withStart, {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: 'hi'
+    })
+
+    expect(withChunk).toHaveLength(2)
+    expect(withChunk[1]).toMatchObject({
+      id: 'assistant-9',
+      role: 'assistant',
+      content: 'hi',
+      status: 'streaming',
+      shellType: 'ClaudeCode'
+    })
+  })
+
+  test('keeps repeated optimistic user message delivery idempotent', () => {
+    const message: WorkbenchMessage = {
+      id: 'runtime-local-pane-1',
+      role: 'user',
+      content: 'inspect the latest screenshot',
+      status: 'done',
+      createdAt: '2026-05-25T00:00:00.000Z'
+    }
+
+    const optimistic = reduceWorkbenchMessages([], {
+      type: 'user_added',
+      message
+    })
+    const reconciled = reduceWorkbenchMessages(optimistic, {
+      type: 'user_added',
+      message: {
+        ...message,
+        subtaskId: 'runtime-worktree-0'
+      }
+    })
+
+    expect(reconciled).toHaveLength(1)
+    expect(reconciled[0]).toMatchObject({
+      id: 'runtime-local-pane-1',
+      content: 'inspect the latest screenshot',
+      subtaskId: 'runtime-worktree-0'
+    })
+  })
+
+  test('uses chunk offsets to ignore duplicate assistant chunks', () => {
+    const started = reduceWorkbenchMessages([], {
+      type: 'assistant_started',
+      subtaskId: '9'
+    })
+    const withHello = reduceWorkbenchMessages(started, {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: '你好',
+      offset: 0
+    })
+    const duplicated = reduceWorkbenchMessages(withHello, {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: '你好',
+      offset: 0
+    })
+    const completed = reduceWorkbenchMessages(duplicated, {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: '，世界',
+      offset: 2
+    })
+
+    expect(completed[0]).toMatchObject({
+      role: 'assistant',
+      content: '你好，世界',
+      status: 'streaming'
+    })
+  })
+
+  test('uses chunk offsets to append only uncovered overlap suffixes', () => {
+    const started = reduceWorkbenchMessages([], {
+      type: 'assistant_started',
+      subtaskId: '10'
+    })
+    const withPrefix = reduceWorkbenchMessages(started, {
+      type: 'assistant_chunk',
+      subtaskId: '10',
+      content: 'abcdef',
+      offset: 0
+    })
+    const overlapped = reduceWorkbenchMessages(withPrefix, {
+      type: 'assistant_chunk',
+      subtaskId: '10',
+      content: 'defghi',
+      offset: 3
+    })
+
+    expect(overlapped[0]).toMatchObject({
+      role: 'assistant',
+      content: 'abcdefghi',
+      status: 'streaming'
+    })
+  })
+
+  test('tracks chunk offsets when a chunk creates the assistant message', () => {
+    const withHello = reduceWorkbenchMessages([], {
+      type: 'assistant_chunk',
+      subtaskId: '11',
+      content: 'hello',
+      offset: 0
+    })
+    const duplicated = reduceWorkbenchMessages(withHello, {
+      type: 'assistant_chunk',
+      subtaskId: '11',
+      content: 'hello',
+      offset: 0
+    })
+
+    expect(duplicated[0]).toMatchObject({
+      role: 'assistant',
+      content: 'hello',
+      status: 'streaming'
+    })
+  })
+
+  test('late assistant stream creates an assistant message when a user message has the same subtask id', () => {
+    const state: WorkbenchMessage[] = [
+      {
+        id: 'user-9',
+        role: 'user',
+        subtaskId: '9',
+        content: 'hello',
+        status: 'done',
+        createdAt: '2026-05-25T00:00:00.000Z'
+      }
+    ]
+
+    const withTool = reduceWorkbenchMessages(state, {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'call_1',
+        subtaskId: '9',
+        type: 'tool',
+        toolName: 'bash',
+        status: 'pending',
+        createdAt: 1770000000000
+      }
+    })
+    const withChunk = reduceWorkbenchMessages(withTool, {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: 'Hi'
+    })
+    const done = reduceWorkbenchMessages(withChunk, {
+      type: 'assistant_done',
+      subtaskId: '9',
+      turnId: 'turn-9',
+      content: 'Hi'
+    })
+
+    expect(done).toHaveLength(2)
+    expect(done[0]).toMatchObject({
+      role: 'user',
+      content: 'hello',
+      status: 'done'
+    })
+    expect(done[1]).toMatchObject({
+      role: 'assistant',
+      turnId: 'turn-9',
+      content: 'Hi',
+      status: 'done',
+      blocks: [{ type: 'tool', toolName: 'bash', status: 'done' }]
+    })
+  })
+
+  test('ignores late chunks after an assistant message is done', () => {
+    const streaming = reduceWorkbenchMessages([], {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: 'Done.'
+    })
+    const done = reduceWorkbenchMessages(streaming, {
+      type: 'assistant_done',
+      subtaskId: '9',
+      content: 'Done.'
+    })
+    const afterLateChunk = reduceWorkbenchMessages(done, {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: 'Done.'
+    })
+
+    expect(afterLateChunk).toHaveLength(1)
+    expect(afterLateChunk[0]).toMatchObject({
+      role: 'assistant',
+      subtaskId: '9',
+      content: 'Done.',
+      status: 'done'
+    })
+  })
+
+  test('finalizes thinking blocks when a tool block is created', () => {
+    const state = reduceWorkbenchMessages(
+      reduceWorkbenchMessages([], {
+        type: 'assistant_started',
+        taskId: '1',
+        subtaskId: '9'
+      }),
+      {
+        type: 'assistant_chunk',
+        subtaskId: '9',
+        content: '',
+        reasoningChunk: 'Running a command'
+      }
+    )
+
+    const withTool = reduceWorkbenchMessages(state, {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'call_1',
+        subtaskId: '9',
+        type: 'tool',
+        toolName: 'bash',
+        toolInput: { command: 'pwd' },
+        status: 'pending',
+        createdAt: 1770000000000
+      }
+    })
+
+    expect(withTool[0].blocks).toMatchObject([
+      { type: 'thinking', status: 'done' },
+      { type: 'tool', toolName: 'bash', status: 'pending' }
+    ])
+    expect(withTool[0].streamingThinkingContent).toBe('Running a command')
+  })
+
+  test('clears the active thinking summary when assistant text starts streaming', () => {
+    const withReasoning = reduceWorkbenchMessages([], {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: '',
+      reasoningChunk: 'Inspecting the current state'
+    })
+
+    expect(withReasoning[0].streamingThinkingContent).toBe(
+      'Inspecting the current state'
+    )
+
+    const withText = reduceWorkbenchMessages(withReasoning, {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: 'I found the issue.'
+    })
+
+    expect(withText[0].streamingThinkingContent).toBeUndefined()
+  })
+
+  test('restores the latest thinking summary when a tool starts after process text', () => {
+    const withReasoning = reduceWorkbenchMessages([], {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: '',
+      reasoningChunk: 'Preparing to inspect the files'
+    })
+    const withProcessText = reduceWorkbenchMessages(withReasoning, {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: 'I will inspect the current implementation.'
+    })
+    const withTool = reduceWorkbenchMessages(withProcessText, {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'call_1',
+        subtaskId: '9',
+        type: 'tool',
+        toolName: 'bash',
+        toolInput: { command: 'pwd' },
+        status: 'pending',
+        createdAt: 1770000000000
+      }
+    })
+
+    expect(withProcessText[0].streamingThinkingContent).toBeUndefined()
+    expect(withTool[0].streamingThinkingContent).toBe(
+      'Preparing to inspect the files'
+    )
+  })
+
+  test('restores the latest thinking summary when a tool arrives in a stream chunk', () => {
+    const withReasoning = reduceWorkbenchMessages([], {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: '',
+      reasoningChunk: 'Preparing to inspect the files'
+    })
+    const withProcessText = reduceWorkbenchMessages(withReasoning, {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: 'I will inspect the current implementation.'
+    })
+    const withTool = reduceWorkbenchMessages(withProcessText, {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: '',
+      blocks: [
+        {
+          id: 'call_1',
+          subtaskId: '9',
+          type: 'tool',
+          toolName: 'bash',
+          toolInput: { command: 'pwd' },
+          status: 'pending',
+          createdAt: 1770000000000
+        }
+      ]
+    })
+
+    expect(withTool[0].streamingThinkingContent).toBe(
+      'Preparing to inspect the files'
+    )
+  })
+
+  test('keeps the active thinking summary when a tool continuation starts', () => {
+    const withReasoning = reduceWorkbenchMessages([], {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: '',
+      reasoningChunk: 'Preparing the next step'
+    })
+    const continued = reduceWorkbenchMessages(withReasoning, {
+      type: 'assistant_started',
+      taskId: '1',
+      subtaskId: '9'
+    })
+
+    expect(continued[0].streamingThinkingContent).toBe(
+      'Preparing the next step'
+    )
+  })
+
+  test('orders tool blocks by creation time when create events arrive out of order', () => {
+    const withLaterTool = reduceWorkbenchMessages([], {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'call-later',
+        subtaskId: '9',
+        type: 'tool',
+        toolName: 'bash',
+        toolInput: { command: 'second' },
+        status: 'pending',
+        createdAt: 1770000002000
+      }
+    })
+    const withEarlierTool = reduceWorkbenchMessages(withLaterTool, {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'call-earlier',
+        subtaskId: '9',
+        type: 'tool',
+        toolName: 'bash',
+        toolInput: { command: 'first' },
+        status: 'pending',
+        createdAt: 1770000001000
+      }
+    })
+
+    expect(withEarlierTool[0].blocks?.map((block) => block.id)).toEqual([
+      'call-earlier',
+      'call-later'
+    ])
+  })
+
+  test('keeps tool arrival order when creation times are equal', () => {
+    const withFirstTool = reduceWorkbenchMessages([], {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'call-first',
+        subtaskId: '9',
+        type: 'tool',
+        toolName: 'bash',
+        status: 'pending',
+        createdAt: 1770000001000
+      }
+    })
+    const withSecondTool = reduceWorkbenchMessages(withFirstTool, {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'call-second',
+        subtaskId: '9',
+        type: 'tool',
+        toolName: 'bash',
+        status: 'pending',
+        createdAt: 1770000001000
+      }
+    })
+
+    expect(withSecondTool[0].blocks?.map((block) => block.id)).toEqual([
+      'call-first',
+      'call-second'
+    ])
+  })
+
+  test('orders completed response blocks by creation time', () => {
+    const done = reduceWorkbenchMessages([], {
+      type: 'assistant_done',
+      subtaskId: '9',
+      blocks: [
+        {
+          id: 'call-later',
+          subtaskId: '9',
+          type: 'tool',
+          toolName: 'bash',
+          status: 'done',
+          createdAt: 1770000002000
+        },
+        {
+          id: 'call-earlier',
+          subtaskId: '9',
+          type: 'tool',
+          toolName: 'bash',
+          status: 'done',
+          createdAt: 1770000001000
+        }
+      ]
+    })
+
+    expect(done[0].blocks?.map((block) => block.id)).toEqual([
+      'call-earlier',
+      'call-later'
+    ])
+  })
+
+  test('moves streamed content into a text block before a tool block', () => {
+    const state = reduceWorkbenchMessages(
+      reduceWorkbenchMessages([], {
+        type: 'assistant_started',
+        taskId: '1',
+        subtaskId: '9'
+      }),
+      {
+        type: 'assistant_chunk',
+        subtaskId: '9',
+        content: 'Let me inspect the repository first.'
+      }
+    )
+
+    const withTool = reduceWorkbenchMessages(state, {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'call_1',
+        subtaskId: '9',
+        type: 'tool',
+        toolName: 'bash',
+        toolInput: { command: 'ls' },
+        status: 'pending',
+        createdAt: 1770000000000
+      }
+    })
+
+    expect(withTool[0].content).toBe('')
+    expect(withTool[0].blocks).toMatchObject([
+      {
+        type: 'text',
+        content: 'Let me inspect the repository first.',
+        status: 'done'
+      },
+      { type: 'tool', toolName: 'bash', status: 'pending' }
+    ])
+  })
+
+  test('resets the text offset after moving content before a tool block', () => {
+    const firstPreamble = '找到了关键错误。看一下失败前后的上下文：'
+    const secondPreamble =
+      '本地分支落后于 main，CI 跑的提交是 `719f99694 fix(wework)`。'
+    const withFirstPreamble = reduceWorkbenchMessages(
+      reduceWorkbenchMessages([], {
+        type: 'assistant_started',
+        taskId: '1',
+        subtaskId: '9'
+      }),
+      {
+        type: 'assistant_chunk',
+        subtaskId: '9',
+        content: firstPreamble,
+        offset: 0
+      }
+    )
+
+    const withTool = reduceWorkbenchMessages(withFirstPreamble, {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'call_1',
+        subtaskId: '9',
+        type: 'tool',
+        toolName: 'bash',
+        toolInput: { command: 'grep error' },
+        status: 'pending',
+        createdAt: 1770000000000
+      }
+    })
+    const withSecondPreamble = reduceWorkbenchMessages(withTool, {
+      type: 'assistant_chunk',
+      subtaskId: '9',
+      content: secondPreamble,
+      offset: 0
+    })
+
+    expect(withTool[0]).toMatchObject({
+      content: '',
+      streamTextOffset: undefined
+    })
+    expect(withSecondPreamble[0].content).toBe(secondPreamble)
+    expect(withSecondPreamble[0].blocks).toMatchObject([
+      {
+        type: 'text',
+        content: firstPreamble,
+        status: 'done'
+      },
+      { type: 'tool', toolName: 'bash', status: 'pending' }
+    ])
+  })
+
+  test('finalizes incoming processing blocks on done', () => {
+    const state = reduceWorkbenchMessages([], {
+      type: 'assistant_started',
+      taskId: '1',
+      subtaskId: '9'
+    })
+
+    const done = reduceWorkbenchMessages(state, {
+      type: 'assistant_done',
+      subtaskId: '9',
+      content: 'Final',
+      blocks: [
+        {
+          id: 'thinking-real',
+          subtaskId: '9',
+          type: 'thinking',
+          content: 'Drafting',
+          status: 'streaming',
+          createdAt: 1770000000000
+        },
+        {
+          id: 'call_1',
+          subtaskId: '9',
+          type: 'tool',
+          toolName: 'bash',
+          status: 'pending',
+          createdAt: 1770000001000
+        },
+        {
+          id: 'text-real',
+          subtaskId: '9',
+          type: 'text',
+          content: 'Final text',
+          status: 'streaming',
+          createdAt: 1770000002000
+        }
+      ]
+    })
+
+    expect(done[0].blocks).toMatchObject([
+      { id: 'thinking-real', type: 'thinking', status: 'done' },
+      { id: 'call_1', type: 'tool', status: 'done' },
+      { id: 'text-real', type: 'text', status: 'done' }
+    ])
+  })
+
+  test('settles a streamed assistant message without replacing its content', () => {
+    const state = reduceWorkbenchMessages(
+      reduceWorkbenchMessages([], {
+        type: 'assistant_started',
+        taskId: '1',
+        subtaskId: '9'
+      }),
+      {
+        type: 'assistant_chunk',
+        subtaskId: '9',
+        content: 'streamed answer'
+      }
+    )
+
+    const done = reduceWorkbenchMessages(state, {
+      type: 'assistant_done',
+      subtaskId: '9'
+    })
+
+    expect(done[0]).toMatchObject({
+      content: 'streamed answer',
+      status: 'done'
+    })
+  })
+
+  test('marks all streaming assistant messages cancelled when no subtask is specified', () => {
+    const state = [
+      {
+        id: 'user-1',
+        role: 'user' as const,
+        content: 'stop',
+        status: 'done' as const,
+        createdAt: '2026-05-25T00:00:00.000Z'
+      },
+      {
+        id: 'assistant-old',
+        role: 'assistant' as const,
+        content: 'persisted streaming',
+        status: 'streaming' as const,
+        createdAt: '2026-05-25T00:00:00.000Z'
+      },
+      {
+        id: 'assistant-new',
+        role: 'assistant' as const,
+        content: '',
+        status: 'streaming' as const,
+        subtaskId: '9',
+        createdAt: '2026-05-25T00:00:01.000Z'
+      }
+    ]
+
+    const cancelled = reduceWorkbenchMessages(state, {
+      type: 'assistant_cancelled'
+    })
+
+    expect(cancelled[0]).toMatchObject({ role: 'user', status: 'done' })
+    expect(cancelled[1]).toMatchObject({
+      status: 'done',
+      runtimeStatus: 'cancelled',
+      stoppedNotice: true
+    })
+    expect(cancelled[2]).toMatchObject({
+      status: 'done',
+      runtimeStatus: 'cancelled',
+      stoppedNotice: true
+    })
+  })
+
+  test('clears stale stream error when an active block update arrives after disconnect', () => {
+    const state = reduceWorkbenchMessages(
+      reduceWorkbenchMessages([], {
+        type: 'assistant_started',
+        taskId: '1',
+        subtaskId: '9'
+      }),
+      {
+        type: 'assistant_error',
+        subtaskId: '9',
+        error: 'Device disconnected',
+        errorType: 'container_error'
+      }
+    )
+
+    const withTool = reduceWorkbenchMessages(state, {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'call_1',
+        subtaskId: '9',
+        type: 'tool',
+        toolName: 'bash',
+        status: 'pending',
+        createdAt: 1770000000000
+      }
+    })
+    const resumed = reduceWorkbenchMessages(withTool, {
+      type: 'block_updated',
+      subtaskId: '9',
+      blockId: 'call_1',
+      updates: {
+        status: 'streaming',
+        toolOutput: 'still running'
+      }
+    })
+
+    expect(resumed[0].status).toBe('streaming')
+    expect(resumed[0].error).toBeUndefined()
+    expect(resumed[0].errorType).toBeUndefined()
+    expect(resumed[0].blocks).toMatchObject([
+      {
+        id: 'call_1',
+        type: 'tool',
+        status: 'streaming',
+        toolOutput: 'still running'
+      }
+    ])
+  })
+
+  test('appends tool output deltas without replacing existing output', () => {
+    const state = reduceWorkbenchMessages(
+      reduceWorkbenchMessages([], {
+        type: 'block_created',
+        subtaskId: '9',
+        block: {
+          id: 'call_1',
+          subtaskId: '9',
+          type: 'tool',
+          toolName: 'bash',
+          status: 'pending',
+          createdAt: 1770000000000
+        }
+      }),
+      {
+        type: 'block_updated',
+        subtaskId: '9',
+        blockId: 'call_1',
+        updates: {
+          status: 'streaming',
+          toolOutputDelta: 'hello'
+        }
+      }
+    )
+
+    const next = reduceWorkbenchMessages(state, {
+      type: 'block_updated',
+      subtaskId: '9',
+      blockId: 'call_1',
+      updates: {
+        status: 'streaming',
+        toolOutputDelta: ' world'
+      }
+    })
+
+    expect(next[0].blocks).toMatchObject([
+      {
+        id: 'call_1',
+        type: 'tool',
+        status: 'streaming',
+        toolOutput: 'hello world'
+      }
+    ])
+  })
+
+  test('appends text block content deltas without replacing existing content', () => {
+    const state = reduceWorkbenchMessages([], {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'message-1',
+        subtaskId: '9',
+        type: 'text',
+        content: 'hello',
+        status: 'streaming',
+        createdAt: 1770000000000
+      }
+    })
+
+    const next = reduceWorkbenchMessages(state, {
+      type: 'block_updated',
+      subtaskId: '9',
+      blockId: 'message-1',
+      updates: {
+        status: 'streaming',
+        contentDelta: ' world'
+      }
+    })
+
+    expect(next[0].blocks).toMatchObject([
+      {
+        id: 'message-1',
+        type: 'text',
+        status: 'streaming',
+        content: 'hello world'
+      }
+    ])
+  })
+
+  test('preserves custom tool render payload on block create and update', () => {
+    const requestPayload = {
+      kind: 'request_user_input',
+      request_id: 12,
+      questions: [{ id: 'goal', question: 'What should I prioritize?' }]
+    }
+    const updatedPayload = {
+      ...requestPayload,
+      submitted: true
+    }
+
+    const state = reduceWorkbenchMessages([], {
+      type: 'block_created',
+      subtaskId: '9',
+      block: {
+        id: 'request-1',
+        subtaskId: '9',
+        type: 'tool',
+        toolName: 'request_user_input',
+        renderPayload: requestPayload,
+        status: 'pending',
+        createdAt: 1770000000000
+      }
+    })
+    const updated = reduceWorkbenchMessages(state, {
+      type: 'block_updated',
+      subtaskId: '9',
+      blockId: 'request-1',
+      updates: {
+        status: 'done',
+        renderPayload: updatedPayload
+      }
+    })
+
+    expect(state[0].blocks?.[0]).toMatchObject({
+      type: 'tool',
+      toolName: 'request_user_input',
+      renderPayload: requestPayload
+    })
+    expect(updated[0].blocks?.[0]).toMatchObject({
+      type: 'tool',
+      status: 'done',
+      renderPayload: updatedPayload
+    })
+  })
+
+  test('keeps a specific assistant error when a later generic task status error arrives', () => {
+    const state = reduceWorkbenchMessages(
+      reduceWorkbenchMessages([], {
+        type: 'assistant_started',
+        taskId: '1',
+        subtaskId: '9'
+      }),
+      {
+        type: 'assistant_error',
+        subtaskId: '9',
+        error: 'Codex CLI failed to resume thread: session not found',
+        errorType: 'execution_error'
+      }
+    )
+
+    const next = reduceWorkbenchMessages(state, {
+      type: 'assistant_error',
+      subtaskId: '9',
+      error: 'Task failed with status: FAILED',
+      errorType: 'execution_error'
+    })
+
+    expect(next[0]).toMatchObject({
+      status: 'failed',
+      error: 'Codex CLI failed to resume thread: session not found',
+      errorType: 'execution_error'
+    })
+  })
+
+  test('preserves state for unknown runtime actions', () => {
+    const state: WorkbenchMessage[] = [
+      {
+        id: 'assistant-9',
+        role: 'assistant',
+        content: 'hello',
+        status: 'done',
+        createdAt: '2026-05-25T00:00:00.000Z'
+      }
+    ]
+
+    const next = reduceWorkbenchMessages(state, {
+      type: 'unexpected'
+    } as unknown as Parameters<typeof reduceWorkbenchMessages>[1])
+
+    expect(next).toBe(state)
+  })
+})
+
+describe('normalizeWorkbenchBlockStatus', () => {
+  test('keeps supported statuses and normalizes legacy or unknown statuses', () => {
+    expect(normalizeWorkbenchBlockStatus('generating_arguments')).toBe(
+      'generating_arguments'
+    )
+    expect(normalizeWorkbenchBlockStatus('pending')).toBe('pending')
+    expect(normalizeWorkbenchBlockStatus('streaming')).toBe('streaming')
+    expect(normalizeWorkbenchBlockStatus('done')).toBe('done')
+    expect(normalizeWorkbenchBlockStatus('error')).toBe('error')
+    expect(normalizeWorkbenchBlockStatus('completed')).toBe('done')
+    expect(normalizeWorkbenchBlockStatus('succeeded')).toBe('done')
+    expect(normalizeWorkbenchBlockStatus('failed')).toBe('error')
+    expect(normalizeWorkbenchBlockStatus('running')).toBe('pending')
+    expect(normalizeWorkbenchBlockStatus('inProgress')).toBe('pending')
+    expect(normalizeWorkbenchBlockStatus('unsupported')).toBe('pending')
+    expect(normalizeWorkbenchBlockStatus()).toBe('pending')
+  })
+})
+
+test.each([
+  'assistant_cancelled',
+  'assistant_done',
+  'assistant_error'
+] as const)('%s cannot manufacture successful context compaction', (type) => {
+  const state: WorkbenchMessage[] = [
+    {
+      id: 'assistant',
+      subtaskId: 'turn',
+      role: 'assistant',
+      content: '',
+      status: 'streaming',
+      createdAt: '2026-09-24T00:00:00Z',
+      blocks: ['pending', 'done', 'error'].map((status, index) => ({
+        id: `compact-${index}`,
+        subtaskId: 'turn',
+        type: 'tool',
+        toolName: 'context_compaction',
+        status: status as 'pending' | 'done' | 'error',
+        createdAt: 1
+      }))
+    }
+  ]
+  const action =
+    type === 'assistant_error'
+      ? { type, subtaskId: 'turn', error: 'failed' }
+      : { type, subtaskId: 'turn' }
+  const result = reduceWorkbenchMessages(state, action)
+  expect(result[0].blocks?.map((block) => block.status)).toEqual([
+    'error',
+    'done',
+    'error'
+  ])
+  expect(state[0].blocks?.[0].status).toBe('pending')
+})

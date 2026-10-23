@@ -1,0 +1,1273 @@
+import {
+  countTextOccurrences,
+  createCheckpointTaskFixture,
+  waitForNewTaskRow,
+  waitForSnapshot,
+} from './conversation-layout.mjs'
+
+import { inputUserMessageTexts } from './desktop-server.mjs'
+
+import { assertConversationTextOrder } from './conversation-navigation.mjs'
+
+import { ensureTaskRowVisible } from './memory-tool-flows.mjs'
+import { findRuntimeWorkTask, waitForForkTaskRow } from './runtime-task-evidence.mjs'
+
+import {
+  ACTIVE_WORKBENCH_SELECTOR,
+  BACKGROUND_COMPLETION_RESTORE_PROMPT,
+  BACKGROUND_COMPLETION_RESTORE_TEXT,
+  BACKGROUND_FOLLOW_UP_RESTORE_PROMPT,
+  BACKGROUND_FOLLOW_UP_RESTORE_TEXT,
+  COMPLETION_TEXT,
+  COMPOSER_READY_STABILITY_MS,
+  DEFAULT_MODEL_ID,
+  DEFAULT_MODEL_LABEL,
+  DEFAULT_STEP_TIMEOUT_MS,
+  FORK_ENCRYPTED_CONTENT,
+  FORK_FOLLOW_UP_COMPLETION_TEXT,
+  FORK_FOLLOW_UP_PROMPT,
+  FORK_PROVIDER_FOLLOW_UP_COMPLETION_TEXT,
+  FORK_PROVIDER_FOLLOW_UP_PROMPT,
+  FORK_PROVIDER_SOURCE_COMPLETION_TEXT,
+  FORK_PROVIDER_SOURCE_PROMPT,
+  LOCAL_MODEL_CASES,
+  REQUEST_USER_INPUT_COMPLETION_TEXT,
+  REQUEST_USER_INPUT_PROMPT,
+  REQUEST_USER_INPUT_QUESTION,
+  REQUEST_USER_INPUT_ASYNC_ANSWER,
+  REQUEST_USER_INPUT_ASYNC_BUSY_ANSWER,
+  REQUEST_USER_INPUT_ASYNC_BUSY_COMPLETION_TEXT,
+  REQUEST_USER_INPUT_ASYNC_BUSY_PROMPT,
+  REQUEST_USER_INPUT_ASYNC_BUSY_QUESTION,
+  REQUEST_USER_INPUT_ASYNC_COMPLETION_TEXT,
+  REQUEST_USER_INPUT_ASYNC_PROMPT,
+  REQUEST_USER_INPUT_ASYNC_QUESTION,
+  REQUEST_USER_INPUT_ASYNC_WAITING_TEXT,
+  RUNNING_FORK_COMPLETION_TEXT,
+  RUNNING_FORK_FOLLOW_UP_PROMPT,
+  WORKBENCH_READY_TIMEOUT_MS,
+  assert,
+  join,
+  mkdir,
+  readFile,
+  rm,
+  selectE2EModel,
+  sendPromptUntilScenarioRequest,
+  writeFile,
+  withTimeout,
+} from './shared.mjs'
+
+import { captureVerificationScreenshot, waitForWorkbenchDebugState } from './workspace-flows.mjs'
+
+const PRIORITY_FILTER_SHORTCUT = process.platform === 'win32' ? 'Control+Alt+U' : 'Meta+Alt+U'
+
+async function verifyPriorityFilter({ composerSelector, control }) {
+  let requestInputResponseReleased = false
+  control.setScenario('request_user_input')
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await control.command('waitFor', composerSelector, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await selectE2EModel(control, DEFAULT_MODEL_ID, DEFAULT_MODEL_LABEL)
+  const composerSnapshot = JSON.parse(await control.command('snapshot', 'body'))
+  if (composerSnapshot.testIds.includes('plan-mode-pill')) {
+    await control.command('click', '[data-testid="cancel-plan-mode-button"]')
+  }
+  await waitForSnapshot(
+    control,
+    snapshot => !snapshot.testIds.includes('plan-mode-pill'),
+    'The request-user-input regression must run in Default mode'
+  )
+  await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    REQUEST_USER_INPUT_PROMPT,
+    'request_user_input'
+  )
+
+  const requestInputDebugSnapshot = await waitForWorkbenchDebugState(
+    control,
+    snapshot => Boolean(snapshot.workbench?.currentRuntimeTask?.taskId),
+    'The priority-filter fixture did not expose its runtime task ID'
+  )
+  const requestInputTaskId = requestInputDebugSnapshot.workbench?.currentRuntimeTask?.taskId
+  assert.ok(requestInputTaskId, 'The priority-filter fixture did not expose its runtime task ID')
+  const requestInputTaskRowTestId = `runtime-local-task-row-${requestInputTaskId}`
+  await control.command('waitFor', `[data-testid="${requestInputTaskRowTestId}"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command(
+    'waitFor',
+    `[data-testid="runtime-local-task-running-${requestInputTaskId}"]`,
+    {
+      timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+    }
+  )
+
+  try {
+    await control.command('click', '[data-testid="new-chat-button"]')
+    await control.command('waitFor', composerSelector, {
+      timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+    })
+    await control.command('press', 'body', { key: 'Escape' })
+    await captureVerificationScreenshot(control, 'priority-filter-01-background-task.png')
+
+    await control.command('click', '[data-testid="runtime-task-view-menu-button"]')
+    await control.command('click', '[data-testid="runtime-task-view-priority"]')
+    await control.command('waitFor', '[data-testid="runtime-priority-section"]', {
+      timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+    })
+    await control.command(
+      'waitFor',
+      `[data-testid="runtime-priority-section"] [data-testid="${requestInputTaskRowTestId}"]`,
+      {
+        timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+      }
+    )
+    const filteredSidebarSnapshot = JSON.parse(
+      await control.command('snapshot', '[data-testid="desktop-sidebar"]')
+    )
+    assert.equal(
+      filteredSidebarSnapshot.testIds.includes('new-chat-button'),
+      true,
+      'Priority filtering removed the primary new-task navigation'
+    )
+    assert.equal(
+      filteredSidebarSnapshot.testIds.includes('plugins-button'),
+      true,
+      'Priority filtering removed the plugins navigation'
+    )
+    assert.equal(
+      filteredSidebarSnapshot.testIds.includes('projects-section-toggle'),
+      false,
+      'Priority filtering kept the regular project list visible'
+    )
+    await captureVerificationScreenshot(control, 'priority-filter-02-filtered-sidebar.png')
+
+    await withTimeout(
+      control.releaseRequestUserInputResponse(),
+      DEFAULT_STEP_TIMEOUT_MS,
+      'Timed out releasing the priority-filter request-user-input response'
+    )
+    requestInputResponseReleased = true
+    await control.command('click', `[data-testid="${requestInputTaskRowTestId}"]`)
+    await control.command('waitFor', '[data-testid="request-user-input-card"]', {
+      text: REQUEST_USER_INPUT_QUESTION,
+      visible: true,
+      stableMs: COMPOSER_READY_STABILITY_MS,
+      timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+    })
+    await control.command('click', '[data-testid="request-user-input-option-direction-1"]')
+    await control.command('waitFor', '[data-testid="message-assistant"]', {
+      text: REQUEST_USER_INPUT_COMPLETION_TEXT,
+      visible: true,
+      stableMs: COMPOSER_READY_STABILITY_MS,
+      timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+    })
+    await waitForWorkbenchDebugState(
+      control,
+      snapshot =>
+        snapshot.workbench?.currentRuntimeTask?.taskId === requestInputTaskId &&
+        snapshot.pane?.status?.isBusy === false,
+      'The handled priority task did not settle before reopening the filter'
+    )
+    await control.command(
+      'waitFor',
+      `[data-testid="runtime-priority-section"] [data-testid="${requestInputTaskRowTestId}"]`,
+      {
+        timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+      }
+    )
+    await captureVerificationScreenshot(control, 'priority-filter-03-handled-task-settled.png')
+
+    await control.command('press', 'body', { key: PRIORITY_FILTER_SHORTCUT })
+    await control.command('waitFor', '[data-testid="projects-section-toggle"]', {
+      timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+    })
+    await control.command('press', 'body', { key: PRIORITY_FILTER_SHORTCUT })
+    await control.command('waitFor', '[data-testid="runtime-priority-empty"]', {
+      stableMs: COMPOSER_READY_STABILITY_MS,
+      timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+    })
+    const reopenedPrioritySnapshot = JSON.parse(
+      await control.command('snapshot', '[data-testid="runtime-priority-section"]')
+    )
+    assert.equal(
+      reopenedPrioritySnapshot.testIds.includes('runtime-priority-empty'),
+      true,
+      'Reopening the priority filter left the handled task in the Priority group'
+    )
+    await captureVerificationScreenshot(control, 'priority-filter-04-reopened-task-in-recent.png')
+
+    await control.command('press', 'body', { key: PRIORITY_FILTER_SHORTCUT })
+    await control.command('waitFor', '[data-testid="projects-section-toggle"]', {
+      timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+    })
+    const restoredSidebarSnapshot = JSON.parse(
+      await control.command('snapshot', '[data-testid="desktop-sidebar"]')
+    )
+    assert.equal(
+      restoredSidebarSnapshot.testIds.includes('runtime-priority-section'),
+      false,
+      'The priority shortcut did not restore the regular sidebar'
+    )
+    await captureVerificationScreenshot(control, 'priority-filter-05-shortcut-restored-sidebar.png')
+  } finally {
+    if (!requestInputResponseReleased) {
+      try {
+        await withTimeout(
+          control.releaseRequestUserInputResponse(),
+          DEFAULT_STEP_TIMEOUT_MS,
+          'Timed out releasing the priority-filter request-user-input response'
+        )
+      } catch (releaseError) {
+        console.warn(
+          `[desktop-e2e] priority-filter cleanup release failed: ${String(releaseError)}`
+        )
+      }
+    }
+  }
+}
+
+/**
+ * Codex's non-blocking `request_user_input_async` question must render as the
+ * interactive card and be answered with the next user message.
+ */
+async function setCatalogOverride(executorHome, slug, fields) {
+  const capabilities = join(executorHome, 'capabilities')
+  await mkdir(capabilities, { recursive: true })
+  await writeFile(
+    join(capabilities, 'model-catalog-overrides.json'),
+    `${JSON.stringify([{ slug, fields }], null, 2)}\n`
+  )
+  // Codex caches the served catalog; drop it so the new entry is picked up.
+  await rm(join(executorHome, 'codex', 'models_cache.json'), { force: true })
+}
+
+export async function verifyAsyncRequestUserInput({ composerSelector, control, executorHome }) {
+  // Codex only exposes its non-blocking question tool to models that declare it,
+  // which the cloud catalog does in production. Declare it for the E2E model so
+  // the regression exercises the real app-server path.
+  await setCatalogOverride(executorHome, DEFAULT_MODEL_ID, {
+    experimental_supported_tools: ['request_user_input_async'],
+  })
+  control.setScenario('request_user_input_async')
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await control.command('waitFor', composerSelector, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await selectE2EModel(control, DEFAULT_MODEL_ID, DEFAULT_MODEL_LABEL)
+  const composerSnapshot = JSON.parse(await control.command('snapshot', 'body'))
+  if (composerSnapshot.testIds.includes('plan-mode-pill')) {
+    await control.command('click', '[data-testid="cancel-plan-mode-button"]')
+  }
+  await waitForSnapshot(
+    control,
+    snapshot => !snapshot.testIds.includes('plan-mode-pill'),
+    'The async request-user-input regression must run in Default mode'
+  )
+  await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    REQUEST_USER_INPUT_ASYNC_PROMPT,
+    'request_user_input_async'
+  )
+
+  // The question used to be flattened into the assistant's final text, so the
+  // interactive card never appeared.
+  await control.command('waitFor', '[data-testid="request-user-input-card"]', {
+    text: REQUEST_USER_INPUT_ASYNC_QUESTION,
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: REQUEST_USER_INPUT_ASYNC_WAITING_TEXT,
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForWorkbenchDebugState(
+    control,
+    snapshot => snapshot.pane?.status?.isBusy === false,
+    'The async question turn did not settle before it was answered'
+  )
+  await captureVerificationScreenshot(control, 'request-user-input-async-01-question-card.png')
+
+  await control.command('click', '[data-testid="request-user-input-option-question_1-1"]')
+  await control.command('waitFor', '[data-testid="message-user"]', {
+    text: REQUEST_USER_INPUT_ASYNC_ANSWER,
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  // The answer travels as a normal user message, so the reply has to show the
+  // question it answered instead of reading like an unprompted message.
+  await control.command('waitFor', '[data-testid="user-message-question-reply"]', {
+    text: REQUEST_USER_INPUT_ASYNC_QUESTION,
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: REQUEST_USER_INPUT_ASYNC_COMPLETION_TEXT,
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  assert.equal(
+    Number(await control.command('getElementCount', '[data-testid="request-user-input-card"]')),
+    0,
+    'The answered async question must not stay interactive'
+  )
+  await captureVerificationScreenshot(control, 'request-user-input-async-02-answered.png')
+
+  // The non-blocking question must also be answerable while the model keeps
+  // working, otherwise the "async" contract only holds once the turn settles.
+  await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    REQUEST_USER_INPUT_ASYNC_BUSY_PROMPT,
+    'request_user_input_async'
+  )
+  await control.command('waitFor', '[data-testid="request-user-input-card"]', {
+    text: REQUEST_USER_INPUT_ASYNC_BUSY_QUESTION,
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForWorkbenchDebugState(
+    control,
+    snapshot => snapshot.pane?.status?.isBusy === true,
+    'The model stopped working while the async question waited to be answered'
+  )
+  await captureVerificationScreenshot(
+    control,
+    'request-user-input-async-03-question-while-running.png'
+  )
+
+  await control.command('click', '[data-testid="request-user-input-option-question_1-1"]')
+  // Hold the turn open until the answer has provably landed, so the assertion
+  // covers delivery while the model is still working rather than after it stops.
+  await control.command('waitFor', '[data-testid="message-user"]', {
+    text: REQUEST_USER_INPUT_ASYNC_BUSY_ANSWER,
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('waitFor', '[data-testid="user-message-question-reply"]', {
+    text: REQUEST_USER_INPUT_ASYNC_BUSY_QUESTION,
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForWorkbenchDebugState(
+    control,
+    snapshot => snapshot.pane?.status?.isBusy === true,
+    'The async answer only landed after the model stopped working'
+  )
+  await withTimeout(
+    control.releaseAsyncRequestUserInputHold(),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'Timed out releasing the running async question turn'
+  )
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: REQUEST_USER_INPUT_ASYNC_BUSY_COMPLETION_TEXT,
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  assert.ok(
+    control.modelRequests.some(
+      request =>
+        request.scenario === 'request_user_input_async' &&
+        inputUserMessageTexts(request.body).some(text =>
+          text.includes(REQUEST_USER_INPUT_ASYNC_BUSY_ANSWER)
+        )
+    ),
+    'The async answer never reached the model while the turn kept running'
+  )
+  assert.equal(
+    Number(await control.command('getElementCount', '[data-testid="request-user-input-card"]')),
+    0,
+    'The async question answered while running must not stay interactive'
+  )
+  await captureVerificationScreenshot(
+    control,
+    'request-user-input-async-04-answered-while-running.png'
+  )
+}
+
+export async function verifyAsyncQuestionWaitingIndicator({
+  composerSelector,
+  control,
+  executorHome,
+}) {
+  await setCatalogOverride(executorHome, DEFAULT_MODEL_ID, {
+    experimental_supported_tools: ['request_user_input_async'],
+  })
+  control.setScenario('request_user_input_async')
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await control.command('waitFor', composerSelector, { timeoutMs: WORKBENCH_READY_TIMEOUT_MS })
+  await selectE2EModel(control, DEFAULT_MODEL_ID, DEFAULT_MODEL_LABEL)
+  const snapshot = JSON.parse(await control.command('snapshot', 'body'))
+  if (snapshot.testIds.includes('plan-mode-pill')) {
+    await control.command('click', '[data-testid="cancel-plan-mode-button"]')
+  }
+  await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    REQUEST_USER_INPUT_ASYNC_PROMPT,
+    'request_user_input_async'
+  )
+  await control.command('waitFor', '[data-testid="request-user-input-card"]', {
+    text: REQUEST_USER_INPUT_ASYNC_QUESTION,
+    visible: true,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: REQUEST_USER_INPUT_ASYNC_WAITING_TEXT,
+    visible: true,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForWorkbenchDebugState(
+    control,
+    state => state.pane?.status?.isBusy === false,
+    'The async question execution did not finish'
+  )
+  const debug = JSON.parse(await control.command('getWorkbenchDebugSnapshot', 'body'))
+  const taskId = debug.workbench?.currentRuntimeTask?.taskId
+  assert.ok(taskId, 'The async question task must have a runtime ID')
+  await ensureTaskRowVisible(control, `runtime-local-task-row-${taskId}`)
+  const waitingSelector = `[data-testid="runtime-local-task-waiting-${taskId}"]`
+  await control.command('waitFor', waitingSelector, {
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await ensureTaskRowVisible(control, `runtime-local-task-row-${taskId}`)
+  await control.command('waitFor', waitingSelector, {
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('click', `[data-testid="runtime-local-task-row-${taskId}"]`)
+  await control.command('waitFor', '[data-testid="request-user-input-card"]', {
+    text: REQUEST_USER_INPUT_ASYNC_QUESTION,
+    visible: true,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('click', '[data-testid="request-user-input-option-question_1-1"]')
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: REQUEST_USER_INPUT_ASYNC_COMPLETION_TEXT,
+    visible: true,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await waitForSnapshot(
+    control,
+    snapshot => !snapshot.testIds.includes(`runtime-local-task-waiting-${taskId}`),
+    'The sidebar did not receive the accepted async reply state'
+  )
+  assert.equal(
+    Number(await control.command('getElementCount', waitingSelector)),
+    0,
+    'The sidebar must clear its async waiting indicator after the reply is accepted'
+  )
+}
+
+async function findRuntimeTaskSortableListSelector(control, taskRowTestIds) {
+  const snapshot = JSON.parse(await control.command('snapshot', 'body'))
+  const candidateTestIds = snapshot.testIds.filter(
+    testId =>
+      testId === 'runtime-chat-task-sortable-list' ||
+      testId.startsWith('project-runtime-task-sortable-')
+  )
+  for (const testId of candidateTestIds) {
+    const selector = `[data-testid="${testId}"]`
+    const containsEveryTask = await Promise.all(
+      taskRowTestIds.map(
+        async taskRowTestId =>
+          Number(
+            await control.command('getElementCount', `${selector} [data-testid="${taskRowTestId}"]`)
+          ) === 1
+      )
+    )
+    if (containsEveryTask.every(Boolean)) return selector
+  }
+  throw new Error('The runtime tasks did not share a sortable sidebar list')
+}
+
+async function waitForRuntimeTaskOrder(control, listSelector, expectedTaskRowTestIds) {
+  const expectedOrder = expectedTaskRowTestIds.join(',')
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < DEFAULT_STEP_TIMEOUT_MS) {
+    const testIdOrder = JSON.parse(await control.command('getTestIdOrder', listSelector))
+    const actualOrder = testIdOrder.filter(testId => expectedTaskRowTestIds.includes(testId))
+    if (actualOrder.join(',') === expectedOrder) return
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 100))
+  }
+  throw new Error(`The runtime chat task order did not become ${expectedOrder}`)
+}
+
+async function assertRuntimeTaskOrderRemainsStable(
+  control,
+  listSelector,
+  expectedTaskRowTestIds,
+  stableMs = COMPOSER_READY_STABILITY_MS
+) {
+  const expectedOrder = expectedTaskRowTestIds.join(',')
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < stableMs) {
+    const testIdOrder = JSON.parse(await control.command('getTestIdOrder', listSelector))
+    const actualOrder = testIdOrder.filter(testId => expectedTaskRowTestIds.includes(testId))
+    assert.equal(
+      actualOrder.join(','),
+      expectedOrder,
+      'Selecting an idle conversation changed the sidebar recency order'
+    )
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 100))
+  }
+}
+
+async function verifyRuntimeTaskOrderAndUnreadVisibility({
+  composerSelector,
+  control,
+  executorHome,
+}) {
+  const standaloneNewTaskButtonSelector = '[data-testid="runtime-chat-section-new-chat-button"]'
+  const firstTaskRowTestId = await createCheckpointTaskFixture(
+    control,
+    composerSelector,
+    standaloneNewTaskButtonSelector
+  )
+  const secondTaskRowTestId = await createCheckpointTaskFixture(
+    control,
+    composerSelector,
+    standaloneNewTaskButtonSelector
+  )
+  const taskRows = [firstTaskRowTestId, secondTaskRowTestId]
+  const sortableListSelector = await findRuntimeTaskSortableListSelector(control, taskRows)
+  const sortableTestIdOrder = JSON.parse(
+    await control.command('getTestIdOrder', sortableListSelector)
+  )
+  const initialOrder = sortableTestIdOrder.filter(testId => taskRows.includes(testId))
+  assert.deepEqual(
+    initialOrder.toSorted(),
+    taskRows.toSorted(),
+    'The task-order fixture did not expose both standalone tasks'
+  )
+
+  const sourceTaskRowTestId = initialOrder[1]
+  const targetTaskRowTestId = initialOrder[0]
+  await ensureTaskRowVisible(control, sourceTaskRowTestId)
+  await ensureTaskRowVisible(control, targetTaskRowTestId)
+  const reorderedTaskRows = [sourceTaskRowTestId, targetTaskRowTestId]
+  const sourceTaskId = sourceTaskRowTestId.replace('runtime-local-task-row-', '')
+  const targetTaskId = targetTaskRowTestId.replace('runtime-local-task-row-', '')
+  const runtimeIndex = JSON.parse(
+    await readFile(join(executorHome, 'runtime-work', 'index.json'), 'utf8')
+  )
+  const sourceTask = runtimeIndex.tasks[sourceTaskId]
+  const targetTask = runtimeIndex.tasks[targetTaskId]
+  assert.ok(sourceTask?.thread_id, 'The reordered task had no persisted thread ID')
+  assert.ok(targetTask?.thread_id, 'The target task had no persisted thread ID')
+  await control.command('click', `[data-testid="${sourceTaskRowTestId}"]`)
+  const sourceTaskDebug = JSON.parse(
+    await control.command('getWorkbenchDebugSnapshot', 'body')
+  ).workbench
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: 'WEWORK_DESKTOP_E2E_CHECKPOINT_TASK_COMPLETE',
+    visible: true,
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await assertRuntimeTaskOrderRemainsStable(control, sortableListSelector, initialOrder)
+  await control.command('click', `[data-testid="${targetTaskRowTestId}"]`)
+  const targetTaskDebug = JSON.parse(
+    await control.command('getWorkbenchDebugSnapshot', 'body')
+  ).workbench
+  assert.ok(sourceTaskDebug?.activeTaskProjectKey, 'The reordered task had no sidebar project key')
+  assert.equal(
+    sourceTaskDebug.activeTaskProjectKey,
+    targetTaskDebug?.activeTaskProjectKey,
+    'The task-order fixture placed its tasks in different sidebar groups'
+  )
+  await control.command('reorderRuntimeProjectTasks', 'body', {
+    value: JSON.stringify({
+      deviceId: 'local-device',
+      projectKey: sourceTaskDebug.activeTaskProjectKey,
+      threadId: sourceTask.thread_id,
+      beforeThreadId: targetTask.thread_id,
+      insertAtEnd: false,
+    }),
+  })
+  const reorderedRuntimeWork = JSON.parse(await control.command('getLocalRuntimeWork', 'body'))
+  const reorderedSourceTask = findRuntimeWorkTask(reorderedRuntimeWork, sourceTaskId)
+  const reorderedTargetTask = findRuntimeWorkTask(reorderedRuntimeWork, targetTaskId)
+  const sourceSidebarOrder = reorderedSourceTask?.sidebarOrder ?? reorderedSourceTask?.sidebar_order
+  const targetSidebarOrder = reorderedTargetTask?.sidebarOrder ?? reorderedTargetTask?.sidebar_order
+  assert.equal(
+    typeof sourceSidebarOrder,
+    'number',
+    'The executor did not return a sidebar order for the reordered task'
+  )
+  assert.equal(
+    typeof targetSidebarOrder,
+    'number',
+    'The executor did not return a sidebar order for the target task'
+  )
+  assert.ok(
+    sourceSidebarOrder < targetSidebarOrder,
+    `The executor did not persist the requested runtime task order (${sourceSidebarOrder} !< ${targetSidebarOrder})`
+  )
+
+  const readyCountBeforeReload = control.readyCount
+  await control.command('reloadMainWindow', 'body')
+  await withTimeout(
+    control.awaitReadyAfter(readyCountBeforeReload),
+    WORKBENCH_READY_TIMEOUT_MS,
+    'The task-order reload did not reconnect to the desktop controller'
+  )
+  for (const taskRowTestId of reorderedTaskRows) {
+    await control.command('waitFor', `[data-testid="${taskRowTestId}"]`, {
+      timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+    })
+  }
+  const reloadedSortableListSelector = await findRuntimeTaskSortableListSelector(
+    control,
+    reorderedTaskRows
+  )
+  await control.command('waitFor', reloadedSortableListSelector, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await waitForRuntimeTaskOrder(control, reloadedSortableListSelector, reorderedTaskRows)
+
+  const unreadBefore = JSON.parse(
+    await control.command('getWorkbenchDebugSnapshot', 'body')
+  ).workbench
+  assert.ok(unreadBefore, 'The unread-visibility fixture did not expose workbench diagnostics')
+  const staleAddress = {
+    deviceId: 'e2e-stale-device',
+    taskId: `e2e-stale-unread-${Date.now()}`,
+    runtime: 'codex',
+    workspacePath: '/tmp/wework-e2e-stale-unread',
+  }
+  await control.command('dispatchRuntimeLifecycleEvent', 'body', {
+    value: JSON.stringify({
+      address: staleAddress,
+      type: 'transcript_received',
+      transcript: {
+        taskId: staleAddress.taskId,
+        messages: [],
+        running: true,
+        turns: [{ id: 'stale-unread-turn', items: [], status: 'streaming' }],
+      },
+    }),
+  })
+  await control.command('dispatchRuntimeLifecycleEvent', 'body', {
+    value: JSON.stringify({
+      address: staleAddress,
+      type: 'transcript_received',
+      transcript: {
+        taskId: staleAddress.taskId,
+        messages: [],
+        running: false,
+        turns: [],
+      },
+    }),
+  })
+  await waitForWorkbenchDebugState(
+    control,
+    snapshot =>
+      snapshot.workbench?.lifecycleUnreadTaskCount === unreadBefore.lifecycleUnreadTaskCount + 1 &&
+      snapshot.workbench?.visibleUnreadTaskCount === unreadBefore.visibleUnreadTaskCount,
+    'A stale lifecycle task increased the visible unread task count'
+  )
+}
+
+async function verifyBackgroundCompletionRestore({
+  composerSelector,
+  control,
+  otherTaskRowTestId,
+}) {
+  const knownTaskRows = new Set(
+    JSON.parse(await control.command('snapshot', 'body')).testIds.filter(testId =>
+      testId.startsWith('runtime-local-task-row-')
+    )
+  )
+  control.setScenario('background_completion_restore')
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await control.command('waitFor', composerSelector, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await selectE2EModel(control, DEFAULT_MODEL_ID, DEFAULT_MODEL_LABEL)
+  await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    BACKGROUND_COMPLETION_RESTORE_PROMPT,
+    'background_completion_restore'
+  )
+  await withTimeout(
+    control.awaitBackgroundCompletionRestoreResponseStarted(),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'Timed out waiting for the background-completion response to start'
+  )
+  const taskRowTestId = await waitForNewTaskRow(
+    control,
+    knownTaskRows,
+    'WEWORK_DESKTOP_E2E_BACKGROUND_COMPLETION_RESTORE'
+  )
+  const taskId = taskRowTestId.replace('runtime-local-task-row-', '')
+  const runningTaskTestId = `runtime-local-task-running-${taskId}`
+  await control.command('waitFor', `[data-testid="${runningTaskTestId}"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+
+  await control.command('clickWhenEnabled', `[data-testid="${otherTaskRowTestId}"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  control.releaseBackgroundCompletionRestoreResponse()
+  await waitForSnapshot(
+    control,
+    snapshot => !snapshot.testIds.includes(runningTaskTestId),
+    'The background-completion task did not settle while another conversation was active'
+  )
+
+  await control.command('clickWhenEnabled', `[data-testid="${taskRowTestId}"]`, {
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await waitForWorkbenchDebugState(
+    control,
+    snapshot =>
+      snapshot.workbench?.currentRuntimeTask?.taskId === taskId &&
+      snapshot.pane?.transcript?.loading === false,
+    'The completed background conversation did not finish hydrating after switching back'
+  )
+  const restoredSnapshot = await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.text.includes(BACKGROUND_COMPLETION_RESTORE_TEXT) &&
+      !snapshot.testIds.includes('assistant-stopped-notice') &&
+      !snapshot.testIds.includes('thinking-indicator'),
+    'Switching back restored the completed background turn as stopped or streaming',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+  assert.equal(
+    countTextOccurrences(restoredSnapshot.text, BACKGROUND_COMPLETION_RESTORE_TEXT),
+    1,
+    'Switching back duplicated the completed background assistant message'
+  )
+
+  control.setScenario('background_follow_up_restore')
+  await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    BACKGROUND_FOLLOW_UP_RESTORE_PROMPT,
+    'background_follow_up_restore'
+  )
+  await withTimeout(
+    control.awaitBackgroundFollowUpRestoreResponseStarted(),
+    DEFAULT_STEP_TIMEOUT_MS,
+    'Timed out waiting for the background follow-up response to start'
+  )
+  await control.command('waitFor', `[data-testid="${runningTaskTestId}"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('clickWhenEnabled', `[data-testid="${otherTaskRowTestId}"]`, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  control.releaseBackgroundFollowUpRestoreResponse()
+  await waitForSnapshot(
+    control,
+    snapshot => !snapshot.testIds.includes(runningTaskTestId),
+    'The background follow-up did not settle while another conversation was active'
+  )
+
+  await control.command('clickWhenEnabled', `[data-testid="${taskRowTestId}"]`, {
+    stableMs: COMPOSER_READY_STABILITY_MS,
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await waitForWorkbenchDebugState(
+    control,
+    snapshot =>
+      snapshot.workbench?.currentRuntimeTask?.taskId === taskId &&
+      snapshot.pane?.transcript?.loading === false,
+    'The background follow-up did not finish hydrating after switching back'
+  )
+  const followUpSnapshot = await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.text.includes(BACKGROUND_COMPLETION_RESTORE_TEXT) &&
+      snapshot.text.includes(BACKGROUND_FOLLOW_UP_RESTORE_PROMPT) &&
+      snapshot.text.includes(BACKGROUND_FOLLOW_UP_RESTORE_TEXT) &&
+      !snapshot.testIds.includes('assistant-stopped-notice') &&
+      !snapshot.testIds.includes('thinking-indicator'),
+    'Switching back lost or unsettled the completed background follow-up',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+  const conversationMessageSelector = [
+    `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="message-user"]`,
+    `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="message-assistant"]`,
+  ].join(', ')
+  const followUpMessagesText = await control.command('getText', conversationMessageSelector)
+  assertConversationTextOrder(followUpMessagesText, [
+    BACKGROUND_COMPLETION_RESTORE_PROMPT,
+    BACKGROUND_COMPLETION_RESTORE_TEXT,
+    BACKGROUND_FOLLOW_UP_RESTORE_PROMPT,
+    BACKGROUND_FOLLOW_UP_RESTORE_TEXT,
+  ])
+  for (const text of [
+    BACKGROUND_COMPLETION_RESTORE_PROMPT,
+    BACKGROUND_COMPLETION_RESTORE_TEXT,
+    BACKGROUND_FOLLOW_UP_RESTORE_PROMPT,
+    BACKGROUND_FOLLOW_UP_RESTORE_TEXT,
+  ]) {
+    assert.equal(
+      countTextOccurrences(followUpMessagesText, text),
+      1,
+      `Switching back duplicated "${text}"`
+    )
+  }
+
+  const readyCountBeforeReload = control.readyCount
+  await control.command('reloadMainWindow', 'body')
+  await withTimeout(
+    control.awaitReadyAfter(readyCountBeforeReload),
+    WORKBENCH_READY_TIMEOUT_MS,
+    'The reloaded Wework WebView did not reconnect to the desktop controller'
+  )
+  await control.command('waitFor', `[data-testid="${taskRowTestId}"]`, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await waitForWorkbenchDebugState(
+    control,
+    snapshot =>
+      snapshot.workbench?.currentRuntimeTask?.taskId === taskId &&
+      snapshot.pane?.transcript?.loading === false,
+    'Reloading did not restore the completed background conversation'
+  )
+  const reloadedSnapshot = await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.text.includes(BACKGROUND_COMPLETION_RESTORE_TEXT) &&
+      snapshot.text.includes(BACKGROUND_FOLLOW_UP_RESTORE_PROMPT) &&
+      snapshot.text.includes(BACKGROUND_FOLLOW_UP_RESTORE_TEXT) &&
+      !snapshot.testIds.includes('assistant-stopped-notice') &&
+      !snapshot.testIds.includes('thinking-indicator'),
+    'Reloading lost or unsettled the completed background turns',
+    DEFAULT_STEP_TIMEOUT_MS,
+    ACTIVE_WORKBENCH_SELECTOR
+  )
+  const reloadedMessagesText = await control.command('getText', conversationMessageSelector)
+  assertConversationTextOrder(reloadedMessagesText, [
+    BACKGROUND_COMPLETION_RESTORE_PROMPT,
+    BACKGROUND_COMPLETION_RESTORE_TEXT,
+    BACKGROUND_FOLLOW_UP_RESTORE_PROMPT,
+    BACKGROUND_FOLLOW_UP_RESTORE_TEXT,
+  ])
+  for (const text of [
+    BACKGROUND_COMPLETION_RESTORE_PROMPT,
+    BACKGROUND_COMPLETION_RESTORE_TEXT,
+    BACKGROUND_FOLLOW_UP_RESTORE_PROMPT,
+    BACKGROUND_FOLLOW_UP_RESTORE_TEXT,
+  ]) {
+    assert.equal(
+      countTextOccurrences(reloadedMessagesText, text),
+      1,
+      `Reloading duplicated "${text}"`
+    )
+  }
+
+  const completedTaskDebugSnapshot = JSON.parse(
+    await control.command('getWorkbenchDebugSnapshot', 'body')
+  )
+  const completedTaskAddress = completedTaskDebugSnapshot.workbench?.currentRuntimeTask
+  assert.equal(
+    completedTaskAddress?.taskId,
+    taskId,
+    'The completed task address was unavailable before My Work lifecycle verification'
+  )
+  await control.command('dispatchRuntimeLifecycleEvent', 'body', {
+    value: JSON.stringify({
+      address: completedTaskAddress,
+      type: 'transcript_received',
+      transcript: {
+        taskId,
+        messages: [],
+        running: true,
+        turns: [],
+      },
+    }),
+  })
+  await waitForSnapshot(
+    control,
+    snapshot =>
+      snapshot.testIds.includes(taskRowTestId) && !snapshot.testIds.includes(runningTaskTestId),
+    'A stale running transcript revived the completed task'
+  )
+
+  await control.command('navigate', 'body', { value: '/' })
+  await control.command('waitFor', '[data-testid="workspace-tab-strip"]', {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await control.command('click', '[data-testid="workspace-tab-select-fixed-task"]')
+  const taskViewMenuButton = '[data-testid="runtime-task-view-menu-button"]'
+  await control.command('waitFor', taskViewMenuButton, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await control.command('click', taskViewMenuButton)
+  await control.command('click', '[data-testid="runtime-task-view-board"]')
+  const completedColumnSelector = '[data-testid="cloud-todo-column-in_review"]'
+  await control.command('scrollIntoView', completedColumnSelector)
+  await control.command('waitFor', completedColumnSelector, {
+    text: 'WEWORK_DESKTOP_E2E_BACKGROUND_COMPLETION_RESTORE',
+    visible: true,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  const runningColumnText = await control.command(
+    'getText',
+    '[data-testid="cloud-todo-column-in_progress"]'
+  )
+  assert.equal(
+    runningColumnText.includes('WEWORK_DESKTOP_E2E_BACKGROUND_COMPLETION_RESTORE'),
+    false,
+    'The local task board revived a completed task from the stale running transcript'
+  )
+  await control.command('click', '[data-testid="new-chat-button"]')
+  await control.command('waitFor', `[data-testid="${taskRowTestId}"]`, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+}
+
+async function waitForTaskRowByText(control, expectedText) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < DEFAULT_STEP_TIMEOUT_MS) {
+    const snapshot = JSON.parse(await control.command('snapshot', 'body'))
+    const candidates = snapshot.testIds.filter(testId =>
+      testId.startsWith('runtime-local-task-row-')
+    )
+    for (const testId of candidates) {
+      const rowText = await control.command('getText', `[data-testid="${testId}"]`)
+      if (rowText.includes(expectedText)) return testId
+    }
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 100))
+  }
+  throw new Error(`The sidebar did not expose a task row containing ${expectedText}`)
+}
+
+async function verifyRunningFollowUpFork({
+  composerSelector,
+  control,
+  executorHome,
+  sourceTaskRowTestId,
+}) {
+  const sourceTaskId = sourceTaskRowTestId.replace('runtime-local-task-row-', '')
+  const previousTask = findRuntimeWorkTask(
+    JSON.parse(await control.command('getLocalRuntimeWork', 'body')),
+    sourceTaskId
+  )
+  assert.equal(previousTask?.running, false, 'The source turn must be complete before follow-up')
+  assert.equal(typeof previousTask?.completedAt, 'number')
+  control.setScenario('running_fork_follow_up')
+  try {
+    await sendPromptUntilScenarioRequest(
+      control,
+      composerSelector,
+      RUNNING_FORK_FOLLOW_UP_PROMPT,
+      'running_fork_follow_up'
+    )
+    const runningTask = findRuntimeWorkTask(
+      JSON.parse(await control.command('getLocalRuntimeWork', 'body')),
+      sourceTaskId
+    )
+    assert.equal(runningTask?.running, true, 'The held follow-up must remain running')
+    assert.ok(
+      runningTask.updatedAt > previousTask.completedAt,
+      'The follow-up projection must be newer than the previous completion'
+    )
+    await control.command('waitFor', '[data-testid="pause-response-button"]', {
+      timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+    })
+    const firstTurnForkButtonSelector = `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="message-assistant"] [data-testid="fork-message-button"]`
+    await control.command('scrollIntoView', firstTurnForkButtonSelector)
+    await captureVerificationScreenshot(control, 'running-follow-up-fork-01-streaming.png')
+
+    await control.command(
+      'clickDescendantInElementWithText',
+      `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="message-assistant"]`,
+      {
+        target: '[data-testid="fork-message-button"]',
+        text: COMPLETION_TEXT,
+        timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+      }
+    )
+    const forkTaskRowTestId = await waitForForkTaskRow(control, sourceTaskId, 15_000)
+    assert.notEqual(
+      forkTaskRowTestId,
+      sourceTaskRowTestId,
+      'Forking the first turn reused the running source task'
+    )
+
+    const forkTaskId = forkTaskRowTestId.replace('runtime-local-task-row-', '')
+    const runtimeIndex = JSON.parse(
+      await readFile(join(executorHome, 'runtime-work', 'index.json'), 'utf8')
+    )
+    assert.equal(
+      runtimeIndex.tasks[forkTaskId]?.parent?.taskId,
+      sourceTaskId,
+      'Forking during a follow-up did not persist the source task relationship'
+    )
+    assert.ok(
+      runtimeIndex.tasks[forkTaskId]?.parent?.lastTurnId,
+      'Forking during a follow-up did not persist the selected first turn'
+    )
+    await control.command('waitFor', '[data-testid="message-assistant"]', {
+      text: COMPLETION_TEXT,
+      timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+    })
+    const forkSnapshot = JSON.parse(await control.command('snapshot', ACTIVE_WORKBENCH_SELECTOR))
+    assert.equal(
+      forkSnapshot.text.includes(RUNNING_FORK_FOLLOW_UP_PROMPT),
+      false,
+      'The forked task included the in-flight follow-up after the selected turn'
+    )
+    await captureVerificationScreenshot(control, 'running-follow-up-fork-02-target-open.png')
+  } finally {
+    control.releaseRunningForkFollowUpResponse()
+  }
+
+  await ensureTaskRowVisible(control, sourceTaskRowTestId)
+  await control.command('click', `[data-testid="${sourceTaskRowTestId}"]`)
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: RUNNING_FORK_COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  const settledRuntimeIndex = JSON.parse(
+    await readFile(join(executorHome, 'runtime-work', 'index.json'), 'utf8')
+  )
+  assert.equal(
+    Object.hasOwn(settledRuntimeIndex.tasks[sourceTaskId] ?? {}, 'turn_status'),
+    false,
+    'The completed source follow-up leaked process-local turn status into the runtime index'
+  )
+}
+
+async function verifyCompletedTurnFork({
+  composerSelector,
+  control,
+  executorHome,
+  sourceTaskRowTestId,
+  workspacePath,
+}) {
+  const sourceTaskId = sourceTaskRowTestId.replace('runtime-local-task-row-', '')
+  const firstTurnForkButtonSelector = `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="message-assistant"] [data-testid="fork-message-button"]`
+  await control.command('scrollIntoView', firstTurnForkButtonSelector)
+  await control.command('waitFor', firstTurnForkButtonSelector, {
+    visible: true,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await captureVerificationScreenshot(control, 'completed-turn-fork-01-source-ready.png')
+  await control.command(
+    'clickDescendantInElementWithText',
+    `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="message-assistant"]`,
+    {
+      target: '[data-testid="fork-message-button"]',
+      text: COMPLETION_TEXT,
+      timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+    }
+  )
+  const forkTaskRowTestId = await waitForForkTaskRow(control, sourceTaskId, DEFAULT_STEP_TIMEOUT_MS)
+  assert.notEqual(
+    forkTaskRowTestId,
+    sourceTaskRowTestId,
+    'Forking reused the source task instead of creating an independent task'
+  )
+  const forkTaskId = forkTaskRowTestId.replace('runtime-local-task-row-', '')
+  const runtimeIndex = JSON.parse(
+    await readFile(join(executorHome, 'runtime-work', 'index.json'), 'utf8')
+  )
+  assert.equal(
+    runtimeIndex.tasks[sourceTaskId]?.workspace_path,
+    workspacePath,
+    'The source task did not use the selected project workspace'
+  )
+  assert.equal(
+    runtimeIndex.tasks[forkTaskId]?.workspace_path,
+    workspacePath,
+    'The forked task did not inherit the source workspace'
+  )
+  assert.equal(
+    runtimeIndex.tasks[forkTaskId]?.parent?.taskId,
+    sourceTaskId,
+    'The backend did not persist the fork parent relationship'
+  )
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await captureVerificationScreenshot(control, 'completed-turn-fork-02-target-open.png')
+
+  control.setScenario('fork_follow_up')
+  const forkFollowUpRequest = await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    FORK_FOLLOW_UP_PROMPT,
+    'fork_follow_up'
+  )
+  assert.ok(
+    JSON.stringify(forkFollowUpRequest.body).includes(FORK_FOLLOW_UP_PROMPT),
+    'The forked task did not accept an independent follow-up'
+  )
+  assert.equal(
+    JSON.stringify(forkFollowUpRequest.body).includes(FORK_ENCRYPTED_CONTENT),
+    false,
+    'The forked request forwarded opaque encrypted reasoning history'
+  )
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: FORK_FOLLOW_UP_COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await captureVerificationScreenshot(control, 'completed-turn-fork-03-follow-up-complete.png')
+
+  await control.command('click', `[data-testid="${sourceTaskRowTestId}"]`)
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  const sourceSnapshot = JSON.parse(await control.command('snapshot', ACTIVE_WORKBENCH_SELECTOR))
+  assert.ok(
+    !sourceSnapshot.text.includes(FORK_FOLLOW_UP_PROMPT) &&
+      !sourceSnapshot.text.includes(FORK_FOLLOW_UP_COMPLETION_TEXT),
+    'The fork follow-up mutated the source task transcript'
+  )
+  await captureVerificationScreenshot(control, 'completed-turn-fork-04-source-unchanged.png')
+}
+
+async function verifyForkProviderModelPreservation({
+  composerSelector,
+  control,
+  executorHome,
+  newConversationSelector,
+}) {
+  const sourceModel = LOCAL_MODEL_CASES.find(model => model.protocol === 'responses')
+  assert.ok(sourceModel, 'Missing the responses local model for fork provider verification')
+
+  await control.command('clickWhenEnabled', newConversationSelector, {
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  await control.command('waitFor', composerSelector, {
+    timeoutMs: WORKBENCH_READY_TIMEOUT_MS,
+  })
+  await selectE2EModel(control, sourceModel.optionIds, sourceModel.labels)
+
+  const taskRowsBeforeSource = new Set(
+    JSON.parse(await control.command('snapshot', 'body')).testIds.filter(testId =>
+      testId.startsWith('runtime-local-task-row-')
+    )
+  )
+  control.setScenario('fork_provider_source')
+  const sourceRequest = await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    FORK_PROVIDER_SOURCE_PROMPT,
+    'fork_provider_source'
+  )
+  assert.equal(
+    sourceRequest.body.model,
+    sourceModel.modelId,
+    'The fork provider source task did not use the selected local model'
+  )
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: FORK_PROVIDER_SOURCE_COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+  const sourceTaskRowTestId = await waitForNewTaskRow(control, taskRowsBeforeSource, '')
+  const sourceTaskId = sourceTaskRowTestId.replace('runtime-local-task-row-', '')
+  const modelSelector = `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="model-selector-button"]`
+  const sourceProviderId = await control.command('getAttribute', modelSelector, {
+    value: 'data-model-provider-id',
+  })
+  const sourceModelLabel = await control.command('getText', modelSelector)
+
+  const sourceIndex = JSON.parse(
+    await readFile(join(executorHome, 'runtime-work', 'index.json'), 'utf8')
+  )
+  assert.equal(
+    sourceIndex.tasks[sourceTaskId]?.runtime_handle?.executionRequest?.model_config?.model_id,
+    sourceModel.modelId,
+    'The source task did not persist its local model execution request'
+  )
+
+  await control.command(
+    'clickDescendantInElementWithText',
+    `${ACTIVE_WORKBENCH_SELECTOR} [data-testid="message-assistant"]`,
+    {
+      target: '[data-testid="fork-message-button"]',
+      text: FORK_PROVIDER_SOURCE_COMPLETION_TEXT,
+      timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+    }
+  )
+  const forkTaskRowTestId = await waitForForkTaskRow(control, sourceTaskId, DEFAULT_STEP_TIMEOUT_MS)
+  const forkTaskId = forkTaskRowTestId.replace('runtime-local-task-row-', '')
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: FORK_PROVIDER_SOURCE_COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+
+  const forkIndex = JSON.parse(
+    await readFile(join(executorHome, 'runtime-work', 'index.json'), 'utf8')
+  )
+  assert.equal(
+    forkIndex.tasks[forkTaskId]?.runtime_handle?.executionRequest?.model_config?.model_id,
+    sourceModel.modelId,
+    'The forked task did not inherit the source execution model'
+  )
+  assert.deepEqual(
+    forkIndex.tasks[forkTaskId]?.runtime_handle?.modelSelection,
+    sourceIndex.tasks[sourceTaskId]?.runtime_handle?.modelSelection,
+    'The forked task did not inherit the source model selection'
+  )
+  assert.equal(
+    await control.command('getText', modelSelector),
+    sourceModelLabel,
+    'The forked task model selector changed the source model'
+  )
+  assert.equal(
+    await control.command('getAttribute', modelSelector, {
+      value: 'data-model-provider-id',
+    }),
+    sourceProviderId,
+    'The forked task model selector changed the source provider'
+  )
+
+  control.setScenario('fork_provider_follow_up')
+  const followUpRequest = await sendPromptUntilScenarioRequest(
+    control,
+    composerSelector,
+    FORK_PROVIDER_FOLLOW_UP_PROMPT,
+    'fork_provider_follow_up'
+  )
+  assert.equal(
+    followUpRequest.body.model,
+    sourceModel.modelId,
+    'The fork follow-up did not preserve the source model route'
+  )
+  await control.command('waitFor', '[data-testid="message-assistant"]', {
+    text: FORK_PROVIDER_FOLLOW_UP_COMPLETION_TEXT,
+    timeoutMs: DEFAULT_STEP_TIMEOUT_MS,
+  })
+}
+
+export {
+  verifyPriorityFilter,
+  verifyRuntimeTaskOrderAndUnreadVisibility,
+  verifyBackgroundCompletionRestore,
+  waitForTaskRowByText,
+  verifyRunningFollowUpFork,
+  verifyCompletedTurnFork,
+  verifyForkProviderModelPreservation,
+}

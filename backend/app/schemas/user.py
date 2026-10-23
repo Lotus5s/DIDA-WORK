@@ -1,0 +1,302 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+from datetime import datetime
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+
+class MCPProviderKeys(BaseModel):
+    """MCP provider API keys
+
+    Supports dynamic fields for flexible provider key storage.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    # Legacy fields for backward compatibility
+    bailian: Optional[str] = None  # Aliyun Bailian API key
+    modelscope: Optional[str] = None  # ModelScope API key
+    mcp_router: Optional[str] = None  # MCP Router API key
+
+
+class QuickAccessPreference(BaseModel):
+    """User quick access team preferences."""
+
+    version: Optional[int] = None
+    teams: List[int] = Field(default_factory=list)
+
+
+class UserModelSelectionPreference(BaseModel):
+    """User-level model selection preference."""
+
+    modelName: str
+    modelType: Optional[Literal["public", "user", "group", "runtime"]] = None
+    options: dict[str, str] = Field(default_factory=dict)
+
+
+class UserRuntimeConfigPreference(BaseModel):
+    """User-level runtime configuration preference."""
+
+    use_user_config: bool = False
+
+
+class UserProjectWorkPreference(BaseModel):
+    """Per-project Wework execution preference."""
+
+    executionMode: Literal["current_workspace", "git_worktree"] = "current_workspace"
+    worktreeBranch: Optional[str] = None
+
+
+class ComposerQuickPhrase(BaseModel):
+    """Composer preferences, independent of agent quick-launch presets."""
+
+    id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    content: str
+    mode: Literal["normal", "plan", "goal"]
+    attachmentPaths: Optional[List[str]] = None
+    createdAt: Optional[float] = None
+
+    @model_validator(mode="after")
+    def validate_phrase(self) -> "ComposerQuickPhrase":
+        self.id = self.id.strip()
+        self.title = self.title.strip()
+        self.content = self.content.strip()
+        if not self.id or not self.title:
+            raise ValueError("Quick phrase id and title are required")
+        if self.attachmentPaths is not None:
+            self.attachmentPaths = [
+                path.strip() for path in self.attachmentPaths if path.strip()
+            ]
+        if not self.content and not self.attachmentPaths:
+            raise ValueError("Quick phrase content or attachments are required")
+        return self
+
+
+class UserPreferences(BaseModel):
+    """User preferences model"""
+
+    send_key: Literal["enter", "cmd_enter"] = "enter"
+    follow_up_behavior: Literal["queue", "guide"] = "queue"
+    search_key: Literal["cmd_k", "cmd_f", "disabled"] = "cmd_k"
+    memory_enabled: bool = False
+    chat_status_items: Optional[List[str]] = None
+    tool_output_guard_enabled: bool = False
+    mcp_provider_keys: Optional[MCPProviderKeys] = None
+    quick_access: Optional[QuickAccessPreference] = None
+    composer_quick_phrases: Optional[List[ComposerQuickPhrase]] = None
+    # Default execution target: 'cloud' for cloud mode, or device_id for a specific device
+    default_execution_target: Optional[str] = None
+    wework_new_chat_model_selection: Optional[UserModelSelectionPreference] = None
+    wework_project_execution_mode: Literal["current_workspace", "git_worktree"] = (
+        "current_workspace"
+    )
+    wework_project_work_preferences: dict[str, UserProjectWorkPreference] = Field(
+        default_factory=dict
+    )
+    runtime_configs: dict[str, UserRuntimeConfigPreference] = Field(
+        default_factory=dict
+    )
+
+
+class Token(BaseModel):
+    """Token response model"""
+
+    access_token: str
+    token_type: str
+
+
+class TokenData(BaseModel):
+    """Token data model"""
+
+    username: Optional[str] = None
+
+
+class GitInfo(BaseModel):
+    """Git information model"""
+
+    id: Optional[str] = None  # Unique identifier for this git info entry (UUID)
+    git_domain: str
+    git_token: str
+    type: str
+    user_name: Optional[str] = None
+    git_id: Optional[str] = None
+    git_login: Optional[str] = None
+    git_email: Optional[str] = None
+    auth_type: Optional[str] = (
+        None  # Authentication type for Gerrit: 'digest' or 'basic'
+    )
+
+
+class GitTokenOrderUpdate(BaseModel):
+    """Ordered stable keys for the current user's Git tokens."""
+
+    ordered_keys: List[str]
+
+
+class UserBase(BaseModel):
+    """User base model"""
+
+    user_name: str
+    email: Optional[EmailStr] = None
+    is_active: Optional[bool] = True
+
+
+class UserCreate(UserBase):
+    """User creation model"""
+
+    git_info: Optional[List[GitInfo]] = None
+    preferences: Optional[UserPreferences] = None
+    password: Optional[str] = None
+
+
+class UserUpdate(BaseModel):
+    """User update model"""
+
+    user_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    git_info: Optional[List[GitInfo]] = None
+    preferences: Optional[UserPreferences] = None
+    password: Optional[str] = None
+
+
+class UserInDB(UserBase):
+    """Database user model"""
+
+    id: int
+    git_info: Optional[List[GitInfo]] = None
+    preferences: Optional[UserPreferences] = None
+    role: str = "user"
+    auth_source: str = "unknown"
+    created_at: datetime
+    updated_at: datetime
+    # Admin-only field: indicates if admin setup wizard has been completed
+    admin_setup_completed: Optional[bool] = None
+
+    @field_validator("preferences", mode="before")
+    @classmethod
+    def parse_preferences(cls, v):
+        """Parse preferences from JSON string or dict to UserPreferences object"""
+        if v is None or v == "" or v == "null":
+            return None
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                if not parsed:  # Empty dict or None after parsing
+                    return None
+                return UserPreferences(**parsed)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        if isinstance(v, dict):
+            if not v:  # Empty dict
+                return None
+            return UserPreferences(**v)
+        return v
+
+    class Config:
+        from_attributes = True
+
+
+class LoginRequest(BaseModel):
+    user_name: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class AdminPasswordSetupRequest(BaseModel):
+    """Request body for setting the initial admin password."""
+
+    password: str = Field(..., min_length=6)
+
+
+class UserInfo(BaseModel):
+    """User info model for admin list"""
+
+    id: int
+    user_name: str
+    role: str = "user"
+
+
+class UserAuthTypeResponse(BaseModel):
+    """Response model for user authentication type query"""
+
+    exists: bool
+    auth_source: Optional[str] = None
+
+
+class CLILoginInitRequest(BaseModel):
+    """Request model for CLI OIDC login initialization"""
+
+    session_id: str
+
+
+class CLILoginInitResponse(BaseModel):
+    """Response model for CLI OIDC login initialization"""
+
+    auth_url: str
+    session_id: str
+
+
+class CLIPollResponse(BaseModel):
+    """Response model for CLI polling"""
+
+    status: str  # pending, success, failed
+    access_token: Optional[str] = None
+    username: Optional[str] = None
+    error: Optional[str] = None
+
+
+class WeworkAuthSessionCreateResponse(BaseModel):
+    """Response model for Wework desktop cloud authorization initialization."""
+
+    session_id: str
+    poll_token: str
+    authorize_url: str
+    web_url: str
+    expires_at: int
+    poll_interval_seconds: int
+
+
+class WeworkAuthSessionCreateRequest(BaseModel):
+    """Optional device key for refresh-capable Wework desktop clients."""
+
+    device_public_key: Optional[dict[str, str]] = None
+
+
+class WeworkWebConfigResponse(BaseModel):
+    """Web application metadata exposed to Wework desktop."""
+
+    web_url: str
+    socket_url: Optional[str] = None
+
+
+class WeworkAuthSessionPollResponse(BaseModel):
+    """Response model for Wework desktop authorization polling."""
+
+    status: str
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: Optional[str] = None
+    username: Optional[str] = None
+    error: Optional[str] = None
+
+
+class WeworkAuthSessionActionResponse(BaseModel):
+    """Response model for Web authorization approve/decline actions."""
+
+    status: str

@@ -1,0 +1,153 @@
+// SPDX-FileCopyrightText: 2026 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import type { CollaborationIssue, CollaborationProject } from "../types";
+import { executionDisplayStatus } from "../issue-detail/executionStatus";
+
+export type WorkspaceOperationState =
+  | "failed"
+  | "unavailable"
+  | "review"
+  | "running"
+  | "pending"
+  | "completed";
+
+export type WorkspaceProjectIssuesSnapshot =
+  | { status: "loading" }
+  | { status: "available"; issues: CollaborationIssue[] }
+  | { status: "unavailable" };
+
+export interface WorkspaceProjectOperation {
+  project: CollaborationProject;
+  issues: CollaborationIssue[];
+  unavailable: boolean;
+  runningCount: number;
+  reviewCount: number;
+  failedCount: number;
+  pendingCount: number;
+  updatedAt: string;
+}
+
+export function workspaceIssueOperationState(
+  issue: CollaborationIssue,
+): WorkspaceOperationState {
+  const executionState = executionDisplayStatus(issue.execution_state);
+  if (executionState === "failed" || issue.execution_error) {
+    return "failed";
+  }
+  if (issue.status === "in_review" || executionState === "waiting_approval") {
+    return "review";
+  }
+  switch (executionState) {
+    case "running":
+      return "running";
+    case "queued":
+    case "starting":
+    case "waiting_runtime":
+    case "cancelling":
+    case "unknown":
+    case "succeeded":
+    case "cancelled":
+    case "skipped":
+      return issue.status === "completed" ? "completed" : "pending";
+    case null:
+      if (issue.status === "in_progress") return "running";
+      if (issue.status === "completed") return "completed";
+      return "pending";
+    default:
+      executionState satisfies never;
+      return "pending";
+  }
+}
+
+export function createWorkspaceOperationsSnapshot({
+  projects,
+  projectIssues,
+}: {
+  projects: CollaborationProject[];
+  projectIssues: Record<string, WorkspaceProjectIssuesSnapshot>;
+}) {
+  const operations = projects
+    .map<WorkspaceProjectOperation>((project) => {
+      const projectSnapshot = projectIssues[project.id] ?? {
+        status: "loading",
+      };
+      const unavailable = projectSnapshot.status === "unavailable";
+      const issues =
+        projectSnapshot.status === "available" ? projectSnapshot.issues : [];
+      const states = issues.map(workspaceIssueOperationState);
+      const updatedAt =
+        [...issues]
+          .sort((left, right) =>
+            right.updated_at.localeCompare(left.updated_at),
+          )
+          .at(0)?.updated_at ?? project.updated_at;
+      return {
+        project,
+        issues,
+        unavailable,
+        runningCount: states.filter((state) => state === "running").length,
+        reviewCount: states.filter((state) => state === "review").length,
+        failedCount: states.filter((state) => state === "failed").length,
+        pendingCount: states.filter((state) => state === "pending").length,
+        updatedAt,
+      };
+    })
+    .sort((left, right) => {
+      if (left.unavailable !== right.unavailable) {
+        return left.unavailable ? -1 : 1;
+      }
+      if (left.failedCount !== right.failedCount) {
+        return right.failedCount - left.failedCount;
+      }
+      if (left.reviewCount !== right.reviewCount) {
+        return right.reviewCount - left.reviewCount;
+      }
+      if (left.runningCount !== right.runningCount) {
+        return right.runningCount - left.runningCount;
+      }
+      return right.updatedAt.localeCompare(left.updatedAt);
+    });
+
+  const issues = operations.flatMap((operation) =>
+    operation.issues.map((issue) => ({ issue, project: operation.project })),
+  );
+  const attentionItems = issues
+    .filter(({ issue }) => {
+      const state = workspaceIssueOperationState(issue);
+      return state === "failed" || state === "review";
+    })
+    .sort((left, right) => {
+      const leftState = workspaceIssueOperationState(left.issue);
+      const rightState = workspaceIssueOperationState(right.issue);
+      if (leftState !== rightState) return leftState === "failed" ? -1 : 1;
+      return right.issue.updated_at.localeCompare(left.issue.updated_at);
+    })
+    .slice(0, 6);
+  const unavailableProjects = operations.filter(
+    (operation) => operation.unavailable,
+  );
+
+  return {
+    operations,
+    attentionItems,
+    unavailableProjects,
+    totals: {
+      projects: projects.length,
+      running: issues.filter(
+        ({ issue }) => workspaceIssueOperationState(issue) === "running",
+      ).length,
+      review: issues.filter(
+        ({ issue }) => workspaceIssueOperationState(issue) === "review",
+      ).length,
+      failed: issues.filter(
+        ({ issue }) => workspaceIssueOperationState(issue) === "failed",
+      ).length,
+      unavailable: unavailableProjects.length,
+      pending: issues.filter(
+        ({ issue }) => workspaceIssueOperationState(issue) === "pending",
+      ).length,
+    },
+  };
+}

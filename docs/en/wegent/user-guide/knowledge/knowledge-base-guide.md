@@ -1,0 +1,340 @@
+---
+sidebar_position: 6
+---
+
+# Knowledge Base Guide
+
+Knowledge Base enables you to store, organize, and retrieve documents for RAG (Retrieval-Augmented Generation), allowing AI agents to answer questions based on your specific documents.
+
+---
+
+## 🎯 Overview
+
+### What is Knowledge Base?
+
+Knowledge Base is a document storage and retrieval system that enables RAG. It allows AI agents to search through your documents and provide answers grounded in your specific content.
+
+### Core Benefits
+
+| Benefit | Description |
+|---------|-------------|
+| **Grounded Responses** | AI answers based on your documents |
+| **Source Citations** | Every answer includes references to source documents |
+| **Smart Chunking** | Automatic document splitting optimized for retrieval |
+| **Flexible Retrieval** | Vector, keyword, or hybrid search modes |
+
+---
+
+## 🆕 Creating Knowledge Bases
+
+### Step 1: Navigate to Knowledge Base
+
+1. Log in to Wegent
+2. Navigate to **Knowledge Base** section in the sidebar
+3. Click **Create Knowledge Base**
+
+### Step 2: Choose Knowledge Base Type
+
+| Type | Document Limit | Chat Support | Best For |
+|------|----------------|--------------|----------|
+| **Notebook** | 50 documents | ✅ Yes | Interactive research, Q&A sessions |
+| **Classic** | Unlimited | ❌ No | Large document collections, archives |
+
+See [Knowledge Base Types](./knowledge-base-types.md) for detailed comparison.
+
+### Step 3: Configure Basic Settings
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| **Name** | Display name (1-100 chars) | "Product Documentation" |
+| **Description** | Optional description (max 500 chars) | "Internal product docs and guides" |
+
+### Step 4: Configure Retrieval Settings
+
+| Setting | Options | Description |
+|---------|---------|-------------|
+| **Retrieval Mode** | Vector / Keyword / Hybrid | Search method |
+| **top_k** | 1-10 (default: 5) | Number of results |
+| **score_threshold** | 0.0-1.0 (default: 0.5) | Minimum relevance score |
+
+### Step 5: Upload Documents
+
+1. Click **Add Document**
+2. Choose source type (File / Text / URL / External Table)
+3. Configure chunking settings (optional)
+4. Click **Upload**
+
+---
+
+## 📄 Document Management
+
+### Supported Sources
+
+| Source | Description |
+|--------|-------------|
+| **File Upload** | Upload from local computer |
+| **Text Paste** | Paste text content directly |
+| **External Table** | Import from DingTalk/Feishu |
+| **Web Scraping** | Scrape content from URL |
+
+### Supported Formats
+
+- `.txt` - Plain text files
+- `.md` - Markdown files
+- `.pdf` - PDF documents
+- `.doc`, `.docx` - Word documents
+
+See [Document Management](./document-management.md) for detailed guide.
+
+---
+
+## 🔪 Chunking Strategies
+
+### Available Strategies
+
+| Strategy | Best For | Description |
+|----------|----------|-------------|
+| **Smart Chunking** | General documents | Auto-detect structure |
+| **Sentence-based** | FAQ, Q&A content | Split by sentence boundaries |
+| **Semantic** | Long articles | Split by semantic similarity |
+
+### Key Parameters
+
+| Parameter | Range | Default | Description |
+|-----------|-------|---------|-------------|
+| **chunk_size** | 128-8192 | 500 | Characters per chunk |
+| **chunk_overlap** | 0-2048 | 50 | Overlapping characters |
+
+See [Chunking Strategies](./chunking-strategies.md) for detailed guide.
+
+---
+
+## 🔍 Retrieval Test
+
+For smaller knowledge bases, the system may also use an `all-chunks` direct injection path to load the full chunk set into the model. This exists mainly to compensate for cases where vector retrieval recall is not stable enough.
+
+See [Retrieval And Direct Injection](./retrieval-and-direct-injection.md) for the design rationale and permission model.
+
+Before saving retrieval configuration, you can test the retrieval effectiveness.
+
+### How to Use
+
+1. Go to Knowledge Base **Retrieval Settings**
+2. Configure retrieval parameters
+3. Enter a test query in the **Retrieval Test** area
+4. Click **Test** button
+5. Review returned chunks and relevance scores
+6. Adjust parameters based on results
+7. Click **Save** when satisfied
+
+---
+
+## 📝 Summary Features
+
+### Document Summaries
+
+When enabled, the system automatically generates summaries for each document:
+
+1. Document is uploaded and indexed
+2. Summary model processes content
+3. Summary stored with document metadata
+4. Available for quick reference
+
+### Knowledge Base Summary
+
+Generate an aggregate summary of the entire Knowledge Base:
+
+1. Navigate to Knowledge Base settings
+2. Click **Generate Summary**
+3. View combined summary of all documents
+
+#### Manually Editing Knowledge Base Summary
+
+Knowledge base summaries can be edited manually to correct AI-generated content, add missing context, or rewrite the summary in a form that better fits team usage.
+
+- Manual summary takes priority in UI display
+- Manual summary takes priority when injected into knowledge-base chat context
+- AI summary generation continues running in the background
+- Use **Restore AI Summary** to switch back to the latest AI-generated summary
+
+**Notes:**
+
+- The current version only supports manual editing of the knowledge base long summary
+- Document summaries are still generated automatically
+- If **Auto Generate Summary** is disabled, new AI summaries stop updating, but saved manual summary content can still be displayed
+
+### Summary Retry
+
+If summary generation fails:
+
+1. Find the document with failed summary
+2. Click **Retry Summary** button
+3. System will attempt to regenerate
+
+---
+
+## 🤖 Integration with Agents
+
+### Selecting Knowledge Base in Chat
+
+1. Click the **context selector** near the chat input
+2. Select **Knowledge Base** from options
+3. Choose your desired Knowledge Base
+4. Send your question
+
+### Notebook Mode Chat
+
+In Notebook mode, you can chat directly within the Knowledge Base:
+
+1. Open a Notebook-type Knowledge Base
+2. Use the chat panel on the right
+3. Select specific documents for context (optional)
+4. Ask questions about your documents
+
+---
+
+## 📑 Citations and References
+
+### Citation Format
+
+AI responses include numbered citations linking to source documents:
+
+```
+Based on your product documentation [1], the feature works by...
+Additionally, the troubleshooting guide [2] suggests...
+
+Sources:
+[1] product-overview.pdf (Section 3)
+[2] troubleshooting-guide.md (Chunk 15)
+```
+
+### Viewing Source Content
+
+1. Click on a citation number in the response
+2. View the original chunk content
+3. See surrounding context
+4. Navigate to full document if needed
+
+---
+
+## 🔐 Permission Management
+
+Knowledge bases support fine-grained access control through the Share Service architecture. You can manage members, assign roles, and authorize external entities (e.g., groups) to access your knowledge bases.
+
+### Member Roles
+
+| Role | Permissions |
+|------|-------------|
+| **Owner** | Full control, can transfer ownership and manage all members |
+| **Maintainer** | Can manage documents, settings, and invite members |
+| **Developer** | Can read and contribute documents |
+| **Reporter** | Read-only access |
+
+### Managing Members
+
+1. Open a knowledge base and click **Permission Management**
+2. Under the **Personal** tab, invite users by username or email
+3. Assign a role from the dropdown (Owner, Maintainer, Developer, Reporter)
+4. Click **Add** to send the invitation
+
+### Entity-Level Authorization
+
+In addition to individual users, you can authorize entire groups or namespaces:
+
+1. Switch to the **Group** tab in the permission dialog
+2. Search for a group or namespace
+3. Select the desired group and assign a role
+4. All members of that group inherit the assigned permissions
+
+**Note:** Entity-authorized knowledge bases appear in the members' **Shared with Me** section rather than under the group's native knowledge bases.
+
+### Permission Source Visualization
+
+When viewing members, the system displays how each member gained access:
+
+- **Direct** — Added directly as a member
+- **Entity** — Access granted through a group or namespace
+- **Link** — Access obtained via a share link
+
+### Role Conflict Resolution
+
+When a user has multiple access paths to the same knowledge base (e.g., direct membership and group membership), the system automatically resolves conflicts by selecting the highest-privilege role.
+
+### Ownership Transfer
+
+Owners can transfer ownership to another member:
+
+1. In **Permission Management**, locate the target member
+2. Click **Transfer Ownership** next to their name
+3. Confirm the transfer in the dialog
+
+The previous owner is downgraded to Maintainer, and the new owner gains full control.
+
+---
+
+## 🔄 Automatic DingTalk document updates
+
+Enable **Automatically update DingTalk documents** under **Advanced settings** when creating or editing a knowledge base (off by default). A daily scan checks the source update time of existing and subsequently imported DingTalk copies. Successful, available copies are skipped when the saved timestamp is unchanged, or when the source reports no update time while a baseline exists; all other copies are reimported, including copies without a baseline, and the refresh establishes that baseline only when DingTalk reports an update time. The scan runs daily at 02:00 Asia/Shanghai (18:00 UTC); when the service is unavailable at that time, the run waits for the next schedule instead of catching up.
+
+- Each copy uses its original importer's DingTalk authorization. That account must remain active and retain permission to maintain documents in the target knowledge base.
+- Copies remain shared under the target knowledge base's permissions. New documents in source folders are not imported automatically. Source deletion or revoked access does not delete the Wegent document record.
+- Updates use the same processing flow as manual reimport. Content may be unavailable during an update. Failures appear through the existing error and retry controls and are attempted again in a later cycle.
+- Disabling the setting skips automatic jobs that have not started; processing already underway finishes. Manual reimport remains available.
+- A failed timestamp probe preserves the available copy. Failed processing remains retryable even if the source timestamp is unchanged. Manual reimport always updates and invalidates the old automatic comparison baseline.
+
+The document list offers **Sync now** on DingTalk copies so the latest source body can be fetched without waiting for the daily scan; the entry reads **Retry sync** when the source is unavailable or indexing failed, and is disabled with **Syncing** while a refresh is in flight. A source that has been deleted or lost access marks the copy **Source unavailable**, and a failed latest sync marks it **Synchronization failed**. A previously imported copy keeps its existing body and index when source probing or body fetching fails. If conversion or indexing fails after a new body is attached, the copy may be temporarily unavailable. The mark clears once the source is reachable again and a sync succeeds.
+
+Fetching a fresh body still requires the node to be present in the original importer's local DingTalk directory. If that directory entry is missing, sync fails; sync the DingTalk directory again before retrying the copy. A missing local entry alone does not establish that the DingTalk source file was deleted.
+
+This first version accepts delayed DingTalk MCP `updateTime` values: content may change before the timestamp does, causing a scan to skip it; a copy whose source stops reporting a time keeps its saved baseline and stays skipped until a time is reported again. After rollout, observe timestamp delays by format, persistently unchanged nodes, and actual content freshness. This behavior was observed with online documents; recovery on the next cycle is not guaranteed. Use manual reimport when an immediate update is needed; the backend sync trigger still applies timestamp comparison.
+
+Deployment requires `SCHEDULED_TASKS_ENABLED` plus `DINGTALK_SYNC_SCHEDULE_ENABLED` (off by default), which is what registers the daily schedule; run Celery Beat and a Worker consuming the default queue. Restart these processes after upgrading to load the new tasks. The manual trigger does not depend on `DINGTALK_SYNC_SCHEDULE_ENABLED`. No database migration is needed.
+
+For testing, an authenticated knowledge-base manager can call `POST /api/knowledge-bases/{knowledge_base_id}/dingtalk-sync` with no request body after enabling automatic updates. It queues the same daily scan for that knowledge base only; workers retain each copy's original importer authorization. HTTP 202 with `{"task_id":"...","status":"queued"}` means queued, not successfully updated. Check document processing results in the document list. A disabled setting returns 400, insufficient management permission returns 403, and enqueue failure returns 503. A Worker is required, but there is no need to wait for the next Beat tick.
+
+## ❓ Troubleshooting
+
+### Upload Issues
+
+| Problem | Solution |
+|---------|----------|
+| File upload fails | Check file size (max 50MB) and format |
+| Document stuck in "Processing" | Wait for large documents or re-upload |
+
+### Retrieval Issues
+
+| Problem | Solution |
+|---------|----------|
+| No results returned | Lower score_threshold or try different query |
+| Irrelevant results | Reduce chunk_size or try hybrid mode |
+
+---
+
+## 💡 Best Practices
+
+### Document Organization
+
+| Practice | Description |
+|----------|-------------|
+| **Meaningful names** | Use descriptive document names |
+| **Consistent format** | Standardize document formatting |
+| **Regular updates** | Re-index when documents change |
+| **Clean content** | Remove irrelevant headers/footers |
+
+### Retrieval Tuning
+
+| Scenario | Mode | top_k | threshold |
+|----------|------|-------|-----------|
+| Precise answers | Vector | 3-5 | 0.8 |
+| Broad search | Hybrid | 8-10 | 0.6 |
+| Exact matching | Keyword | 5 | 0.7 |
+
+---
+
+## 🔗 Related Resources
+
+- [Knowledge Base Types](./knowledge-base-types.md) - Notebook vs Classic comparison
+- [Document Management](./document-management.md) - Adding and managing documents
+- [Chunking Strategies](./chunking-strategies.md) - Document chunking options
+- [Configuring Retrievers](./configuring-retrievers.md) - Retrieval configuration
+- [Permission Management](#-permission-management) - Member roles and access control

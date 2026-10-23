@@ -1,0 +1,28 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "wework-personal",
+  "description": "Plugins bundled with DIDA Work.",
+  "owner": {
+    "name": "DIDA Work"
+  },
+  "plugins": [
+    {
+      "name": "wework-space",
+      "description": "Provides project-space, Issue, attachment, and delivery tools to DIDA Work Agent sessions.",
+      "source": "./plugins/wework-space",
+      "version": "0.2.2"
+    },
+    {
+      "name": "smart-app-builder",
+      "description": "Builds, tests, packages, and installs DeepSeek Harness Smart apps for DIDA Work.",
+      "source": "./plugins/smart-app-builder",
+      "version": "0.1.1"
+    },
+    {
+      "name": "wework-plugin-developer",
+      "description": "Creates and debugs DIDA Work Core DSH plugins and their Codex Skills.",
+      "source": "./plugins/wework-plugin-developer",
+      "version": "0.1.9"
+    }
+  ]
+}

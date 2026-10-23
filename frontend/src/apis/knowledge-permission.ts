@@ -1,0 +1,323 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+import type {
+  BatchPermissionAddRequest,
+  BatchPermissionAddResponse,
+  JoinByLinkRequest,
+  JoinByLinkResponse,
+  KBShareInfo,
+  MemberRole,
+  MyPermissionResponse,
+  PermissionAddRequest,
+  PermissionApplyRequest,
+  PermissionApplyResponse,
+  PermissionListResponse,
+  PermissionResponse,
+  PermissionReviewRequest,
+  PermissionReviewResponse,
+  PermissionUpdateRequest,
+  PermissionUserInfo,
+  PublicKnowledgeBaseResponse,
+  ShareLinkConfig,
+  ShareLinkResponse,
+} from '@/types/knowledge'
+
+// Type for unified share API member response
+interface ResourceMemberResponse {
+  id: number
+  resource_type: string
+  resource_id: number
+  user_id: number
+  display_name: string | null
+  user_email: string | null
+  role: string
+  status: string
+  entity_type?: string | null
+  entity_id?: string | null
+  entity_display_name?: string | null
+  source_type?: string | null
+  invited_by_user_id: number
+  invited_by_user_name: string | null
+  reviewed_by_user_id: number | null
+  reviewed_by_user_name: string | null
+  reviewed_at: string | null
+  copied_resource_id: number | null
+  requested_at: string
+  created_at: string
+  updated_at: string
+}
+import client from './client'
+import { ApiError } from './client'
+
+export const knowledgePermissionApi = {
+  /**
+   * Apply for knowledge base access permission
+   */
+  applyPermission: async (
+    kbId: number,
+    request: PermissionApplyRequest
+  ): Promise<PermissionApplyResponse> => {
+    const response = await client.post<PermissionApplyResponse>(
+      `/share/KnowledgeBase/${kbId}/join`,
+      {
+        share_token: '', // Will be filled by the caller
+        requested_role: request.role,
+      }
+    )
+    return response
+  },
+
+  /**
+   * Review a permission request (approve or reject)
+   */
+  reviewPermission: async (
+    kbId: number,
+    permissionId: number,
+    request: PermissionReviewRequest
+  ): Promise<PermissionReviewResponse> => {
+    const response = await client.post<PermissionReviewResponse>(
+      `/share/KnowledgeBase/${kbId}/requests/${permissionId}/review`,
+      {
+        approved: request.action === 'approve',
+        role: request.role,
+      }
+    )
+    return response
+  },
+
+  /**
+   * List all permissions for a knowledge base
+   */
+  listPermissions: async (
+    kbId: number,
+    options?: { includePendingRequests?: boolean }
+  ): Promise<PermissionListResponse> => {
+    // Fetch approved members
+    const membersResponse = await client.get<{ members: ResourceMemberResponse[]; total: number }>(
+      `/share/KnowledgeBase/${kbId}/members`
+    )
+
+    let pending: PermissionListResponse['pending'] = []
+    if (options?.includePendingRequests) {
+      try {
+        const pendingResponse = await client.get<{
+          requests: {
+            id: number
+            user_id: number
+            user_name: string | null
+            user_email: string | null
+            requested_role: string
+            requested_at: string
+          }[]
+          total: number
+        }>(`/share/KnowledgeBase/${kbId}/requests`)
+
+        pending = pendingResponse.requests.map(r => {
+          return {
+            id: r.id,
+            user_id: r.user_id,
+            username: r.user_name || '',
+            email: r.user_email || '',
+            role: (r.requested_role as MemberRole) || 'Reporter',
+            requested_at: r.requested_at,
+          }
+        })
+      } catch (err) {
+        // Viewer may have just lost manage permission (e.g. removed a group
+        // that granted them Maintainer). Treat as empty list instead of error.
+        if (!(err instanceof ApiError) || err.status !== 403) {
+          throw err
+        }
+      }
+    }
+
+    // Transform approved members - group by role
+    const approved = membersResponse.members.reduce<{
+      [K in MemberRole]: PermissionUserInfo[]
+    }>(
+      (acc, m) => {
+        const role = (m.role as MemberRole) || 'Reporter'
+        if (!acc[role]) acc[role] = []
+        // For entity-type members, backend populates display_name via _get_entity_display_name
+        const isEntity = m.entity_type && m.entity_type !== 'user'
+        const member: PermissionUserInfo = {
+          id: m.id,
+          user_id: m.user_id,
+          display_name:
+            m.display_name || m.entity_display_name || (isEntity ? m.entity_id || '' : ''),
+          email: isEntity ? '' : m.user_email || '',
+          role: role,
+          requested_at: m.requested_at,
+          reviewed_at: m.reviewed_at || undefined,
+          reviewed_by: m.reviewed_by_user_id || undefined,
+          entity_type: m.entity_type || undefined,
+          entity_id: m.entity_id || undefined,
+          source_type: m.source_type || undefined,
+        }
+        acc[role].push(member)
+        return acc
+      },
+      { Owner: [], Maintainer: [], Developer: [], Reporter: [], RestrictedAnalyst: [] }
+    )
+    return { pending, approved }
+  },
+
+  /**
+   * Directly add permission for a user
+   */
+  addPermission: async (
+    kbId: number,
+    request: PermissionAddRequest
+  ): Promise<PermissionResponse> => {
+    // First, search for user by username using the search API
+    const searchResponse = await client.get<{
+      users: { id: number; user_name: string; email: string | null }[]
+      total: number
+    }>(`/users/search?q=${encodeURIComponent(request.user_name)}&limit=10`)
+
+    // Find exact match by username
+    const user = searchResponse.users.find(
+      u => u.user_name.toLowerCase() === request.user_name.toLowerCase()
+    )
+    if (!user) {
+      throw new Error('User not found')
+    }
+    const response = await client.post<PermissionResponse>(`/share/KnowledgeBase/${kbId}/members`, {
+      user_id: user.id,
+      role: request.role,
+    })
+    return response
+  },
+
+  /**
+   * Add permission for a namespace (group-level permission)
+   */
+  addNamespacePermission: async (
+    kbId: number,
+    namespaceId: number,
+    role: string
+  ): Promise<PermissionResponse> => {
+    const response = await client.post<PermissionResponse>(`/share/KnowledgeBase/${kbId}/members`, {
+      user_id: 0,
+      role,
+      entity_type: 'namespace',
+      entity_id: String(namespaceId),
+    })
+    return response
+  },
+
+  /**
+   * Batch add permissions for multiple users in a single request
+   */
+  batchAddPermission: async (
+    kbId: number,
+    request: BatchPermissionAddRequest
+  ): Promise<BatchPermissionAddResponse> => {
+    const response = await client.post<BatchPermissionAddResponse>(
+      `/share/KnowledgeBase/${kbId}/members/batch`,
+      request
+    )
+    return response
+  },
+
+  /**
+   * Update a user's role
+   */
+  updatePermission: async (
+    kbId: number,
+    permissionId: number,
+    request: PermissionUpdateRequest
+  ): Promise<PermissionResponse> => {
+    const response = await client.put<PermissionResponse>(
+      `/share/KnowledgeBase/${kbId}/members/${permissionId}`,
+      {
+        role: request.role,
+      }
+    )
+    return response
+  },
+
+  /**
+   * Delete (revoke) a user's permission
+   */
+  deletePermission: async (kbId: number, permissionId: number): Promise<{ message: string }> => {
+    const response = await client.delete<{ message: string }>(
+      `/share/KnowledgeBase/${kbId}/members/${permissionId}`
+    )
+    return response
+  },
+
+  /**
+   * Get current user's permission for a knowledge base
+   */
+  getMyPermission: async (kbId: number): Promise<MyPermissionResponse> => {
+    const response = await client.get<MyPermissionResponse>(
+      `/share/KnowledgeBase/${kbId}/my-permission`
+    )
+    return response
+  },
+
+  /**
+   * Get knowledge base info for share page
+   */
+  getShareInfo: async (kbId: number): Promise<KBShareInfo> => {
+    const response = await client.get<KBShareInfo>(`/share/KnowledgeBase/${kbId}/share-info`)
+    return response
+  },
+
+  /**
+   * Get public knowledge base info by share token (no auth required)
+   */
+  getPublicKnowledgeBase: async (token: string): Promise<PublicKnowledgeBaseResponse> => {
+    const response = await client.get<PublicKnowledgeBaseResponse>(
+      `/share/public/knowledge?token=${encodeURIComponent(token)}`
+    )
+    return response
+  },
+
+  /**
+   * Get share token for KB redirect (no auth required)
+   */
+  getShareTokenByKbId: async (kbId: number): Promise<{ share_token: string }> => {
+    const response = await client.get<{ share_token: string }>(
+      `/share/public/knowledge/redirect?kb_id=${kbId}`
+    )
+    return response
+  },
+
+  /**
+   * Create or get share link for knowledge base
+   */
+  createShareLink: async (kbId: number, config?: ShareLinkConfig): Promise<ShareLinkResponse> => {
+    const response = await client.post<ShareLinkResponse>(`/share/KnowledgeBase/${kbId}/link`, {
+      config: config || { require_approval: true, default_role: 'Reporter' },
+    })
+    return response
+  },
+
+  /**
+   * Get existing share link for knowledge base
+   */
+  getShareLink: async (kbId: number): Promise<ShareLinkResponse | null> => {
+    const response = await client.get<ShareLinkResponse | null>(`/share/KnowledgeBase/${kbId}/link`)
+    return response
+  },
+
+  /**
+   * Delete share link for knowledge base
+   */
+  deleteShareLink: async (kbId: number): Promise<{ message: string }> => {
+    const response = await client.delete<{ message: string }>(`/share/KnowledgeBase/${kbId}/link`)
+    return response
+  },
+
+  /**
+   * Join knowledge base via share link
+   */
+  joinByLink: async (request: JoinByLinkRequest): Promise<JoinByLinkResponse> => {
+    const response = await client.post<JoinByLinkResponse>('/share/join', request)
+    return response
+  },
+}

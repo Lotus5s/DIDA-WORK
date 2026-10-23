@@ -1,0 +1,143 @@
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from datetime import datetime
+from typing import Any, List, Optional
+
+from pydantic import BaseModel
+
+from app.schemas.bot import BotInDB
+from app.schemas.kind import ModeSpec, TeamDisplayConfig, TeamInputPlaceholder
+from app.schemas.quick_launch import QuickPhraseMixin
+from app.schemas.user import UserInDB
+
+
+class BotSummary(BaseModel):
+    """Bot summary model with only necessary fields for team list"""
+
+    agent_config: Optional[dict[str, Any]] = None
+    agent_name: Optional[str] = None
+    shell_type: Optional[str] = None  # Shell type (e.g., "Chat", "Docker", "Dify")
+
+
+class BotInfo(BaseModel):
+    """Bot information model"""
+
+    bot_id: int
+    bot_prompt: Optional[str] = None
+    role: Optional[str] = None
+    requireConfirmation: Optional[bool] = (
+        False  # Pipeline mode: pause after this stage for user confirmation
+    )
+    contextPassing: Optional[str] = (
+        "none"  # Pipeline mode: message passed from this stage to the next stage
+    )
+    bot: Optional[BotSummary] = None
+
+
+class BotDetailInfo(BaseModel):
+    """Bot detail information model with bot object"""
+
+    bot: BotInDB
+    bot_prompt: Optional[str] = None
+    role: Optional[str] = None
+
+
+class TeamBase(QuickPhraseMixin):
+    """Team base model"""
+
+    name: str
+    displayName: Optional[str] = None  # Human-readable display name
+    description: Optional[str] = None  # Team description
+    bots: List[BotInfo]
+    workflow: Optional[dict[str, Any]] = None
+    bind_mode: Optional[List[str]] = None  # ['chat', 'code'] or empty list for none
+    mode_spec: Optional[ModeSpec] = None
+    is_active: bool = True
+    icon: Optional[str] = None  # Icon ID from preset icon library
+    display_config: Optional[TeamDisplayConfig] = None
+    inputPlaceholder: Optional[TeamInputPlaceholder] = None
+    requires_workspace: Optional[bool] = (
+        None  # Whether this team requires a workspace/repository (None = auto-infer)
+    )
+
+
+class TeamCreate(TeamBase):
+    """Team creation model"""
+
+    namespace: str = (
+        "default"  # Group namespace, defaults to 'default' for personal teams
+    )
+
+
+class TeamUpdate(QuickPhraseMixin):
+    """Team update model"""
+
+    name: Optional[str] = None
+    displayName: Optional[str] = None  # Human-readable display name
+    description: Optional[str] = None  # Team description
+    bots: Optional[List[BotInfo]] = None
+    workflow: Optional[dict[str, Any]] = None
+    bind_mode: Optional[List[str]] = None  # ['chat', 'code'] or empty list for none
+    mode_spec: Optional[ModeSpec] = None
+    is_active: Optional[bool] = None
+    namespace: Optional[str] = None  # Group namespace
+    icon: Optional[str] = None  # Icon ID from preset icon library
+    display_config: Optional[TeamDisplayConfig] = None
+    inputPlaceholder: Optional[TeamInputPlaceholder] = None
+    requires_workspace: Optional[bool] = (
+        None  # Whether this team requires a workspace/repository (None = auto-infer)
+    )
+    quick_phrases: Optional[List[str]] = None
+
+
+class TeamInDB(TeamBase):
+    """Database team model"""
+
+    id: int
+    user_id: int
+    namespace: Optional[str] = "default"  # Group namespace
+    created_at: datetime
+    updated_at: datetime
+    user: Optional[dict[str, Any]] = None
+    share_status: int = 0  # 0-private, 1-sharing, 2-shared from others
+    agent_type: Optional[str] = None  # agno, claude, dify, etc.
+    bind_mode: Optional[List[str]] = None  # ['chat', 'code'] or empty list for none
+    display_config: Optional[TeamDisplayConfig] = None
+    recommended_mode: Optional[str] = (
+        None  # 'chat', 'code', or 'both' - derived from bind_mode
+    )
+    publication_status: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TeamDetail(BaseModel):
+    """Detailed team model with related entities"""
+
+    id: int
+    name: str
+    displayName: Optional[str] = None  # Human-readable display name
+    description: Optional[str] = None  # Team description
+    bots: List[BotDetailInfo]
+    workflow: Optional[dict[str, Any]] = None
+    quick_phrases: List[str] = []
+    is_active: bool = True
+    created_at: datetime
+    updated_at: datetime
+    user: Optional[UserInDB] = None
+    share_status: int = 0  # 0-private, 1-sharing, 2-shared from others
+    display_config: Optional[TeamDisplayConfig] = None
+    inputPlaceholder: Optional[TeamInputPlaceholder] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TeamListResponse(BaseModel):
+    """Team paginated response model"""
+
+    total: int
+    items: list[TeamInDB]

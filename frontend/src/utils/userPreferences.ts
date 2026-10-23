@@ -1,0 +1,247 @@
+// SPDX-FileCopyrightText: 2025 Weibo, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * User preferences management using localStorage
+ */
+
+const STORAGE_KEYS = {
+  LAST_TAB: 'wegent_last_tab',
+  LAST_TEAM_ID: 'wegent_last_team_id',
+  LAST_TEAM_ID_CHAT: 'wegent_last_team_id_chat',
+  LAST_TEAM_ID_CODE: 'wegent_last_team_id_code',
+  LAST_TEAM_ID_KNOWLEDGE: 'wegent_last_team_id_knowledge',
+  LAST_REPO_ID: 'wegent_last_repo_id',
+  LAST_REPO_NAME: 'wegent_last_repo_name',
+  DEFAULT_EXECUTION_TARGET: 'wegent_default_execution_target',
+  SHOW_ADVANCED_DEVICES: 'wegent_show_advanced_devices',
+  SHOW_ADVANCED_KNOWLEDGE: 'wegent_show_advanced_knowledge',
+} as const
+
+/**
+ * Execution target type for chat input
+ * - 'cloud': Use cloud mode (no device)
+ * - device_id string: Use specific device
+ */
+export type ExecutionTargetPreference = 'cloud' | string
+
+export type TabType = 'chat' | 'code' | 'wiki' | 'devices'
+
+/**
+ * Save user's last active tab
+ */
+export function saveLastTab(tab: TabType): void {
+  try {
+    localStorage.setItem(STORAGE_KEYS.LAST_TAB, tab)
+  } catch (error) {
+    console.warn('Failed to save last tab to localStorage:', error)
+  }
+}
+
+/**
+ * Get user's last active tab
+ */
+export function getLastTab(): TabType | null {
+  try {
+    const tab = localStorage.getItem(STORAGE_KEYS.LAST_TAB)
+    return tab === 'chat' || tab === 'code' || tab === 'wiki' || tab === 'devices' ? tab : null
+  } catch (error) {
+    console.warn('Failed to get last tab from localStorage:', error)
+    return null
+  }
+}
+
+/**
+ * Save user's last selected team
+ */
+export function saveLastTeam(teamId: number): void {
+  try {
+    if (!teamId || isNaN(teamId)) {
+      console.warn('[userPreferences] Invalid team ID, not saving:', teamId)
+      return
+    }
+    localStorage.setItem(STORAGE_KEYS.LAST_TEAM_ID, String(teamId))
+  } catch (error) {
+    console.warn('Failed to save last team to localStorage:', error)
+  }
+}
+
+/**
+ * Get user's last selected team ID
+ */
+export function getLastTeamId(): number | null {
+  try {
+    const teamId = localStorage.getItem(STORAGE_KEYS.LAST_TEAM_ID)
+    if (!teamId || teamId === 'undefined' || teamId === 'null' || teamId === 'NaN') {
+      return null
+    }
+    const result = parseInt(teamId, 10)
+    if (isNaN(result)) {
+      return null
+    }
+    return result
+  } catch (error) {
+    console.warn('Failed to get last team from localStorage:', error)
+    return null
+  }
+}
+
+/**
+ * Save user's last selected team for a specific mode (chat/code/knowledge/task)
+ */
+export function saveLastTeamByMode(
+  teamId: number,
+  mode: 'chat' | 'code' | 'knowledge' | 'task'
+): void {
+  try {
+    if (!teamId || isNaN(teamId)) {
+      console.warn('[userPreferences] Invalid team ID, not saving:', teamId)
+      return
+    }
+    let key: string
+    if (mode === 'chat') {
+      key = STORAGE_KEYS.LAST_TEAM_ID_CHAT
+    } else if (mode === 'code') {
+      key = STORAGE_KEYS.LAST_TEAM_ID_CODE
+    } else if (mode === 'knowledge') {
+      key = STORAGE_KEYS.LAST_TEAM_ID_KNOWLEDGE
+    } else {
+      // 'task' mode - use code key as fallback since task mode typically uses code teams
+      key = STORAGE_KEYS.LAST_TEAM_ID_CODE
+    }
+    localStorage.setItem(key, String(teamId))
+    // Also save to the generic key for backward compatibility
+    localStorage.setItem(STORAGE_KEYS.LAST_TEAM_ID, String(teamId))
+  } catch (error) {
+    console.warn('Failed to save last team to localStorage:', error)
+  }
+}
+
+/**
+ * Get user's last selected team ID for a specific mode (chat/code/knowledge/task)
+ */
+export function getLastTeamIdByMode(mode: 'chat' | 'code' | 'knowledge' | 'task'): number | null {
+  try {
+    let key: string
+    if (mode === 'chat') {
+      key = STORAGE_KEYS.LAST_TEAM_ID_CHAT
+    } else if (mode === 'code') {
+      key = STORAGE_KEYS.LAST_TEAM_ID_CODE
+    } else if (mode === 'knowledge') {
+      key = STORAGE_KEYS.LAST_TEAM_ID_KNOWLEDGE
+    } else {
+      // 'task' mode - use code key as fallback since task mode typically uses code teams
+      key = STORAGE_KEYS.LAST_TEAM_ID_CODE
+    }
+    const teamId = localStorage.getItem(key)
+    if (!teamId || teamId === 'undefined' || teamId === 'null' || teamId === 'NaN') {
+      // console.log(
+      //   `[userPreferences] Invalid or missing team ID in localStorage for ${mode} mode:`,
+      //   teamId
+      // );
+      // Fallback to generic key
+      return getLastTeamId()
+    }
+    const result = parseInt(teamId, 10)
+    if (isNaN(result)) {
+      return getLastTeamId()
+    }
+    return result
+  } catch (error) {
+    console.warn('Failed to get last team from localStorage:', error)
+    return null
+  }
+}
+
+/**
+ * Save user's last selected repository
+ */
+export function saveLastRepo(repoId: number, repoName: string): void {
+  try {
+    localStorage.setItem(STORAGE_KEYS.LAST_REPO_ID, String(repoId))
+    localStorage.setItem(STORAGE_KEYS.LAST_REPO_NAME, repoName)
+  } catch (error) {
+    console.warn('Failed to save last repo to localStorage:', error)
+  }
+}
+
+/**
+ * Get user's last selected repository info
+ */
+export function getLastRepo(): { repoId: number; repoName: string } | null {
+  try {
+    const repoId = localStorage.getItem(STORAGE_KEYS.LAST_REPO_ID)
+    const repoName = localStorage.getItem(STORAGE_KEYS.LAST_REPO_NAME)
+
+    if (repoId && repoName) {
+      return {
+        repoId: parseInt(repoId, 10),
+        repoName,
+      }
+    }
+    return null
+  } catch (error) {
+    console.warn('Failed to get last repo from localStorage:', error)
+    return null
+  }
+}
+
+/**
+ * Persist whether advanced execution devices should be visible.
+ */
+export function saveShowAdvancedDevices(show: boolean): void {
+  try {
+    localStorage.setItem(STORAGE_KEYS.SHOW_ADVANCED_DEVICES, String(show))
+  } catch (error) {
+    console.warn('Failed to save advanced device visibility to localStorage:', error)
+  }
+}
+
+/**
+ * Return whether the user opted in to advanced execution devices.
+ */
+export function getShowAdvancedDevices(): boolean {
+  try {
+    return localStorage.getItem(STORAGE_KEYS.SHOW_ADVANCED_DEVICES) === 'true'
+  } catch (error) {
+    console.warn('Failed to load advanced device visibility from localStorage:', error)
+    return false
+  }
+}
+
+/**
+ * Persist whether advanced knowledge bases (code wikis) should be visible.
+ */
+export function saveShowAdvancedKnowledge(show: boolean): void {
+  try {
+    localStorage.setItem(STORAGE_KEYS.SHOW_ADVANCED_KNOWLEDGE, String(show))
+  } catch (error) {
+    console.warn('Failed to save advanced knowledge visibility to localStorage:', error)
+  }
+}
+
+/**
+ * Return whether the user opted in to advanced knowledge bases (code wikis).
+ */
+export function getShowAdvancedKnowledge(): boolean {
+  try {
+    return localStorage.getItem(STORAGE_KEYS.SHOW_ADVANCED_KNOWLEDGE) === 'true'
+  } catch (error) {
+    console.warn('Failed to load advanced knowledge visibility from localStorage:', error)
+    return false
+  }
+}
+
+/**
+ * Clear all user preferences
+ */
+export function clearAllPreferences(): void {
+  try {
+    Object.values(STORAGE_KEYS).forEach(key => {
+      localStorage.removeItem(key)
+    })
+  } catch (error) {
+    console.warn('Failed to clear preferences from localStorage:', error)
+  }
+}

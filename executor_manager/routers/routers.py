@@ -1,0 +1,1727 @@
+#!/usr/bin/env python
+
+# SPDX-FileCopyrightText: 2025 Weibo, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# -*- coding: utf-8 -*-
+
+"""
+API routes module, defines FastAPI routes and models.
+
+Callback endpoint uses pure transparent proxy pattern - forwards all events
+to backend's callback endpoint without processing.
+"""
+
+import asyncio
+import json
+import os
+import time
+import uuid
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import APIRouter, Body, FastAPI, HTTPException, Request, Response
+from fastapi.responses import PlainTextResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from executor_manager.common.config import ROUTE_PREFIX
+from executor_manager.config.config import EXECUTOR_DISPATCHER_MODE
+from executor_manager.executors.dispatcher import ExecutorDispatcher
+from executor_manager.executors.docker.constants import DEFAULT_DOCKER_HOST
+from executor_manager.executors.docker.utils import get_running_task_details
+from executor_manager.tasks.task_processor import TaskProcessor
+from shared.logger import setup_logger
+from shared.models.attachment_sync import AttachmentSyncRequest, AttachmentSyncResponse
+from shared.models.execution import ExecutionRequest
+from shared.telemetry.config import get_otel_config
+from shared.telemetry.context import (
+    set_request_context,
+    set_task_context,
+    set_user_context,
+)
+from shared.telemetry.context.large_data import log_json_body
+from shared.utils.http_client import traced_async_client
+from shared.utils.ip_util import get_host_ip
+
+# Setup logger
+logger = setup_logger(__name__)
+
+WORKSPACE_FILE_TIMEOUT_SECONDS = 130.0
+
+# Create FastAPI app
+app = FastAPI(
+    title="Executor Manager API",
+    description="API for managing executor tasks and callbacks",
+)
+
+# E2B Standard API routes
+from executor_manager.routers.e2b import router as e2b_router
+from executor_manager.routers.sandbox import router as sandbox_router
+
+# Wegent E2B private protocol proxy routes
+from executor_manager.routers.wegent_e2b_proxy import router as wegent_e2b_proxy_router
+
+# Create main API router with unified prefix
+api_router = APIRouter(prefix=ROUTE_PREFIX)
+
+# Mount sub-routers to api_router
+api_router.include_router(sandbox_router)
+# E2B standard endpoints:
+# - /executor-manager/e2b/sandboxes - Create sandbox (POST), Get sandbox (GET), Delete (DELETE)
+# - /executor-manager/e2b/v2/sandboxes - List sandboxes
+# - /executor-manager/e2b/sandboxes/{id}/timeout - Set timeout
+# - /executor-manager/e2b/sandboxes/{id}/pause - Pause sandbox
+# - /executor-manager/e2b/sandboxes/{id}/resume - Resume sandbox
+# - /executor-manager/e2b/sandboxes/{id}/connect - Connect to sandbox
+api_router.include_router(e2b_router, prefix="/e2b")
+# Private protocol proxy for sandbox access
+# Routes: /executor-manager/e2b/proxy/<sandboxID>/<port>/<path> -> container
+api_router.include_router(wegent_e2b_proxy_router, prefix="/e2b/proxy")
+
+# Create task processor for validation tasks
+task_processor = TaskProcessor()
+
+# Health check paths that should skip logging to reduce overhead
+HEALTH_CHECK_PATHS = {"/", "/health"}
+SENSITIVE_BODY_CAPTURE_PATHS = {f"{ROUTE_PREFIX}/callback", "/callback"}
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Middleware: Log request duration, source IP, and capture OTEL data"""
+    from starlette.responses import StreamingResponse
+
+    # Skip logging for health check requests
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    # Get request_id from header (propagated from upstream service) or generate new one
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:8]
+    request.state.request_id = request_id
+
+    start_time = time.time()
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Always set request context for logging (works even without OTEL)
+    from shared.telemetry.context import set_request_context
+
+    set_request_context(request_id)
+
+    # Get OTEL config
+    otel_config = get_otel_config()
+    should_capture_body = request.url.path not in SENSITIVE_BODY_CAPTURE_PATHS
+
+    # Capture request body if OTEL is enabled and body capture is configured
+    request_body = None
+    if (
+        otel_config.enabled
+        and otel_config.capture_request_body
+        and should_capture_body
+        and request.method in ("POST", "PUT", "PATCH")
+    ):
+        try:
+            body_bytes = await request.body()
+            if body_bytes:
+                max_body_size = 4096
+                if len(body_bytes) <= max_body_size:
+                    request_body = body_bytes.decode("utf-8", errors="replace")
+                else:
+                    request_body = (
+                        body_bytes[:max_body_size].decode("utf-8", errors="replace")
+                        + f"... [truncated, total size: {len(body_bytes)} bytes]"
+                    )
+        except Exception as e:
+            logger.debug(f"Failed to capture request body: {e}")
+
+    # Add OpenTelemetry span attributes if enabled
+    if otel_config.enabled:
+        try:
+            from opentelemetry import trace
+
+            from shared.telemetry.core import is_telemetry_enabled
+
+            if is_telemetry_enabled():
+                if request_body:
+                    current_span = trace.get_current_span()
+                    if current_span and current_span.is_recording():
+                        log_json_body("http.request.body", request_body)
+        except Exception as e:
+            logger.debug(f"Failed to set OTEL context: {e}")
+
+    # Pre-request logging
+    logger.info(
+        f"request : {request.method} {request.url.path} {request.query_params} {request_id} {client_ip}"
+    )
+
+    # Process request
+    response = await call_next(request)
+
+    # Calculate duration in milliseconds
+    process_time_ms = (time.time() - start_time) * 1000
+
+    # Capture response headers and body if OTEL is enabled
+    if otel_config.enabled:
+        try:
+            from opentelemetry import trace
+
+            from shared.telemetry.core import is_telemetry_enabled
+
+            if is_telemetry_enabled():
+                current_span = trace.get_current_span()
+                if current_span and current_span.is_recording():
+                    # Capture response headers
+                    if otel_config.capture_response_headers:
+                        for header_name, header_value in response.headers.items():
+                            if header_name.lower() in (
+                                "authorization",
+                                "cookie",
+                                "set-cookie",
+                            ):
+                                header_value = "[REDACTED]"
+                            current_span.set_attribute(
+                                f"http.response.header.{header_name}", header_value
+                            )
+
+                    # Capture response body (only for non-streaming responses)
+                    if otel_config.capture_response_body and should_capture_body:
+                        if not isinstance(response, StreamingResponse):
+                            try:
+                                response_body_chunks = []
+                                async for chunk in response.body_iterator:
+                                    response_body_chunks.append(chunk)
+
+                                response_body = b"".join(response_body_chunks)
+
+                                max_body_size = 4096
+                                if response_body:
+                                    if len(response_body) <= max_body_size:
+                                        body_str = response_body.decode(
+                                            "utf-8", errors="replace"
+                                        )
+                                    else:
+                                        body_str = (
+                                            response_body[:max_body_size].decode(
+                                                "utf-8", errors="replace"
+                                            )
+                                            + f"... [truncated, total size: {len(response_body)} bytes]"
+                                        )
+                                    current_span.set_attribute(
+                                        "http.response.body", body_str
+                                    )
+
+                                from starlette.responses import Response
+
+                                response = Response(
+                                    content=response_body,
+                                    status_code=response.status_code,
+                                    headers=dict(response.headers),
+                                    media_type=response.media_type,
+                                )
+                            except Exception as e:
+                                logger.debug(f"Failed to capture response body: {e}")
+        except Exception as e:
+            logger.debug(f"Failed to capture OTEL response: {e}")
+
+    # Post-request logging
+    logger.info(
+        f"response: {request.method} {request.url.path} {request_id} {client_ip} "
+        f"{response.status_code} {process_time_ms:.0f}ms"
+    )
+
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@api_router.post("/callback")
+async def callback_handler(event_data: dict = Body(...), http_request: Request = None):
+    """
+    Receive callback interface for executor task progress and completion.
+
+    Pure transparent proxy - forwards all events to backend's callback endpoint.
+    Event format is OpenAI Responses API format from executor.
+
+    Args:
+        event_data: Event data dict in OpenAI Responses API format.
+
+    Returns:
+        dict: Processing result
+    """
+    try:
+        client_ip = http_request.client.host if http_request.client else "unknown"
+
+        # Extract task_id and subtask_id for logging and tracing
+        task_id = event_data.get("task_id", 0)
+        subtask_id = event_data.get("subtask_id", 0)
+        event_type = event_data.get("event_type", "")
+        validation_id = event_data.get("validation_id", "")
+
+        logger.info(
+            f"[Callback] Received from {client_ip}: "
+            f"event_type={event_type}, task_id={task_id}, subtask_id={subtask_id}"
+        )
+        logger.info(
+            f"[Callback] Summary: event_type={event_type}, task_id={task_id}, "
+            f"subtask_id={subtask_id}, keys={sorted(event_data.keys())}"
+        )
+        if event_type == "error":
+            error_data = event_data.get("data")
+            if isinstance(error_data, dict):
+                logger.warning(
+                    "[Callback] Executor error: task_id=%s, subtask_id=%s, "
+                    "code=%s, message=%s",
+                    task_id,
+                    subtask_id,
+                    _to_log_preview(str(error_data.get("code", ""))),
+                    _to_log_preview(str(error_data.get("message", ""))),
+                )
+
+        # Set task context for tracing
+        set_task_context(task_id=task_id, subtask_id=subtask_id)
+
+        # Pure transparent proxy - forward to backend
+        task_api_domain = os.getenv("TASK_API_DOMAIN", "http://localhost:8000")
+        callback_url = f"{task_api_domain}/api/internal/callback"
+
+        async with traced_async_client(timeout=30.0) as client:
+            response = await client.post(callback_url, json=event_data)
+            if response.status_code != 200:
+                logger.warning(
+                    f"[Callback] Backend returned error: "
+                    f"status_code={response.status_code}, "
+                    f"body_preview={_to_log_preview(response.text)}"
+                )
+
+        # Handle terminal events - remove from RunningTaskTracker
+        from shared.models.responses_api import ResponsesAPIStreamEvents
+
+        terminal_events = {
+            ResponsesAPIStreamEvents.RESPONSE_COMPLETED.value,
+            ResponsesAPIStreamEvents.ERROR.value,
+            ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE.value,
+        }
+        if event_type in terminal_events:
+            if validation_id:
+                await _update_validation_status_from_callback(
+                    validation_id, event_type, event_data
+                )
+
+            try:
+                from executor_manager.services.task_heartbeat_manager import (
+                    get_running_task_tracker,
+                )
+
+                tracker = get_running_task_tracker()
+                logger.info(
+                    f"[Callback] Removing task {task_id} from RunningTaskTracker "
+                    f"(source: callback, event_type={event_type})"
+                )
+                tracker.remove_running_task(task_id)
+            except Exception as e:
+                logger.warning(f"Failed to remove task from RunningTaskTracker: {e}")
+
+        logger.info(f"[Callback] Successfully forwarded for task {task_id}")
+        return {
+            "status": "success",
+            "message": f"Successfully forwarded callback for task {task_id}",
+        }
+    except Exception as e:
+        logger.error(f"[Callback] Error processing callback: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/", response_class=PlainTextResponse)
+async def root_health_check():
+    """Root health check endpoint for load balancers that check /"""
+    return "ok"
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness probe endpoint."""
+    return {"status": "ready"}
+
+
+class DeleteExecutorRequest(BaseModel):
+    executor_name: str
+    executor_namespace: Optional[str] = None
+
+
+@api_router.post("/executor/delete")
+async def delete_executor(request: DeleteExecutorRequest, http_request: Request):
+    try:
+        client_ip = http_request.client.host if http_request.client else "unknown"
+        logger.info(
+            "Received request to delete executor: %s namespace=%s from %s",
+            request.executor_name,
+            request.executor_namespace,
+            client_ip,
+        )
+
+        executor = ExecutorDispatcher.get_executor(EXECUTOR_DISPATCHER_MODE)
+
+        # Get task_id from executor before deletion (for cleanup)
+        task_id_str = executor.get_executor_task_id(request.executor_name)
+
+        try:
+            result = executor.delete_executor(
+                request.executor_name,
+                executor_namespace=request.executor_namespace,
+            )
+        except TypeError:
+            result = executor.delete_executor(request.executor_name)
+
+        # Clean up running task state and the warm-pool binding if we got task_id.
+        if task_id_str:
+            try:
+                from executor_manager.services.heartbeat_manager import (
+                    HeartbeatType,
+                    get_heartbeat_manager,
+                )
+                from executor_manager.services.sandbox.repository import (
+                    get_sandbox_repository,
+                )
+                from executor_manager.services.task_heartbeat_manager import (
+                    get_running_task_tracker,
+                )
+
+                task_id = int(task_id_str)
+                tracker = get_running_task_tracker()
+                heartbeat_mgr = get_heartbeat_manager()
+
+                await heartbeat_mgr.delete_heartbeat(task_id_str, HeartbeatType.TASK)
+                logger.info(
+                    f"[DeleteExecutor] Removing task {task_id} from RunningTaskTracker "
+                    f"(source: delete_executor, executor_name={request.executor_name})"
+                )
+                tracker.remove_running_task(task_id)
+                if result.get("status") in ("success", "not_found"):
+                    get_sandbox_repository().delete_executor_binding(task_id)
+            except Exception as e:
+                logger.warning(f"Failed to clean up running task tracker: {e}")
+
+        return result
+    except Exception as e:
+        logger.error(f"Error deleting executor '{request.executor_name}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/executor/load")
+async def get_executor_load(http_request: Request):
+    try:
+        client_ip = http_request.client.host if http_request.client else "unknown"
+        logger.info(f"Received request to get executor load from {client_ip}")
+        executor = ExecutorDispatcher.get_executor(EXECUTOR_DISPATCHER_MODE)
+        result = executor.get_executor_count()
+        result["total"] = int(os.getenv("MAX_CONCURRENT_TASKS", "30"))
+        return result
+    except Exception as e:
+        logger.error(f"Error getting executor load: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/executor/address")
+async def get_executor_address(
+    executor_name: str,
+    http_request: Request,
+    executor_namespace: Optional[str] = None,
+):
+    """Get executor runtime address by executor name."""
+    try:
+        client_ip = http_request.client.host if http_request.client else "unknown"
+        logger.info(
+            "Received request to get executor address: %s namespace=%s from %s",
+            executor_name,
+            executor_namespace,
+            client_ip,
+        )
+
+        executor = ExecutorDispatcher.get_executor(EXECUTOR_DISPATCHER_MODE)
+        if not hasattr(executor, "get_container_address"):
+            raise HTTPException(
+                status_code=501, detail="Executor address lookup is not supported"
+            )
+
+        try:
+            result = executor.get_container_address(
+                executor_name,
+                executor_namespace=executor_namespace,
+            )
+        except TypeError:
+            # Fallback to legacy signature without executor_namespace
+            result = executor.get_container_address(executor_name)
+        logger.info(
+            "Resolved executor address: executor_name=%s executor_namespace=%s result=%s",
+            executor_name,
+            executor_namespace,
+            result,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting executor address for '{executor_name}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _to_log_preview(raw: str, limit: int = 300) -> str:
+    if not raw:
+        return ""
+    return " ".join(raw.split())[:limit]
+
+
+def _parse_json_or_none(response: httpx.Response) -> Optional[dict[str, Any]]:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _is_route_not_found_response(response: httpx.Response) -> bool:
+    if response.status_code != 404:
+        return False
+    payload = _parse_json_or_none(response)
+    detail = payload.get("detail") if payload else None
+    return isinstance(detail, str) and detail.lower() == "not found"
+
+
+def _is_connect_not_found_response(response: httpx.Response) -> bool:
+    if response.status_code != 404:
+        return False
+    payload = _parse_json_or_none(response)
+    code = payload.get("code") if payload else None
+    return isinstance(code, str) and code == "not_found"
+
+
+def _normalize_workspace_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    type_value = str(entry.get("type", "")).upper()
+    if "is_directory" in entry:
+        is_directory = bool(entry.get("is_directory"))
+    else:
+        is_directory = "DIRECTORY" in type_value
+
+    try:
+        size = int(entry.get("size", 0) or 0)
+    except (TypeError, ValueError):
+        size = 0
+
+    return {
+        "name": str(entry.get("name", "")),
+        "path": str(entry.get("path", "")),
+        "is_directory": is_directory,
+        "size": size,
+        "modified_at": entry.get("modified_at") or entry.get("modified_time"),
+    }
+
+
+def _normalize_workspace_entries(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        raw_entries = payload
+    elif isinstance(payload, dict):
+        entries = payload.get("entries")
+        if isinstance(entries, list):
+            raw_entries = entries
+        else:
+            items = payload.get("items")
+            raw_entries = items if isinstance(items, list) else []
+    else:
+        raw_entries = []
+
+    return [
+        _normalize_workspace_entry(entry)
+        for entry in raw_entries
+        if isinstance(entry, dict)
+    ]
+
+
+async def _resolve_workspace_runtime_base_url(
+    task_id: int,
+    executor_name: Optional[str],
+) -> str:
+    from executor_manager.services.sandbox import get_sandbox_manager
+
+    sandbox_manager = get_sandbox_manager()
+    sandbox = await sandbox_manager.get_sandbox(str(task_id))
+    if sandbox and sandbox.base_url:
+        return str(sandbox.base_url).rstrip("/")
+
+    if not executor_name:
+        raise HTTPException(
+            status_code=404,
+            detail="Executor runtime not found and sandbox is unavailable",
+        )
+
+    executor = ExecutorDispatcher.get_executor(EXECUTOR_DISPATCHER_MODE)
+    if not hasattr(executor, "get_container_address"):
+        raise HTTPException(
+            status_code=501, detail="Executor address lookup is not supported"
+        )
+
+    result = executor.get_container_address(executor_name)
+    status = str(result.get("status", "")).lower()
+    base_url = result.get("base_url")
+    if status and status != "success":
+        raise HTTPException(
+            status_code=404,
+            detail=result.get("error_msg") or "Executor runtime is unavailable",
+        )
+    if not isinstance(base_url, str) or not base_url:
+        raise HTTPException(status_code=404, detail="Executor runtime has no base_url")
+
+    return base_url.rstrip("/")
+
+
+@api_router.get("/executor/workspace/tree")
+async def get_executor_workspace_tree(
+    task_id: int,
+    path: Optional[str] = None,
+    executor_name: Optional[str] = None,
+    http_request: Request = None,  # FastAPI injects Request
+):
+    normalized_path = path or f"/workspace/{task_id}"
+    client_ip = (
+        http_request.client.host if http_request and http_request.client else "unknown"
+    )
+    base_url = await _resolve_workspace_runtime_base_url(task_id, executor_name)
+    logger.info(
+        "[workspace_proxy] list request task_id=%s executor_name=%s path=%s base_url=%s from %s",
+        task_id,
+        executor_name,
+        normalized_path,
+        base_url,
+        client_ip,
+    )
+
+    legacy_url = f"{base_url}/filesystem/list-dir"
+    connect_url = f"{base_url}/filesystem.Filesystem/ListDir"
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        legacy_response = await client.get(legacy_url, params={"path": normalized_path})
+        if legacy_response.status_code < 400:
+            payload = legacy_response.json()
+            return _normalize_workspace_entries(payload)
+
+        logger.info(
+            "[workspace_proxy] legacy list failed task_id=%s status_code=%s body_preview=%s",
+            task_id,
+            legacy_response.status_code,
+            _to_log_preview(legacy_response.text),
+        )
+
+        connect_response = await client.post(
+            connect_url,
+            json={"path": normalized_path, "depth": 1},
+            headers={"Content-Type": "application/json"},
+        )
+        if connect_response.status_code < 400:
+            payload = connect_response.json()
+            return _normalize_workspace_entries(payload)
+
+        logger.warning(
+            "[workspace_proxy] connect list failed task_id=%s status_code=%s body_preview=%s",
+            task_id,
+            connect_response.status_code,
+            _to_log_preview(connect_response.text),
+        )
+
+    if _is_connect_not_found_response(connect_response):
+        raise HTTPException(status_code=404, detail="Path not found")
+    if legacy_response.status_code == 404 and not _is_route_not_found_response(
+        legacy_response
+    ):
+        raise HTTPException(status_code=404, detail="Path not found")
+    raise HTTPException(status_code=502, detail="Remote workspace list failed")
+
+
+@api_router.get("/executor/workspace/file")
+async def get_executor_workspace_file(
+    task_id: int,
+    path: str,
+    executor_name: Optional[str] = None,
+    http_request: Request = None,  # FastAPI injects Request
+):
+    client_ip = (
+        http_request.client.host if http_request and http_request.client else "unknown"
+    )
+    base_url = await _resolve_workspace_runtime_base_url(task_id, executor_name)
+    logger.info(
+        "[workspace_proxy] file request task_id=%s executor_name=%s path=%s base_url=%s from %s",
+        task_id,
+        executor_name,
+        path,
+        base_url,
+        client_ip,
+    )
+
+    legacy_url = f"{base_url}/filesystem/file"
+    rest_file_url = f"{base_url}/files"
+
+    async with httpx.AsyncClient(timeout=WORKSPACE_FILE_TIMEOUT_SECONDS) as client:
+        legacy_response = await client.get(legacy_url, params={"path": path})
+        if legacy_response.status_code < 400:
+            return StreamingResponse(
+                iter([legacy_response.content]),
+                media_type=legacy_response.headers.get(
+                    "content-type", "application/octet-stream"
+                ),
+            )
+        if legacy_response.status_code in {408, 413, 429}:
+            raise HTTPException(
+                status_code=legacy_response.status_code,
+                detail=_to_log_preview(legacy_response.text),
+            )
+
+        logger.info(
+            "[workspace_proxy] legacy file failed task_id=%s status_code=%s body_preview=%s",
+            task_id,
+            legacy_response.status_code,
+            _to_log_preview(legacy_response.text),
+        )
+
+        fallback_response = await client.get(rest_file_url, params={"path": path})
+        if fallback_response.status_code < 400:
+            return StreamingResponse(
+                iter([fallback_response.content]),
+                media_type=fallback_response.headers.get(
+                    "content-type", "application/octet-stream"
+                ),
+            )
+        if fallback_response.status_code in {408, 413, 429}:
+            raise HTTPException(
+                status_code=fallback_response.status_code,
+                detail=_to_log_preview(fallback_response.text),
+            )
+
+        logger.warning(
+            "[workspace_proxy] fallback file failed task_id=%s status_code=%s body_preview=%s",
+            task_id,
+            fallback_response.status_code,
+            _to_log_preview(fallback_response.text),
+        )
+
+    if fallback_response.status_code == 404:
+        raise HTTPException(status_code=404, detail="File not found")
+    if legacy_response.status_code == 404 and not _is_route_not_found_response(
+        legacy_response
+    ):
+        raise HTTPException(status_code=404, detail="File not found")
+    raise HTTPException(status_code=502, detail="Remote file request failed")
+
+
+class CancelTaskRequest(BaseModel):
+    task_id: int = Field(..., strict=True)
+    subtask_id: Optional[int] = Field(None, strict=True)
+
+
+class ValidateImageRequest(BaseModel):
+    """Request body for validating base image compatibility"""
+
+    image: str
+    shell_type: str  # e.g., "ClaudeCode", "Agno"
+    user_name: Optional[str] = None
+    shell_name: Optional[str] = None  # Optional shell name for tracking
+    validation_id: str = Field(min_length=1)  # UUID for tracking validation status
+
+
+class ImageCheckResult(BaseModel):
+    """Individual check result"""
+
+    name: str
+    version: Optional[str] = None
+    status: str  # 'pass' or 'fail'
+    message: Optional[str] = None
+
+
+class ValidateImageResponse(BaseModel):
+    """Response for image validation"""
+
+    status: str  # 'submitted' for async validation
+    message: str
+    validation_task_id: Optional[int] = None
+
+
+def _extract_validation_result_from_event(event_data: dict) -> Optional[Dict[str, Any]]:
+    """Extract validation result from a response.completed callback event.
+
+    The ImageValidatorAgent stores its validation result as JSON in the
+    done_event content, which ends up at:
+      data.response.output[0].content[0].text
+
+    Args:
+        event_data: Full callback event data dict
+
+    Returns:
+        Parsed validation result dict, or None if not found/parseable
+    """
+    import json
+
+    try:
+        response = event_data.get("data", {}).get("response", {})
+        output_items = response.get("output", [])
+        for item in output_items:
+            if not isinstance(item, dict):
+                continue
+            for content_part in item.get("content", []):
+                if not isinstance(content_part, dict):
+                    continue
+                text = content_part.get("text", "")
+                if not text:
+                    continue
+                try:
+                    result = json.loads(text)
+                    if isinstance(result, dict) and "valid" in result:
+                        return result
+                except (json.JSONDecodeError, TypeError):
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+async def _update_validation_status_from_callback(
+    validation_id: str,
+    event_type: str,
+    event_data: dict,
+) -> None:
+    """Bridge callback terminal events to Redis validation status for frontend polling.
+
+    When a validation task completes via the callback chain, this function
+    forwards the result to the backend's validation-status endpoint so the
+    Redis entry gets updated and the frontend polling can see the completion.
+
+    Args:
+        validation_id: Validation status identifier carried by the callback
+        event_type: Terminal event type (response.completed, error, etc.)
+        event_data: Full event data dict from the callback
+    """
+    from shared.models.responses_api import ResponsesAPIStreamEvents
+
+    task_api_domain = os.getenv("TASK_API_DOMAIN", "http://localhost:8000")
+    update_url = f"{task_api_domain}/api/shells/validation-status/{validation_id}"
+
+    if event_type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED.value:
+        update_payload: Dict[str, Any] = {
+            "status": "completed",
+            "stage": "Validation completed",
+            "progress": 100,
+            "valid": True,
+        }
+        # Try to extract detailed validation results from event content
+        # The content is at data.response.output[0].content[0].text
+        # and contains JSON-serialized validation_result from ImageValidatorAgent
+        validation_result = _extract_validation_result_from_event(event_data)
+        if validation_result:
+            update_payload["valid"] = validation_result.get("valid", True)
+            if validation_result.get("checks"):
+                update_payload["checks"] = validation_result["checks"]
+            if validation_result.get("errors"):
+                update_payload["errors"] = validation_result["errors"]
+    elif event_type == ResponsesAPIStreamEvents.ERROR.value:
+        error_data = event_data.get("data", {})
+        error_obj = error_data.get("error")
+        if isinstance(error_obj, dict):
+            error_message = error_obj.get("message", "Unknown error")
+        else:
+            error_message = str(
+                error_obj or error_data.get("message") or "Validation failed"
+            )
+        update_payload = {
+            "status": "completed",
+            "stage": "Validation failed",
+            "progress": 100,
+            "valid": False,
+            "errorMessage": error_message,
+        }
+    else:
+        # response.incomplete or other terminal events
+        update_payload = {
+            "status": "completed",
+            "stage": "Validation incomplete",
+            "progress": 100,
+            "valid": False,
+            "errorMessage": "Validation task did not complete normally",
+        }
+
+    # Include executor_name for container cleanup by the backend
+    executor_name = event_data.get("executor_name")
+    if executor_name:
+        update_payload["executor_name"] = executor_name
+
+    try:
+        async with traced_async_client(timeout=10.0) as client:
+            response = await client.post(update_url, json=update_payload)
+            if response.status_code == 200:
+                logger.info(
+                    f"[Callback] Updated validation status: "
+                    f"{validation_id} valid={update_payload.get('valid')}"
+                )
+            else:
+                logger.warning(
+                    f"[Callback] Failed to update validation status: "
+                    f"status_code={response.status_code}, "
+                    f"body_preview={_to_log_preview(response.text)}"
+                )
+    except Exception as e:
+        logger.error(
+            f"[Callback] Error updating validation status {validation_id}: {e}"
+        )
+
+
+async def _run_validation_task_in_background(
+    validation_task: Dict[str, Any], validation_task_id: int, image: str
+) -> None:
+    """Run validation task submission in background to avoid blocking HTTP handlers."""
+    try:
+        await asyncio.to_thread(task_processor.process_tasks, [validation_task])
+        logger.info(
+            f"Validation task submitted: task_id={validation_task_id}, image={image}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to submit validation task for {image}: {e}")
+
+
+@api_router.post("/images/validate")
+async def validate_image(request: ValidateImageRequest, http_request: Request):
+    """
+    Validate if a base image is compatible with a specific shell type.
+
+    This endpoint creates a validation task that runs inside the target image container.
+    The validation is asynchronous - results are returned via callback mechanism.
+
+    For Codex: checks Codex CLI and app-server support
+    For ClaudeCode: checks Node.js 20+, claude-code CLI, Python 3.12+
+    For Agno: checks Python 3.12+, SQLite 3.50+
+    For Dify: No check needed (external_api type)
+
+    The validation task will:
+    1. Start a container with the specified base_image
+    2. Run ImageValidatorAgent to execute validation checks
+    3. Report results back via callback with validation_result in result field
+    """
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    logger.info(
+        f"Received image validation request: image={request.image}, shell_type={request.shell_type}, validation_id={request.validation_id} from {client_ip}"
+    )
+
+    shell_type = request.shell_type
+    image = request.image
+    validation_id = request.validation_id
+
+    # Dify doesn't need validation (external_api type)
+    if shell_type == "Dify":
+        return {
+            "status": "skipped",
+            "message": "Dify is an external_api type and doesn't require image validation",
+            "valid": True,
+            "checks": [],
+            "errors": [],
+        }
+
+    # Validate shell_type
+    if shell_type not in ["Codex", "ClaudeCode", "Agno"]:
+        return {
+            "status": "error",
+            "message": f"Unknown shell type: {shell_type}",
+            "valid": False,
+            "checks": [],
+            "errors": [f"Unknown shell type: {shell_type}"],
+        }
+
+    # Build validation task data
+    # Use a unique negative task_id to distinguish validation tasks from regular tasks
+    import time
+
+    validation_task_id = (
+        int(time.time() * 1000) % 1000000
+    )  # Negative ID for validation tasks
+
+    # Build validation task in OpenAI Responses API format (same as normal code tasks)
+    # Build callback URL from environment variables
+    callback_host = os.getenv("CALLBACK_HOST", get_host_ip())
+    callback_port = os.getenv("CALLBACK_PORT", "8001")
+    parsed = urlparse(
+        callback_host if "://" in callback_host else f"http://{callback_host}"
+    )
+    callback_scheme = parsed.scheme or "http"
+    callback_hostname = parsed.hostname or callback_host
+    callback_effective_port = parsed.port or callback_port
+    callback_url = (
+        f"{callback_scheme}://{callback_hostname}:{callback_effective_port}"
+        f"/executor-manager/callback"
+    )
+
+    validation_task = {
+        "model": "ImageValidator",  # Dummy model for validation agent
+        "input": f"Validate {shell_type} image: {image}",
+        "instructions": f"You are an ImageValidator agent. Validate that the base image is compatible with {shell_type} shell type.",
+        "stream": False,
+        "background": True,  # Validation runs in background
+        "metadata": {
+            "task_id": validation_task_id,
+            "subtask_id": 1,
+            "task_title": f"Image Validation: {request.shell_name or image}",
+            "subtask_title": f"Validating {shell_type} dependencies",
+            "type": "validation",
+            "user_name": request.user_name or "validator",
+            "user": {"name": request.user_name or "validator"},
+            "bot": [
+                {
+                    "agent_name": "ImageValidator",
+                    "base_image": image,
+                }
+            ],
+            "validation_params": {
+                "shell_type": shell_type,
+                "image": image,
+                "shell_name": request.shell_name or "",
+                "validation_id": validation_id,
+            },
+            "callback_url": callback_url,  # Set callback_url for executor container
+        },
+        "executor_image": os.getenv("EXECUTOR_IMAGE", ""),
+    }
+
+    # Submit in background to keep this endpoint responsive.
+    asyncio.create_task(
+        _run_validation_task_in_background(validation_task, validation_task_id, image)
+    )
+
+    logger.info(
+        f"Validation task queued: task_id={validation_task_id}, validation_id={validation_id}, image={image}"
+    )
+
+    return {
+        "status": "submitted",
+        "message": "Validation task submitted. Results will be returned via callback.",
+        "validation_task_id": validation_task_id,
+    }
+
+
+@api_router.post("/tasks/cancel")
+async def cancel_task(request: CancelTaskRequest, http_request: Request):
+    """
+    Cancel a running task by calling the executor's cancel API.
+
+    Args:
+        request: Request containing task_id to cancel
+
+    Returns:
+        dict: Cancellation result
+    """
+    try:
+        client_ip = http_request.client.host if http_request.client else "unknown"
+        logger.info(
+            f"Received request to cancel task {request.task_id} from {client_ip}"
+        )
+
+        # Set task context for tracing (function handles OTEL enabled check internally)
+        set_task_context(task_id=request.task_id, subtask_id=request.subtask_id)
+
+        executor = ExecutorDispatcher.get_executor(EXECUTOR_DISPATCHER_MODE)
+        result = executor.cancel_task(request.task_id, request.subtask_id)
+
+        if result["status"] == "success":
+            logger.info(f"Successfully cancelled task {request.task_id}")
+
+            # Clean up Redis heartbeat data immediately on cancel
+            try:
+                from executor_manager.services.heartbeat_manager import (
+                    HeartbeatType,
+                    get_heartbeat_manager,
+                )
+                from executor_manager.services.task_heartbeat_manager import (
+                    get_running_task_tracker,
+                )
+
+                task_id_str = str(request.task_id)
+                heartbeat_mgr = get_heartbeat_manager()
+                tracker = get_running_task_tracker()
+
+                # Delete heartbeat key
+                await heartbeat_mgr.delete_heartbeat(task_id_str, HeartbeatType.TASK)
+                # Remove from running tasks tracker
+                logger.info(
+                    f"[CancelTask] Removing task {request.task_id} from RunningTaskTracker "
+                    f"(source: cancel_task)"
+                )
+                tracker.remove_running_task(request.task_id)
+            except Exception as e:
+                logger.warning(f"Failed to clean up heartbeat data: {e}")
+
+            return result
+        else:
+            logger.warning(
+                f"Failed to cancel task {request.task_id}: {result.get('error_msg', 'Unknown error')}"
+            )
+            raise HTTPException(
+                status_code=400, detail=result.get("error_msg", "Failed to cancel task")
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling task {request.task_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# V1 Transparent Proxy APIs (OpenAI Responses API)
+# =============================================================================
+# These endpoints implement the transparent proxy pattern for task dispatch
+# using OpenAI Responses API format with background mode.
+# executor_manager only forwards requests to containers without business logic.
+# =============================================================================
+
+
+class OpenAIResponsesRequest(BaseModel):
+    """Request model for /v1/responses endpoint (OpenAI Responses API format).
+
+    This is a transparent proxy request that forwards OpenAI Responses API
+    format requests to the appropriate executor container.
+
+    Supports background mode (non-streaming) for HTTP+Callback dispatch.
+    """
+
+    # OpenAI Responses API standard fields
+    model: str
+    input: Any  # Can be string or list of messages
+    instructions: Optional[str] = None
+    stream: bool = False
+
+    # Background mode flag (OpenAI extension)
+    background: bool = False
+
+    # Custom metadata for task identification
+    metadata: Optional[Dict[str, Any]] = None
+
+    # Model configuration
+    model_config_data: Optional[Dict[str, Any]] = None
+
+    class Config:
+        # Allow extra fields for forward compatibility
+        extra = "allow"
+
+
+class CancelRequest(BaseModel):
+    """Request model for /v1/cancel endpoint."""
+
+    task_id: int = Field(..., strict=True)
+    subtask_id: Optional[int] = Field(None, strict=True)
+    executor_name: Optional[str] = None
+
+
+@api_router.post("/v1/cancel")
+async def cancel_task_v1(request: CancelRequest, http_request: Request):
+    """Cancel task execution - transparent proxy.
+
+    This endpoint cancels a running task by:
+    1. If executor_name is provided, send cancel request directly to that container
+    2. Otherwise, find the container by task_id and send cancel request
+
+    Args:
+        request: CancelRequest containing task_id and optional executor_name
+        http_request: HTTP request object
+
+    Returns:
+        dict: Cancellation result
+    """
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    logger.info(
+        f"[v1/cancel] Received request: task_id={request.task_id}, "
+        f"subtask_id={request.subtask_id}, executor_name={request.executor_name} "
+        f"from {client_ip}"
+    )
+
+    # Set task context for tracing
+    set_task_context(task_id=request.task_id, subtask_id=request.subtask_id)
+
+    try:
+        executor = ExecutorDispatcher.get_executor(EXECUTOR_DISPATCHER_MODE)
+
+        if request.executor_name:
+            # Direct cancel to specified container
+            port, error = await asyncio.to_thread(
+                executor._get_container_port,
+                request.executor_name,
+            )
+            if not port:
+                logger.warning(
+                    f"[v1/cancel] Container {request.executor_name} not found: {error}"
+                )
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Container {request.executor_name} not found: {error}",
+                )
+
+            # Send cancel request to container
+            cancel_url = (
+                f"http://{DEFAULT_DOCKER_HOST}:{port}/api/tasks/cancel"
+                f"?task_id={request.task_id}"
+            )
+            if request.subtask_id is not None:
+                cancel_url += f"&subtask_id={request.subtask_id}"
+
+            try:
+                async with traced_async_client(timeout=10.0) as client:
+                    response = await client.post(cancel_url)
+                    response.raise_for_status()
+
+                logger.info(
+                    f"[v1/cancel] Successfully cancelled task {request.task_id} "
+                    f"in container {request.executor_name}"
+                )
+
+                # Clean up heartbeat data
+                await _cleanup_task_heartbeat(request.task_id)
+
+                return {
+                    "status": "success",
+                    "message": f"Task {request.task_id} cancellation requested",
+                    "executor_name": request.executor_name,
+                }
+
+            except httpx.RequestError as e:
+                logger.error(
+                    f"[v1/cancel] Failed to send cancel to container "
+                    f"{request.executor_name}: {e}"
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Failed to communicate with container: {str(e)}",
+                )
+
+        else:
+            # Find container by task_id and cancel
+            result = await asyncio.to_thread(
+                executor.cancel_task,
+                request.task_id,
+                request.subtask_id,
+            )
+
+            if result.get("status") == "success":
+                logger.info(
+                    f"[v1/cancel] Successfully cancelled task {request.task_id}"
+                )
+                await _cleanup_task_heartbeat(request.task_id)
+                return result
+            else:
+                logger.warning(
+                    f"[v1/cancel] Failed to cancel task {request.task_id}: "
+                    f"{result.get('error_msg')}"
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=result.get("error_msg", "Failed to cancel task"),
+                )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[v1/cancel] Error cancelling task {request.task_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/executors/prepare")
+async def prepare_executor(request: ExecutionRequest, http_request: Request):
+    """Prepare a normal executor runtime without dispatching the task."""
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    logger.info(
+        f"[executors/prepare] Received request: task_id={request.task_id}, "
+        f"subtask_id={request.subtask_id} from {client_ip}"
+    )
+
+    set_task_context(task_id=request.task_id, subtask_id=request.subtask_id)
+
+    try:
+        task_dict = request.to_dict()
+        task_dict["prepare_only"] = True
+
+        result_map = await asyncio.to_thread(task_processor.process_tasks, [task_dict])
+        result = result_map.get(request.task_id) or next(
+            iter(result_map.values()),
+            None,
+        )
+
+        if not result:
+            raise HTTPException(status_code=500, detail="No executor result returned")
+        if result.get("status") != "success":
+            logger.error(
+                "[executors/prepare] Failed request: task_id=%s, subtask_id=%s, "
+                "executor_name=%s, error=%s",
+                request.task_id,
+                request.subtask_id,
+                result.get("executor_name"),
+                result.get("error_msg", "Failed to prepare executor"),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("error_msg", "Failed to prepare executor"),
+            )
+
+        return {
+            "status": result.get("status"),
+            "executor_name": result.get("executor_name"),
+            "executor_namespace": result.get("executor_namespace"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"[executors/prepare] Error preparing executor for task {request.task_id}: {e}"
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/tasks/{task_id}/attachments/sync")
+async def sync_task_attachments(
+    task_id: int, payload: Dict[str, Any], http_request: Request
+):
+    """Prepare task attachments inside the target executor runtime."""
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    sync_request = AttachmentSyncRequest.from_dict({**payload, "task_id": task_id})
+    logger.info(
+        "[attachments/sync] Received request: task_id=%s, subtask_id=%s, "
+        "attachments=%d, executor_name=%s from %s",
+        sync_request.task_id,
+        sync_request.subtask_id,
+        len(sync_request.attachments),
+        sync_request.executor_name,
+        client_ip,
+    )
+
+    set_task_context(task_id=sync_request.task_id, subtask_id=sync_request.subtask_id)
+
+    if not sync_request.attachments:
+        return AttachmentSyncResponse(
+            task_id=sync_request.task_id,
+            subtask_id=sync_request.subtask_id,
+            executor_name=sync_request.executor_name,
+            executor_namespace=sync_request.executor_namespace,
+        ).to_dict()
+
+    executor_type = sync_request.executor_type or EXECUTOR_DISPATCHER_MODE
+    executor = ExecutorDispatcher.get_executor(executor_type)
+    task_dict = sync_request.to_dict()
+    task_dict["prepare_only"] = True
+
+    try:
+        prepare_result = await asyncio.to_thread(
+            executor.submit_executor,
+            task_dict,
+            None,
+        )
+        if not prepare_result or prepare_result.get("status") != "success":
+            error = (
+                prepare_result.get("error_msg", "Failed to prepare executor")
+                if prepare_result
+                else "No executor prepare result returned"
+            )
+            logger.error(
+                "[attachments/sync] Executor prepare failed: task_id=%s, error=%s",
+                sync_request.task_id,
+                error,
+            )
+            return AttachmentSyncResponse.failed_for_request(
+                sync_request, error
+            ).to_dict()
+
+        executor_name = (
+            prepare_result.get("executor_name") or sync_request.executor_name
+        )
+        executor_namespace = (
+            prepare_result.get("executor_namespace") or sync_request.executor_namespace
+        )
+        sync_request.executor_name = executor_name
+        sync_request.executor_namespace = executor_namespace
+        if not executor_name:
+            return AttachmentSyncResponse.failed_for_request(
+                sync_request, "Executor name is unavailable after prepare"
+            ).to_dict()
+
+        if not hasattr(executor, "get_container_address"):
+            return AttachmentSyncResponse.failed_for_request(
+                sync_request, "Executor address lookup is not supported"
+            ).to_dict()
+
+        address = await asyncio.to_thread(
+            executor.get_container_address,
+            executor_name,
+            executor_namespace,
+        )
+        if address.get("status") != "success" or not address.get("base_url"):
+            return AttachmentSyncResponse.failed_for_request(
+                sync_request,
+                address.get("error_msg") or "Executor runtime is unavailable",
+            ).to_dict()
+
+        endpoint = f"{str(address['base_url']).rstrip('/')}/v1/attachments/sync"
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            response = await client.post(
+                endpoint,
+                json=sync_request.to_dict(),
+                headers={"Content-Type": "application/json"},
+            )
+        if response.status_code >= 400:
+            body_preview = response.text[:200]
+            return AttachmentSyncResponse.failed_for_request(
+                sync_request,
+                f"Executor sync failed: HTTP {response.status_code}; body={body_preview}",
+            ).to_dict()
+
+        data = response.json()
+        data["executor_name"] = executor_name
+        data["executor_namespace"] = executor_namespace
+        logger.info(
+            "[attachments/sync] Completed: task_id=%s, subtask_id=%s, "
+            "executor_name=%s, success_count=%s, failed_count=%s",
+            sync_request.task_id,
+            sync_request.subtask_id,
+            executor_name,
+            data.get("success_count"),
+            data.get("failed_count"),
+        )
+        return data
+    except Exception as e:
+        logger.exception(
+            "[attachments/sync] Error syncing attachments: task_id=%s, subtask_id=%s",
+            sync_request.task_id,
+            sync_request.subtask_id,
+        )
+        return AttachmentSyncResponse.failed_for_request(sync_request, str(e)).to_dict()
+
+
+async def _cleanup_task_heartbeat(task_id: int) -> None:
+    """Clean up heartbeat data for a cancelled task.
+
+    Args:
+        task_id: Task ID to clean up
+    """
+    try:
+        from executor_manager.services.heartbeat_manager import (
+            HeartbeatType,
+            get_heartbeat_manager,
+        )
+        from executor_manager.services.task_heartbeat_manager import (
+            get_running_task_tracker,
+        )
+
+        task_id_str = str(task_id)
+        heartbeat_mgr = get_heartbeat_manager()
+        tracker = get_running_task_tracker()
+
+        await heartbeat_mgr.delete_heartbeat(task_id_str, HeartbeatType.TASK)
+        logger.info(f"[v1/cancel] Removing task {task_id} from RunningTaskTracker")
+        tracker.remove_running_task(task_id)
+    except Exception as e:
+        logger.warning(f"[v1/cancel] Failed to clean up heartbeat data: {e}")
+
+
+@api_router.post("/v1/responses")
+async def openai_responses(http_request: Request):
+    """OpenAI Responses API endpoint - async queue mode.
+
+    This endpoint accepts OpenAI Responses API format requests and enqueues
+    them directly to Redis for async processing. The OpenAI format is stored
+    as-is in the queue - no conversion to ExecutionRequest format.
+    The task queue consumer will handle container creation and task execution.
+
+    Request format (OpenAI Responses API):
+    {
+        "model": "...",
+        "input": "..." or [...],
+        "instructions": "...",
+        "stream": false,
+        "background": true,
+        "metadata": {
+            "task_id": 123,
+            "subtask_id": 456,
+            "type": "online",
+            ...
+        },
+        "model_config": {...}
+    }
+
+    Args:
+        http_request: HTTP request object
+
+    Returns:
+        dict: Queued status response
+    """
+    client_ip = http_request.client.host if http_request.client else "unknown"
+
+    # Read raw JSON data from request body
+    body_bytes = await http_request.body()
+    import json
+
+    request_data = json.loads(body_bytes)
+
+    # Extract task identification from metadata
+    metadata = request_data.get("metadata", {})
+    task_id = metadata.get("task_id", 0)
+    subtask_id = metadata.get("subtask_id", 0)
+    background = request_data.get("background", False)
+
+    logger.info(
+        f"[v1/responses] Received OpenAI request: task_id={task_id}, "
+        f"subtask_id={subtask_id}, background={background} from {client_ip}"
+    )
+
+    # Set task context for tracing
+    set_task_context(task_id=task_id, subtask_id=subtask_id)
+
+    try:
+        # Enqueue OpenAI format directly to Redis (no conversion needed)
+        from executor_manager.services.task_queue_service import TaskQueueService
+
+        queue_type = metadata.get("type") or "online"
+        service_pool = os.getenv("SERVICE_POOL", "default")
+        queue_service = TaskQueueService(service_pool, queue_type)
+        success = queue_service.enqueue_task(request_data)
+
+        if not success:
+            logger.error(f"[v1/responses] Failed to enqueue task {task_id}")
+            raise HTTPException(status_code=500, detail="Failed to enqueue task")
+
+        logger.info(
+            f"[v1/responses] Task {task_id} enqueued to "
+            f"pool '{service_pool}' queue '{queue_type}'"
+        )
+
+        return {
+            "id": f"resp_{subtask_id}",
+            "status": "queued",
+            "message": "Task enqueued for processing",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[v1/responses] Error processing request for task {task_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/tasks/{task_id}/heartbeat")
+async def task_heartbeat(task_id: str, http_request: Request):
+    """
+    Receive heartbeat from executor container for regular (online/offline) tasks.
+
+    This endpoint is called by the executor's HeartbeatService when running
+    regular tasks (not sandbox tasks). It updates the heartbeat timestamp in Redis
+    to indicate that the executor container is still alive.
+
+    Args:
+        task_id: Task ID as string
+        http_request: HTTP request object
+
+    Returns:
+        dict: Heartbeat acknowledgement
+    """
+    from executor_manager.services.heartbeat_manager import (
+        HeartbeatType,
+        get_heartbeat_manager,
+    )
+
+    heartbeat_mgr = get_heartbeat_manager()
+    success = await heartbeat_mgr.update_heartbeat(task_id, HeartbeatType.TASK)
+
+    if not success:
+        logger.warning(f"[TaskAPI] Failed to update heartbeat for task {task_id}")
+        raise HTTPException(
+            status_code=503,
+            detail="Failed to update heartbeat",
+            headers={"Retry-After": "1"},
+        )
+
+    return {"status": "ok", "task_id": task_id}
+
+
+# =============================================================================
+# Workspace Archive/Restore APIs
+# =============================================================================
+# These endpoints forward archive and restore requests to executor pods.
+# Used by backend to archive workspace before Pod deletion and restore
+# workspace when user resumes conversation after Pod recreation.
+# =============================================================================
+
+
+class ArchiveExecutorRequest(BaseModel):
+    """Request model for /executor/archive endpoint."""
+
+    task_id: int
+    upload_url: str  # Presigned MinIO upload URL
+    executor_name: str
+    executor_namespace: str
+    max_size_mb: int = 2048
+    runtime_type: str = "executor"
+
+
+class RestoreExecutorRequest(BaseModel):
+    """Request model for /executor/restore endpoint."""
+
+    task_id: int
+    download_url: str  # Presigned MinIO download URL
+    executor_name: str
+    executor_namespace: str
+    runtime_type: str = "executor"
+
+
+@api_router.post("/executor/archive")
+async def archive_executor_workspace(
+    request: ArchiveExecutorRequest,
+    http_request: Request,
+):
+    """Archive workspace files before Pod deletion.
+
+    Forwards the archive request to the executor pod, which packages
+    the workspace and uploads directly to MinIO using the presigned URL.
+    """
+    try:
+        client_ip = http_request.client.host if http_request.client else "unknown"
+        logger.info(
+            f"[Archive] Received archive request for task {request.task_id} "
+            f"from {client_ip}, executor={request.executor_namespace}/{request.executor_name}"
+        )
+
+        # Get executor address
+        executor = ExecutorDispatcher.get_executor(EXECUTOR_DISPATCHER_MODE)
+        if not hasattr(executor, "get_container_address"):
+            raise HTTPException(
+                status_code=501,
+                detail="Executor address lookup is not supported",
+            )
+
+        result = executor.get_container_address(
+            request.executor_name,
+            executor_namespace=request.executor_namespace,
+        )
+        status = str(result.get("status", "")).lower()
+        base_url = result.get("base_url")
+
+        if status != "success" or not base_url:
+            raise HTTPException(
+                status_code=404,
+                detail=result.get("error_msg") or "Executor runtime is unavailable",
+            )
+
+        # Forward archive request to executor
+        archive_url = f"{base_url.rstrip('/')}/api/archive"
+        payload = {
+            "task_id": request.task_id,
+            "upload_url": request.upload_url,
+            "max_size_mb": request.max_size_mb,
+            "runtime_type": request.runtime_type,
+        }
+
+        logger.info(f"[Archive] Forwarding to executor: {archive_url}")
+
+        async with traced_async_client(timeout=120.0) as client:
+            response = await client.post(
+                archive_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            archive_result = response.json()
+
+        logger.info(
+            f"[Archive] Successfully archived task {request.task_id}, "
+            f"size={archive_result.get('size_bytes')} bytes"
+        )
+
+        return archive_result
+
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        logger.error(f"[Archive] HTTP error for task {request.task_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"HTTP error: {str(e)}")
+    except Exception as e:
+        logger.error(f"[Archive] Error archiving task {request.task_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/executor/restore")
+async def restore_executor_workspace(
+    request: RestoreExecutorRequest,
+    http_request: Request,
+):
+    """Restore workspace files after Pod recreation.
+
+    Forwards the restore request to the executor pod, which downloads
+    the archive from MinIO and extracts it to the workspace directory.
+    """
+    try:
+        client_ip = http_request.client.host if http_request.client else "unknown"
+        logger.info(
+            f"[Restore] Received restore request for task {request.task_id} "
+            f"from {client_ip}, executor={request.executor_namespace}/{request.executor_name}"
+        )
+
+        # Get executor address
+        executor = ExecutorDispatcher.get_executor(EXECUTOR_DISPATCHER_MODE)
+        if not hasattr(executor, "get_container_address"):
+            raise HTTPException(
+                status_code=501,
+                detail="Executor address lookup is not supported",
+            )
+
+        result = executor.get_container_address(
+            request.executor_name,
+            executor_namespace=request.executor_namespace,
+        )
+        status = str(result.get("status", "")).lower()
+        base_url = result.get("base_url")
+
+        if status != "success" or not base_url:
+            raise HTTPException(
+                status_code=404,
+                detail=result.get("error_msg") or "Executor runtime is unavailable",
+            )
+
+        # Forward restore request to executor
+        restore_url = f"{base_url.rstrip('/')}/api/restore"
+        payload = {
+            "task_id": request.task_id,
+            "download_url": request.download_url,
+            "runtime_type": request.runtime_type,
+        }
+
+        logger.info(f"[Restore] Forwarding to executor: {restore_url}")
+
+        async with traced_async_client(timeout=120.0) as client:
+            response = await client.post(
+                restore_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            restore_result = response.json()
+
+        logger.info(
+            f"[Restore] Successfully restored task {request.task_id}, "
+            f"session={restore_result.get('session_restored')}, "
+            f"git={restore_result.get('git_restored')}"
+        )
+
+        return restore_result
+
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        logger.error(f"[Restore] HTTP error for task {request.task_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"HTTP error: {str(e)}")
+    except Exception as e:
+        logger.error(f"[Restore] Error restoring task {request.task_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Mount api_router to app
+app.include_router(api_router)
