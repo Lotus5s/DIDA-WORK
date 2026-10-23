@@ -217,6 +217,10 @@ function didaCatalogEntry(
       toolProfile: 'custom',
       contextWindow,
     }),
+    // DIDA chat models are multimodal. The default custom catalog is text-only,
+    // which made the composer treat screenshots as unreadable attachments.
+    input_modalities: ['text', 'image'],
+    supports_image_detail_original: true,
     base_instructions: `${DEFAULT_CUSTOM_MODEL_BASE_INSTRUCTIONS}\n\nThe upstream model serving this session is ${displayName} (model id: ${upstreamModelId}). When asked which model you are, identify yourself as ${displayName}.
 
 The desktop application hosting this session is DIDA Work. Its former names Wework and WeWork are obsolete; never call the application Wework or WeWork. When you refer to the application, call it DIDA Work.`,
