@@ -8,9 +8,20 @@ permissions:
 
 jobs:
   macos:
-    name: macOS x64
-    runs-on: macos-15-intel
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            cargo_target: aarch64-apple-darwin
+          - arch: x64
+            runner: macos-15-intel
+            cargo_target: x86_64-apple-darwin
 
     steps:
       - name: Checkout
@@ -19,7 +30,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-apple-darwin
+          targets: ${{ matrix.cargo_target }}
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -60,12 +71,12 @@ jobs:
       - name: Build unsigned DMG and ZIP
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-          CARGO_BUILD_TARGET: x86_64-apple-darwin
-          WEWORK_CODEX_TARGET: x86_64-apple-darwin
-          WEWORK_DWS_TARGET: x86_64-apple-darwin
+          CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
+          WEWORK_CODEX_TARGET: ${{ matrix.cargo_target }}
+          WEWORK_DWS_TARGET: ${{ matrix.cargo_target }}
           WEWORK_ELECTRON_DEPENDENCIES_READY: "true"
           WEWORK_ONLINE_UPDATE_INCLUDE_COMPONENTS: "true"
-          WEWORK_RELEASE_ARCH: x64
+          WEWORK_RELEASE_ARCH: ${{ matrix.arch }}
           WEWORK_RELEASE_PLATFORM: macos
           WEWORK_SOURCE_SHA: ${{ github.sha }}
           VITE_WEWORK_RELEASE_CHANNEL: stable
@@ -82,7 +93,7 @@ jobs:
       - name: Upload DMG and ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: DIDAWork-macos-x64
+          name: DIDAWork-macos-${{ matrix.arch }}
           path: |
             wework/electron/release-installer/**/*.dmg
             wework/electron/release-installer/**/*.zip
