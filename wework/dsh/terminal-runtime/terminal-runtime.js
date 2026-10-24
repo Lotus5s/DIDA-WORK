@@ -1,5 +1,6 @@
 import { homedir } from 'node:os'
-import { isAbsolute } from 'node:path'
+import { existsSync } from 'node:fs'
+import { isAbsolute, join } from 'node:path'
 import { stat } from 'node:fs/promises'
 
 const DEFAULT_COLS = 80
@@ -340,7 +341,14 @@ function terminalEnvironment(base, overrides) {
 
 function terminalShell(platform, environment) {
   if (platform === 'win32') {
-    const executable = environment.COMSPEC?.trim() || 'pwsh.exe'
+    // The DSH process can run without COMSPEC (for example when the desktop
+    // app starts it with a curated environment), so fall back to an absolute
+    // Windows shell instead of a bare "pwsh.exe" that the PTY cannot resolve.
+    const configured = environment.COMSPEC?.trim()
+    const executable =
+      configured && isAbsolute(configured)
+        ? configured
+        : windowsShellFallback(environment)
     return {
       executable,
       args: /pwsh|powershell/i.test(executable) ? ['-NoLogo'] : [],
@@ -354,6 +362,16 @@ function terminalShell(platform, environment) {
         ? '/bin/zsh'
         : '/bin/bash'
   return { executable, args: ['-l'] }
+}
+
+function windowsShellFallback(environment) {
+  const systemRoot =
+    environment.SystemRoot?.trim() || environment.windir?.trim() || 'C:\\Windows'
+  const candidates = [
+    join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    join(systemRoot, 'System32', 'cmd.exe'),
+  ]
+  return candidates.find(candidate => existsSync(candidate)) ?? 'pwsh.exe'
 }
 
 function terminalCommand(params, platform, environment) {
