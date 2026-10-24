@@ -204,12 +204,50 @@ function uniqueLocalModelId(base: string, used: Set<string>): string {
 
 const DEFAULT_DIDA_CONTEXT_WINDOW = 1_048_576
 
+const REASONING_LEVEL_DESCRIPTIONS: Record<string, string> = {
+  low: 'Light reasoning',
+  medium: 'Balanced reasoning',
+  high: 'Deep reasoning',
+  xhigh: 'Extra-high reasoning',
+  max: 'Maximum reasoning',
+  ultra: 'Ultra reasoning',
+}
+
+/**
+ * Reasoning levels each DIDA upstream model accepts, mirroring Codex's own
+ * model catalog. Custom catalog entries in this app start with an empty
+ * `supported_reasoning_levels`, which hides the composer's thinking-strength
+ * picker, so every DIDA model has to declare its levels explicitly.
+ */
+const DIDA_REASONING_SUPPORT: Record<
+  string,
+  { levels: string[]; defaultEffort: string }
+> = {
+  'gpt-6.1-sol': { levels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], defaultEffort: 'medium' },
+  'gpt-6-sol': { levels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], defaultEffort: 'medium' },
+  'gpt-6-astra': { levels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], defaultEffort: 'medium' },
+  'gpt-6-luna': { levels: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'medium' },
+  'gpt-5.6-sol': { levels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], defaultEffort: 'medium' },
+  'gpt-5.6-terra': { levels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], defaultEffort: 'medium' },
+  'gpt-5.6-luna': { levels: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'medium' },
+}
+
+const DIDA_FALLBACK_REASONING_SUPPORT = {
+  levels: ['low', 'medium', 'high', 'xhigh'],
+  defaultEffort: 'medium',
+}
+
+function didaReasoningSupport(upstreamModelId: string) {
+  return DIDA_REASONING_SUPPORT[upstreamModelId] ?? DIDA_FALLBACK_REASONING_SUPPORT
+}
+
 function didaCatalogEntry(
   localModelId: string,
   displayName: string,
   upstreamModelId: string,
   contextWindow: number
 ) {
+  const reasoning = didaReasoningSupport(upstreamModelId)
   return {
     ...createDefaultLocalModelCatalogEntry({
       id: localModelId,
@@ -221,6 +259,11 @@ function didaCatalogEntry(
     // which made the composer treat screenshots as unreadable attachments.
     input_modalities: ['text', 'image'],
     supports_image_detail_original: true,
+    supported_reasoning_levels: reasoning.levels.map(effort => ({
+      effort,
+      description: REASONING_LEVEL_DESCRIPTIONS[effort] ?? effort,
+    })),
+    default_reasoning_level: reasoning.defaultEffort,
     base_instructions: `${DEFAULT_CUSTOM_MODEL_BASE_INSTRUCTIONS}\n\nThe upstream model serving this session is ${displayName} (model id: ${upstreamModelId}). When asked which model you are, identify yourself as ${displayName}.
 
 The desktop application hosting this session is DIDA Work. Its former names Wework and WeWork are obsolete; never call the application Wework or WeWork. When you refer to the application, call it DIDA Work.`,

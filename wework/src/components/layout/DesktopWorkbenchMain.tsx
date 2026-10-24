@@ -238,7 +238,6 @@ import {
   useWorkbenchPaneVisible,
 } from './workbenchPanePresentation'
 import { useWorkbenchPaneSession } from './useWorkbenchPaneSession'
-import { RUNTIME_RETRY_CONTINUATION_PROMPT } from './runtimeRetry'
 import {
   formatEnvironmentReviewErrorMessage,
   type BottomPanelRenderContext,
@@ -3083,7 +3082,7 @@ const DesktopWorkbenchPane = memo(function DesktopWorkbenchPane({
         paneSession.messages.at(-1)?.role === 'assistant' &&
         paneSession.messages.at(-1)?.runtimeStatus === 'cancelled',
       onContinue: () => {
-        void paneSession.sendContinuation(RUNTIME_RETRY_CONTINUATION_PROMPT, '继续')
+        void paneSession.sendContinuation('继续未完成的工作。', '继续')
       },
       scopeKey: paneSession.scopeKey,
       attachments: paneSession.attachments,
