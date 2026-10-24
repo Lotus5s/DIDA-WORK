@@ -102,6 +102,8 @@ export interface ProjectChatControls {
   getSelectedModel?: () => UnifiedModel | null
   getSelectedModelOptions?: () => ModelOptions
   onBlockedModelSelect?: (model: UnifiedModel, message?: string) => void
+  continueAvailable?: boolean
+  onContinue?: () => void
   toggleSkill: (skill: SkillRef) => void
   handleFileSelect: (files: File | File[]) => Promise<void>
   removeAttachment: (attachmentId: number) => Promise<void>
@@ -732,6 +734,8 @@ const ChatInputBody = forwardRef<ChatInputHandle, ChatInputProps>(function ChatI
             onSelectModelAndOptions={(model, options) => requestModelSelection(model, options)}
             onSelectModelOption={controls.setSelectedModelOption}
             onBlockedModelSelect={controls.onBlockedModelSelect}
+            continueAvailable={controls.continueAvailable}
+            onContinue={controls.onContinue}
             onFileSelect={files => controls.handleFileSelect(files)}
             planModeActive={planModeActive}
             onSetPlanMode={handleSetPlanMode}

@@ -84,7 +84,6 @@ export interface ScrollableMessageAreaProps extends Pick<
   conversationKey?: string | number | null
   devices?: MessageListProps['devices']
   onRetryFailedMessage?: (message: WorkbenchMessage) => void
-  onContinueStoppedMessage?: (message: WorkbenchMessage) => void
   onSwitchModelForFailedMessage?: (message: WorkbenchMessage) => void
   onLoadFileChangesDiff?: (
     subtaskId: string,
@@ -172,9 +171,6 @@ export function areScrollableMessageAreaPropsEqual(
     previous.conversationKey !== next.conversationKey ? 'conversationKey' : null,
     previous.devices !== next.devices ? 'devices' : null,
     previous.onRetryFailedMessage !== next.onRetryFailedMessage ? 'onRetryFailedMessage' : null,
-    previous.onContinueStoppedMessage !== next.onContinueStoppedMessage
-      ? 'onContinueStoppedMessage'
-      : null,
     previous.onSwitchModelForFailedMessage !== next.onSwitchModelForFailedMessage
       ? 'onSwitchModelForFailedMessage'
       : null,

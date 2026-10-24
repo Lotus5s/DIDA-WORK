@@ -3078,6 +3078,13 @@ const DesktopWorkbenchPane = memo(function DesktopWorkbenchPane({
   const projectChatWithModelSelectorSignal = useMemo<ProjectChatControls>(
     () => ({
       ...projectChat,
+      continueAvailable:
+        !paneSession.status.isBusy &&
+        paneSession.messages.at(-1)?.role === 'assistant' &&
+        paneSession.messages.at(-1)?.runtimeStatus === 'cancelled',
+      onContinue: () => {
+        void paneSession.sendContinuation(RUNTIME_RETRY_CONTINUATION_PROMPT, '继续')
+      },
       scopeKey: paneSession.scopeKey,
       attachments: paneSession.attachments,
       uploadingFiles: paneSession.uploadingFiles,
@@ -3106,8 +3113,11 @@ const DesktopWorkbenchPane = memo(function DesktopWorkbenchPane({
       paneSession.attachmentErrors,
       paneSession.attachments,
       paneSession.handleFileSelect,
+      paneSession.messages,
       paneSession.removeAttachment,
       paneSession.scopeKey,
+      paneSession.sendContinuation,
+      paneSession.status.isBusy,
       paneSession.uploadingFiles,
       projectChat,
       refinePluginTrialPrompt,
@@ -5531,13 +5541,6 @@ const DesktopWorkbenchPane = memo(function DesktopWorkbenchPane({
                         ? undefined
                         : message => {
                             void paneSession.retryFailedMessage(message)
-                          }
-                    }
-                    onContinueStoppedMessage={
-                      issueExecutionReadOnly
-                        ? undefined
-                        : () => {
-                            void paneSession.sendContinuation(RUNTIME_RETRY_CONTINUATION_PROMPT, '继续')
                           }
                     }
                     onSwitchModelForFailedMessage={

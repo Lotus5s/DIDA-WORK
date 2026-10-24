@@ -74,6 +74,8 @@ interface ProjectChatComposerProps {
   onSelectModelAndOptions?: (model: UnifiedModel, options: ModelOptions) => void
   onSelectModelOption: (optionId: string, value: string) => void
   onBlockedModelSelect?: (model: UnifiedModel, message?: string) => void
+  continueAvailable?: boolean
+  onContinue?: () => void
   onFileSelect: (files: File | File[]) => void
   onOpenSkillFile?: (path: string) => void
   workspaceTarget?: WorkspaceTarget | null
@@ -159,6 +161,8 @@ export const ProjectChatComposer = forwardRef<ComposerTextareaHandle, ProjectCha
       onSelectModelAndOptions,
       onSelectModelOption,
       onBlockedModelSelect,
+      continueAvailable = false,
+      onContinue,
       onFileSelect,
       onOpenSkillFile,
       workspaceTarget,
@@ -406,6 +410,8 @@ export const ProjectChatComposer = forwardRef<ComposerTextareaHandle, ProjectCha
               onSelectModelAndOptions={onSelectModelAndOptions}
               onSelectModelOption={onSelectModelOption}
               onBlockedModelSelect={onBlockedModelSelect}
+              continueAvailable={continueAvailable}
+              onContinue={onContinue}
               modelSelectorOverride={modelSelectorOverride}
               contextUsage={contextUsage}
               onFileSelect={onFileSelect}

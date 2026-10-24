@@ -1,4 +1,4 @@
-import { ArrowUp, ChevronDown, ClipboardList, Clock3, CornerDownRight, Zap } from 'lucide-react'
+import { ArrowUp, ChevronDown, ClipboardList, Clock3, CornerDownRight, Play, Zap } from 'lucide-react'
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { ActionMenu } from '../controls/ActionMenu'
 import type { ComposerSubmitOptions } from './composerInputTypes'
@@ -57,6 +57,8 @@ export interface ComposerToolbarProps {
   onCancelGoalDraft?: () => void
   isStreaming?: boolean
   onPause?: () => void
+  continueAvailable?: boolean
+  onContinue?: () => void
   onSubmit: (options?: ComposerSubmitOptions) => void
   sendButtonTestId?: string
   sendButtonLabel?: string
@@ -104,6 +106,8 @@ export function ComposerToolbar({
   onCancelGoalDraft,
   isStreaming = false,
   onPause,
+  continueAvailable = false,
+  onContinue,
   onSubmit,
   sendButtonTestId = 'send-message-button',
   sendButtonLabel,
@@ -309,6 +313,24 @@ export function ComposerToolbar({
                 ]}
               />
             </div>
+          ) : continueAvailable && !canSend && !disabled ? (
+            <Tooltip
+              label={t('workbench.continue_response', '继续')}
+              align="end"
+              testId="composer-continue-tooltip"
+            >
+              <button
+                type="button"
+                data-composer-primary-action="true"
+                data-testid="continue-response-button"
+                onClick={onContinue}
+                disabled={!onContinue}
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-text-primary p-0 text-background hover:bg-text-primary/90 disabled:cursor-not-allowed disabled:bg-text-muted/45"
+                aria-label={t('workbench.continue_response', '继续')}
+              >
+                <Play className="h-4 w-4" />
+              </button>
+            </Tooltip>
           ) : (
             <Tooltip
               label={sendButtonLabel ?? t('workbench.send_message', '发送消息')}

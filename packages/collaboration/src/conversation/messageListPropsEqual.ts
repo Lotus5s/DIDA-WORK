@@ -30,9 +30,6 @@ export function areMessageListPropsEqual(
     previous.searchMessageId !== next.searchMessageId ? 'searchMessageId' : null,
     previous.devices !== next.devices ? 'devices' : null,
     previous.onRetryFailedMessage !== next.onRetryFailedMessage ? 'onRetryFailedMessage' : null,
-    previous.onContinueStoppedMessage !== next.onContinueStoppedMessage
-      ? 'onContinueStoppedMessage'
-      : null,
     previous.onSwitchModelForFailedMessage !== next.onSwitchModelForFailedMessage
       ? 'onSwitchModelForFailedMessage'
       : null,

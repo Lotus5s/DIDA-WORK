@@ -34,6 +34,8 @@ interface ComposerToolbarProps {
   selectedModelOptions: ModelOptions
   modelSelectorOpenSignal?: number
   onModelSelectorOpenChange?: (open: boolean, closeReason?: ModelSelectorCloseReason) => void
+  continueAvailable?: boolean
+  onContinue?: () => void
   isModelSelectionReady: boolean
   contextUsage?: RuntimeContextUsage
   onSelectModel: (model: UnifiedModel | null) => boolean | void
