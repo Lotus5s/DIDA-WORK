@@ -1,7 +1,13 @@
-import { BrowserWindow, session } from 'electron'
+import { app, BrowserWindow, session } from 'electron'
 import type { BrowserWindow as BrowserWindowType } from 'electron'
 import { HostCapabilityError, type HostCapabilityRouter } from './capability-router.js'
 import type { SecureValueStore } from './secure-value-store.js'
+import {
+  legacyCodexHome,
+  readCodexImportStatus,
+  requestCodexImport,
+  scanCodexConversations,
+} from '../runtime/codex-conversation-import.js'
 
 /**
  * DIDA (Sub2API) onboarding bridge.
@@ -365,7 +371,8 @@ async function captureLoginWindow(
 export function registerDidaCapabilities(
   router: HostCapabilityRouter,
   window: () => BrowserWindowType | null,
-  secrets: SecureValueStore
+  secrets: SecureValueStore,
+  options: { executorHome: string; homeDirectory?: string } = { executorHome: '' }
 ): void {
   router.register('dida.session', async () => {
     const stored = await readSession(secrets)
@@ -574,5 +581,28 @@ export function registerDidaCapabilities(
       models.push(model)
     }
     return { models }
+  })
+
+  router.register('dida.codexImport.status', async () => {
+    return readCodexImportStatus(app.getPath('userData'))
+  })
+
+  router.register('dida.codexImport.scan', async () => {
+    const homeDirectory = options.homeDirectory?.trim() || app.getPath('home')
+    return scanCodexConversations({
+      legacyHome: legacyCodexHome(homeDirectory),
+      executorHome: options.executorHome,
+    })
+  })
+
+  router.register('dida.codexImport.request', async params => {
+    const homeDirectory = options.homeDirectory?.trim() || app.getPath('home')
+    const mode = stringValue(params.mode) === 'overwrite' ? 'overwrite' : 'skip'
+    await requestCodexImport({
+      userDataDirectory: app.getPath('userData'),
+      legacyHome: legacyCodexHome(homeDirectory),
+      mode,
+    })
+    return { pending: true, mode }
   })
 }

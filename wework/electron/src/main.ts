@@ -79,6 +79,7 @@ import { handlePopoutWindowInput } from './host/popout-window-shortcuts.js'
 import { createWeworkProcessExplorerService } from './host/process-explorer-service.js'
 import { DesktopRuntime } from './runtime/desktop-runtime.js'
 import { prewarmCoreDsh } from './runtime/prewarm-core-dsh.js'
+import { applyPendingCodexImport } from './runtime/codex-conversation-import.js'
 import { isolateDevelopmentEnvironment } from './runtime/development-isolation.js'
 import { prepareDevelopmentHistory } from './runtime/development-history-migration.js'
 import { FeedbackBundleManager } from './host/feedback-bundle-manager.js'
@@ -1799,6 +1800,19 @@ async function configureDesktopRuntime(): Promise<void> {
   const environment = await desktopEnvironment()
   startupRuntimeEnvironment = environment
   logStartupStep('desktop-environment', 'completed')
+  try {
+    const codexImportStatus = await applyPendingCodexImport({
+      executorHome: environment.WEGENT_EXECUTOR_HOME?.trim() || executorHome,
+      userDataDirectory: app.getPath('userData'),
+      homeDirectory: app.getPath('home'),
+      log: message => console.info('[codex-import]', message),
+    })
+    if (codexImportStatus) {
+      console.info('[codex-import] finished', codexImportStatus)
+    }
+  } catch (error) {
+    console.warn('[codex-import] pending import failed', error)
+  }
   if (!pluginDevelopmentInstance && !pluginDevelopment) {
     pluginDevelopment = new PluginDevelopmentManager({
       ...currentElectronLaunch(),

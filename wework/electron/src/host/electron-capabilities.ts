@@ -408,7 +408,10 @@ export function createElectronCapabilityRouter(
     desktopServices.secureStorage,
     desktopServices.events
   )
-  registerDidaCapabilities(router, window, desktopServices.secureStorage)
+  registerDidaCapabilities(router, window, desktopServices.secureStorage, {
+    executorHome: desktopServices.executorHome,
+    homeDirectory: app.getPath('home'),
+  })
   registerMicrophoneDiagnostics(router, readMacosMicrophoneChecks)
 
   router.register('navigation.pendingSchemes', () => desktopServices.pendingSchemes.read())

@@ -28,6 +28,7 @@ import {
 } from './settings-ui'
 import { applyLanguagePreference, languagePreferenceOptions } from '@/i18n/languagePreference'
 import { ExternalContentImportDialog } from './ExternalContentImportDialog'
+import { CodexConversationImportSection } from './CodexConversationImportSection'
 import {
   defaultAppPreferences,
   getAppPreferences,
@@ -1108,6 +1109,8 @@ export function GeneralSettingsPage() {
           })}
         </SettingsGroup>
       </section>
+
+      <CodexConversationImportSection />
 
       {(loading || saving || error) && (
         <div

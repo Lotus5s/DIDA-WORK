@@ -245,8 +245,7 @@ export function ToolBlocksDisplay({
   const hasClosedToolSegment = processingPhase !== 'live'
   const usesUnifiedToolList = showSummary && !isLockedOpen
   const expanded = isLockedOpen || (userExpanded && !usesUnifiedToolList)
-  const canToggleSummary =
-    showSummary && !isLockedOpen && !hasRunningToolActivity && rows.length > 0
+  const canToggleSummary = showSummary && !isLockedOpen && rows.length > 0
   const hasLivePreview =
     isRunning &&
     (!hasClosedToolSegment || hasRunningToolActivity || showInterToolThinking) &&
