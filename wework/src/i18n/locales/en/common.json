@@ -1854,6 +1854,7 @@
     "permission_mode": "Permission mode",
     "permission_mode_read_only": "Read only",
     "permission_mode_workspace": "Workspace",
+    "permission_mode_auto_review": "Approve for me",
     "permission_mode_full_access": "Full access",
     "permission_full_access_confirm_title": "Turn on Full access?",
     "permission_full_access_confirm_description": "Codex will be able to run commands, use the internet, and read, create, edit, or delete files anywhere on this computer without asking.",

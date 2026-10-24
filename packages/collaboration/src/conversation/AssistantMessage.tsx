@@ -1,5 +1,5 @@
 import { Fragment, useMemo, useState, type ReactNode } from "react";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, Play } from "lucide-react";
 import type {
   Attachment,
   RequestUserInputResponse,
@@ -71,6 +71,7 @@ export function AssistantMessage({
   forceExpanded = false,
   devices,
   onRetryFailedMessage,
+  onContinueStoppedMessage,
   onSwitchModelForFailedMessage,
   onLoadFileChangesDiff,
   onRevertFileChanges,
@@ -97,6 +98,7 @@ export function AssistantMessage({
   forceExpanded?: boolean;
   devices: Array<{ device_id: string; status: string }>;
   onRetryFailedMessage?: (message: WorkbenchMessage) => void;
+  onContinueStoppedMessage?: (message: WorkbenchMessage) => void;
   onSwitchModelForFailedMessage?: (message: WorkbenchMessage) => void;
   onLoadFileChangesDiff?: (
     subtaskId: string,
@@ -412,13 +414,26 @@ export function AssistantMessage({
           {shouldShowStoppedNotice ? (
             <div
               data-testid="assistant-stopped-notice"
-              className="mb-3 w-full pb-1 text-xs text-text-muted"
+              className="mb-3 flex w-full flex-wrap items-center gap-3 pb-1 text-xs text-text-muted"
             >
-              {stoppedElapsedDuration
-                ? t("assistant_status.stopped_after", {
-                    duration: stoppedElapsedDuration,
-                  })
-                : t("assistant_status.stopped")}
+              <span>
+                {stoppedElapsedDuration
+                  ? t("assistant_status.stopped_after", {
+                      duration: stoppedElapsedDuration,
+                    })
+                  : t("assistant_status.stopped")}
+              </span>
+              {onContinueStoppedMessage ? (
+                <button
+                  type="button"
+                  data-testid="assistant-continue-button"
+                  className="inline-flex h-6 items-center gap-1 rounded-md border border-border bg-surface px-2 text-xs font-medium text-text-secondary transition hover:bg-muted hover:text-text-primary"
+                  onClick={() => onContinueStoppedMessage(message)}
+                >
+                  <Play className="h-3 w-3" aria-hidden="true" />
+                  {t("assistant_status.continue")}
+                </button>
+              ) : null}
             </div>
           ) : null}
           {(hasProcessingActivity ||

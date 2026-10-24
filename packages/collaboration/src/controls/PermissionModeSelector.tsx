@@ -4,6 +4,7 @@ import {
   FolderPen,
   Globe2,
   ShieldAlert,
+  Sparkles,
   TerminalSquare,
 } from "lucide-react";
 import {
@@ -50,6 +51,7 @@ export function PermissionModeSelector({
   const labels: Record<RuntimePermissionMode, string> = {
     "read-only": t("composer.permission_mode_read_only", "只读"),
     "workspace-write": t("composer.permission_mode_workspace", "工作区"),
+    "auto-review": t("composer.permission_mode_auto_review", "帮我批准"),
     "full-access": t("composer.permission_mode_full_access", "完整访问"),
   };
   const ariaLabel = `${t("composer.permission_mode", "权限模式")}: ${labels[value]}`;
@@ -71,9 +73,11 @@ export function PermissionModeSelector({
           icon={
             value === "read-only"
               ? Eye
-              : value === "full-access"
-                ? ShieldAlert
-                : FolderPen
+              : value === "auto-review"
+                ? Sparkles
+                : value === "full-access"
+                  ? ShieldAlert
+                  : FolderPen
           }
           triggerLabel={iconOnly ? undefined : labels[value]}
           disabled={disabled}
@@ -83,7 +87,7 @@ export function PermissionModeSelector({
               ? "flex h-8 w-8 items-center justify-center rounded-full text-text-secondary transition-colors hover:bg-muted hover:text-text-primary"
               : "flex h-8 max-w-32 items-center gap-1.5 rounded-lg px-2 text-xs text-text-secondary transition-colors hover:bg-muted hover:text-text-primary"
           }
-          items={(["read-only", "workspace-write", "full-access"] as const).map(
+          items={(["read-only", "workspace-write", "auto-review", "full-access"] as const).map(
             (mode) => ({
               label: (
                 <span className="flex min-w-0 flex-1 items-center justify-between gap-3">
@@ -96,9 +100,11 @@ export function PermissionModeSelector({
               icon:
                 mode === "read-only"
                   ? Eye
-                  : mode === "full-access"
-                    ? ShieldAlert
-                    : FolderPen,
+                  : mode === "auto-review"
+                    ? Sparkles
+                    : mode === "full-access"
+                      ? ShieldAlert
+                      : FolderPen,
               testId: `permission-mode-${mode}`,
               onSelect: () => choose(mode),
               danger: mode === "full-access",

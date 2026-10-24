@@ -3,6 +3,7 @@ export const RUNTIME_PERMISSION_MODE_OPTION = "permissionMode";
 export type RuntimePermissionMode =
   | "read-only"
   | "workspace-write"
+  | "auto-review"
   | "full-access";
 
 export const DEFAULT_RUNTIME_PERMISSION_MODE: RuntimePermissionMode =
@@ -15,6 +16,7 @@ export function runtimePermissionMode(
   if (
     value === "read-only" ||
     value === "workspace-write" ||
+    value === "auto-review" ||
     value === "full-access"
   )
     return value;
@@ -27,6 +29,8 @@ export function runtimePermissionProfile(mode: RuntimePermissionMode): string {
       return ":read-only";
     case "workspace-write":
       return ":workspace";
+    case "auto-review":
+      return ":auto-review";
     case "full-access":
       return ":danger-full-access";
   }

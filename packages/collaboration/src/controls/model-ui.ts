@@ -883,6 +883,7 @@ export function normalizeModelOptions(
   if (
     permissionMode === "read-only" ||
     permissionMode === "workspace-write" ||
+    permissionMode === "auto-review" ||
     permissionMode === "full-access"
   ) {
     normalized.permissionMode = permissionMode;

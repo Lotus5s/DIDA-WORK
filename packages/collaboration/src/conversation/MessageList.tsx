@@ -71,6 +71,7 @@ export interface MessageListProps {
   searchMessageId?: string
   devices?: Array<{ device_id: string; status: string }>
   onRetryFailedMessage?: (message: WorkbenchMessage) => void
+  onContinueStoppedMessage?: (message: WorkbenchMessage) => void
   onSwitchModelForFailedMessage?: (message: WorkbenchMessage) => void
   onLoadFileChangesDiff?: (
     subtaskId: string,
@@ -155,6 +156,7 @@ export const MessageList = memo(function MessageList({
   searchMessageId,
   devices = [],
   onRetryFailedMessage,
+  onContinueStoppedMessage,
   onSwitchModelForFailedMessage,
   onLoadFileChangesDiff,
   onRevertFileChanges,
@@ -723,6 +725,7 @@ export const MessageList = memo(function MessageList({
                 isActiveTurn={isWaitingForAssistant && index === visibleMessages.length - 1}
                 devices={devices}
                 onRetryFailedMessage={onRetryFailedMessage}
+                onContinueStoppedMessage={onContinueStoppedMessage}
                 onSwitchModelForFailedMessage={onSwitchModelForFailedMessage}
                 onLoadFileChangesDiff={onLoadFileChangesDiff}
                 onRevertFileChanges={onRevertFileChanges}

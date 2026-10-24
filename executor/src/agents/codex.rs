@@ -5767,6 +5767,7 @@ fn resolve_codex_binary(value: &str) -> String {
 pub(crate) const CODEX_DANGER_FULL_ACCESS_PERMISSION_PROFILE: &str = ":danger-full-access";
 pub(crate) const CODEX_READ_ONLY_PERMISSION_PROFILE: &str = ":read-only";
 pub(crate) const CODEX_WORKSPACE_PERMISSION_PROFILE: &str = ":workspace";
+pub(crate) const CODEX_AUTO_REVIEW_PERMISSION_PROFILE: &str = ":auto-review";
 
 pub(crate) fn codex_runtime_approval_policy(request: &ExecutionRequest) -> Value {
     match codex_runtime_permission_profile(request) {
@@ -5796,6 +5797,7 @@ fn codex_runtime_permission_profile(request: &ExecutionRequest) -> &'static str 
     {
         Some(CODEX_READ_ONLY_PERMISSION_PROFILE) => CODEX_READ_ONLY_PERMISSION_PROFILE,
         Some(CODEX_WORKSPACE_PERMISSION_PROFILE) => CODEX_WORKSPACE_PERMISSION_PROFILE,
+        Some(CODEX_AUTO_REVIEW_PERMISSION_PROFILE) => CODEX_AUTO_REVIEW_PERMISSION_PROFILE,
         Some(CODEX_DANGER_FULL_ACCESS_PERMISSION_PROFILE) => {
             CODEX_DANGER_FULL_ACCESS_PERMISSION_PROFILE
         }
@@ -5807,10 +5809,40 @@ fn insert_codex_runtime_permissions(
     params: &mut serde_json::Map<String, Value>,
     request: &ExecutionRequest,
 ) {
+    // ":auto-review" is a Wework-side mode, not a sandbox Codex understands.
+    // It runs in the workspace profile; Codex only changes its approvals reviewer.
+    let profile = match codex_runtime_permission_profile(request) {
+        CODEX_AUTO_REVIEW_PERMISSION_PROFILE => CODEX_WORKSPACE_PERMISSION_PROFILE,
+        profile => profile,
+    };
     params.insert(
         "permissions".to_owned(),
-        Value::String(codex_runtime_permission_profile(request).to_owned()),
+        Value::String(profile.to_owned()),
     );
+}
+
+fn codex_runtime_uses_auto_review(request: &ExecutionRequest) -> bool {
+    codex_runtime_permission_profile(request) == CODEX_AUTO_REVIEW_PERMISSION_PROFILE
+}
+
+/// Enable Codex's "Approve for me" reviewer on thread/turn config.
+fn insert_codex_auto_review_config(
+    params: &mut serde_json::Map<String, Value>,
+    request: &ExecutionRequest,
+) {
+    if !codex_runtime_uses_auto_review(request) {
+        return;
+    }
+    let mut config = params
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    config.insert(
+        "approvals_reviewer".to_owned(),
+        Value::String("auto_review".to_owned()),
+    );
+    params.insert("config".to_owned(), Value::Object(config));
 }
 
 fn insert_runtime_workspace_roots(
@@ -5878,6 +5910,7 @@ fn thread_start_params(request: &ExecutionRequest, launch_config: &CodexLaunchCo
         codex_runtime_approval_policy(request),
     );
     insert_codex_runtime_permissions(&mut params, request);
+    insert_codex_auto_review_config(&mut params, request);
     if request.ephemeral {
         params.insert("ephemeral".to_owned(), Value::Bool(true));
     }
@@ -5913,6 +5946,7 @@ fn thread_fork_params(
         codex_runtime_approval_policy(request),
     );
     insert_codex_runtime_permissions(&mut params, request);
+    insert_codex_auto_review_config(&mut params, request);
     if request.ephemeral {
         params.insert("ephemeral".to_owned(), Value::Bool(true));
     }
@@ -5981,6 +6015,7 @@ fn thread_resume_params(
         codex_runtime_approval_policy(request),
     );
     insert_codex_runtime_permissions(&mut params, request);
+    insert_codex_auto_review_config(&mut params, request);
     Value::Object(params)
 }
 
@@ -6056,6 +6091,7 @@ fn turn_start_params(
         codex_runtime_approval_policy(request),
     );
     insert_codex_runtime_permissions(&mut params, request);
+    insert_codex_auto_review_config(&mut params, request);
     if let Some(cwd) = request.cwd() {
         params.insert("cwd".to_owned(), Value::String(cwd.to_owned()));
     }

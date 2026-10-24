@@ -6,6 +6,7 @@ export const composerMessages: Record<
     "composer.permission_mode": "权限模式",
     "composer.permission_mode_read_only": "只读",
     "composer.permission_mode_workspace": "工作区",
+    "composer.permission_mode_auto_review": "帮我批准",
     "composer.permission_mode_full_access": "完整访问",
     "composer.permission_full_access_confirm_title": "启用完整访问？",
     "composer.permission_full_access_confirm_description":
@@ -27,6 +28,7 @@ export const composerMessages: Record<
     "composer.permission_mode": "Permission mode",
     "composer.permission_mode_read_only": "Read only",
     "composer.permission_mode_workspace": "Workspace",
+    "composer.permission_mode_auto_review": "Approve for me",
     "composer.permission_mode_full_access": "Full access",
     "composer.permission_full_access_confirm_title": "Turn on Full access?",
     "composer.permission_full_access_confirm_description":

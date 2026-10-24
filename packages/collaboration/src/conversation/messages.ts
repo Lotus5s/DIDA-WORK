@@ -37,6 +37,7 @@ export const conversationMessages: Record<
     "conversation.workbench.remove_link_preview": "移除链接预览",
     "conversation.continue_in_new_task": "在新任务中继续",
     "conversation.assistant_status.stopped": "已停止",
+    "conversation.assistant_status.continue": "继续",
     "conversation.assistant_status.stopped_after": "你在 {{duration}} 后停止了",
     "conversation.assistant_error.details": "错误详情",
     "conversation.assistant_error.actions.switch_model_retry": "切换模型并重试",
@@ -415,6 +416,7 @@ export const conversationMessages: Record<
     "conversation.workbench.remove_link_preview": "Remove link preview",
     "conversation.continue_in_new_task": "Continue in new task",
     "conversation.assistant_status.stopped": "Stopped",
+    "conversation.assistant_status.continue": "Continue",
     "conversation.assistant_status.stopped_after":
       "You stopped after {{duration}}",
     "conversation.assistant_error.details": "Error details",

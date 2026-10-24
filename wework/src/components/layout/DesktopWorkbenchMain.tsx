@@ -238,6 +238,7 @@ import {
   useWorkbenchPaneVisible,
 } from './workbenchPanePresentation'
 import { useWorkbenchPaneSession } from './useWorkbenchPaneSession'
+import { RUNTIME_RETRY_CONTINUATION_PROMPT } from './runtimeRetry'
 import {
   formatEnvironmentReviewErrorMessage,
   type BottomPanelRenderContext,
@@ -5530,6 +5531,13 @@ const DesktopWorkbenchPane = memo(function DesktopWorkbenchPane({
                         ? undefined
                         : message => {
                             void paneSession.retryFailedMessage(message)
+                          }
+                    }
+                    onContinueStoppedMessage={
+                      issueExecutionReadOnly
+                        ? undefined
+                        : () => {
+                            void paneSession.sendContinuation(RUNTIME_RETRY_CONTINUATION_PROMPT, '继续')
                           }
                     }
                     onSwitchModelForFailedMessage={

@@ -1853,6 +1853,7 @@
     "permission_mode": "权限模式",
     "permission_mode_read_only": "只读",
     "permission_mode_workspace": "工作区",
+    "permission_mode_auto_review": "帮我批准",
     "permission_mode_full_access": "完整访问",
     "permission_full_access_confirm_title": "启用完整访问？",
     "permission_full_access_confirm_description": "Codex 将无需询问即可运行命令、访问网络，并读取、创建、修改或删除这台电脑任意位置的文件。",

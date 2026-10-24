@@ -67,6 +67,7 @@ function ScrollableMessagePaneContent({
   conversationKey,
   devices,
   onRetryFailedMessage,
+  onContinueStoppedMessage,
   onSwitchModelForFailedMessage,
   onLoadFileChangesDiff,
   onRevertFileChanges,
@@ -848,6 +849,7 @@ function ScrollableMessagePaneContent({
                 disableContentVisibility={turnNavigationLoading}
                 devices={devices}
                 onRetryFailedMessage={onRetryFailedMessage}
+                onContinueStoppedMessage={onContinueStoppedMessage}
                 onSwitchModelForFailedMessage={onSwitchModelForFailedMessage}
                 onLoadFileChangesDiff={onLoadFileChangesDiff}
                 onRevertFileChanges={onRevertFileChanges}
