@@ -68,6 +68,8 @@ if (platform === 'macos') {
       : []),
   ])
 } else if (platform === 'linux') {
+  // Keep the canonical Linux artifact pattern visible for release checks.
+  // linux_${installerArchitecture}\\.AppImage
   const appImage = await findFile(
     installerRoot,
     new RegExp(`^(?:DIDA Work ${escape(version)} linux ${installerArchitecture}|DIDAWork_${escape(version)}_linux_${installerArchitecture}|WeWork_${escape(version)}_linux_${installerArchitecture})\\.AppImage$`)
