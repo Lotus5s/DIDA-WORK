@@ -1,11 +1,13 @@
 const path = require('node:path')
+const fs = require('node:fs/promises')
 
 const { resolveBuildIdentity } = require('./scripts/build-identity.cjs')
 const macosAppIcon = require('./scripts/macos-app-icon.cjs')
+const verifyWindowsMigrationLock = require('./scripts/verify-windows-migration-lock.cjs')
 
 const updateBaseUrl =
   process.env.WEWORK_UPDATE_BASE_URL ||
-  'https://github.com/wecode-ai/Wegent/releases/download/wework-updater'
+  'https://github.com/Lotus5s/DIDA-WORK/releases/download/dida-work-updater'
 const identity = resolveBuildIdentity()
 const useCustomMacosNotarization =
   process.env.WEWORK_CUSTOM_MACOS_NOTARIZATION?.trim().toLowerCase() === 'true'
@@ -13,6 +15,7 @@ const onlineUpdateBuild = process.env.WEWORK_ONLINE_UPDATE_BUILD?.trim().toLower
 const onlineUpdateIncludesComponents =
   process.env.WEWORK_ONLINE_UPDATE_INCLUDE_COMPONENTS?.trim().toLowerCase() === 'true'
 const artifactPrefix = onlineUpdateBuild ? 'DIDAWorkHostUpdate' : 'DIDAWork'
+const didaUpdaterCacheDirName = 'io.wecode.dida-work-updater'
 const managedComponentResources = [
   { from: 'resources/harness-runtime', to: 'harness-runtime' },
   { from: 'resources/bin', to: 'bin' },
@@ -29,7 +32,23 @@ module.exports = {
   executableName: identity.executableName,
   compression: 'normal',
   beforePack: macosAppIcon.prepare,
-  afterPack: require('./scripts/verify-windows-migration-lock.cjs'),
+  afterPack: async context => {
+    await verifyWindowsMigrationLock(context)
+    if (context.electronPlatformName !== 'win32') return
+    const updateConfigPath = path.join(context.appOutDir, 'resources', 'app-update.yml')
+    try {
+      const updateConfig = await fs.readFile(updateConfigPath, 'utf8')
+      await fs.writeFile(
+        updateConfigPath,
+        updateConfig.replace(
+          /^updaterCacheDirName:.*$/m,
+          `updaterCacheDirName: ${didaUpdaterCacheDirName}`
+        )
+      )
+    } catch {
+      // The update config is generated only for packaged desktop targets.
+    }
+  },
   extraMetadata: {
     name: identity.packageName,
     weworkUpdateBaseUrl: updateBaseUrl,
@@ -90,7 +109,7 @@ module.exports = {
       onlineUpdateBuild && !onlineUpdateIncludesComponents
         ? [{ from: 'resources/bin/wegent-executor.exe', to: 'bin/wegent-executor.exe' }]
         : [],
-    artifactName: `${artifactPrefix}_\${version}_windows_\${arch}-setup.\${ext}`,
+    artifactName: `${onlineUpdateBuild ? 'DIDA Work Update' : 'DIDA Work'} \${version} Windows \${arch}${onlineUpdateBuild ? '' : ' Setup'}.\${ext}`,
     electronLanguages: ['en-US', 'zh-CN'],
     icon: path.resolve(__dirname, '../resources/icons/icon.ico'),
     target: ['nsis'],

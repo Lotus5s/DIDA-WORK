@@ -46,7 +46,7 @@ if (platform === 'macos') {
       ? [
           await findFile(
             onlineUpdateRoot,
-            new RegExp(`^(?:DIDA Work Host Update ${escape(version)} macos ${arch}|DIDAWorkHostUpdate_${escape(version)}_macos_${arch}|WeWorkHostUpdate_${escape(version)}_macos_${arch})\\.zip$`)
+            new RegExp(`^(?:DIDA Work Update ${escape(version)} macos ${arch}|DIDA Work Host Update ${escape(version)} macos ${arch}|DIDAWorkHostUpdate_${escape(version)}_macos_${arch}|WeWorkHostUpdate_${escape(version)}_macos_${arch})\\.zip$`)
           ),
         ]
       : []),
@@ -62,7 +62,7 @@ if (platform === 'macos') {
       ? [
           await findFile(
             onlineUpdateRoot,
-            new RegExp(`^(?:DIDA Work Host Update ${escape(version)} Windows ${arch} Setup|DIDAWorkHostUpdate_${escape(version)}_windows_${arch}-setup|WeWorkHostUpdate_${escape(version)}_windows_${arch}-setup)\\.exe$`)
+            new RegExp(`^(?:DIDA Work Update ${escape(version)} Windows ${arch}|DIDA Work Host Update ${escape(version)} Windows ${arch} Setup|DIDAWorkHostUpdate_${escape(version)}_windows_${arch}-setup|WeWorkHostUpdate_${escape(version)}_windows_${arch}-setup)\\.exe$`)
           ),
         ]
       : []),
@@ -81,7 +81,7 @@ if (platform === 'macos') {
           await findFile(
             onlineUpdateRoot,
             new RegExp(
-              `^(?:DIDA Work Host Update ${escape(version)} linux ${installerArchitecture}|DIDAWorkHostUpdate_${escape(version)}_linux_${installerArchitecture}|WeWorkHostUpdate_${escape(version)}_linux_${installerArchitecture})\\.AppImage$`
+              `^(?:DIDA Work Update ${escape(version)} linux ${installerArchitecture}|DIDA Work Host Update ${escape(version)} linux ${installerArchitecture}|DIDAWorkHostUpdate_${escape(version)}_linux_${installerArchitecture}|WeWorkHostUpdate_${escape(version)}_linux_${installerArchitecture})\\.AppImage$`
             )
           ),
         ]

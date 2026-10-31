@@ -151,8 +151,8 @@ async function updateAsset(suffix) {
   const names = useComponentizedHostUpdate
     ? [
         isWindows
-          ? `DIDA Work Host Update ${version} Windows ${archLabel} Setup.exe`
-          : `DIDA Work Host Update ${version} ${platformLabel} ${archLabel}.${extension}`,
+          ? `DIDA Work Update ${version} Windows ${archLabel}.exe`
+          : `DIDA Work Update ${version} ${platformLabel} ${archLabel}.${extension}`,
         ...(isWindows ? [] : [`DIDAWorkHostUpdate_${version}_${platform}_${architecture}.${extension}`]),
         isWindows
           ? `WeWorkHostUpdate_${version}_windows_x64-setup.exe`
