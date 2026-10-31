@@ -92,7 +92,7 @@ test('generates Electron and component rolling manifests from one release', asyn
     version: '0.1.1-rc.2',
     contentSha256: 'a'.repeat(64),
     archiveBytes: 'macos-arm64-coreDsh'.length,
-    downloadUrl: `https://github.com/wecode-ai/Wegent/releases/download/wework-updater/WeworkComponent_coreDsh_${createHash('sha256').update('macos-arm64-coreDsh').digest('hex')}_macos_arm64.tar.gz`,
+    downloadUrl: `https://github.com/wecode-ai/Wegent/releases/download/dida-work-updater/WeworkComponent_coreDsh_${createHash('sha256').update('macos-arm64-coreDsh').digest('hex')}_macos_arm64.tar.gz`,
   })
   expect(components.components.coreDsh.archiveSha256).toMatch(/^[0-9a-f]{64}$/)
   expect(components.components.executor.downloadUrl).toBe(

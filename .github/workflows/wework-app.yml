@@ -74,7 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           manifest="$RUNNER_TEMP/current-components.json"
-          if gh release download wework-updater \
+          if gh release download dida-work-updater \
             --pattern "components-${RELEASE_CHANNEL}-macos-arm64.json" \
             --output "$manifest" \
             --clobber >/dev/null 2>&1; then
@@ -475,7 +475,7 @@ jobs:
           set -euo pipefail
           find release-assets -maxdepth 1 -type f \
             ! -name 'components-*.json' \
-            ! -name 'WeworkComponent_*.tar.gz' \
+            ! -name '*Component_*.tar.gz' \
             -print0 |
             xargs -0 gh release upload "$RELEASE_TAG" --clobber
           node wework/scripts/upload-desktop-component-assets.mjs \
@@ -510,15 +510,15 @@ jobs:
           RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
           set -euo pipefail
-          if ! gh release view wework-updater >/dev/null 2>&1; then
-            gh release create wework-updater \
+          if ! gh release view dida-work-updater >/dev/null 2>&1; then
+            gh release create dida-work-updater \
               --target "$RELEASE_SHA" \
-              --title "Wework shared dependencies and updater manifests" \
+              --title "DIDA Work shared dependencies and updater manifests" \
               --notes "Content-addressed shared dependencies plus rolling Electron and component update manifests." \
               --prerelease
           fi
           existing_component_assets="$RUNNER_TEMP/existing-component-assets.txt"
-          gh release view wework-updater \
+          gh release view dida-work-updater \
             --json assets \
             --jq '.assets[].name' > "$existing_component_assets"
           harness_runtime_assets="$RUNNER_TEMP/harness-runtime-assets"
@@ -531,7 +531,7 @@ jobs:
               echo "Reusing immutable Harness Runtime asset $runtime_name."
               continue
             fi
-            gh release upload wework-updater "$runtime_asset"
+            gh release upload dida-work-updater "$runtime_asset"
             echo "$runtime_name" >> "$existing_component_assets"
           done < <(find "$harness_runtime_assets" -maxdepth 1 -type f | sort)
           while IFS= read -r component_asset; do
@@ -540,7 +540,7 @@ jobs:
               echo "Reusing immutable component asset $component_name."
               continue
             fi
-            gh release upload wework-updater "$component_asset"
+            gh release upload dida-work-updater "$component_asset"
             echo "$component_name" >> "$existing_component_assets"
           done < <(
             node wework/scripts/desktop-component-release.mjs release-assets shared |
@@ -556,8 +556,8 @@ jobs:
             local current_manifest="$RUNNER_TEMP/current-${channel}.yml"
             [[ "$channel" == "stable" ]] && electron_channel="latest"
 
-            gh release view wework-updater --json assets > "$current_assets"
-            if gh release download wework-updater \
+            gh release view dida-work-updater --json assets > "$current_assets"
+            if gh release download dida-work-updater \
               --pattern "${electron_channel}-mac.yml" \
               --output "$current_manifest" \
               --clobber >/dev/null 2>&1; then
@@ -574,7 +574,7 @@ jobs:
                   echo "Keeping ${channel} component manifests at newer app version ${current_version}."
                   return
                 fi
-                gh release upload wework-updater \
+                gh release upload dida-work-updater \
                   "release-manifests/components-${channel}-macos-arm64.json" \
                   "release-manifests/components-${channel}-macos-x64.json" \
                   "release-manifests/components-${channel}-windows-x64.json" \
@@ -601,7 +601,7 @@ jobs:
               return 1
             fi
 
-            gh release upload wework-updater \
+            gh release upload dida-work-updater \
               "release-manifests/components-${channel}-macos-arm64.json" \
               "release-manifests/components-${channel}-macos-x64.json" \
               "release-manifests/components-${channel}-windows-x64.json" \

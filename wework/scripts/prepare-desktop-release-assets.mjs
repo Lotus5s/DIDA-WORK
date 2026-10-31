@@ -33,11 +33,11 @@ await mkdir(output, { recursive: true })
 if (platform === 'macos') {
   const dmg = await findFile(
     installerRoot,
-    new RegExp(`^WeWork_${escape(version)}_macos_${arch}\\.dmg$`)
+    new RegExp(`^(?:DIDA Work ${escape(version)} macos ${arch}|DIDAWork_${escape(version)}_macos_${arch}|WeWork_${escape(version)}_macos_${arch})\\.dmg$`)
   )
   const installerZip = await findFile(
     installerRoot,
-    new RegExp(`^WeWork_${escape(version)}_macos_${arch}\\.zip$`)
+    new RegExp(`^(?:DIDA Work ${escape(version)} macos ${arch}|DIDAWork_${escape(version)}_macos_${arch}|WeWork_${escape(version)}_macos_${arch})\\.zip$`)
   )
   await cp(dmg, join(output, basename(dmg)))
   await copyUpdateArtifacts([
@@ -46,7 +46,7 @@ if (platform === 'macos') {
       ? [
           await findFile(
             onlineUpdateRoot,
-            new RegExp(`^WeWorkHostUpdate_${escape(version)}_macos_${arch}\\.zip$`)
+            new RegExp(`^(?:DIDA Work Host Update ${escape(version)} macos ${arch}|DIDAWorkHostUpdate_${escape(version)}_macos_${arch}|WeWorkHostUpdate_${escape(version)}_macos_${arch})\\.zip$`)
           ),
         ]
       : []),
@@ -54,7 +54,7 @@ if (platform === 'macos') {
 } else if (platform === 'windows') {
   const installer = await findFile(
     installerRoot,
-    new RegExp(`^WeWork_${escape(version)}_windows_${arch}-setup\\.exe$`)
+    new RegExp(`^(?:DIDA Work ${escape(version)} Windows ${arch} Setup|DIDAWork_${escape(version)}_windows_${arch}-setup|WeWork_${escape(version)}_windows_${arch}-setup)\\.exe$`)
   )
   await copyUpdateArtifacts([
     installer,
@@ -62,7 +62,7 @@ if (platform === 'macos') {
       ? [
           await findFile(
             onlineUpdateRoot,
-            new RegExp(`^WeWorkHostUpdate_${escape(version)}_windows_${arch}-setup\\.exe$`)
+            new RegExp(`^(?:DIDA Work Host Update ${escape(version)} Windows ${arch} Setup|DIDAWorkHostUpdate_${escape(version)}_windows_${arch}-setup|WeWorkHostUpdate_${escape(version)}_windows_${arch}-setup)\\.exe$`)
           ),
         ]
       : []),
@@ -70,7 +70,7 @@ if (platform === 'macos') {
 } else if (platform === 'linux') {
   const appImage = await findFile(
     installerRoot,
-    new RegExp(`^WeWork_${escape(version)}_linux_${installerArchitecture}\\.AppImage$`)
+    new RegExp(`^(?:DIDA Work ${escape(version)} linux ${installerArchitecture}|DIDAWork_${escape(version)}_linux_${installerArchitecture}|WeWork_${escape(version)}_linux_${installerArchitecture})\\.AppImage$`)
   )
   await copyUpdateArtifacts([
     appImage,
@@ -79,7 +79,7 @@ if (platform === 'macos') {
           await findFile(
             onlineUpdateRoot,
             new RegExp(
-              `^WeWorkHostUpdate_${escape(version)}_linux_${installerArchitecture}\\.AppImage$`
+              `^(?:DIDA Work Host Update ${escape(version)} linux ${installerArchitecture}|DIDAWorkHostUpdate_${escape(version)}_linux_${installerArchitecture}|WeWorkHostUpdate_${escape(version)}_linux_${installerArchitecture})\\.AppImage$`
             )
           ),
         ]
@@ -127,7 +127,7 @@ async function prepareComponentAssets() {
       throw new Error(`Component source is unavailable: ${sourcePath}`)
     }
     const archiveSha256 = await sha256(temporaryAssetPath)
-    const assetName = `WeworkComponent_${id}_${archiveSha256}_${platform}_${arch}.tar.gz`
+    const assetName = `DIDAWorkComponent_${id}_${archiveSha256}_${platform}_${arch}.tar.gz`
     await rename(temporaryAssetPath, join(output, assetName))
     componentAssets[id] = {
       version: component.version,

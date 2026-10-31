@@ -45,7 +45,8 @@ const output = resolve(outputDirectory)
 const notes = await readFile(resolve(notesPath), 'utf8')
 const releaseDate = new Date().toISOString()
 const releaseBaseUrl = `https://github.com/${repository}/releases/download/${releaseTag}`
-const sharedComponentBaseUrl = `https://github.com/${repository}/releases/download/wework-updater`
+const sharedComponentReleaseTag = process.env.DIDA_UPDATER_RELEASE_TAG || 'dida-work-updater'
+const sharedComponentBaseUrl = `https://github.com/${repository}/releases/download/${sharedComponentReleaseTag}`
 const useComponentizedHostUpdate = process.env.WEWORK_USE_COMPONENTIZED_HOST_UPDATE === 'true'
 await mkdir(output, { recursive: true })
 
@@ -141,8 +142,44 @@ async function asset(name) {
 }
 
 async function updateAsset(suffix) {
-  const prefix = useComponentizedHostUpdate ? 'WeWorkHostUpdate' : 'WeWork'
-  return asset(`${prefix}_${version}_${suffix}`)
+  const isWindows = suffix === 'windows_x64-setup.exe'
+  const platform = isWindows ? 'windows' : suffix.startsWith('macos_arm64') ? 'macos' : 'macos'
+  const architecture = isWindows ? 'x64' : suffix.startsWith('macos_arm64') ? 'arm64' : 'x64'
+  const extension = isWindows ? 'exe' : 'zip'
+  const platformLabel = platform === 'macos' ? 'macos' : 'Windows'
+  const archLabel = architecture
+  const names = useComponentizedHostUpdate
+    ? [
+        isWindows
+          ? `DIDA Work Host Update ${version} Windows ${archLabel} Setup.exe`
+          : `DIDA Work Host Update ${version} ${platformLabel} ${archLabel}.${extension}`,
+        ...(isWindows ? [] : [`DIDAWorkHostUpdate_${version}_${platform}_${architecture}.${extension}`]),
+        isWindows
+          ? `WeWorkHostUpdate_${version}_windows_x64-setup.exe`
+          : `WeWorkHostUpdate_${version}_${platform}_${architecture}.${extension}`,
+      ]
+    : [
+        isWindows
+          ? `DIDA Work ${version} Windows ${archLabel} Setup.exe`
+          : `DIDA Work ${version} ${platformLabel} ${archLabel}.${extension}`,
+        ...(isWindows ? [] : [`DIDAWork_${version}_${platform}_${architecture}.${extension}`]),
+        isWindows
+          ? `WeWork_${version}_windows_x64-setup.exe`
+          : `WeWork_${version}_${platform}_${architecture}.${extension}`,
+      ]
+  return asset(await firstExistingAsset(names))
+}
+
+async function firstExistingAsset(names) {
+  for (const name of names) {
+    try {
+      await stat(resolve(assets, name))
+      return name
+    } catch {
+      // Try the next supported artifact naming convention.
+    }
+  }
+  throw new Error(`Desktop release asset is missing; tried: ${names.join(', ')}`)
 }
 
 async function localAsset(name) {
