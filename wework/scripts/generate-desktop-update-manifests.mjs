@@ -45,8 +45,8 @@ const output = resolve(outputDirectory)
 const notes = await readFile(resolve(notesPath), 'utf8')
 const releaseDate = new Date().toISOString()
 const releaseBaseUrl = `https://github.com/${repository}/releases/download/${releaseTag}`
-const sharedComponentReleaseTag = process.env.DIDA_UPDATER_RELEASE_TAG || 'dida-work-updater'
-const sharedComponentBaseUrl = `https://github.com/${repository}/releases/download/${sharedComponentReleaseTag}`
+const componentReleaseTag = process.env.DIDA_COMPONENT_RELEASE_TAG || 'dida-work-components'
+const componentReleaseBaseUrl = `https://github.com/${repository}/releases/download/${componentReleaseTag}`
 const useComponentizedHostUpdate = process.env.WEWORK_USE_COMPONENTIZED_HOST_UPDATE === 'true'
 await mkdir(output, { recursive: true })
 
@@ -103,7 +103,7 @@ for (const [platform, architecture] of [
       contentSha256: component.contentSha256,
       archiveSha256,
       archiveBytes: archive.size,
-      downloadUrl: `${releaseScope === 'shared' ? sharedComponentBaseUrl : releaseBaseUrl}/${encodeURIComponent(component.assetName)}`,
+      downloadUrl: `${componentReleaseBaseUrl}/${encodeURIComponent(component.assetName)}`,
       entryPath: component.entryPath,
     }
   }
